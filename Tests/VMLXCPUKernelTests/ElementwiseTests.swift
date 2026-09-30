@@ -178,7 +178,8 @@
             }
         }
 
-        /// As `base_simd.h` computes it: NaN in a wins for maximum and minimum, and remainder moves
+        /// As `base_simd.h` computes it: maximum and minimum give NaN when either operand is NaN
+        /// (which NaN is not checked: `expectIdentical` treats NaNs as equal), and remainder moves
         /// std::remainder's result into b's sign (#3019's std::fmod gives the same, bit for bit).
         func float(_ a: Float, _ b: Float) -> Float {
             switch self {
@@ -186,8 +187,12 @@
             case .subtract: return a - b
             case .multiply: return a * b
             case .divide: return a / b
-            case .maximum: return a.isNaN ? a : (a > b ? a : b)
-            case .minimum: return a.isNaN ? a : (a < b ? a : b)
+            case .maximum:
+                if a.isNaN || b.isNaN { return .nan }
+                return a > b ? a : b
+            case .minimum:
+                if a.isNaN || b.isNaN { return .nan }
+                return a < b ? a : b
             case .arctan2: return Glibc.atan2f(a, b)
             case .power: return Glibc.powf(a, b)
             case .remainder:
@@ -203,8 +208,12 @@
             case .subtract: return a - b
             case .multiply: return a * b
             case .divide: return a / b
-            case .maximum: return a.isNaN ? a : (a > b ? a : b)
-            case .minimum: return a.isNaN ? a : (a < b ? a : b)
+            case .maximum:
+                if a.isNaN || b.isNaN { return .nan }
+                return a > b ? a : b
+            case .minimum:
+                if a.isNaN || b.isNaN { return .nan }
+                return a < b ? a : b
             case .arctan2: return Glibc.atan2(a, b)
             case .power: return Glibc.pow(a, b)
             case .remainder:
@@ -305,6 +314,44 @@
                         .count
                     #expect(differing == 0, "\(name) \(dtype): \(differing) of \(got.count) differ")
                 }
+            }
+        }
+
+        /// fromFP8 decodes each of the 256 E4M3 codes, the sign of zero included, in whole vectors,
+        /// then three codes one at a time: a Highway build's scalar path, which tails and strided
+        /// inputs take. Every E4M3 value is exact in float32, float16 and bfloat16. float64 is left
+        /// out: MLX's CPU from_fp8 writes float32 values into a float64 output. 0x7F and 0xFF are
+        /// E4M3's NaN, and MLX decodes them as NaN on every path since MLX 0.32.3.
+        @Test(arguments: [DType.float32, .float16, .bfloat16])
+        func fromFP8OfEveryCode(dtype: DType) {
+            KernelLock.run {
+                // 256 codes fill whole vectors at every width up to 16; the last three, -0, the
+                // negative NaN code and the smallest subnormal, form the tail.
+                let codes = (0 ..< 256).map { UInt8($0) } + [0x80, 0xFF, 0x01]
+                expectIdentical(
+                    fromFP8(MLXArray(codes), dtype: dtype), codes.map { fp8E4M3(UInt32($0)) },
+                    "fromFP8 \(dtype)")
+            }
+        }
+
+        /// maximum and minimum as base_simd.h computes them: a NaN in either operand gives NaN, and
+        /// a tie of +0 and -0 gives b, in either order, where NEON's FMAXNM and FMINNM would
+        /// give +0 and -0. The 16 pairs, four times over, fill 64 elements: whole vectors at every
+        /// width. No pair reaches the scalar tail; the build without Highway runs them all through
+        /// the scalar code.
+        @Test(arguments: floatTypes)
+        func maximumAndMinimumOfSignedZerosAndNaN(dtype: DType) {
+            KernelLock.run {
+                let a = (0 ..< 64).map { [0.0, -0.0, Double.nan, 1.0][$0 % 4] }
+                let b = (0 ..< 64).map { [-0.0, 0.0, 1.0, Double.nan][($0 / 4) % 4] }
+                let (x, xs) = materialize(a, dtype)
+                let (y, ys) = materialize(b, dtype)
+                expectIdentical(
+                    MLX.maximum(x, y), zip(xs, ys).map { ExactBinary.maximum.double($0, $1) },
+                    "maximum \(dtype)")
+                expectIdentical(
+                    MLX.minimum(x, y), zip(xs, ys).map { ExactBinary.minimum.double($0, $1) },
+                    "minimum \(dtype)")
             }
         }
 

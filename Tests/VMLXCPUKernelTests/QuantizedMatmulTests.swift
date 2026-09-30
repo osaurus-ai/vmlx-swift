@@ -113,9 +113,12 @@
             let k = 1024
             let w = MLXRandom.normal([256, k], dtype: .float32, key: MLXRandom.key(9))
             let (wq, scales, _) = quantized(w, groupSize: groupSize, bits: bits, mode: qmode)
-            let wHat = dequantized(
-                wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits, mode: qmode,
-                dtype: .float32)
+            // Decoded on the host (hostDequantized), as the gather test's weights are: the oracle
+            // shares no decoding with MLX.
+            let wHat = MLXArray(
+                hostDequantized(
+                    wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits, mode: qmode),
+                [256, k])
             for rows in [1, 8, 32, 64] {
                 let x = MLXRandom.normal(
                     [rows, k], dtype: .float32, key: MLXRandom.key(UInt64(rows))
@@ -145,6 +148,28 @@
             mode: (QuantizationMode, Int, Int), dtype: DType
         ) {
             KernelLock.run { Self.checkFloatingPointMode(mode, dtype: dtype) }
+        }
+
+        /// MLX's dequantize against a decode written from the formats (`hostDequantized`), exactly,
+        /// for the codes quantize emits from these weights: each product has at most 6 significant
+        /// bits and stays far inside float32's range. (At the top of E8M0's range float32
+        /// overflows, and MLX decodes E8M0 255 as +inf where the spec, and hostDequantized, give
+        /// NaN.)
+        @Test(arguments: floatingPointModes)
+        func dequantizeMatchesTheFormats(mode: (QuantizationMode, Int, Int)) {
+            KernelLock.run {
+                let (qmode, groupSize, bits) = mode
+                let w = MLXRandom.normal([64, 256], dtype: .float32, key: MLXRandom.key(12))
+                let (wq, scales, _) = quantized(w, groupSize: groupSize, bits: bits, mode: qmode)
+                expectIdentical(
+                    dequantized(
+                        wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits,
+                        mode: qmode, dtype: .float32),
+                    hostDequantized(
+                        wq, scales: scales, biases: nil, groupSize: groupSize, bits: bits,
+                        mode: qmode),
+                    "dequantize \(qmode)")
+            }
         }
 
         /// bf16 and fp16 activations with scales and biases in the same dtype. #3019 accumulates in

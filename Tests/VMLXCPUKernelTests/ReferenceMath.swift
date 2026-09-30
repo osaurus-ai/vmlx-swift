@@ -263,7 +263,9 @@
     /// is `bits` wide, packed into 32-bit words from the lowest bits up. Affine: code · scale +
     /// bias of its group. mxfp4 and nvfp4: the E2M1 value of the code; mxfp8: its E4M3 value;
     /// times the group's scale, E8M0 for mxfp4 and mxfp8 and E4M3 for nvfp4. Row-major, in
-    /// `wq`'s shape with the last axis counted in elements.
+    /// `wq`'s shape with the last axis counted in elements. Like the spec, it decodes E4M3 0x7F and
+    /// 0xFF and E8M0 255 as NaN; MLX decodes the first two so too, and the third as +inf. quantize
+    /// never emits those.
     func hostDequantized(
         _ wq: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int, bits: Int,
         mode: QuantizationMode = .affine

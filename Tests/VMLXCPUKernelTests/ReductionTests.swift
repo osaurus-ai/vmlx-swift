@@ -87,6 +87,27 @@
             }
         }
 
+        /// A NaN anywhere makes max and min NaN: in any lane of the vector accumulator, or in the
+        /// scalar tail. A pin: reduce.cpp returns NaN before Highway's ReduceMax, which on x86-64
+        /// can drop one (NEON's FMAXV keeps it); only the x86-64 leg catches a change there. A
+        /// failure names the positions that lose the NaN.
+        @Test(arguments: floatTypes)
+        func extremesOfNaN(dtype: DType) {
+            KernelLock.run {
+                var lostByMax: [Int] = []
+                var lostByMin: [Int] = []
+                for p in 0 ..< 67 {
+                    var values = (0 ..< 67).map { Double($0 % 9) * 0.5 - 2 }
+                    values[p] = .nan
+                    let (x, _) = materialize(values, dtype)
+                    if !doubles(MLX.max(x))[0].isNaN { lostByMax.append(p) }
+                    if !doubles(MLX.min(x))[0].isNaN { lostByMin.append(p) }
+                }
+                #expect(lostByMax.isEmpty, "max loses a NaN at \(lostByMax), \(dtype)")
+                #expect(lostByMin.isEmpty, "min loses a NaN at \(lostByMin), \(dtype)")
+            }
+        }
+
         /// A float32 sum of n terms in any order errs by at most (n - 1)·u·Σ|x|; the bound is
         /// (n + 2)·ε·Σ|x|, and the mean's adds its scaling.
         @Test func float32SumsWithinTheBound() {
