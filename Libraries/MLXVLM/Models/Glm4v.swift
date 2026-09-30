@@ -925,14 +925,15 @@ public class Glm4v: Module, VLMModel, KVCacheDimensionProvider {
             if let mask = input.text.mask {
                 // GLM4V text forward has no padding-mask input. An all-true mask
                 // is equivalent to omission; reject actual padding before cache mutation.
-                guard mask.shape == tokens.shape, mask.dtype == .bool,
+                guard mask.shape == tokens.shape,
+                      [.bool, .int8, .uint8, .int16, .uint16, .int32, .uint32, .int64, .uint64].contains(mask.dtype),
                       try withError({ error in
-                          let allTrue = mask.all().item(Bool.self)
+                          let allTrue = (mask .== MLXArray(1, dtype: mask.dtype)).all().item(Bool.self)
                           try error.check()
                           return allTrue
                       }) else {
                     throw NSError(domain: "Glm4v.prepare", code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "GLM4V text preparation requires an all-true bool mask matching tokens"])
+                        userInfo: [NSLocalizedDescriptionKey: "GLM4V text preparation requires an all-one bool or integer mask matching tokens"])
                 }
             }
             languageModel._positionIds = nil

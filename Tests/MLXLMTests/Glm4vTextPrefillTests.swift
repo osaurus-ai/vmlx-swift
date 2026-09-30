@@ -87,6 +87,24 @@ final class Glm4vTextPrefillTests: XCTestCase {
             XCTAssertEqual(cache[0].offset, 0); XCTAssertTrue(cache[0].state.isEmpty)
         }
     }
+    func testProcessorIntegralMasksAcceptOnlyExactOnes() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try model(), ids = MLXArray([Int32(1),2]).reshaped(1,2)
+            for dtype in [DType.int8, .uint8, .int16, .uint16, .int32, .uint32, .int64, .uint64] {
+                let cache = [KVCacheSimple()]
+                let accepted = LMInput(tokens: ids, mask: MLXArray.ones([1,2], dtype: dtype))
+                _ = try m.prepare(accepted, cache: cache, windowSize: 2)
+                XCTAssertEqual(cache[0].offset, 2)
+                let snapshot = cache[0].state.map { $0.asArray(Float.self) }
+                for values in [[0,0], [1,0], [1,2]] {
+                    let mask = MLXArray(values.map(Int32.init)).reshaped(1,2).asType(dtype)
+                    XCTAssertThrowsError(try m.prepare(LMInput(tokens: ids, mask: mask), cache: cache, windowSize: 2))
+                    XCTAssertEqual(cache[0].offset, 2)
+                    XCTAssertEqual(cache[0].state.map { $0.asArray(Float.self) }, snapshot)
+                }
+            }
+        }
+    }
     private final class Progress: @unchecked Sendable {
         let lock = NSLock(); var values: [Int] = []
         func add(_ value: Int) { lock.lock(); defer { lock.unlock() }; values.append(value) }
