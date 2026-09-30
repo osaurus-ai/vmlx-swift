@@ -5,10 +5,11 @@
 // sources less its benchmarking and profiling tools (nanobenchmark,
 // perf_counters, profiler). Cmlx excludes the submodule; these compile it.
 #if defined(MLX_USE_HIGHWAY_KERNELS)
-// Package.swift's #if arch(x86_64) tests the host, so a cross-compilation from
-// x86-64 could define the macro for a target mlx refuses Highway for.
-#if !defined(__x86_64__) && !defined(_M_X64)
-#error "MLX_USE_HIGHWAY_KERNELS requires an x86-64 target"
+// Package.swift's #if arch tests the host, so a cross-compilation could define
+// the macro for a target mlx refuses Highway for.
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && \
+    !defined(_M_ARM64)
+#error "MLX_USE_HIGHWAY_KERNELS requires an x86-64 or arm64 target"
 #endif
 #include "hwy/targets.cc"
 #endif

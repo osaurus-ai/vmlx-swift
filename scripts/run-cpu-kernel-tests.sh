@@ -9,10 +9,11 @@
 #                                    [--filter <swift-testing filter>] [--once] [--stall <seconds>]
 #
 # The test build (VMLX_HWY_ALL_TARGETS=1, release) compiles every attainable Highway target, EMU128
-# included. VMLX_EXPECT_HWY_TARGETS, the targets this host must execute, is --expect's value, or else
-# Highway's own detection of this CPU (scripts/hwy-supported-targets.cc, compiled with $CXX, by
-# default g++) intersected with the targets Highway 1.4.0 attains on this architecture, plus EMU128.
-# It never comes from what the build contains.
+# included. VMLX_EXPECT_HWY_TARGETS, the targets this host must execute, is --expect's value, or
+# else Highway's own detection of this CPU (scripts/hwy-supported-targets.cc, compiled with $CXX, by
+# default g++) intersected with the targets Highway 1.4.0 attains on this architecture, less the SVE
+# family that Package.swift disables on arm64, plus EMU128. It never comes from what the build
+# contains.
 # --sde runs the probe and the tests under Intel SDE, emulating <chip> (for example spr).
 # --filter narrows the tests (default: the whole target); --once runs only the default pool, for
 # emulated runs, which are slow. A run whose log stops growing for --stall seconds (default 1200) is
@@ -95,7 +96,9 @@ if [ -z "$EXPECT" ]; then
     # Highway 1.4.0 marks AVX10_2 broken below Clang 23 (hwy/detect_targets.h), so Swift 6.4's
     # Clang 21 attains the rest. Add AVX10_2 when the toolchain's Clang reaches 23.
     x86_64) ATTAINABLE="AVX3_SPR AVX3_ZEN4 AVX3_DL AVX3 AVX2 SSE4 SSSE3 SSE2" ;;
-    *) ATTAINABLE="" ;; # no Highway kernels off x86-64 yet
+    # No SVE: the build disables it (Package.swift) until the kernels are vector-length agnostic.
+    aarch64) ATTAINABLE="NEON_BF16 NEON NEON_WITHOUT_AES" ;;
+    *) ATTAINABLE="" ;; # no Highway kernels elsewhere
   esac
   if [ -n "$ATTAINABLE" ]; then
     H="$ROOT/Source/Cmlx/highway"

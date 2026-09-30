@@ -73,12 +73,17 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
     ]
 
-    // Google Highway SIMD kernels in the CPU backend, on x86-64 for now. In a
-    // manifest, #if arch tests the host, which is the target in a native build.
-    // VMLX_HWY_ALL_TARGETS=1 compiles every attainable target, EMU128 included, for the kernel tests.
-    #if arch(x86_64)
+    // Google Highway SIMD kernels in the CPU backend, on Linux x86-64 and arm64. In a manifest,
+    // #if arch tests the host, which is the target in a native build. VMLX_HWY_ALL_TARGETS=1
+    // compiles every attainable target, EMU128 included, for the kernel tests.
+    #if arch(x86_64) || arch(arm64)
         let highwayDefines: [CXXSetting] =
-            [.define("MLX_USE_HIGHWAY_KERNELS"), .define("HWY_DISABLE_PCLMUL_AES")]
+            [
+                .define("MLX_USE_HIGHWAY_KERNELS"), .define("HWY_DISABLE_PCLMUL_AES"),
+                // No SVE until the dispatched kernels are vector-length agnostic. Also set on
+                // x86-64, where it does nothing, since #if arch tests the host, not the target.
+                .define("HWY_DISABLED_TARGETS", to: "HWY_ALL_SVE"),
+            ]
             + (Context.environment["VMLX_HWY_ALL_TARGETS"] == "1"
                 ? [.define("HWY_COMPILE_ALL_ATTAINABLE")] : [])
     #else
@@ -233,8 +238,8 @@ let cmlx = Target.target(
         // vendored library, include header only
         "json",
 
-        // Google Highway, a submodule. Linux x86-64 compiles its runtime sources through the
-        // wrappers in highway-runtime/, and nothing else of it compiles anywhere.
+        // Google Highway, a submodule. Builds with Highway kernels compile its runtime sources
+        // through the wrappers in highway-runtime/, and nothing else of it compiles anywhere.
         "highway",
 
         // vendored library
