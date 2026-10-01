@@ -2660,8 +2660,9 @@ public final class Glm5NextProcessor: UserInputProcessor {
         // tokens after it, which produced a prompt with no role framing at all — the model was doing
         // free continuation, and answered a picture of a red 1 with "The digit is 3, and it is red.
         // The digit is 3, and it is orange." Fluent, confident, and nothing to do with the image.
+        let messages = Glm5NextMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
-            messages: Glm5NextMessageGenerator().generate(from: input),
+            messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext)
 
@@ -2697,9 +2698,24 @@ public final class Glm5NextProcessor: UserInputProcessor {
         }
 
         guard !input.images.isEmpty else {
+            // The exact active template proves text-only resume boundaries.
+            // Media expansion needs its own companion-state proof before it
+            // can publish these counts. Unsupported tokenizers fail closed.
+            let boundaries = input.audios.isEmpty
+                ? canonicalChatCacheBoundaries(
+                    tokenizer: tokenizer,
+                    messages: messages,
+                    tools: input.tools,
+                    additionalContext: input.additionalContext,
+                    promptTokens: promptTokens,
+                    staticSystemPrefix: input.cacheStableSystemPrefix)
+                : CanonicalChatCacheBoundaries(all: [], stable: [])
             return LMInput(
-                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) })),
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                text: .init(tokens: MLXArray(promptTokens.map { Int32($0) }), tokenIds: promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                cachePrefixTokenCounts: boundaries.all,
+                cacheStablePrefixTokenCounts: boundaries.stable,
+                toolSchemas: input.tools)
         }
 
         var patches = [MLXArray]()
@@ -2939,12 +2955,14 @@ public struct Glm5NextMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
-        [
-            "role": message.role.rawValue,
-            "content": [["type": "text", "text": message.content]]
-                + message.images.map { _ in ["type": "image"] }
-                + message.videos.map { _ in ["type": "video"] },
-        ]
+        // Preserve reasoning, call/result IDs and emitted argument order for
+        // the native template to interpret. Only GLM's media content differs
+        // from the shared history mapping.
+        var result = defaultMessageDict(for: message)
+        result["content"] = [["type": "text", "text": message.content]]
+            + message.images.map { _ in ["type": "image"] }
+            + message.videos.map { _ in ["type": "video"] }
+        return result
     }
 }
 
