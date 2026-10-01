@@ -29,6 +29,14 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
             throw XCTSkip("Requires supported compiled decode; a skip is not runtime proof")
         }
         try MLXMetalTestLock.withLock {
+            // Keep the native compile-cache context fixed. Core keys traces
+            // by peek_default_stream(), whereas Swift passes Stream.gpu to
+            // operations explicitly. The first safetensors write invokes
+            // native contiguous() without a stream and lazily creates a core
+            // default, legitimately changing that key. Bind the same stream
+            // before tracing so this assertion measures storage/state changes,
+            // rather than one-time initialization of a different context.
+            Stream.restoreDefault()
             // The wrapped case begins after a native wrap and stays away from
             // idx==capacity. It isolates metadata export from the separate ring-write fix.
             for (capacity, promptLength) in [(16, 3), (8, 10)] {
@@ -51,6 +59,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                 }
                 for value in [Float(100), Float(110), Float(120)] {
                     eval(controlForward([row(value)]))
+                    XCTAssertEqual(controlCounter.read(), 1, "Unstored control must keep its trace")
                     print("postanswer no-store control capacity=\(capacity) value=\(value) traces=\(controlCounter.read())")
                 }
                 for layout in 0..<3 {
@@ -98,7 +107,6 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                         _ = simpleReference.update(keys: next, values: next * 2)
                     }
                     let tracedCount = traceCounter.read()
-                    print("postanswer pre-store traces=\(tracedCount) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
                     XCTAssertGreaterThan(tracedCount, 0)
                     if includeSimple { XCTAssertEqual(simple.offset, boundary) }
                     XCTAssertEqual(rotating.offsetArray.item(Int.self), boundary)
@@ -123,7 +131,6 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                             promptTokenIds: prompt, generatedTokenIds: generated,
                             cacheOffsets: cacheBoundaryLeafOffsets(caches), pendingDrainedTokenId: nil), key)
                     let snapshot = makePromptBoundaryCacheSnapshot(from: caches)
-                    print("postanswer snapshot traces=\(traceCounter.read()) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
                     writer.storeAfterGeneration(
                         promptTokens: key, perLayerData: [], ssmStates: nil,
                         cache: snapshot, isPostAnswer: true)
@@ -157,7 +164,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                     // Host materialization must not break the existing trace, and
                     // must never rewrite the retained prompt boundary.
                     eval(forward([row(120)]))
-                    print("postanswer continued traces=\(traceCounter.read()) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
+                    print("postanswer continued traces=\(traceCounter.read())")
                     XCTAssertEqual(traceCounter.read(), tracedCount, "Storage must not retrace the forward")
                     if includeSimple { XCTAssertEqual(simple.offset, boundary + 1) }
                     synchronizeCompiledRotatingCacheMetadataForStorage(caches)
