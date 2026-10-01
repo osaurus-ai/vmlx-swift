@@ -56,13 +56,13 @@ private final class PostAnswerEntryFixture: Module, LanguageModel, @unchecked Se
 }
 
 final class CompiledPostAnswerEntrypointTests: XCTestCase {
-    private func config(_ directory: URL) -> CacheCoordinatorConfig {
+    private static func config(_ directory: URL) -> CacheCoordinatorConfig {
         CacheCoordinatorConfig(
             usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1,
             diskCacheDir: directory, modelKey: "post-answer-entrypoint")
     }
 
-    private func assertRestoredStateMatchesCold(
+    private static func assertRestoredStateMatchesCold(
         _ restored: [any KVCache], key: [Int], model: PostAnswerEntryFixture,
         parameters: GenerateParameters
     ) {
@@ -91,7 +91,7 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("solo-postanswer-entry-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: directory) }
-            let coordinator = CacheCoordinator(config: config(directory))
+            let coordinator = CacheCoordinator(config: Self.config(directory))
             let model = PostAnswerEntryFixture()
             let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
             let parameters = GenerateParameters(
@@ -115,14 +115,14 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
             // This is the production entry point, intentionally not the helper.
             iterator.storeCacheAfterGeneration(generatedTokenIds: emitted, includeGeneratedBoundary: true)
             XCTAssertEqual(compiled.offset, 6)
-            let reader = CacheCoordinator(config: config(directory))
+            let reader = CacheCoordinator(config: Self.config(directory))
             let key = [1, 2, 3, 4, 5, 6] // includes the actually forwarded stop token
             let arrays = try XCTUnwrap(reader.diskCache?.fetch(
                 tokens: key, mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
             var restored = model.newCache(parameters: parameters)
             XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), key.count)
             XCTAssertTrue(validateRestoredCacheBoundary(restored, matchedTokens: key.count, restoredTokens: key.count))
-            assertRestoredStateMatchesCold(restored, key: key, model: model, parameters: parameters)
+            Self.assertRestoredStateMatchesCold(restored, key: key, model: model, parameters: parameters)
             print("solo cache fixture tokens_per_second=\(Double(emitted.count) / Date().timeIntervalSince(started))")
         }
     }
@@ -134,7 +134,7 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
                 let directory = FileManager.default.temporaryDirectory
                     .appendingPathComponent("batch-postanswer-entry-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: directory) }
-                let coordinator = CacheCoordinator(config: config(directory))
+                let coordinator = CacheCoordinator(config: Self.config(directory))
                 let model = PostAnswerEntryFixture(wrapped: wrapped)
                 let processor = TestInputProcessor()
                 var modelConfiguration = processor.configuration
@@ -163,14 +163,14 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
                 let compiled = try XCTUnwrap(model.compiledCache(), "Must execute actual batch compiled forward")
                 XCTAssertEqual(compiled.offsetArray.item(Int.self), 5)
                 XCTAssertEqual(compiled.offset, 5, "finishSlot must publish counters before admission/copy")
-                let reader = CacheCoordinator(config: config(directory))
+                let reader = CacheCoordinator(config: Self.config(directory))
                 let key = [1, 2, 3, 4, 5]
                 let arrays = try XCTUnwrap(reader.diskCache?.fetch(
                     tokens: key, mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
                 var restored = model.newCache(parameters: parameters)
                 XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), key.count)
                 XCTAssertTrue(validateRestoredCacheBoundary(restored, matchedTokens: key.count, restoredTokens: key.count))
-                assertRestoredStateMatchesCold(restored, key: key, model: model, parameters: parameters)
+                Self.assertRestoredStateMatchesCold(restored, key: key, model: model, parameters: parameters)
                 print("batch cache fixture wrapped=\(wrapped) tokens_per_second=\(Double(emitted.count) / Date().timeIntervalSince(started))")
             }
         }
