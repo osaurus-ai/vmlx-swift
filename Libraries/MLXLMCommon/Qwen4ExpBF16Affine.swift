@@ -76,8 +76,13 @@ public enum Qwen4ExpBF16Affine {
           return scale * accum + sum * bias;
         }
 
-        template <typename T, typename ScalePtr, typename BiasPtr,
-                  int group_size, int bits, int packs_per_thread>
+        // Deduce pointer types from by-value arguments. Metal decltype on a
+        // kernel parameter also carries the pointer variable's thread address
+        // space, which is invalid on another function's by-value parameter.
+        // Deduction preserves the pointee's constant/device space without
+        // propagating that top-level qualifier.
+        template <typename T, int group_size, int bits, int packs_per_thread,
+                  typename ScalePtr, typename BiasPtr>
         inline void qwen_mixed_qmv(
             const device uint* w, ScalePtr scales,
             BiasPtr biases, const device T* x, device T* y,
@@ -134,8 +139,7 @@ public enum Qwen4ExpBF16Affine {
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["out"],
         source: """
-            qwen_mixed_qmv<T, decltype(scales), decltype(biases),
-                           GROUP_SIZE, BITS, PACKS_PER_THREAD>(
+            qwen_mixed_qmv<T, GROUP_SIZE, BITS, PACKS_PER_THREAD>(
                 w, scales, biases, x, out,
                 int(x_shape[x_ndim - 1]), int(w_shape[0]),
                 threadgroup_position_in_grid.x,
@@ -163,8 +167,7 @@ public enum Qwen4ExpBF16Affine {
             constexpr uint VALUES_PER_WORD = 32u / BITS;
             uint PACKED_K = K / VALUES_PER_WORD;
             uint GROUPS = K / GROUP_SIZE;
-            qwen_mixed_qmv<T, decltype(scales), decltype(biases),
-                           GROUP_SIZE, BITS, PACKS_PER_THREAD>(
+            qwen_mixed_qmv<T, GROUP_SIZE, BITS, PACKS_PER_THREAD>(
                 w + expert * N * PACKED_K,
                 scales + expert * N * GROUPS,
                 biases + expert * N * GROUPS,
