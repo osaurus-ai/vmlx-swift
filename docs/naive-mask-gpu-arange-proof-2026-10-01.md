@@ -1,14 +1,14 @@
 # Naive allowed-mask GPU arange: source-separated proof
 
-**Delivery status: default OFF, opt-in only. This main-based revision is UNBUILT/UNRUN.** Root must review and run exact-source gates before claiming this branch verified or changing the default.
+**Delivery source: model default ON, explicit `0` opt-out. This main-based default revision is UNBUILT/UNRUN.** Root requested this separate promotion commit after reviewing retained b049 proof. Root must review and run exact-source gates before any qualified-default, merge or delivery claim. The preceding source-separated commit `48709b10` preserves default OFF.
 
 Base is engine main `9d196112257929ce87320ba465c32d2c9be14d26` (`Preserve compiled cache boundaries and sliding-window positions (#540)`), verified by read-only HTTPS `git ls-remote` on2026-10-01. Core gitlink: `88e2211cc2265b453c47bc6004a7a79ac6d34ea3`. The dirty primary checkout and frozen native integration checkout were preserved.
 
 ## What changes
 
-Naive allowed-mask construction formerly builds query/key positions with `MLXArray(Range<Int>)`. That constructor materializes Swift `Int` values, bounds-checks them and creates an `Int32` payload on the host. The opt-in path creates the same Int32 position values with lazy MLX `arange`. It keeps the same causal/SWA comparisons and padding/indexer masks; no per-token eval/readback, global range cache, new buffer policy, custom Metal shader or sampler override is introduced.
+Naive allowed-mask construction formerly builds query/key positions with `MLXArray(Range<Int>)`. That constructor materializes Swift `Int` values, bounds-checks them and creates an `Int32` payload on the host. The model-default path creates the same Int32 position values with lazy MLX `arange`. It keeps the same causal/SWA comparisons and padding/indexer masks; no per-token eval/readback, global range cache, new buffer policy, custom Metal shader or sampler override is introduced.
 
-`VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE=1` selects the candidate; absent, `0`, or unrecognized values retain the reference path in this commit. `NaiveN05FlashModel` captures one immutable policy at construction and passes it through all layers. A typed explicit Boolean override remains available to focused fixtures. The attention-level convenience default remains the reference path; runtime model construction owns and explicitly propagates the policy.
+An absent `VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE` or exact `1` selects arange; exact `0` and unrecognized spellings select the reference path. Empty, whitespace-padded, `true`, `false`, `yes`, and other unsupported spellings are not treated as enablement. `NaiveN05FlashModel` captures one immutable policy at construction and passes it through all layers. A typed explicit Boolean override remains available to focused fixtures. The attention-level convenience default remains the reference path; runtime model construction owns and explicitly propagates the policy.
 
 The GPU range is admitted only within the existing Int32 constructor contract. Int32.max singletons and unsupported bounds use the baseline constructor, preserving its existing out-of-Int32 failure behavior rather than adding a new precondition. Position dtype stays Int32; mask dtype stays Boolean. `cacheStorageDTypeIdentity` remains `naive-n05-paired-v1` because the integer/mask values are exact and no attention reduction or cache schema changes. The unrelated selected-KV candidate is excluded from this branch.
 
@@ -23,6 +23,8 @@ The actual Naive-N0.5-Flash-JANGH2 bundle drove native sampling: temperature1, t
 ## Focused native fixture
 
 The retained root-owned b049 `NaiveN05AllowedMaskGPUArangeTests` gate passed **6/6, zero skips**, covering immutable/default policy and cache identity, exact signed/large/Int32-boundary positions,8k/10k one-row causal/padding/SWA masks, batched multiquery/all-masked cases, stable sparse-selection ties/masked entries, and attention/indexer/cache companion parity across prefill and decode. Its receipt SHA256 is `927a64b0b94298b30f7eba7d29c556190e108d4a2f7c7b2a4caa78697a8d8ce3`.
+
+The retained b049 suite tested its then-default-OFF policy. This branch now renames that method to `testPolicyDefaultsOnIsImmutableAndKeepsNumericalCacheIdentity`, checks strict default/opt-out/invalid-value parsing, and checks the no-override model owner plus every layer against the current process policy without changing global environment. This revised six-method fixture is UNBUILT/UNRUN.
 
 The optional host-construction diagnostic is a separate test class and is not part of this six-method correctness gate. Its timed region performs no eval/synchronize/readback, and live heap deltas cannot measure cumulative transient allocation. This branch has not executed either class.
 
@@ -58,6 +60,6 @@ Manual review: `NAIVE-ARANGE-ABBA-SEMANTIC-REVIEW.md` SHA256 `3c84b028b96313bad7
 
 This ABBA is sustained ordinary prose evidence at one source, bundle, host and context family. It is not exact full-model logits/state proof or a statistical confidence estimate; host page-cache warmth remains unmeasured. Owned process physical-footprint samples are available, but this diagnostic ceiling is not a blanket family/hardware RAM qualification.
 
-Zero-tool text turns do not prove per-tool checkpoints, recurrent-companion SSD reconstruction, media, MTP or Osaurus GUI behavior. Disk `stores` is a legacy attempt count rather than successful-publication proof. The focused parity fixture, ABBA and semantic review do not authorize merge, default promotion or release.
+Zero-tool text turns do not prove per-tool checkpoints, recurrent-companion SSD reconstruction, media, MTP or Osaurus GUI behavior. Disk `stores` is a legacy attempt count rather than successful-publication proof. The retained focused parity fixture, ABBA and semantic review do not certify this later default revision, merge or release.
 
 Root must run the exact main-based candidate fixture and native/app proof as appropriate before delivery. No source-agent native test/build/model/GPU execution, push, PR, merge or release occurred while preparing this branch.

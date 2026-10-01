@@ -6,7 +6,10 @@ import MLX
 /// Asymmetric prefill remains explicit until a supported fused kernel is proven.
 enum NaiveN05FlashMath {
     static func allowedMaskGPUArangeRequested(environment: [String: String]) -> Bool {
-        environment["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE"] == "1"
+        // Unset uses the model default. Exact 1 enables; 0 and unrecognized
+        // values keep the reference path rather than accepting truthy spellings.
+        guard let value = environment["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE"] else { return true }
+        return value == "1"
     }
 
     /// One forward's positions only. Reusing these lazy arrays across layers
@@ -63,8 +66,7 @@ enum NaiveN05FlashMath {
     }
 
     /// Preserve the Sequence<Int> constructor's Int32 values without its two
-    /// host arrays. The lazy arange adds GPU work, so it remains opt-in until
-    /// exact-mask and native whole-model performance gates have passed.
+    /// host arrays. Callers retain an explicit reference-path comparison policy.
     static func maskPositionRange(start: Int, count: Int, gpuArange: Bool) -> MLXArray {
         precondition(count >= 0)
         let stop = start + count

@@ -21,9 +21,15 @@ final class NaiveN05AllowedMaskGPUArangeTests: XCTestCase {
             from: JSONSerialization.data(withJSONObject: values))
     }
 
-    func testPolicyDefaultsOffIsImmutableAndKeepsNumericalCacheIdentity() throws {
-        for environment in [[:], ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "0"],
-                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "true"]] {
+    func testPolicyDefaultsOnIsImmutableAndKeepsNumericalCacheIdentity() throws {
+        XCTAssertTrue(NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: [:]))
+        for environment in [["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "0"],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "true"],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "false"],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "yes"],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": " 1 "],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": ""],
+                            ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "2"]] {
             XCTAssertFalse(NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: environment))
         }
         XCTAssertTrue(NaiveN05FlashMath.allowedMaskGPUArangeRequested(
@@ -33,13 +39,22 @@ final class NaiveN05AllowedMaskGPUArangeTests: XCTestCase {
                                                 allowedMaskGPUArange: false)
             let candidate = try NaiveN05FlashModel(configuration(),
                                                  allowedMaskGPUArange: true)
+            let modelDefault = try NaiveN05FlashModel(configuration())
+            let expectedDefault = NaiveN05FlashMath.allowedMaskGPUArangeRequested(
+                environment: ProcessInfo.processInfo.environment)
+            XCTAssertEqual(modelDefault.allowedMaskGPUArange, expectedDefault)
+            XCTAssertTrue(modelDefault.model.layers.allSatisfy {
+                $0.attention.allowedMaskGPUArange == expectedDefault
+            })
             XCTAssertFalse(baseline.allowedMaskGPUArange)
             XCTAssertTrue(candidate.allowedMaskGPUArange)
             XCTAssertTrue(baseline.model.layers.allSatisfy { !$0.attention.allowedMaskGPUArange })
             XCTAssertTrue(candidate.model.layers.allSatisfy { $0.attention.allowedMaskGPUArange })
             XCTAssertEqual(baseline.cacheStorageDTypeIdentity, "naive-n05-paired-v1")
             XCTAssertEqual(candidate.cacheStorageDTypeIdentity, baseline.cacheStorageDTypeIdentity)
-            XCTAssertFalse(NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: [:]))
+            XCTAssertEqual(modelDefault.cacheStorageDTypeIdentity, baseline.cacheStorageDTypeIdentity)
+            XCTAssertFalse(NaiveN05FlashMath.allowedMaskGPUArangeRequested(
+                environment: ["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE": "0"]))
             XCTAssertTrue(candidate.allowedMaskGPUArange)
         }
     }
