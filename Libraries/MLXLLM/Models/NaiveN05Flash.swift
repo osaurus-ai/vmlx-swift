@@ -195,11 +195,14 @@ final class NaiveN05FlashModel: Module {
     let config: NaiveN05ArchitectureContract
     /// Exact Int32 mask positions; captured once, with no cache-policy change.
     let allowedMaskGPUArange: Bool
+    /// Candidate apply-only rotary fusion; immutable and default off.
+    let fusedRotaryApply: Bool
     let excludedSafetensorsKeys: Set<String>
     let model: NaiveN05FlashBackbone
     @ModuleInfo(key: "lm_head") var head: Linear
     init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
-        excludedSafetensorsKeys: Set<String> = [], allowedMaskGPUArange: Bool? = nil) throws {
+        excludedSafetensorsKeys: Set<String> = [], allowedMaskGPUArange: Bool? = nil,
+        fusedRotaryApply: Bool? = nil) throws {
         let canonicalExclusions = Set(c.routedLayers.indices.filter { c.routedLayers[$0] }.flatMap { layer in
             ["gate_proj", "up_proj", "down_proj"].flatMap { role in
                 ["tq2_packed", "tq2_scales"].map {
@@ -215,6 +218,8 @@ final class NaiveN05FlashModel: Module {
         let allowedMaskGPUArange = allowedMaskGPUArange
             ?? NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: ProcessInfo.processInfo.environment)
         self.allowedMaskGPUArange = allowedMaskGPUArange
+        self.fusedRotaryApply = fusedRotaryApply
+            ?? NaiveN05FusedRotaryApply.requested(environment: ProcessInfo.processInfo.environment)
         model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory,
             allowedMaskGPUArange: allowedMaskGPUArange)
         _head.wrappedValue = Linear(c.hiddenDimensions, c.vocabularySize, bias: false)
@@ -231,7 +236,8 @@ final class NaiveN05FlashModel: Module {
         guard padding.shape == [tokens.dim(0), past + tokens.dim(1)] else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         let positions = suppliedPositions ?? maximum(cumsum(padding.asType(.int32), axis: -1) - 1, 0)[0..., past...]
         guard positions.shape == tokens.shape else { throw NaiveN05FlashCache.Failure.invalidGeometry }
-        let rotaryTables = NaiveN05FlashMath.RotaryTables(positions: positions)
+        let rotaryTables = NaiveN05FlashMath.RotaryTables(
+            positions: positions, fusedApply: fusedRotaryApply)
         var h = model.embedding(tokens)
         for (i, layer) in model.layers.enumerated() { h = try layer(h, positions: positions, padding: padding, cache: cache?[i], rotaryTables: rotaryTables) }
         return head(model.norm(h))

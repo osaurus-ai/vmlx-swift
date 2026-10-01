@@ -22,9 +22,13 @@ enum NaiveN05FlashMath {
             let dtype: DType
         }
         private let positions: MLXArray
+        let fusedApply: Bool
         private var values: [Key: (MLXArray, MLXArray)] = [:]
         var count: Int { values.count }
-        init(positions: MLXArray) { self.positions = positions }
+        init(positions: MLXArray, fusedApply: Bool = false) {
+            self.positions = positions
+            self.fusedApply = fusedApply
+        }
         func phases(dimensions: Int, theta: Double, dtype: DType) -> (MLXArray, MLXArray) {
             let key = Key(dimensions: dimensions, theta: theta, dtype: dtype)
             if let found = values[key] { return found }
@@ -59,6 +63,10 @@ enum NaiveN05FlashMath {
         precondition(dimensions > 0 && dimensions.isMultiple(of: 2) && dimensions <= x.dim(-1))
         let (c, s) = tables?.phases(dimensions: dimensions, theta: theta, dtype: x.dtype)
             ?? rotaryPhases(positions: positions, dimensions: dimensions, theta: theta, dtype: x.dtype)
+        if tables?.fusedApply == true,
+           let fused = NaiveN05FusedRotaryApply.apply(x, cosine: c, sine: s, dimensions: dimensions) {
+            return fused
+        }
         let a = x[.ellipsis, ..<(dimensions / 2)]
         let b = x[.ellipsis, (dimensions / 2)..<dimensions]
         let rotated = concatenated([a * c - b * s, b * c + a * s], axis: -1)
