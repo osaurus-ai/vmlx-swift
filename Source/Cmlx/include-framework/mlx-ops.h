@@ -382,6 +382,9 @@ inline array transpose(
   return transpose(a, std::vector<int>(axes), s);
 }
 
+/** Permutes last two dimensions of an array. */
+MLX_API array matrix_transpose(const array& a, StreamOrDevice s = {});
+
 /** Swap two axes of an array. */
 MLX_API array
 swapaxes(const array& a, int axis1, int axis2, StreamOrDevice s = {});
@@ -1627,6 +1630,7 @@ MLX_API array gather_qmm(
     std::optional<int> group_size = std::nullopt,
     std::optional<int> bits = std::nullopt,
     const std::string& mode = "affine",
+    const std::optional<array>& global_scale = std::nullopt,
     bool sorted_indices = false,
     StreamOrDevice s = {});
 

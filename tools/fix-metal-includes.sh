@@ -22,6 +22,7 @@ KERNELS_DIR="${CMLX_MLX_DIR}/${KERNELS_INCLUDE_PATH}"
 KERNEL_LIST=" \
 arg_reduce.metal \
 gather_mm_offsets.metal \
+gated_delta_update.metal \
 conv.metal \
 dot.metal \
 layer_norm.metal \

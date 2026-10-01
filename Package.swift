@@ -27,6 +27,8 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/metal/binary.cpp",
         "mlx/mlx/backend/metal/compiled.cpp",
         "mlx/mlx/backend/metal/conv.cpp",
+        "mlx/mlx/backend/metal/cross_entropy.cpp",
+        "mlx/mlx/backend/metal/gated_delta_update.cpp",
         "mlx/mlx/backend/metal/copy.cpp",
         "mlx/mlx/backend/metal/custom_kernel.cpp",
         "mlx/mlx/backend/metal/device.cpp",
@@ -206,7 +208,6 @@ let cmlx = Target.target(
         // mlx files that are not part of the build
         "mlx/ACKNOWLEDGMENTS.md",
         "mlx/CMakeLists.txt",
-        "mlx/CODE_OF_CONDUCT.md",
         "mlx/CONTRIBUTING.md",
         "mlx/LICENSE",
         "mlx/MANIFEST.in",
@@ -229,6 +230,7 @@ let cmlx = Target.target(
         "mlx/mlx/backend/cuda/conv.cpp",
         "mlx/mlx/backend/cuda/cublas_utils.cpp",
         "mlx/mlx/backend/cuda/cudnn_utils.cpp",
+        "mlx/mlx/backend/cuda/cusolver_utils.cpp",
         "mlx/mlx/backend/cuda/custom_kernel.cpp",
         "mlx/mlx/backend/cuda/delayload.cpp",
         "mlx/mlx/backend/cuda/device_info.cpp",
@@ -246,6 +248,8 @@ let cmlx = Target.target(
         "mlx/mlx/backend/cuda/slicing.cpp",
         "mlx/mlx/backend/cuda/utils.cpp",
         "mlx/mlx/backend/cuda/worker.cpp",
+        "mlx/mlx/backend/cuda/wddm.cpp",
+        "mlx/mlx/backend/cuda/cholesky.cu",
 
         "mlx/mlx/backend/cuda/binary",
         "mlx/mlx/backend/cuda/conv",
@@ -286,7 +290,7 @@ let cmlx = Target.target(
         .headerSearchPath("json/single_include/nlohmann"),
         .headerSearchPath("mlx/mlx/distributed/jaccl/lib"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.32.2\""),
+        .define("MLX_VERSION", to: "\"0.32.3\""),
     ],
     linkerSettings: linkerSettings
 )

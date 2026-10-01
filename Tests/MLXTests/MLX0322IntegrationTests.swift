@@ -15,7 +15,7 @@ final class MLX0322IntegrationTests: XCTestCase {
         defer { mlx_string_free(version) }
         XCTAssertEqual(mlx_version(&version), 0)
         let actual = String(cString: mlx_string_data(version))
-        XCTAssertEqual(actual, "0.32.2")
+        XCTAssertEqual(actual, "0.32.3")
         print("MLX0322 linked_core_version=\(actual)")
     }
 
