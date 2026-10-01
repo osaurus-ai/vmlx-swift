@@ -147,6 +147,7 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
                 let parameters = GenerateParameters(
                     maxTokens: 8, compiledMaxCacheLength: 16,
                     enableCompiledBatchDecode: true, temperature: 0)
+                let mediaSalt = computeCacheSalt(for: input, parameters: parameters)
                 let started = Date()
                 let (_, stream) = await engine.submit(input: input, parameters: parameters)
                 var emitted: [Int] = []
@@ -166,7 +167,7 @@ final class CompiledPostAnswerEntrypointTests: XCTestCase {
                 let reader = CacheCoordinator(config: Self.config(directory))
                 let key = [1, 2, 3, 4, 5]
                 let arrays = try XCTUnwrap(reader.diskCache?.fetch(
-                    tokens: key, mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
+                    tokens: key, mediaSalt: mediaSalt))
                 var restored = model.newCache(parameters: parameters)
                 XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), key.count)
                 XCTAssertTrue(validateRestoredCacheBoundary(restored, matchedTokens: key.count, restoredTokens: key.count))
