@@ -809,6 +809,10 @@ public class Gemma4Model: Module {
 
             let layerCacheEntry = prevIdx == i
                 ? (i < layerCache.count ? layerCache[i] : nil) : nil
+            // Shared queries use the same pre-update positions as their source
+            // keys. An expression owns that graph value before the cache's
+            // _updateInternal advances the mutable offset-array object.
+            let layerOffsetArray = graphOffsetArray(for: layerCacheEntry).map { $0 + 0 }
 
             let result = layer(
                 h, mask: layerMask, cache: layerCacheEntry,
@@ -817,7 +821,6 @@ public class Gemma4Model: Module {
                 sharedOffsetArray: sharedOffsetArray)
 
             h = result.h
-            let layerOffsetArray = graphOffsetArray(for: layerCacheEntry)
             intermediates[i] = (keys: result.keys, values: result.values, offset: result.offset, offsetArray: layerOffsetArray)
         }
 

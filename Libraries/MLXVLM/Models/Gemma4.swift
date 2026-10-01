@@ -1042,6 +1042,9 @@ private class TextModel: Module {
             if prevIdx != i, let prev = intermediates[prevIdx] { skv = (prev.keys, prev.values); soff = prev.offset; soffArr = prev.offsetArray }
             else { skv = nil; soff = nil; soffArr = nil }
             let ce = prevIdx == i ? (i < lc.count ? lc[i] : nil) : nil
+            // Capture the source's pre-update position as its own graph value;
+            // the layer advances the cache's mutable offset-array object.
+            let layerOffArr = graphOffsetArray(for: ce).map { $0 + 0 }
             let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff, sharedOffsetArray: soffArr)
             // Mirror `Libraries/MLXLLM/Models/Gemma4Text.swift:762` — use
             // `graphOffsetArray(for:)` so KV-sharing layers still receive a
@@ -1051,7 +1054,6 @@ private class TextModel: Module {
             // The prior `(ce as? BatchKVCache)?.offsetArray` cast missed
             // every Compilable* path, forcing a host readback of
             // `cache.offset` on the next shared-KV layer.
-            let layerOffArr = graphOffsetArray(for: ce)
             h = res.h; intermediates[i] = (res.keys, res.values, res.offset, layerOffArr)
         }
         return norm(h)
