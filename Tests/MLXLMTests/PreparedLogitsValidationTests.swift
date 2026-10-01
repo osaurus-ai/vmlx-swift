@@ -433,20 +433,29 @@ final class PreparedLogitsValidationTests: XCTestCase {
     func testStableBoundaryPreservesOriginatingPrepareAndForwardErrors() throws {
         try MLXMetalTestLock.withLock {
             for returnsTokens in [false, true] {
-                let fixture = PreparedLogitsFixture(shape: [1, 1, 4], failProjection: true, mutateCache: true)
+                let fixture = PreparedLogitsFixture(
+                    shape: [1, 1, 4], failProjection: true, mutateCache: true)
                 fixture.returnsTokens = returnsTokens
-                let input = LMInput(tokens: MLXArray([Int32(1), 2, 3, 1, 2, 3]),
+                let input = LMInput(
+                    tokens: MLXArray([Int32(1), 2, 3, 1, 2, 3]),
                     cachePrefixTokenCounts: [4], cacheStablePrefixTokenCounts: [4])
-                XCTAssertThrowsError(try TokenIterator(input: input, model: fixture,
-                    parameters: GenerateParameters(maxTokens: 1, temperature: 0))) { error in
-                    guard let mlxError = error as? MLXError, case .caught(let message) = mlxError else {
+                XCTAssertThrowsError(
+                    try TokenIterator(
+                        input: input, model: fixture,
+                        parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                ) { error in
+                    guard let mlxError = error as? MLXError, case .caught(let message) = mlxError
+                    else {
                         return XCTFail("Expected originating boundary MLX error, got \(error)")
                     }
                     XCTAssertTrue(message.contains("matmul"))
                 }
-                XCTAssertEqual(fixture.preparedTokenCounts, [3], "Failure must stop before preparing later boundary or tail")
+                XCTAssertEqual(
+                    fixture.preparedTokenCounts, [3],
+                    "Failure must stop before preparing later boundary or tail")
                 let healthy = PreparedLogitsFixture(shape: [1, 1, 4], mutateCache: true)
-                var iterator = try TokenIterator(input: input, model: healthy,
+                var iterator = try TokenIterator(
+                    input: input, model: healthy,
                     parameters: GenerateParameters(maxTokens: 1, temperature: 0))
                 XCTAssertNotNil(iterator.next(), "A fresh boundary request must remain usable")
             }
