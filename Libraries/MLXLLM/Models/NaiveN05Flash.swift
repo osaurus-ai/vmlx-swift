@@ -42,14 +42,16 @@ final class NaiveN05FlashAttention: Module {
     let config: NaiveN05ArchitectureContract
     let geometry: NaiveN05ArchitectureContract.Attention
     let sliding: Bool
+    let allowedMaskGPUArange: Bool
     @ModuleInfo(key: "q_proj") var query: Linear
     @ModuleInfo(key: "k_proj") var key: Linear
     @ModuleInfo(key: "v_proj") var value: Linear
     @ModuleInfo(key: "o_proj") var output: Linear
     let indexer: NaiveN05FlashIndexer?
     @ParameterInfo(key: "attention_sink_bias") var sink: MLXArray?
-    init(_ c: NaiveN05ArchitectureContract, layer: Int) {
+    init(_ c: NaiveN05ArchitectureContract, layer: Int, allowedMaskGPUArange: Bool = false) {
         config = c
+        self.allowedMaskGPUArange = allowedMaskGPUArange
         sliding = c.attentionKinds[layer] == .sliding
         geometry = sliding ? c.slidingAttention : c.fullAttention
         let g = geometry
@@ -76,7 +78,8 @@ final class NaiveN05FlashAttention: Module {
             k = full.0; v = full.1; indexKeys = full.2
         }
         var allowed = NaiveN05FlashMath.allowedMask(padding: padding, queryOffset: past, length: length,
-            keyOffset: keyOffset, keyLength: k.dim(2), window: sliding ? config.window : nil)
+            keyOffset: keyOffset, keyLength: k.dim(2), window: sliding ? config.window : nil,
+            gpuArange: allowedMaskGPUArange)
         if let indexer, let projectedIndex, let indexKeys {
             let scores = indexer.scores(query: projectedIndex.0, keys: indexKeys, weights: projectedIndex.2)
             allowed = NaiveN05FlashMath.sparseMask(scores: scores, allowed: allowed, topK: config.indexerTopK)
@@ -155,8 +158,10 @@ final class NaiveN05FlashDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postNorm: RMSNorm
     let mlp: UnaryLayer
-    init(_ c: NaiveN05ArchitectureContract, layer: Int, routed: (Module & WeightedRoutedExpertLayer)?) {
-        _attention.wrappedValue = NaiveN05FlashAttention(c, layer: layer)
+    init(_ c: NaiveN05ArchitectureContract, layer: Int, routed: (Module & WeightedRoutedExpertLayer)?,
+         allowedMaskGPUArange: Bool) {
+        _attention.wrappedValue = NaiveN05FlashAttention(c, layer: layer,
+            allowedMaskGPUArange: allowedMaskGPUArange)
         _inputNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
         _postNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
         mlp = c.routedLayers[layer] ? NaiveN05FlashMoE(c, experts: routed, layerIndex: layer) : NaiveN05FlashDenseMLP(c)
@@ -171,11 +176,13 @@ final class NaiveN05FlashBackbone: Module {
     @ModuleInfo(key: "embed_tokens") var embedding: Embedding
     let layers: [NaiveN05FlashDecoderLayer]
     let norm: RMSNorm
-    init(_ c: NaiveN05ArchitectureContract, routedFactory: NaiveN05FlashModel.RoutedFactory?) throws {
+    init(_ c: NaiveN05ArchitectureContract, routedFactory: NaiveN05FlashModel.RoutedFactory?,
+         allowedMaskGPUArange: Bool) throws {
         _embedding.wrappedValue = Embedding(embeddingCount: c.vocabularySize, dimensions: c.hiddenDimensions)
         layers = try (0..<c.layerCount).map { layer in
             let routed = c.routedLayers[layer] ? try routedFactory?(layer, c) : nil
-            return NaiveN05FlashDecoderLayer(c, layer: layer, routed: routed)
+            return NaiveN05FlashDecoderLayer(c, layer: layer, routed: routed,
+                allowedMaskGPUArange: allowedMaskGPUArange)
         }
         norm = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
     }
@@ -186,11 +193,13 @@ final class NaiveN05FlashBackbone: Module {
 final class NaiveN05FlashModel: Module {
     typealias RoutedFactory = (Int, NaiveN05ArchitectureContract) throws -> (Module & WeightedRoutedExpertLayer)
     let config: NaiveN05ArchitectureContract
+    /// Exact Int32 mask positions; captured once, with no cache-policy change.
+    let allowedMaskGPUArange: Bool
     let excludedSafetensorsKeys: Set<String>
     let model: NaiveN05FlashBackbone
     @ModuleInfo(key: "lm_head") var head: Linear
     init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
-        excludedSafetensorsKeys: Set<String> = []) throws {
+        excludedSafetensorsKeys: Set<String> = [], allowedMaskGPUArange: Bool? = nil) throws {
         let canonicalExclusions = Set(c.routedLayers.indices.filter { c.routedLayers[$0] }.flatMap { layer in
             ["gate_proj", "up_proj", "down_proj"].flatMap { role in
                 ["tq2_packed", "tq2_scales"].map {
@@ -203,7 +212,11 @@ final class NaiveN05FlashModel: Module {
         else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         self.excludedSafetensorsKeys = excludedSafetensorsKeys
         config = c
-        model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory)
+        let allowedMaskGPUArange = allowedMaskGPUArange
+            ?? NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: ProcessInfo.processInfo.environment)
+        self.allowedMaskGPUArange = allowedMaskGPUArange
+        model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory,
+            allowedMaskGPUArange: allowedMaskGPUArange)
         _head.wrappedValue = Linear(c.hiddenDimensions, c.vocabularySize, bias: false)
     }
     func newCache() -> [NaiveN05FlashCache] {
