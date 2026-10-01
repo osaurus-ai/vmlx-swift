@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -9,8 +12,9 @@ import XCTest
 /// Strict native storage fixtures, including real typed-cache runtime paths.
 /// Source preparation is separate from the owner's native execution and A/B.
 final class NaiveN05FusedRotaryApplyTests: XCTestCase {
-    private static func configuration(indexerPrecision: String = "fp8_e4m3") throws -> NaiveN05ArchitectureContract {
-        let values: [String: Any] = [
+    private static func configuration(indexerPrecision: String = "fp8_e4m3",
+                                      overrides: [String: Any] = [:]) throws -> NaiveN05ArchitectureContract {
+        var values: [String: Any] = [
             "model_type": "naive_n05_flash", "hidden_size": 8, "intermediate_size": 12,
             "num_hidden_layers": 2, "vocab_size": 16, "num_attention_heads": 64,
             "num_key_value_heads": 4, "head_dim": 192, "v_head_dim": 128,
@@ -22,6 +26,7 @@ final class NaiveN05FusedRotaryApplyTests: XCTestCase {
             "indexer_activation_dtype": indexerPrecision,
             "sliding_window": 3, "attention_value_scale": 0.707,
         ]
+        values.merge(overrides) { _, override in override }
         return try JSONDecoder().decode(NaiveN05ArchitectureContract.self,
             from: JSONSerialization.data(withJSONObject: values))
     }
@@ -114,19 +119,76 @@ final class NaiveN05FusedRotaryApplyTests: XCTestCase {
         }
     }
 
-    func testPolicyDefaultsOffIsImmutableAndKeepsNumericalCacheIdentity() throws {
+    func testPolicyDefaultsToQualifiedM5IsImmutableAndKeepsNumericalCacheIdentity() throws {
         XCTAssertFalse(NaiveN05FusedRotaryApply.requested(environment: [:]))
+        let c = try Self.configuration()
+        XCTAssertTrue(NaiveN05FusedRotaryApply.defaultEnabled(c, backend: .gpu,
+            metalDeviceName: "Apple M5 Max"))
+        let otherBackends: [DeviceType?] = [.cpu, nil]
+        for backend in otherBackends {
+            XCTAssertFalse(NaiveN05FusedRotaryApply.defaultEnabled(c, backend: backend,
+                metalDeviceName: "Apple M5 Max"))
+        }
+        let otherNames: [String?] = [nil, "", "Unknown", "Apple M5", "Apple M5 Pro", "Apple M4 Max",
+            "applegpu_g17s", "Apple M5 Max ", "apple m5 max", "AMD Radeon"]
+        for name in otherNames {
+            XCTAssertFalse(NaiveN05FusedRotaryApply.defaultEnabled(c, backend: .gpu, metalDeviceName: name))
+        }
+        let otherGeometries: [[String: Any]] = [
+            ["num_attention_heads": 32], ["num_key_value_heads": 8],
+            ["swa_num_attention_heads": 32], ["swa_num_key_value_heads": 4],
+            ["head_dim": 128], ["swa_head_dim": 128],
+            ["partial_rotary_factor": 0.25], ["index_n_heads": 8], ["index_head_dim": 64],
+        ]
+        for overrides in otherGeometries {
+            XCTAssertFalse(NaiveN05FusedRotaryApply.defaultEnabled(try Self.configuration(overrides: overrides),
+                backend: .gpu, metalDeviceName: "Apple M5 Max"))
+        }
+        XCTAssertTrue(NaiveN05FusedRotaryApply.requested(environment: [:], defaultEnabled: true))
         for value in ["0", "true", "false", "yes", " 1 ", "", "2"] {
             XCTAssertFalse(NaiveN05FusedRotaryApply.requested(
                 environment: ["VMLX_NAIVE_FUSED_ROTARY_APPLY": value]))
+            XCTAssertFalse(NaiveN05FusedRotaryApply.requested(
+                environment: ["VMLX_NAIVE_FUSED_ROTARY_APPLY": value], defaultEnabled: true))
         }
         XCTAssertTrue(NaiveN05FusedRotaryApply.requested(
             environment: ["VMLX_NAIVE_FUSED_ROTARY_APPLY": "1"]))
         try MLXMetalTestLock.withLock {
             let (baseline, candidate) = try Self.models()
+            let flag = "VMLX_NAIVE_FUSED_ROTARY_APPLY"
+            let original = getenv(flag).map { String(cString: $0) }
+            defer {
+                if let original { setenv(flag, original, 1) } else { unsetenv(flag) }
+            }
+            unsetenv(flag)
             let automatic = try NaiveN05FlashModel(Self.configuration())
             XCTAssertEqual(automatic.fusedRotaryApply,
-                NaiveN05FusedRotaryApply.requested(environment: ProcessInfo.processInfo.environment))
+                NaiveN05FusedRotaryApply.modelRequested(c, environment: [:]))
+            let capturedDefault = automatic.fusedRotaryApply
+            let metalName = NaiveN05FusedRotaryApply.nativeMetalDeviceName() ?? "unavailable"
+            let backend = Device.defaultDevice().deviceType?.rawValue ?? "unavailable"
+            print("[NaiveRotaryPolicy] metal_device_name=\(String(reflecting: metalName)) backend=\(backend) default_enabled=\(capturedDefault)")
+            setenv(flag, "0", 1)
+            let environmentOff = try NaiveN05FlashModel(c)
+            setenv(flag, "1", 1)
+            let environmentOn = try NaiveN05FlashModel(c)
+            setenv(flag, "true", 1)
+            let environmentUnrecognized = try NaiveN05FlashModel(c)
+            XCTAssertFalse(environmentOff.fusedRotaryApply)
+            XCTAssertTrue(environmentOn.fusedRotaryApply)
+            XCTAssertFalse(environmentUnrecognized.fusedRotaryApply)
+            XCTAssertEqual(automatic.fusedRotaryApply, capturedDefault)
+            CompiledDecodeTrace.withActive {
+                XCTAssertFalse(NaiveN05FusedRotaryApply.modelRequested(c, environment: [:]))
+            }
+            Device.withDefaultDevice(.cpu) {
+                XCTAssertFalse(NaiveN05FusedRotaryApply.modelRequested(c, environment: [:]))
+            }
+            for model in [automatic, environmentOff, environmentOn, environmentUnrecognized] {
+                XCTAssertEqual(model.cacheStorageDTypeIdentity, baseline.cacheStorageDTypeIdentity)
+                XCTAssertEqual(model.newCache().map(\.diskCacheStateIdentifier),
+                    baseline.newCache().map(\.diskCacheStateIdentifier))
+            }
             XCTAssertFalse(baseline.fusedRotaryApply)
             XCTAssertTrue(candidate.fusedRotaryApply)
             XCTAssertFalse(NaiveN05FusedRotaryApply.requested(

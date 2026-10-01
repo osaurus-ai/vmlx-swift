@@ -195,7 +195,7 @@ final class NaiveN05FlashModel: Module {
     let config: NaiveN05ArchitectureContract
     /// Exact Int32 mask positions; captured once, with no cache-policy change.
     let allowedMaskGPUArange: Bool
-    /// Candidate apply-only rotary fusion; immutable and default off.
+    /// Exact apply-only rotary policy; captured once for qualified hardware.
     let fusedRotaryApply: Bool
     let excludedSafetensorsKeys: Set<String>
     let model: NaiveN05FlashBackbone
@@ -219,7 +219,7 @@ final class NaiveN05FlashModel: Module {
             ?? NaiveN05FlashMath.allowedMaskGPUArangeRequested(environment: ProcessInfo.processInfo.environment)
         self.allowedMaskGPUArange = allowedMaskGPUArange
         self.fusedRotaryApply = fusedRotaryApply
-            ?? NaiveN05FusedRotaryApply.requested(environment: ProcessInfo.processInfo.environment)
+            ?? NaiveN05FusedRotaryApply.modelRequested(c, environment: ProcessInfo.processInfo.environment)
         model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory,
             allowedMaskGPUArange: allowedMaskGPUArange)
         _head.wrappedValue = Linear(c.hiddenDimensions, c.vocabularySize, bias: false)

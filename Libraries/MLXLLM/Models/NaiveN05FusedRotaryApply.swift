@@ -1,12 +1,53 @@
 import MLX
 import MLXLMCommon
+#if canImport(Metal)
+import Metal
+#endif
 
-/// One default-off decode dispatch for the existing, already-rounded phases.
+/// One bounded decode dispatch for the existing, already-rounded phases.
 /// Trigonometry, position construction, projections and cache mutation remain
 /// owned by the reference graph. This kernel has no model/phase array capture.
 enum NaiveN05FusedRotaryApply {
-    static func requested(environment: [String: String]) -> Bool {
-        environment["VMLX_NAIVE_FUSED_ROTARY_APPLY"] == "1"
+    static func requested(environment: [String: String], defaultEnabled: Bool = false) -> Bool {
+        guard let value = environment["VMLX_NAIVE_FUSED_ROTARY_APPLY"] else { return defaultEnabled }
+        return value == "1"
+    }
+
+    static func modelGeometryEligible(_ c: NaiveN05ArchitectureContract) -> Bool {
+        c.fullAttention.heads == 64 && c.fullAttention.kvHeads == 4
+            && c.fullAttention.keyDimensions == 192 && c.fullAttention.rotaryDimensions == 64
+            && c.slidingAttention.heads == 64 && c.slidingAttention.kvHeads == 8
+            && c.slidingAttention.keyDimensions == 192 && c.slidingAttention.rotaryDimensions == 64
+            && c.indexerHeads == 16 && c.indexerDimensions == 128
+    }
+
+    /// Pure hardware/metadata policy; no model names, GPU buffers or global state.
+    static func defaultEnabled(_ c: NaiveN05ArchitectureContract,
+                               backend: DeviceType?, metalDeviceName: String?) -> Bool {
+        backend == .gpu && metalDeviceName == "Apple M5 Max" && modelGeometryEligible(c)
+    }
+
+    /// Match the pinned MLX Metal backend's first-device/fallback selection.
+    /// This metadata query is used only during model construction/qualification.
+    static func nativeMetalDeviceName() -> String? {
+        #if os(macOS) && canImport(Metal)
+            return (MTLCopyAllDevices().first ?? MTLCreateSystemDefaultDevice())?.name
+        #else
+            return nil
+        #endif
+    }
+
+    static func modelRequested(_ c: NaiveN05ArchitectureContract,
+                               environment: [String: String]) -> Bool {
+        // Explicit controls preserve the existing diagnostic opt-in/reference
+        // behavior and never query hardware. Only an absent override uses default.
+        if environment["VMLX_NAIVE_FUSED_ROTARY_APPLY"] != nil {
+            return requested(environment: environment)
+        }
+        guard Device.defaultDevice().deviceType == .gpu,
+            !CompiledDecodeTrace.isActive, modelGeometryEligible(c)
+        else { return false }
+        return defaultEnabled(c, backend: .gpu, metalDeviceName: nativeMetalDeviceName())
     }
 
     /// Only the current attention Q/K and sparse-indexer Q/K roles. Metadata
