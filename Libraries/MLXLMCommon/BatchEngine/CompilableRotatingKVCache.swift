@@ -48,9 +48,8 @@ import MLXNN
 ///   `dynamicSliceUpdate`, then advances `idxArray` with wrap semantics
 ///   entirely in MLXArray space.
 /// - `makeMask` always returns `.array(mask)` — the full-buffer return
-///   means attention must be told which positions are valid. In the pre-
-///   wrap linear region, this is standard causal. Post-wrap, the mask
-///   admits all `maxCacheSize` positions because the ring is full.
+///   means attention must be told which positions are valid. Explicit
+///   windows compare logical token positions even after the ring wraps.
 ///
 /// ## Scope
 ///
@@ -84,9 +83,10 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     }
 
     /// Promote an existing populated ``RotatingKVCache`` to a compile-
-    /// traceable variant. Copies the state references AND allocates the
-    /// unified buffer at full `maxCacheSize` size if the parent's buffer
-    /// is smaller (the parent grows lazily in `step`-sized chunks).
+    /// traceable variant. Owns fixed-capacity state and normalizes the next
+    /// write position. The parent's multi-token prefill deliberately leaves
+    /// up to `maxCacheSize + S - 1` rows; retain the pinned prefix and newest
+    /// rotating tail before tracing a single-token continuation.
     ///
     /// - Parameter rotating: Source cache. Typically the result of a
     ///   prefill that has populated keys/values.
@@ -97,12 +97,11 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
             step: rotating.step
         )
 
-        // Copy state references from the source. Same-module subclass
-        // access works because parent's state is `internal`.
+        // Preserve absolute position while normalizing physical storage.
         self.idx = rotating.idx
         self.offset = rotating.offset
 
-        // Pre-allocate or extend the unified buffer to full maxCacheSize.
+        // Normalize the unified buffer to exactly maxCacheSize.
         // This prevents the compile-breaking concat-growth path from ever
         // firing during decode.
         if let srcK = rotating.keys, let srcV = rotating.values {
@@ -121,10 +120,28 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
                 let padV = MLXArray.zeros([B, H, padLen, vD], dtype: srcV.dtype)
                 self.keys = concatenated([srcK, padK], axis: 2)
                 self.values = concatenated([srcV, padV], axis: 2)
+            } else if curLen > maxCacheSize {
+                // Prefill returns a temporal buffer wider than the eventual
+                // decode ring. Match the parent's first in-place trim without
+                // mutating its arrays or consuming an extra token.
+                let ordered = rotating.temporallyOrderedKV()!
+                let tailStart = ordered.keys.dim(2) - (maxCacheSize - keep)
+                self.keys = concatenated(
+                    [ordered.keys[.ellipsis, ..<keep, 0...],
+                     ordered.keys[.ellipsis, tailStart..., 0...]], axis: 2)
+                self.values = concatenated(
+                    [ordered.values[.ellipsis, ..<keep, 0...],
+                     ordered.values[.ellipsis, tailStart..., 0...]], axis: 2)
+                self.idx = keep
             } else {
-                self.keys = srcK
-                self.values = srcV
+                // _updateInternal mutates the array object. Promotion must not
+                // hand that same object back to the source cache or snapshot.
+                self.keys = ownedStateCopy(srcK)
+                self.values = ownedStateCopy(srcV)
             }
+            // The parent uses maxCacheSize as a sentinel until its next update.
+            // dynamicSliceUpdate must receive an actual destination column.
+            if self.idx >= maxCacheSize { self.idx = keep }
         }
         // else: keys/values remain nil; first `update` call allocates
         // them at full size.
@@ -243,7 +260,21 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
 
         if let windowSize {
             let windowStart = linds - Int32(windowSize - 1)
-            mask = mask & (rinds .>= windowStart)
+            if n == 1 {
+                // The mask is built before update, so the incoming token will
+                // occupy idxArray. Recover each rotating column's absolute
+                // position from its age relative to that write. Pinned columns
+                // retain their original positions and may fall outside a window.
+                let cycleLength = Int32(maxCacheSize - keep)
+                let age = (idxArray.reshaped(1, 1) - rinds + cycleLength) % cycleLength
+                let ringPositions = linds - age
+                let positions = MLX.`where`(
+                    (offsetArray .>= Int32(maxCacheSize)) & (rinds .>= Int32(keep)),
+                    ringPositions, rinds)
+                mask = mask & (positions .>= windowStart)
+            } else {
+                mask = mask & (rinds .>= windowStart)
+            }
         }
 
         return .array(mask)
