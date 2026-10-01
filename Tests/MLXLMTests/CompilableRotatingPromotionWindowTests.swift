@@ -99,13 +99,21 @@ final class CompilableRotatingPromotionWindowTests: XCTestCase {
                         preconditionFailure("Expected an explicit fixed-capacity mask")
                     }
                     let output = MLXFast.scaledDotProductAttention(
-                        queries: MLXArray.zeros([1, 2, 1, 8]), keys: pair.0,
+                        queries: args[2], keys: pair.0,
                         values: pair.1, scale: 1, mask: mask)
-                    return [output, array, pair.1]
+                    // update returns the mutable cache-state object. compile
+                    // restores that object's original context after recording
+                    // the body, so a direct result aliases an uncaptured input.
+                    // Observe an independent graph value without changing V.
+                    let observedValues = pair.1 + 0
+                    return [output, array, observedValues]
                 }
                 let forward = compiled ? compile(inputs: [cache], outputs: [cache], step) : step
+                let query = MLXArray.zeros([1, 2, 1, 8])
                 for token in seed ..< seed + 20 {
-                    let result = forward([rows(token ..< token + 1), rows(token ..< token + 1, dimensions: 4)])
+                    let result = forward([
+                        rows(token ..< token + 1), rows(token ..< token + 1, dimensions: 4), query,
+                    ])
                     eval(result)
                     let allowed = result[1].asArray(Bool.self)
                     let positions = result[2][0, 0, 0..., 0].asArray(Float.self)
