@@ -337,12 +337,17 @@ public enum TQDiskSerializer {
                     // `.kv` record. Also covers the empty pre-prefill case.
                     result[kindKey(for: i)] = kindArray(.skip)
                 }
-            } else if layer is KVCacheSimple || layer is TurboQuantKVCache {
+            } else if layer is KVCacheSimple || layer is CompilableKVCache
+                || layer is TurboQuantKVCache
+            {
                 // KVCacheSimple always, plus TurboQuantKVCache in fill phase.
                 // A compressed TQ layer restored from paged decoded KV also
                 // lands here because it has no native encoded payload. Store
                 // that decoded state as exact standard KV rather than writing
                 // a false TQ record or repeatedly re-quantizing it.
+                // CompilableKVCache also exports just its valid rows through
+                // `state`; its fixed-capacity buffer and device counter are
+                // execution details, not a different disk format.
                 // All variants expose `state` as [keys, values].
                 let state = layer.state
                 if state.count >= 2 {
@@ -636,7 +641,9 @@ public enum TQDiskSerializer {
                 continue
             }
 
-            if sub is KVCacheSimple || sub is TurboQuantKVCache {
+            if sub is KVCacheSimple || sub is CompilableKVCache
+                || sub is TurboQuantKVCache
+            {
                 let state = sub.state
                 if state.count >= 2 {
                     result["kv_\(i)_sub_\(j)_keys"] = state[0]

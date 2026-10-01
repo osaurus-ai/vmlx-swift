@@ -32,7 +32,29 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
             // The wrapped case begins after a native wrap and stays away from
             // idx==capacity. It isolates metadata export from the separate ring-write fix.
             for (capacity, promptLength) in [(16, 3), (8, 10)] {
+                // Independent control: three identical-shape native calls with
+                // no snapshot, metadata synchronization or disk operations.
+                let controlRaw = RotatingKVCache(maxSize: capacity)
+                for token in 0..<promptLength {
+                    let next = row(Float(token * 10))
+                    _ = controlRaw.update(keys: next, values: next * 2)
+                }
+                let control = CompilableRotatingKVCache(from: controlRaw)
+                eval(control)
+                let controlCounter = TraceCounter()
+                let controlForward: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+                    inputs: [control], outputs: [control]
+                ) { args in
+                    controlCounter.increment()
+                    let pair = control.update(keys: args[0], values: args[0] * 2)
+                    return [pair.0 + 0, pair.1 + 0]
+                }
+                for value in [Float(100), Float(110), Float(120)] {
+                    eval(controlForward([row(value)]))
+                    print("postanswer no-store control capacity=\(capacity) value=\(value) traces=\(controlCounter.read())")
+                }
                 for layout in 0..<3 {
+                    print("postanswer variant capacity=\(capacity) prompt=\(promptLength) layout=\(layout)")
                     let boundary = promptLength + 2
                     let prompt = Array(1...promptLength)
                     let generated = [promptLength + 1, boundary]
@@ -76,6 +98,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                         _ = simpleReference.update(keys: next, values: next * 2)
                     }
                     let tracedCount = traceCounter.read()
+                    print("postanswer pre-store traces=\(tracedCount) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
                     XCTAssertGreaterThan(tracedCount, 0)
                     if includeSimple { XCTAssertEqual(simple.offset, boundary) }
                     XCTAssertEqual(rotating.offsetArray.item(Int.self), boundary)
@@ -100,6 +123,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                             promptTokenIds: prompt, generatedTokenIds: generated,
                             cacheOffsets: cacheBoundaryLeafOffsets(caches), pendingDrainedTokenId: nil), key)
                     let snapshot = makePromptBoundaryCacheSnapshot(from: caches)
+                    print("postanswer snapshot traces=\(traceCounter.read()) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
                     writer.storeAfterGeneration(
                         promptTokens: key, perLayerData: [], ssmStates: nil,
                         cache: snapshot, isPostAnswer: true)
@@ -133,6 +157,7 @@ final class CompiledPostAnswerBoundaryTests: XCTestCase {
                     // Host materialization must not break the existing trace, and
                     // must never rewrite the retained prompt boundary.
                     eval(forward([row(120)]))
+                    print("postanswer continued traces=\(traceCounter.read()) state=\(caches.flatMap { $0.innerState() }.map { ($0.shape, $0.dtype) })")
                     XCTAssertEqual(traceCounter.read(), tracedCount, "Storage must not retrace the forward")
                     if includeSimple { XCTAssertEqual(simple.offset, boundary + 1) }
                     synchronizeCompiledRotatingCacheMetadataForStorage(caches)
