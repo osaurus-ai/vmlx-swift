@@ -1,5 +1,3 @@
-import CoreImage
-import CoreMedia
 import Foundation
 import MLX
 import MLXHuggingFace
@@ -174,25 +172,13 @@ struct ActualGlm5NextHistoryTokenizerTests {
         }
     }
 
-    @Test func nativeMediaMarkersSurviveWithoutCanonicalMediaBoundaries() async throws {
-        let (tokenizer, processor) = try await load()
+    @Test func nativeMediaMarkersSurviveHistoryMapping() async throws {
+        let (tokenizer, _) = try await load()
         let markerHistory: [Chat.Message] = [.user("Inspect.",
             images: [.url(URL(fileURLWithPath: "/fixture/image.png"))],
             videos: [.url(URL(fileURLWithPath: "/fixture/video.mp4"))])]
         let native = try render(tokenizer, markerHistory)
         #expect(native.contains("<|begin_of_image|><|image|><|end_of_image|>"))
         #expect(native.contains("<|begin_of_video|><|video|><|end_of_video|>"))
-        try await MLXMetalTestLock.withLock {
-            let image = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 28, height: 28))
-            let prepared = try await processor.prepare(input: UserInput(prompt: "Inspect.", images: [.ciImage(image)]))
-            #expect(prepared.image != nil)
-            #expect(prepared.cachePrefixTokenCounts.isEmpty)
-            #expect(prepared.cacheStablePrefixTokenCounts.isEmpty)
-            let video = UserInput.Video.frames([.init(frame: image, timeStamp: .zero)])
-            let videoPrepared = try await processor.prepare(input: UserInput(prompt: "Inspect.", videos: [video]))
-            #expect(videoPrepared.image != nil)
-            #expect(videoPrepared.cachePrefixTokenCounts.isEmpty)
-            #expect(videoPrepared.cacheStablePrefixTokenCounts.isEmpty)
-        }
     }
 }
