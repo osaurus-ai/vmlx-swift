@@ -98,7 +98,9 @@ struct HybridRestoreBoundaryRoundTripTests {
         for m in fx.mambaIndices {
             try #require(record["mamba_\(m)_state0"] != nil, "missing mamba_\(m)_state0")
             let off = try #require(record["__mamba_\(m)_offset__"], "missing __mamba_\(m)_offset__")
-            #expect(off.shape == [1] && off.dtype == .int32, "offset meta shape \(off.shape) \(off.dtype)")
+            #expect(
+                off.shape == [1] && off.dtype == .int32,
+                "offset meta shape \(off.shape) \(off.dtype)")
             #expect(off[0].item(Int32.self) == Int32(prefixLength))
         }
         for a in fx.attentionIndices {
@@ -127,7 +129,8 @@ struct HybridRestoreBoundaryRoundTripTests {
             MLX.eval(oneShotCache.flatMap(\.state))
             let oneShotLast = oneShot[0, Self.totalLength - 1]
             for (i, layer) in oneShotCache.enumerated() {
-                #expect(layer.offset == Self.totalLength, "one-shot: layer \(i) offset \(layer.offset)")
+                #expect(
+                    layer.offset == Self.totalLength, "one-shot: layer \(i) offset \(layer.offset)")
             }
             // Non-empty baseline: random-init logits must not be degenerate.
             try #require(abs(oneShotLast.asType(.float32)).max().item(Float.self) > 0)
@@ -151,7 +154,9 @@ struct HybridRestoreBoundaryRoundTripTests {
                     restoredTokens: restoredTokens, detail: "round-trip"),
                 "validator refused a consistent restore")
             for (i, layer) in restoredCache.enumerated() {
-                #expect(layer.offset == Self.prefixLength, "restored: layer \(i) offset \(layer.offset)")
+                #expect(
+                    layer.offset == Self.prefixLength, "restored: layer \(i) offset \(layer.offset)"
+                )
             }
 
             // Continue with the suffix through the restored cache.
@@ -159,7 +164,9 @@ struct HybridRestoreBoundaryRoundTripTests {
             MLX.eval(step)
             MLX.eval(restoredCache.flatMap(\.state))
             for (i, layer) in restoredCache.enumerated() {
-                #expect(layer.offset == Self.totalLength, "after suffix: layer \(i) offset \(layer.offset)")
+                #expect(
+                    layer.offset == Self.totalLength,
+                    "after suffix: layer \(i) offset \(layer.offset)")
             }
 
             // Same tolerance as BailingMoeV3Tests.cachedDecodeParity.
@@ -173,7 +180,9 @@ struct HybridRestoreBoundaryRoundTripTests {
                 let reference = try #require(oneShotStates[m])
                 try #require(restored.count == reference.count, "mamba layer \(m) slot count")
                 for (slot, (r, o)) in zip(restored, reference).enumerated() {
-                    #expect(r.shape == o.shape, "mamba layer \(m) slot \(slot) shape \(r.shape) vs \(o.shape)")
+                    #expect(
+                        r.shape == o.shape,
+                        "mamba layer \(m) slot \(slot) shape \(r.shape) vs \(o.shape)")
                     let scale = max(1, abs(o.asType(.float32)).max().item(Float.self))
                     let diff = Self.maxAbsDiff(r, o)
                     #expect(
@@ -190,31 +199,33 @@ struct HybridRestoreBoundaryRoundTripTests {
     func tamperedRecurrentOffsetIsRefused() throws {
         try MLXMetalTestLock.withLock {
             let fx = try Self.makeFixture()
-            var record = try Self.prefixRecord(fx)
+            let record = try Self.prefixRecord(fx)
 
-            // Same shape/dtype `metaInt32` writes (1-element 1D int32) so the
-            // deserializer's `readMetaInt32` accepts it as a valid offset.
-            let tampered = fx.mambaIndices[0]
-            record["__mamba_\(tampered)_offset__"] = MLXArray([Int32(Self.prefixLength + 1)])
-
-            var cache = fx.model.newCache(parameters: nil)
-            let restoredTokens = restoreFromDiskArrays(record, into: &cache)
-
-            // What the code does today: the deserializer trusts a readable
-            // offset and `restoreMambaLayer` seats it verbatim, while
-            // `totalTokens` comes from the attention keys (37). So restore
-            // reports 37 and leaves the tampered layer at 38 — exactly the
-            // production desync shape — and ONLY the validator catches it.
-            #expect(restoredTokens == Self.prefixLength, "restore returned \(restoredTokens)")
-            #expect(cache[tampered].offset == Self.prefixLength + 1)
-            for a in fx.attentionIndices {
-                #expect(cache[a].offset == Self.prefixLength)
+            // The first restored leaf is recurrent. The serializer reports
+            // that leaf's boundary; admission must still check every leaf.
+            try #require(fx.mambaIndices.first == 0)
+            for tampered in fx.mambaIndices {
+                var damaged = record
+                damaged["__mamba_\(tampered)_offset__"] = MLXArray([Int32(Self.prefixLength + 1)])
+                var cache = fx.model.newCache(parameters: nil)
+                let restoredTokens = restoreFromDiskArrays(damaged, into: &cache)
+                let expectedCount = tampered == 0 ? Self.prefixLength + 1 : Self.prefixLength
+                #expect(restoredTokens == expectedCount, "restore returned \(restoredTokens)")
+                for m in fx.mambaIndices {
+                    #expect(
+                        cache[m].offset
+                            == (m == tampered ? Self.prefixLength + 1 : Self.prefixLength))
+                }
+                for a in fx.attentionIndices {
+                    #expect(cache[a].offset == Self.prefixLength)
+                }
+                #expect(
+                    !validateRestoredCacheBoundary(
+                        cache, matchedTokens: Self.prefixLength,
+                        restoredTokens: restoredTokens,
+                        detail: "tampered-recurrent-offset-\(tampered)"),
+                    "validator accepted recurrent layer \(tampered) at 38 against a 37-token match")
             }
-            #expect(
-                !validateRestoredCacheBoundary(
-                    cache, matchedTokens: Self.prefixLength,
-                    restoredTokens: restoredTokens, detail: "tampered-recurrent-offset"),
-                "validator accepted a recurrent layer at 38 against a 37-token match")
         }
     }
 
@@ -223,12 +234,10 @@ struct HybridRestoreBoundaryRoundTripTests {
         try MLXMetalTestLock.withLock {
             let fx = try Self.makeFixture()
             let record = try Self.prefixRecord(fx)
-            let firstAttention = try #require(fx.attentionIndices.first)
+            try #require(fx.mambaIndices.first == 0)
 
-            // Truncate each attention layer in turn. Truncating the FIRST one
-            // also shrinks the restore count (36 != 37); truncating a later
-            // one leaves the count at 37 and is caught only by the per-layer
-            // offset check. Both properties must refuse.
+            // Each attention truncation leaves the first recurrent boundary
+            // at 37. Admission must refuse the mismatched attention leaf.
             for victim in fx.attentionIndices {
                 var damaged = record
                 let keys = try #require(damaged["kv_\(victim)_keys"])
@@ -242,17 +251,16 @@ struct HybridRestoreBoundaryRoundTripTests {
                 var cache = fx.model.newCache(parameters: nil)
                 let restoredTokens = restoreFromDiskArrays(damaged, into: &cache)
 
-                // What the code does today: `totalTokens` is seeded from the
-                // first `.standard` layer's key length, so it is 36 only when
-                // the first attention layer is the truncated one.
-                let expectedCount = victim == firstAttention
-                    ? Self.prefixLength - 1 : Self.prefixLength
                 #expect(
-                    restoredTokens == expectedCount,
-                    "victim \(victim): restore returned \(restoredTokens), expected \(expectedCount)")
-                #expect(cache[victim].offset == Self.prefixLength - 1, "victim \(victim) offset \(cache[victim].offset)")
+                    restoredTokens == Self.prefixLength,
+                    "victim \(victim): restore returned \(restoredTokens)")
+                #expect(
+                    cache[victim].offset == Self.prefixLength - 1,
+                    "victim \(victim) offset \(cache[victim].offset)")
                 for m in fx.mambaIndices {
-                    #expect(cache[m].offset == Self.prefixLength, "mamba \(m) offset \(cache[m].offset)")
+                    #expect(
+                        cache[m].offset == Self.prefixLength, "mamba \(m) offset \(cache[m].offset)"
+                    )
                 }
                 #expect(
                     !validateRestoredCacheBoundary(

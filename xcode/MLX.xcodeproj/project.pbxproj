@@ -254,6 +254,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				".clang-format",
+				".github/workflows/runtime-compatibility.yml",
 				.gitignore,
 				ACKNOWLEDGMENTS.md,
 				CMakeLists.txt,
@@ -361,6 +362,7 @@
 				python/mlxvariants.py,
 				python/type_private_generator.py,
 				python/vector_generator.py,
+				tests/gather_qmm.c,
 			);
 			target = C3AE8EE52EAAA3C5000BD280 /* Cmlx */;
 		};
@@ -388,6 +390,7 @@
 				".github/scripts/update-bypass-list.js",
 				.github/workflows/build_and_test.yml,
 				.github/workflows/documentation.yml,
+				".github/workflows/fork-runtime-contracts.yml",
 				.github/workflows/release.yml,
 				.github/workflows/update_bypass_list.yml,
 				.gitignore,
