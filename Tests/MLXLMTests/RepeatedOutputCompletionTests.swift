@@ -78,7 +78,7 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         let processor = TestInputProcessor(
             tokenizer: tokenizer, configuration: configuration,
             messageGenerator: DefaultMessageGenerator())
-        nonisolated(unsafe) let context = ModelContext(
+        let context = ModelContext(
             configuration: configuration, model: model, processor: processor, tokenizer: tokenizer)
         return BatchEngine(context: context, maxBatchSize: batchSize)
     }
@@ -223,13 +223,11 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         let payload = try JSONSerialization.data(withJSONObject: [
             "name": "record", "arguments": ["text": repeated]
         ], options: [.sortedKeys])
-        let tools: [ToolSpec] = [[
-            "type": "function", "function": [
-                "name": "record", "parameters": [
-                    "type": "object", "properties": ["text": ["type": "string"]]
-                ]
-            ]
-        ]]
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": ["text": ["type": "string"]]
+        ]
+        let function: [String: any Sendable] = ["name": "record", "parameters": parameters]
+        let tools: [ToolSpec] = [["type": "function", "function": function]]
         let raw = "<think>" + repeated + "</think>Visible answer. "
             + "<tool_call>" + String(decoding: payload, as: UTF8.self) + "</tool_call>"
         let result = route(raw, stopStrings: ["remains"], tools: tools, reasoning: true)
