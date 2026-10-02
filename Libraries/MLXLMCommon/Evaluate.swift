@@ -4814,7 +4814,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if !handler.onToken(token, emit: continuation.yield) {
                     streamTiming?.recordTermination(
                         handler.stopSequenceHit ? "stop_sequence"
-                        : handler.haltedOnRepetition ? "repetition_detector"
                         : handler.emittedToolCall ? "tool_call" : "consumer_terminated")
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
@@ -4823,8 +4822,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     // after an emitted tool call is likewise a natural
                     // `.stop`: the dispatched tool ends the turn.
                     stopReason =
-                        (handler.stopSequenceHit || handler.haltedOnRepetition
-                            || handler.emittedToolCall)
+                        (handler.stopSequenceHit || handler.emittedToolCall)
                         ? .stop : .cancelled
                     break
                 }
@@ -5349,15 +5347,6 @@ private protocol TokenLoopHandler: Sendable {
     /// text (e.g., the raw-token handler).
     var stopSequenceHit: Bool { get }
 
-    /// True when the last `onToken` returned false because the degenerate-
-    /// repetition guard fired. Reported like a stop sequence — `.stop`, not
-    /// `.cancelled` — because it is a deliberate library-internal halt, not a
-    /// consumer abort. Without this the collapse the guard exists to bound
-    /// still ends the turn, but arrives indistinguishable from the user
-    /// pressing stop, which is precisely the "no usable stop reason" symptom
-    /// that motivated the guard.
-    var haltedOnRepetition: Bool { get }
-
     /// True when the handler is still inside a reasoning envelope before
     /// terminal flush. Must be snapshotted before `onGenerationEnd`, because
     /// flushing drains and closes parser state.
@@ -5376,7 +5365,6 @@ private protocol TokenLoopHandler: Sendable {
 
 extension TokenLoopHandler {
     var stopSequenceHit: Bool { false }
-    var haltedOnRepetition: Bool { false }
     var unclosedReasoning: Bool { false }
     var emittedToolCall: Bool { false }
     var toolCallProtocolFailure: ToolCallProtocolFailure? { nil }
@@ -5416,17 +5404,9 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// `onToken` returns false to halt the loop; the `.info` event
     /// reports `stopReason = .stop`.
     var stopStringMatcher: StopStringMatcher
-    /// Degenerate-repetition guard. Sees the same visible text as the stop
-    /// matcher and halts the loop when the tail collapses into a verbatim
-    /// cycle, so a model stuck repeating itself cannot spend the whole token
-    /// budget and finish with no stop reason at all.
-    var repetitionDetector: RepetitionCycleDetector = .fromEnvironment()
     /// Flipped by `dispatch` when the stop matcher fires, so the loop
     /// task can signal `.stop` in its terminal `.info` event.
     private(set) var stopSequenceHit: Bool = false
-    /// The cycle that halted generation, when the repetition guard fired.
-    private(set) var repetitionCycle: RepetitionCycleDetector.Cycle?
-    var haltedOnRepetition: Bool { repetitionCycle != nil }
     private(set) var emittedToolCall: Bool = false
 
     init(
@@ -5668,33 +5648,18 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> AsyncStream<Generation>.Continuation.YieldResult {
         guard stopStringMatcher.isEnabled else {
-            let result = emit(.chunk(text))
-            return haltingOnRepetition(text, otherwise: result)
+            return emit(.chunk(text))
         }
         switch stopStringMatcher.feed(text) {
         case .streaming(let out):
             if out.isEmpty { return .enqueued(remaining: 0) }
-            let result = emit(.chunk(out))
-            return haltingOnRepetition(out, otherwise: result)
+            return emit(.chunk(out))
         case .stopped(let out):
             stopSequenceHit = true
             if out.isEmpty { return .terminated }
             _ = emit(.chunk(out))
             return .terminated
         }
-    }
-
-    /// Feed already-emitted visible text to the repetition guard and convert a
-    /// detected cycle into loop termination. Text is emitted first and never
-    /// withheld: the guard bounds how much more arrives, it does not edit what
-    /// already did.
-    private mutating func haltingOnRepetition(
-        _ emitted: String,
-        otherwise result: AsyncStream<Generation>.Continuation.YieldResult
-    ) -> AsyncStream<Generation>.Continuation.YieldResult {
-        guard let cycle = repetitionDetector.feed(emitted) else { return result }
-        repetitionCycle = cycle
-        return .terminated
     }
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {

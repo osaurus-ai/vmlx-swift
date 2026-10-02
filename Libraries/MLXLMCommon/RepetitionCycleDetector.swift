@@ -3,49 +3,13 @@
 
 import Foundation
 
-/// Streaming detector for degenerate repetition — the state where a model
-/// emits one unit of text over and over, verbatim, until something else stops
-/// it.
+/// Text-pattern detector retained for clients that inspect repeated text.
 ///
-/// ## Why this exists
-///
-/// Observed on Raptor 1.0 16B after two consecutive `invalid_args` tool
-/// rejections:
-///
-/// ```
-/// The answer is AppleScript; it begins with `use AppleScript version`.
-/// I do not generate or repeat the request.   (× N, to the token cap)
-/// ```
-///
-/// Nothing downstream caught it. The turn spent its entire token budget, the
-/// host recorded no terminal stop reason at all, and the user was handed
-/// thousands of characters of the same two sentences. A repetition penalty
-/// would make the state less likely but cannot bound it, and not every bundle
-/// ships one — the observed model declares none.
-///
-/// ## What counts as degenerate
-///
-/// A unit `U` repeated back to back at the tail, at least `minimumRepeats`
-/// times, where `U` is at least `minimumUnitLength` characters AND primitive
-/// at that scale — no shorter string repeats to build it. So the trigger is
-/// ≥128 characters of *exact* consecutive repetition of something that is not
-/// itself a repetition.
-///
-/// The primitivity rule is what separates a collapsed model from ordinary
-/// punctuation: a run of `---`, `. . .` or `| | |` also repeats at period 32,
-/// and a length floor alone would fire on all of them. Their real period is 1
-/// to 6, so they are rejected; the observed loop's period is a whole sentence
-/// pair, so it is not.
-///
-/// The shortest qualifying unit wins, so `ABABAB…` reports `AB` rather than
-/// `ABAB`.
-///
-/// ## Scope
-///
-/// Fed the same user-visible `.chunk` text as ``StopStringMatcher``, after
-/// reasoning and tool-call bytes have been scoped out. It never withholds or
-/// rewrites text: detection only reports that the loop should stop, and
-/// everything already emitted stays emitted.
+/// A repeated pattern does not establish decoder failure: quotations, fixtures,
+/// tables, and requested verbatim output can all repeat legitimately. This type
+/// must not decide generation completion or rewrite the model's terminal reason.
+/// The generation pipelines use EOS, configured stops, output limits, and caller
+/// cancellation; they do not invoke this detector.
 public struct RepetitionCycleDetector: Sendable {
 
     /// Shortest repeating unit treated as degenerate. Below this, repetition
