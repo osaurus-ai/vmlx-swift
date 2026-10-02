@@ -3,9 +3,10 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 /// Repeated text is data, not an authoritative completion signal. Exercise both
 /// the B=1 solo path and the scheduled text bridge, including real EOS and limits.
@@ -24,7 +25,7 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
             let length = inputs.dim(-1)
             let offset = cache?.first?.offset ?? 0
-            let rows = (0..<length).map { position in
+            let rows = (0 ..< length).map { position in
                 // Three prompt tokens: its final position predicts the first output.
                 let outputPosition = max(0, offset + position + 1 - 3)
                 let token = repeatsBeforeEOS.map { outputPosition >= $0 ? 8 : 7 } ?? 7
@@ -83,7 +84,9 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         return BatchEngine(context: context, maxBatchSize: batchSize)
     }
 
-    private func collect(_ stream: AsyncStream<Generation>) async -> (String, [GenerateCompletionInfo]) {
+    private func collect(_ stream: AsyncStream<Generation>) async -> (
+        String, [GenerateCompletionInfo]
+    ) {
         var text = ""
         var infos = [GenerateCompletionInfo]()
         for await event in stream {
@@ -91,7 +94,9 @@ final class RepeatedOutputCompletionTests: XCTestCase {
             case .chunk(let chunk): text += chunk
             case .info(let info):
                 infos.append(info)
-                print("fixture tokens=\(info.generationTokenCount) tok/s=\(info.tokensPerSecond) stop=\(info.stopReason)")
+                print(
+                    "fixture tokens=\(info.generationTokenCount) tok/s=\(info.tokensPerSecond) stop=\(info.stopReason)"
+                )
             case .reasoning, .toolCall, .toolCallProgress, .prefillProgress: break
             }
         }
@@ -132,7 +137,8 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         let engine = makeEngine(batchSize: batchSize)
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
-            parameters: GenerateParameters(maxTokens: 80, temperature: 0, extraStopStrings: ["remains"]))
+            parameters: GenerateParameters(
+                maxTokens: 80, temperature: 0, extraStopStrings: ["remains"]))
         let (text, infos) = await collect(stream)
         XCTAssertEqual(infos.count, 1)
         XCTAssertEqual(infos.first?.stopReason, .stop)
@@ -161,14 +167,28 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         try await assertEOS(batchSize: batchSize)
     }
 
-    func testSoloRepeatedTextReachesConfiguredLength() async throws { try await assertLength(batchSize: 1) }
-    func testScheduledRepeatedTextReachesConfiguredLength() async throws { try await assertLength(batchSize: 2) }
+    func testSoloRepeatedTextReachesConfiguredLength() async throws {
+        try await assertLength(batchSize: 1)
+    }
+    func testScheduledRepeatedTextReachesConfiguredLength() async throws {
+        try await assertLength(batchSize: 2)
+    }
     func testSoloRepeatedTextReachesRealEOS() async throws { try await assertEOS(batchSize: 1) }
-    func testScheduledRepeatedTextReachesRealEOS() async throws { try await assertEOS(batchSize: 2) }
-    func testSoloConfiguredStopStillTruncatesExactly() async throws { try await assertConfiguredStop(batchSize: 1) }
-    func testScheduledConfiguredStopStillTruncatesExactly() async throws { try await assertConfiguredStop(batchSize: 2) }
-    func testSoloCancellationDrains() async throws { try await assertCancellationAndFollowUp(batchSize: 1) }
-    func testScheduledCancellationDrains() async throws { try await assertCancellationAndFollowUp(batchSize: 2) }
+    func testScheduledRepeatedTextReachesRealEOS() async throws {
+        try await assertEOS(batchSize: 2)
+    }
+    func testSoloConfiguredStopStillTruncatesExactly() async throws {
+        try await assertConfiguredStop(batchSize: 1)
+    }
+    func testScheduledConfiguredStopStillTruncatesExactly() async throws {
+        try await assertConfiguredStop(batchSize: 2)
+    }
+    func testSoloCancellationDrains() async throws {
+        try await assertCancellationAndFollowUp(batchSize: 1)
+    }
+    func testScheduledCancellationDrains() async throws {
+        try await assertCancellationAndFollowUp(batchSize: 2)
+    }
     private func route(
         _ raw: String, stopStrings: [String] = [], tools: [ToolSpec]? = nil,
         reasoning: Bool = false
@@ -182,7 +202,8 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         var visible = ""
         var thought = ""
         var calls = [ToolCall]()
-        let emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult = { event in
+        let emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult = {
+            event in
             switch event {
             case .chunk(let text): visible += text
             case .reasoning(let text): thought += text
@@ -193,7 +214,10 @@ final class RepeatedOutputCompletionTests: XCTestCase {
         }
         var halted = false
         for token in pieces.indices {
-            if !handler.onToken(token, emit: emit) { halted = true; break }
+            if !handler.onToken(token, emit: emit) {
+                halted = true
+                break
+            }
         }
         handler.onGenerationEnd(emit: emit)
         return (visible, thought, calls, halted)
@@ -220,15 +244,17 @@ final class RepeatedOutputCompletionTests: XCTestCase {
 
     func testRepeatedReasoningAndToolArgumentsRemainScoped() throws {
         let repeated = String(repeating: Self.unit, count: 30)
-        let payload = try JSONSerialization.data(withJSONObject: [
-            "name": "record", "arguments": ["text": repeated]
-        ], options: [.sortedKeys])
+        let payload = try JSONSerialization.data(
+            withJSONObject: [
+                "name": "record", "arguments": ["text": repeated],
+            ], options: [.sortedKeys])
         let parameters: [String: any Sendable] = [
-            "type": "object", "properties": ["text": ["type": "string"]]
+            "type": "object", "properties": ["text": ["type": "string"]],
         ]
         let function: [String: any Sendable] = ["name": "record", "parameters": parameters]
         let tools: [ToolSpec] = [["type": "function", "function": function]]
-        let raw = "<think>" + repeated + "</think>Visible answer. "
+        let raw =
+            "<think>" + repeated + "</think>Visible answer. "
             + "<tool_call>" + String(decoding: payload, as: UTF8.self) + "</tool_call>"
         let result = route(raw, stopStrings: ["remains"], tools: tools, reasoning: true)
         XCTAssertFalse(result.halted)
