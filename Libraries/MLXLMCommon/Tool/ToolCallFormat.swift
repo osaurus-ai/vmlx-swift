@@ -251,7 +251,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .lfm2:
             return LFM2ToolCallParser()
         case .xmlFunction:
-            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+            return XMLFunctionParser(
+                startTag: "<tool_call>", endTag: "</tool_call>",
+                trimsSingleLFStringFraming: true)
         case .mimo:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>",
                                      preservesLiteralStringValues: true)
