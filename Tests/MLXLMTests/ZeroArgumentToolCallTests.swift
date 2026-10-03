@@ -65,6 +65,7 @@ struct ZeroArgumentToolCallTests {
         (.gemma4, "<|tool_call>call:list_mailboxes{}<tool_call|>"),
         (.step, "<tool_call><function=list_mailboxes></function></tool_call>"),
         (.nemotron, "<tool_call><function=list_mailboxes></function></tool_call>"),
+        (.mimo, "<tool_call><function=list_mailboxes></function></tool_call>"),
     ]
 
     /// A format added without a sample here would silently skip the check.
