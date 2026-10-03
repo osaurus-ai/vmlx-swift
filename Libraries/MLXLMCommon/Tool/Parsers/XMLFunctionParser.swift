@@ -11,19 +11,25 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     public let unwrapJSONQuotedStringParameters: Bool
     /// MiMo transports strings without framing newlines or JSON escapes.
     public let preservesLiteralStringValues: Bool
+    /// Native attribute-form strings remove one ASCII LF per edge and otherwise
+    /// preserve literal bytes, including backslashes and quoted text.
+    /// Direct constructors retain legacy trimming unless this is enabled.
+    public let trimsSingleLFStringFraming: Bool
 
     public init(
         startTag: String,
         endTag: String,
         decodesHTMLLineBreaks: Bool = false,
         unwrapJSONQuotedStringParameters: Bool = false,
-        preservesLiteralStringValues: Bool = false
+        preservesLiteralStringValues: Bool = false,
+        trimsSingleLFStringFraming: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.decodesHTMLLineBreaks = decodesHTMLLineBreaks
         self.unwrapJSONQuotedStringParameters = unwrapJSONQuotedStringParameters
         self.preservesLiteralStringValues = preservesLiteralStringValues
+        self.trimsSingleLFStringFraming = trimsSingleLFStringFraming
     }
 
     /// The XML-function transport's closers are protocol control markers even
@@ -179,9 +185,23 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             }
 
             var paramValue = String(paramSection[nameEnd.upperBound ..< valueEnd])
+            let type = getParameterType(
+                funcName: funcName, paramName: paramName, tools: tools)?.lowercased()
+            let nativeString = trimsSingleLFStringFraming && !preservesLiteralStringValues
+                && (type == nil
+                    || ["string", "str", "text", "varchar", "char", "enum"].contains(type ?? ""))
 
-            // Qwen framing includes boundary newlines; MiMo string bytes are literal.
-            if !preservesLiteralStringValues { paramValue = trimBoundaryNewlines(paramValue) }
+            // Qwen's native attribute strings have one framing LF per edge;
+            // additional newlines belong to the payload. Typed values and
+            // legacy XML callers retain their existing boundary trimming.
+            // MiMo string bytes are literal regardless of framing policy.
+            if !preservesLiteralStringValues {
+                if nativeString {
+                    paramValue = trimSingleLFBoundary(paramValue)
+                } else {
+                    paramValue = trimBoundaryNewlines(paramValue)
+                }
+            }
 
             if decodesHTMLLineBreaks,
                isStringType(funcName: funcName, argName: paramName, tools: tools) {
@@ -193,8 +213,9 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
                 paramValue = trimBoundaryNewlines(unwrapped)
             }
 
-            // Convert value based on schema type
-            arguments[paramName] = convertTransportValue(
+            // Native Qwen XML strings are literal, not JSON string scalars.
+            // Keep this attribute-only policy out of nested/legacy transports.
+            arguments[paramName] = nativeString ? paramValue : convertTransportValue(
                 paramValue, paramName: paramName, funcName: funcName, tools: tools)
 
             searchRange = (nextSearchStart ?? paramEnd.upperBound) ..< paramSection.endIndex
@@ -216,8 +237,8 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
     /// Returns nil — so the caller falls through to the attribute-style scan —
     /// unless the distinctive nested `<name>…</name>` / `<value>…</value>`
     /// parameter markers are present, so attribute-style calls are never
-    /// rerouted here. Reuses the same value post-processing / schema validation
-    /// as the attribute path so both wire forms behave identically downstream.
+    /// rerouted here. Retains legacy value post-processing and shared schema
+    /// validation; the single-LF framing option applies only to attributes.
     private func parseNestedParameterForm(
         _ content: String,
         tools: [[String: any Sendable]]?
@@ -381,6 +402,15 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
                 trimBoundaryNewlines(value), paramName: paramName, funcName: funcName, tools: tools)
         }
         return convertParameterValue(value, paramName: paramName, funcName: funcName, tools: tools)
+    }
+
+    private func trimSingleLFBoundary(_ value: String) -> String {
+        // Swift treats CRLF as one Character. Use scalars so removing LF
+        // never consumes an adjacent CR or another payload newline.
+        var scalars = value.unicodeScalars
+        if scalars.first?.value == 0x0A { scalars.removeFirst() }
+        if scalars.last?.value == 0x0A { scalars.removeLast() }
+        return String(scalars)
     }
 
     private func trimBoundaryNewlines(_ value: String) -> String {
