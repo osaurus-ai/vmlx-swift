@@ -2981,7 +2981,11 @@ enum Qwen35Language {
             }
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
                 if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
-                    || ropeDeltas == nil
+                    // A restored text cache has no process-local RoPE delta,
+                    // but its suffix must still start at the cache offset.
+                    // Media grids and cold caches require full index derivation.
+                    || (ropeDeltas == nil
+                        && (cacheOffset == 0 || imageGridTHW != nil || videoGridTHW != nil))
                     || cache == nil
                 {
                     if let precomputedPositionIds {
@@ -3547,7 +3551,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // how token-by-token decode runs), so a causal/padding prefill mask is
         // reconstructed correctly per chunk — same as Gemma4's chunked VLM
         // prefill, which also drops the incoming mask.
-        if inputEmbeddings == nil, pixelValues == nil,
+        if inputEmbeddings == nil, pixelValues == nil, !cache.isEmpty,
             prefillStepSize > 0, promptTokenCount > prefillStepSize
         {
             var offset = 0
