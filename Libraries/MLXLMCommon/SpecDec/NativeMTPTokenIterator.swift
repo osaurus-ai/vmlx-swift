@@ -45,12 +45,11 @@ private struct NativeMTPCacheCheckpoint {
     }
 }
 
-/// Process-wide memo of the hybrid safety-warmup verdict, keyed by model
-/// instance. The 16-cycle probe otherwise re-runs on every request even
-/// though its outcome is a property of the model, not the prompt — census
-/// showed 84% of requests burning the probe just to land in AR fallback
-/// again. Only the *warmup* verdict is memoized; adaptive acceptance-ratio
-/// fallbacks stay per-request because they are content-dependent.
+/// Process-wide memo of successful hybrid warmup, keyed by model instance.
+/// Acceptance is content-dependent, even when it is near zero. A failed
+/// request keeps its own AR fallback but cannot disable later requests.
+/// A successful memo only avoids repeating the legacy warmup; verifier commit
+/// correctness and the reversible wall-cost governor keep their own gates.
 enum NativeMTPHybridWarmupMemo {
     private struct Entry {
         weak var model: AnyObject?
@@ -618,14 +617,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.materializeSyncTime += promptTokenElapsed
 
         if usesHybridMambaCache,
-            let remembered = NativeMTPHybridWarmupMemo.verdict(for: model)
+            NativeMTPHybridWarmupMemo.verdict(for: model) == true
         {
-            if remembered {
-                hybridSafetyWarmupComplete = true
-            } else {
-                forceAutoregressiveFallback = true
-                adaptiveFallbackReason = "hybrid_warmup_memo"
-            }
+            hybridSafetyWarmupComplete = true
         }
 
         let requestsAffineKV: Bool = {
@@ -2415,21 +2409,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 hybridSafetyWarmupComplete = true
                 NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
-                // The memo's contract is "a property of the model, not the
-                // prompt" — but this floor is an acceptance criterion, and
-                // acceptance is content. Memoize the failure only when it is
-                // catastrophic (below even the depth-1 floor), which is the
-                // broken/mismatched-head case the memo exists for. A miss
-                // above that line means THIS prompt drafted badly (prose
-                // warms up around 1.0, code above 3.0 on the same model);
-                // fall back for this request and let the next one re-probe,
-                // or a prose first turn locks every later code turn out of
-                // MTP for the whole residency.
-                if Self.warmupFailureIsModelProperty(
-                    averageAccepted: averageAccepted, depth: currentDepth
-                ) {
-                    NativeMTPHybridWarmupMemo.record(false, for: model)
-                }
+                // This criterion counts accepted proposals, not numerical
+                // cache stability or artifact integrity. Even zero acceptance
+                // can be prompt-dependent. Keep failure local to this request
+                // and let the next request run its own guarded warmup.
                 // A marginal miss at depth >= 2 that clears the DEPTH-1 floor
                 // proves depth-1 speculation is safe — downshift and keep
                 // speculating rather than AR-flooding the whole turn. The
@@ -3077,28 +3060,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// at its native depth (2.75/3 ≈ 0.92 was Nemotron-D3-era calibration,
     /// deliberately relaxed here to the D1-breakeven scale).
     private static let hybridWarmupMinimumAverageAcceptedPerDraft = 0.55
-
-    /// Whether a warmup miss is bad enough to blame the MODEL rather than the
-    /// prompt — i.e. safe to memoize in `NativeMTPHybridWarmupMemo`. Below the
-    /// depth-1 floor no depth could ever clear warmup, which only a broken or
-    /// mismatched MTP head produces; anything above is content variance and
-    /// must stay per-request.
-    /// Catastrophic means "the head is broken or mismatched" — a verdict that
-    /// really is a property of the model and safe to memoize for the whole
-    /// residency. The pass floor scales with depth (`0.55 * depth`), so the
-    /// catastrophic line must scale too: it is HALF the depth's own floor,
-    /// which at depth 2 is the historical 0.55 exactly. The old bare constant
-    /// made EVERY depth-1 warmup miss "catastrophic" (floor 0.55, line 0.55),
-    /// so one depth-1 probe at 0.44 — an ordinary content miss — recorded a
-    /// failed-model verdict and hard-disabled MTP at every depth until the
-    /// container died. Observed live: `adaptiveFallback=hybrid_warmup_memo`,
-    /// `verifyCalls=0` on every subsequent turn including depth 2.
-    static func warmupFailureIsModelProperty(
-        averageAccepted: Double, depth: Int
-    ) -> Bool {
-        averageAccepted
-            < hybridWarmupMinimumAverageAcceptedPerDraft * Double(Swift.max(depth, 1)) / 2
-    }
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
