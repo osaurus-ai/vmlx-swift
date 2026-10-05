@@ -3,6 +3,49 @@
 enum JANGHPrefillSource {
     static let loader = #"""
 
+// Derived from MLX row scheduling (Copyright 2026 Apple Inc.).
+template <int BM>
+METAL_FUNC bool tq_schedule_row_tile(
+    const device int32_t* offsets,
+    const int num_groups,
+    const int M,
+    const int tile,
+    const uint simd_lane_id,
+    thread int& row,
+    thread int& group,
+    thread short& rows) {
+  int tiles_before = 0;
+  // each lane process an expert
+  for (int e = 0; e < num_groups; e += 32) {
+    const int g = e + simd_lane_id; // shift by lane id
+    int start = M;
+    int end = M;
+    if (g < num_groups) {
+      // start of the experts activations
+      start = offsets[g];
+      // end of the experts activations
+      end = g + 1 < num_groups ? offsets[g + 1] : M;
+    }
+    // number of tiles per expert
+    const int n = (end - start + BM - 1) / BM;
+    // the total number of tiles up to and including this expert
+    const int tiles_through = tiles_before + simd_prefix_inclusive_sum(n);
+    const ushort owner_lane = ushort(simd_sum(int(tiles_through <= tile)));
+    if (owner_lane < 32) {
+      // if true, we found an owner
+      group = e + owner_lane;
+      // fill the row to start
+      row = simd_shuffle(start, owner_lane) +
+          (tile - simd_shuffle(tiles_through - n, owner_lane)) * BM;
+      // number of valid rows in the tile
+      rows = short(min(BM, simd_shuffle(end, owner_lane) - row));
+      return true;
+    }
+    tiles_before = simd_shuffle(tiles_through, 31);
+  }
+  return false;
+}
+
 // v2 tile loader: identical byte walk to MLX QuantizedBlockLoader (bitstream packing); decode = scale[row]*level(q)
 template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size, short bits>
 struct TQBlockLoader {
@@ -53,7 +96,7 @@ METAL_FUNC float tq_act(float g, float u, float lim) {
 template <typename T, int bits, int bits_u, bool FUSED, bool ROT_OUT>
 METAL_FUNC void tq_gather_qmm_nax(
     const device T* x, const device uint32_t* wg, const device half* sg, const device uint32_t* wu, const device half* su,
-    const device uint32_t* indices, device T* y, const int M, const int N, const int K, const int EXPERTS, const float lim,
+    const device int32_t* offsets, device T* y, const int M, const int N, const int K, const int EXPERTS, const float lim,
     threadgroup T* Wg, threadgroup T* Wu, uint3 tid, uint simd_group_id, uint simd_lane_id) {
   constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
@@ -65,8 +108,12 @@ METAL_FUNC void tq_gather_qmm_nax(
   const size_t stride_w = size_t(N) * K_w;
   const int K_wu = K * get_bytes_per_pack<bits_u>() / get_pack_factor<bits_u, 8>();
   const size_t stride_wu = size_t(N) * K_wu;
-  const int y_row = tid.y * BM; const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, M - y_row));
+  int y_row, group;
+  short tgp_bm;
+  // Extra group preserves NaN propagation for sorted out-of-range routes.
+  if (!tq_schedule_row_tile<BM>(offsets, EXPERTS + 1, M, tid.y,
+                               simd_lane_id, y_row, group, tgp_bm)) return;
+  const int y_col = tid.x * BN;
   const short tgp_bn = short(min(BN, N - y_col));
   auto wgl = (const device uint8_t*)wg; auto wul = (const device uint8_t*)wu;
   x += size_t(y_row) * K; y += size_t(y_row) * N + y_col;
@@ -74,12 +121,12 @@ METAL_FUNC void tq_gather_qmm_nax(
   constexpr short SM = BM / WM, SN = BN / WN, SK = 32;
   constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
   const short tm = SM * (simd_group_id / WN); const short tn = SN * (simd_group_id % WN);
-  const short sgp_sm = min(SM, short(max(0, (M - (y_row + tm)))));
+  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
   const short sgp_sn = min(SN, short(max(0, (N - (y_col + tn)))));
-  uint32_t index; short offset; uint32_t index_next = indices[y_row]; short offset_next = 0; int n = 0;
-  while (n < tgp_bm) {
-    n++; offset = offset_next; index = index_next; offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) { if (indices[y_row + n] != index) { offset_next = n; index_next = indices[y_row + n]; break; } }
+  // One expert per tile; no repeated weight/MMA traversal at tile boundaries.
+  const uint32_t index = uint32_t(group);
+  const short offset = 0, offset_next = tgp_bm;
+  do {
     // Invalid routes propagate NaN without reading outside a mapped bank.
     // Segment identity is uniform across the complete threadgroup.
     if (index >= uint(EXPERTS)) {
@@ -159,7 +206,7 @@ METAL_FUNC void tq_gather_qmm_nax(
       if (m_lo_lim == 0 && m_hi_lim == SM && sgp_sn == SN) Gt.store(y + tm * N + tn, N);
       else Gt.store_slice(y + tm * N + tn, N, short2(0, m_lo_lim), short2(sgp_sn, m_hi_lim));
     }
-  }
+  } while (false);
 }
 
 """#
@@ -167,7 +214,7 @@ METAL_FUNC void tq_gather_qmm_nax(
 
 template <typename T, int bits>
 METAL_FUNC void tq_gather_qmm_steel(
-    const device T* x, const device uint32_t* wg, const device half* sg, const device uint32_t* indices, device T* y,
+    const device T* x, const device uint32_t* wg, const device half* sg, const device int32_t* offsets, device T* y,
     const int M, const int N, const int K, const int EXPERTS, threadgroup T* Xs, threadgroup T* Ws,
     uint3 tid, uint simd_group_id, uint simd_lane_id) {
   // MLX affine_gather_qmm_rhs (non-NAX, transpose=true) with the TQ tile loader. Tiles: 16x32x32, 1x2 simdgroups.
@@ -180,15 +227,19 @@ METAL_FUNC void tq_gather_qmm_steel(
   using loader_w_t = TQBlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, bits>;
   const int K_w = K * bytes_per_pack / pack_factor; const int K_it = K / BK;
   const size_t stride_w = size_t(N) * K_w;
-  const int y_row = tid.y * BM; const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, M - y_row));
+  int y_row, group;
+  short tgp_bm;
+  // Extra group preserves NaN propagation for sorted out-of-range routes.
+  if (!tq_schedule_row_tile<BM>(offsets, EXPERTS + 1, M, tid.y,
+                               simd_lane_id, y_row, group, tgp_bm)) return;
+  const int y_col = tid.x * BN;
   const short tgp_bn = short(min(BN, N - y_col));
   auto wl = (const device uint8_t*)wg;
   x += size_t(y_row) * K; y += size_t(y_row) * N + y_col; wl += size_t(y_col) * K_w;
-  uint32_t index; short offset; uint32_t index_next = indices[y_row]; short offset_next = 0; int n = 0;
-  while (n < tgp_bm) {
-    n++; offset = offset_next; index = index_next; offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) { if (indices[y_row + n] != index) { offset_next = n; index_next = indices[y_row + n]; break; } }
+  // One expert per tile; no repeated weight/MMA traversal at tile boundaries.
+  const uint32_t index = uint32_t(group);
+  const short offset = 0, offset_next = tgp_bm;
+  do {
     // Invalid routes propagate NaN without reading outside a mapped bank.
     // Segment identity is uniform across the complete threadgroup.
     if (index >= uint(EXPERTS)) {
@@ -207,7 +258,7 @@ METAL_FUNC void tq_gather_qmm_steel(
     else gemm_loop_unaligned<false, false, true>(Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, (short)BK);
     if (offset_next - offset == BM && tgp_bn == BN) mma_op.store_result(y, N);
     else mma_op.store_result_slice(y, N, short2(0, offset), short2(tgp_bn, offset_next));
-  }
+  } while (false);
 }
 
 """#
