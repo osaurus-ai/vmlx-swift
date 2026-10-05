@@ -1719,7 +1719,8 @@ public struct Zaya1VLProcessor: UserInputProcessor {
             return LMInput(
                 tokens: MLXArray(promptTokens),
                 tokenIds: promptTokens,
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                toolSchemas: input.tools)
         }
 
         let placeholderCount = QwenVL.paddingPlaceholderRanges(
@@ -1731,7 +1732,8 @@ public struct Zaya1VLProcessor: UserInputProcessor {
             return LMInput(
                 tokens: MLXArray(promptTokens),
                 tokenIds: promptTokens,
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                toolSchemas: input.tools)
         }
         guard placeholderCount == input.images.count else {
             throw VLMError.processing(
@@ -1756,6 +1758,7 @@ public struct Zaya1VLProcessor: UserInputProcessor {
             image: processedImage,
             mediaTokenIds: MediaTokenIds.resolve(
                 tokenizer: tokenizer, tokens: ["<image>"]),
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            toolSchemas: input.tools)
     }
 }

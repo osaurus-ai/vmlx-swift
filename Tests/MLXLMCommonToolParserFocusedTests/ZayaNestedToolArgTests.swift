@@ -264,4 +264,53 @@ struct ZayaNestedToolArgTests {
     func plainProseNoCall() {
         #expect(zayaParser().parse(content: "Sure, I can help with that.", tools: fileWrite) == nil)
     }
+
+    /// Exact bytes emitted by the installed ZAYA1-VL-8B-JANGTQ4 bundle.
+    /// Exercise the public stream router one character at a time: parsing a
+    /// call inside the processor is insufficient unless the host receives the
+    /// corresponding authoritative `.toolCall` event.
+    @Test("installed JANGTQ4 envelope reaches the public generation stream")
+    func installedJANGTQ4EnvelopeReachesGenerationStream() throws {
+        let weather: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"]
+                        ] as [String: any Sendable],
+                        "required": ["location"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let output = """
+            <zyphra_tool_call>
+            <function=get_weather>
+            <parameter>
+            <name>location</name>
+            <value>Tokyo</value>
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        let processor = ToolCallProcessor(format: .zayaXml, tools: weather)
+        var events = [Generation]()
+        for character in output {
+            events.append(contentsOf: routeGenerationText(
+                String(character), channel: .content, through: processor))
+        }
+        events.append(contentsOf: flushGenerationText(
+            channel: .content, through: processor))
+
+        let calls = events.compactMap(\.toolCall)
+        let visible = events.compactMap(\.chunk).joined()
+        let call = try #require(calls.first)
+        #expect(calls.count == 1)
+        #expect(call.function.name == "get_weather")
+        #expect(call.function.arguments["location"] == .string("Tokyo"))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
 }

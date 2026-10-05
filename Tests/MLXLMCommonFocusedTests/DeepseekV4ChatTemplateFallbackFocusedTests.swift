@@ -795,6 +795,56 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("enable_thinking"))
     }
 
+    @Test("ZAYA1-VL fallback preserves nested spawn-batch item schema")
+    func zayaVLFallbackPreservesNestedSpawnBatchSchema() throws {
+        let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "user", "content": "Delegate both jobs."]
+                    as [String: any Sendable],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "spawn_batch",
+                        "description": "Run a batch of delegated jobs.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "jobs": [
+                                    "type": "array",
+                                    "description": "Jobs to launch.",
+                                    "items": [
+                                        "type": "object",
+                                        "properties": [
+                                            "agent": ["type": "string"],
+                                            "task": ["type": "string"],
+                                            "job_id": ["type": "string"],
+                                        ] as [String: any Sendable],
+                                        "required": ["agent", "task"],
+                                    ] as [String: any Sendable],
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable],
+                            "required": ["jobs"],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ],
+            "bos_token": "<bos>",
+            "add_generation_prompt": true,
+            "tool_choice": "required",
+            "tool_choice_name": "spawn_batch",
+        ])
+
+        #expect(rendered.contains("<name>jobs</name>"))
+        #expect(rendered.contains("<items>"), "Rendered schema used the wrong ZAYA tag: \(rendered)")
+        #expect(!rendered.contains("<schema>"), "Rendered schema used a synthetic wrapper: \(rendered)")
+        #expect(rendered.contains("\"properties\""), "Rendered items dropped object shape: \(rendered)")
+        #expect(rendered.contains("\"agent\""), "Rendered schema dropped nested agent property: \(rendered)")
+        #expect(rendered.contains("\"task\""), "Rendered schema dropped nested task property: \(rendered)")
+    }
+
     @Test("ZAYA1-VL required tool choice repeats at current turn after no-tool history")
     func zayaVLRequiredToolChoiceRepeatsAfterNoToolHistory() throws {
         let template = try Template(ChatTemplateFallbacks.zayaVLVisionToolMinimal)
@@ -1483,5 +1533,47 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let tokenizerTemplate = try #require(rewrittenTokenizer["chat_template"] as? String)
         #expect(tokenizerTemplate.contains("zyphra_tool_call"))
         #expect(tokenizerTemplate.contains("<|vision_start|><image><|vision_end|>"))
+    }
+
+    @Test("ZAYA1-VL explicit unsupported-tools stamp keeps the shipped vision template")
+    func zayaVLExplicitUnsupportedToolsDoesNotInjectToolTemplate() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(
+            "zaya-vl-tools-disabled-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let tokenizerConfig: [String: Any] = [
+            "bos_token": "<bos>",
+            "eos_token": "<|im_end|>",
+            "chat_template": "user: {{ messages[0]['content'] }}\nassistant: ",
+        ]
+        let visionTemplate =
+            "{% for message in messages %}<|vision_start|><image><|vision_end|>{{ message['content'] }}{% endfor %}"
+        let jangConfig: [String: Any] = [
+            "capabilities": [
+                "family": "zaya1_vl",
+                "tool_parser": "zaya_xml",
+                "think_in_template": false,
+                "supports_tools": false,
+                "supports_thinking": true,
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: tokenizerConfig).write(
+            to: root.appendingPathComponent("tokenizer_config.json"))
+        try JSONSerialization.data(withJSONObject: ["chat_template": visionTemplate]).write(
+            to: root.appendingPathComponent("chat_template.json"))
+        try JSONSerialization.data(withJSONObject: jangConfig).write(
+            to: root.appendingPathComponent("jang_config.json"))
+
+        let shim = JangLoader.resolveChatTemplateSidecarSubstitution(for: root)
+        let rewrittenTokenizerData = try Data(
+            contentsOf: shim.appendingPathComponent("tokenizer_config.json"))
+        let rewrittenTokenizer = try #require(
+            JSONSerialization.jsonObject(with: rewrittenTokenizerData) as? [String: Any])
+        let tokenizerTemplate = try #require(rewrittenTokenizer["chat_template"] as? String)
+
+        #expect(tokenizerTemplate == visionTemplate)
+        #expect(!tokenizerTemplate.contains("zyphra_tool_call"))
     }
 }
