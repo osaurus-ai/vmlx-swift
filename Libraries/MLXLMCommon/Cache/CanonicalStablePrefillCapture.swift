@@ -56,11 +56,15 @@ final class CanonicalStablePrefillCapture {
     private let salt: String?
     private let owners: [ObjectIdentifier]
     private let schema: [String]
+    private let exactReplayTarget: Int?
+    private let ordinaryModel: (any CanonicalRequiredToolCacheModel)?
     private(set) var snapshot: [KVCache]?
+    var isOrdinaryStableRederive: Bool { exactReplayTarget != nil }
 
     init?(input: LMInput, promptTokens: [Int], cache: [KVCache],
           chunkSize: Int, targets: [Int], salt: String?,
-          canonicalModel: (any CanonicalRequiredToolCacheModel)? = nil) {
+          canonicalModel: (any CanonicalRequiredToolCacheModel)? = nil,
+          exactReplayTarget: Int? = nil) {
         guard chunkSize > 0, !input.hasMediaContent, !input.requiresPostPrepareCacheKey,
               input.cachePromptIntent != .auxiliary,
               input.text.mask == nil || input.text.mask?.size == promptTokens.count,
@@ -70,8 +74,16 @@ final class CanonicalStablePrefillCapture {
               let first = targets.filter({ $0 >= chunkSize && $0 < promptTokens.count }).min()
         else { return nil }
         let seed = (first / chunkSize) * chunkSize
-        guard seed > 0 else { return nil }
+        guard seed > 0, exactReplayTarget == nil
+            || (exactReplayTarget == first && input.cacheStablePrefixTokenCounts.contains(first + 1)
+                && input.text.mask == nil
+                && input.cacheRestorePolicy == .standard && input.cachePromptIntent == .generation
+                && input.canonicalRequiredToolContext == nil
+                && canonicalModel?.supportsOrdinaryStablePrefixRederive == true)
+        else { return nil }
         self.chunkSize = chunkSize; seedCount = seed
+        self.exactReplayTarget = exactReplayTarget
+        ordinaryModel = exactReplayTarget == nil ? nil : canonicalModel
         modelIdentity = canonicalModel?.canonicalRequiredToolCacheIdentity
         self.promptTokens = promptTokens; self.salt = salt
         owners = cache.map { ObjectIdentifier($0 as AnyObject) }
@@ -89,9 +101,16 @@ final class CanonicalStablePrefillCapture {
               cache.map({ ObjectIdentifier($0 as AnyObject) }) == owners,
               cache.map({ String(reflecting: type(of: $0)) }) == schema,
               cache.allSatisfy({ $0.offset == completed }) else { return }
+        if let ordinaryModel {
+            guard input.text.mask == nil,
+                  ordinaryModel.validateCanonicalRequiredToolCache(cache, boundary: completed),
+                  CacheStoreBudget.canStore(cache) else { return }
+        }
         let start = Date.timeIntervalSinceReferenceDate
         let owned = makePromptBoundaryCacheSnapshot(from: cache)
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled,
+              ordinaryModel.map({ $0.validateCanonicalRequiredToolCache(owned, boundary: completed) }) ?? true
+        else { return }
         let elapsed = Date.timeIntervalSinceReferenceDate - start
         snapshot = owned
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -107,10 +126,18 @@ final class CanonicalStablePrefillCapture {
 
     func copySeed(for tokens: [Int], salt: String?, chunkSize: Int) -> [KVCache]? {
         guard !Task.isCancelled, salt == self.salt, chunkSize == self.chunkSize,
+              exactReplayTarget.map({ tokens.count == $0 }) ?? true,
               tokens.count >= seedCount, tokens.count < promptTokens.count,
               promptTokens.starts(with: tokens), let snapshot,
               snapshot.allSatisfy({ $0.offset == seedCount }),
               snapshot.map({ String(reflecting: type(of: $0)) }) == schema else { return nil }
-        return makePromptBoundaryCacheSnapshot(from: snapshot)
+        if let ordinaryModel {
+            guard ordinaryModel.validateCanonicalRequiredToolCache(snapshot, boundary: seedCount) else { return nil }
+        }
+        let owned = makePromptBoundaryCacheSnapshot(from: snapshot)
+        if let ordinaryModel {
+            guard !Task.isCancelled, ordinaryModel.validateCanonicalRequiredToolCache(owned, boundary: seedCount) else { return nil }
+        }
+        return owned
     }
 }

@@ -2271,11 +2271,24 @@ public struct TokenIterator: TokenIteratorProtocol {
                 .filter { !coordinator.hasDurableDiskEntry(
                     tokens: Array(self.promptTokenIds.prefix($0)), mediaSalt: self.mediaSalt) }
         } else { canonicalTargets = [] }
+        let ordinaryStableTarget = canonicalModel.flatMap {
+            canonicalOrdinaryStableRederiveTarget(
+                input: input, inputForPrepare: inputForPrepare,
+                promptTokens: self.promptTokenIds, cache: self.cache,
+                model: $0, parameters: effectiveParameters,
+                structuralBoundary: self.hybridStripBoundary, missingTargets: canonicalTargets)
+        }
+        // A single cold GLM stable target can reuse its nearest evaluated
+        // chunk during the existing ordinary store. This adds no disk seed,
+        // key, restore admission, or extra split to the prepare schedule.
+        let captureModel = requiredCanonicalModel
+            ?? (ordinaryStableTarget == nil ? nil : canonicalModel)
         let canonicalCapture = CanonicalStablePrefillCapture(
             input: input, promptTokens: self.promptTokenIds, cache: self.cache,
             chunkSize: effectiveParameters.prefillStepSize,
-            targets: canonicalTargets, salt: requiredCanonicalModel == nil ? self.mediaSalt : canonicalRequiredSalt,
-            canonicalModel: requiredCanonicalModel)
+            targets: ordinaryStableTarget.map { [$0] } ?? canonicalTargets,
+            salt: requiredCanonicalModel == nil ? self.mediaSalt : canonicalRequiredSalt,
+            canonicalModel: captureModel, exactReplayTarget: ordinaryStableTarget)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
@@ -3541,15 +3554,29 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // normal prefill/decode: models expect batch-first tokens.
                 // ZAYA CCA reaches a 2D activation and traps if this helper
                 // feeds the 1D `remaining` tensor directly.
-                _ = model(
-                    remaining[text: .newAxis],
-                    cache: cache,
-                    state: nil)
+                if canonicalSeedUsed != nil,
+                   canonicalStablePrefillCapture?.isOrdinaryStableRederive == true {
+                    // GLM generation may substitute zero logits on failure.
+                    // A new ordinary store replay must throw instead of
+                    // publishing state from that substituted forward.
+                    _ = try model.replayForward(remaining.tokens.reshaped(1, -1), cache: cache)
+                } else {
+                    _ = model(
+                        remaining[text: .newAxis],
+                        cache: cache,
+                        state: nil)
+                }
             case .logits:
                 break
             }
             MLX.eval(cache)
             if canonicalSeedUsed != nil { try Task.checkCancellation() }
+            if canonicalSeedUsed != nil,
+               canonicalStablePrefillCapture?.isOrdinaryStableRederive == true {
+                guard let canonicalModel = model as? any CanonicalRequiredToolCacheModel,
+                      canonicalModel.validateCanonicalRequiredToolCache(cache, boundary: tokens.count)
+                else { return nil }
+            }
             reconstructionSucceeded = true
             return cache
         } catch {

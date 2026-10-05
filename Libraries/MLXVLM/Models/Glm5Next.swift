@@ -2138,6 +2138,8 @@ public final class Glm5NextSharedHead: Module {
 
 extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, CanonicalRequiredToolCacheModel {
 
+    public var supportsOrdinaryStablePrefixRederive: Bool { true }
+
     public var canonicalRequiredToolCacheIdentity: String {
         "glm5-solo-cold-bf16-absorbed-tf32-default1-v1"
     }

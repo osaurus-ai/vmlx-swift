@@ -59,8 +59,43 @@ public struct CanonicalRequiredToolContext: Sendable, Equatable {
 /// complete typed state. Does not enable ordinary, batched, MTP or media restore.
 public protocol CanonicalRequiredToolCacheModel: LanguageModel {
     var canonicalRequiredToolCacheIdentity: String { get }
+    /// Opt-in to request-local ordinary stable N-1 reconstruction only.
+    /// This never admits an ordinary canonical disk restore.
+    var supportsOrdinaryStablePrefixRederive: Bool { get }
     func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int?
     func validateCanonicalRequiredToolCache(_ cache: [KVCache], boundary: Int) -> Bool
+}
+
+public extension CanonicalRequiredToolCacheModel {
+    var supportsOrdinaryStablePrefixRederive: Bool { false }
+}
+
+/// Select one missing processor-stable N-1 target without changing cold prepare
+/// geometry. Required selection and warm/unproven origins keep their old paths.
+func canonicalOrdinaryStableRederiveTarget(
+    input: LMInput, inputForPrepare: LMInput, promptTokens: [Int], cache: [KVCache],
+    model: any CanonicalRequiredToolCacheModel, parameters: GenerateParameters,
+    structuralBoundary: Int?, missingTargets: [Int]
+) -> Int? {
+    guard !Task.isCancelled, model.supportsOrdinaryStablePrefixRederive,
+          input.cacheRestorePolicy == .standard, input.cachePromptIntent == .generation,
+          input.canonicalRequiredToolContext == nil,
+          !input.hasMediaContent, !input.requiresPostPrepareCacheKey,
+          input.text.mask == nil, inputForPrepare.text.mask == nil,
+          !inputForPrepare.hasMediaContent, !inputForPrepare.requiresPostPrepareCacheKey,
+          input.text.tokenIds == promptTokens, input.text.tokens.size == promptTokens.count,
+          inputForPrepare.text.tokenIds == promptTokens,
+          inputForPrepare.text.tokens.size == promptTokens.count,
+          let chunk = model.canonicalRequiredToolChunkSize(parameters: parameters),
+          chunk == parameters.prefillStepSize,
+          model.validateCanonicalRequiredToolCache(cache, boundary: 0),
+          let structuralBoundary, structuralBoundary > chunk,
+          structuralBoundary < promptTokens.count
+    else { return nil }
+    return missingTargets.filter {
+        $0 >= chunk && $0 < structuralBoundary
+            && input.cacheStablePrefixTokenCounts.contains($0 + 1)
+    }.min()
 }
 
 func canonicalRequiredToolSalt(input: LMInput, model: any CanonicalRequiredToolCacheModel,
