@@ -1945,7 +1945,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = nextToken
         // Policy may clear proposals or replace their cache. Consume this
         // cycle's accepted drafts and commit target state BEFORE that mutation.
-        updateDepthAfterCommittedCycle(accepted: accepted)
+        updateDepthAfterCommittedCycle(
+            accepted: accepted,
+            preserveConfirmedHead: Self.canPreserveHeadOnAdaptiveDemotion(
+                alignedAndTrimmable: canAlignHeadCache && !mtpCache.isEmpty,
+                targetCommitted: committedCache,
+                targetCacheCompatible: Self.supportsHeadPreservingBlockDemotion(cache),
+                hasConfirmedPairs: alignedCommitHidden != nil && alignedCommitTokens != nil,
+                speculativeRows: headChainPairs,
+                requiresRepair: repairedHiddenForNextMTP != nil))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
@@ -2342,17 +2350,35 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += NativeMTPClock.now() - draftStart
     }
 
-    private mutating func updateDepthAfterCommittedCycle(accepted: Int) {
+    /// Block commit's Boolean does not certify hybrid companion state.
+    /// Admit only concrete nonempty, entirely trimmable target caches here.
+    static func supportsHeadPreservingBlockDemotion(_ cache: [KVCache]) -> Bool {
+        !cache.isEmpty && cache.allSatisfy { $0.isTrimmable }
+    }
+
+    /// Valid only after real target commit and speculative-head trim. This
+    /// carries no authority into AR pause/re-entry or failed repair paths.
+    static func canPreserveHeadOnAdaptiveDemotion(
+        alignedAndTrimmable: Bool, targetCommitted: Bool, targetCacheCompatible: Bool,
+        hasConfirmedPairs: Bool, speculativeRows: Int, requiresRepair: Bool
+    ) -> Bool {
+        alignedAndTrimmable && targetCommitted && targetCacheCompatible && hasConfirmedPairs
+            && speculativeRows == 0 && !requiresRepair
+    }
+
+    private mutating func updateDepthAfterCommittedCycle(
+        accepted: Int, preserveConfirmedHead: Bool
+    ) {
         let previousDepth = currentDepth
         let previousTrips = arSafetyTrips
         arSafetyAfterVerifyCycle(accepted: accepted)
         // A loss/recovery decision owns the cycle. Do not immediately undo it
         // through the acceptance controller on the same committed tokens.
         guard currentDepth == previousDepth, arSafetyTrips == previousTrips else { return }
-        recordAdaptiveCycle(accepted: accepted)
+        recordAdaptiveCycle(accepted: accepted, preserveConfirmedHead: preserveConfirmedHead)
     }
 
-    private mutating func recordAdaptiveCycle(accepted: Int) {
+    private mutating func recordAdaptiveCycle(accepted: Int, preserveConfirmedHead: Bool) {
         // While the AR-safety governor holds the request in AR (or is
         // probing a resume) the depth controller must not also act: one
         // decision per window, one owner.
@@ -2506,8 +2532,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 adaptiveWindow.removeAll(keepingCapacity: true)
                 lastAdaptiveCycleTimestamp = nil
                 windowsSinceUpperProbe = 0
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                if !preserveConfirmedHead {
+                    mtpCache = model.makeNativeMTPCache()
+                    mtpCacheRefreshCount += 1
+                }
                 return
             }
         }
@@ -2524,8 +2552,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2537,8 +2567,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2553,8 +2585,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWindow.removeAll(keepingCapacity: true)
             lastAdaptiveCycleTimestamp = nil
             windowsSinceUpperProbe = 0
-            mtpCache = model.makeNativeMTPCache()
-            mtpCacheRefreshCount += 1
+            if !preserveConfirmedHead {
+                mtpCache = model.makeNativeMTPCache()
+                mtpCacheRefreshCount += 1
+            }
             return
         }
 
@@ -2848,7 +2882,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         nextMain = nextToken
-        updateDepthAfterCommittedCycle(accepted: accepted)
+        updateDepthAfterCommittedCycle(
+            accepted: accepted,
+            preserveConfirmedHead: Self.canPreserveHeadOnAdaptiveDemotion(
+                alignedAndTrimmable: alignHeadHistory && !mtpCache.isEmpty,
+                targetCommitted: true,
+                targetCacheCompatible: true, // Direct S1 target forwards, not a block commit.
+                hasConfirmedPairs: alignedCommitHidden != nil && alignedCommitTokens != nil,
+                speculativeRows: headChainPairs,
+                requiresRepair: false))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
             draftProbabilities.removeAll(keepingCapacity: true)
