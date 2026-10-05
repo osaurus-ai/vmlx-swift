@@ -796,7 +796,13 @@ private final class Qwen4ExpPLE: Module {
                     prefetch!.rows.count).utf8))
             }
         }
-        if let cache, !recordPrefixCommitStates {
+        // Lazy verification advances committed state for the whole block;
+        // its caller owns checkpoint restore/replay on rejection. Staging
+        // PLE here would leave history stale after a fully accepted block.
+        // Preserve the existing staged/capture contracts in every other mode.
+        let stagePLE = recordPrefixCommitStates
+            && NativeMTPVerifierStatePolicy.mode != .lazyRepair
+        if let cache, !stagePLE {
             if preloadedEmbedding != nil {
                 let prior = cache[2] ?? MLXArray.full(
                     [batch, contextLength],
@@ -833,7 +839,7 @@ private final class Qwen4ExpPLE: Module {
         let normalizedGated = normConv(gated)
         let full = concatenated([state, normalizedGated], axis: 1)
         if let cache {
-            if recordPrefixCommitStates {
+            if stagePLE {
                 // Staged native-MTP verification must leave committed PLE
                 // history and convolution state untouched until acceptance is
                 // known. Slots 4/5 retain the verifier inputs required to
