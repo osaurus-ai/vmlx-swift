@@ -110,8 +110,7 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
                 "dense JANGH requires exactly one expert")
         }
         storage = Storage(bank)
-        decode = try JANGHProjectionKernel(
-            contract: banks.contract, module: module, fuseFloatRotation: true)
+        decode = try JANGHProjectionKernel(contract: banks.contract, module: module)
         prefill = try JANGHPrefillKernel(contract: banks.contract, module: module)
         rotation = banks.contract.projections[module]!.rotation
         self.inputDimensions = inputDimensions
@@ -136,8 +135,12 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
                     rotated, packed: storage.bank.packed,
                     scales: storage.bank.scales, indices: indices)
             } else {
+                // Rotate once per input row in FP32. Keeping the rotation in
+                // FP32 preserves the dense decode contract while avoiding its
+                // repetition in every output-row group of the fused kernel.
+                let decodeInput = rotation == .hadamard32 ? x.asType(.float32) : x
                 y = try decode.project(
-                    x, packed: storage.bank.packed, scales: storage.bank.scales, indices: indices)
+                    decodeInput, packed: storage.bank.packed, scales: storage.bank.scales, indices: indices)
             }
             return y.asType(input.dtype).reshaped(shape)
         } catch {

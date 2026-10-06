@@ -149,6 +149,7 @@ final class JANGHProjectionKernelTests: XCTestCase {
                     let packed = MLXArray(pack(codes, bits: bits), [1, outputs, width * bits / 32])
                     let scales = MLXArray([Float16](repeating: 0.125, count: outputs), [1, outputs])
                     let op = try kernel(bits: bits, rotation: "hadamard32", fuseFloatRotation: true)
+                    let separate = try kernel(bits: bits, rotation: "hadamard32")
                     XCTAssertNotEqual(op.identity, try kernel(bits: bits, rotation: "hadamard32").identity)
                     for count in [1, 63, 64] {
                         var values = [Float]()
@@ -158,6 +159,11 @@ final class JANGHProjectionKernelTests: XCTestCase {
                             let roundedInput = input.asType(.float32).asArray(Float.self)
                             let actual = try op.project(input, packed: packed, scales: scales,
                                 indices: MLXArray.zeros([count], type: UInt32.self)).asArray(Float.self)
+                            let rotatedOnce = try separate.project(
+                                input.asType(.float32), packed: packed, scales: scales,
+                                indices: MLXArray.zeros([count], type: UInt32.self)).asArray(Float.self)
+                            XCTAssertEqual(actual.map(\.bitPattern), rotatedOnce.map(\.bitPattern),
+                                "FP32 rotation must preserve every output bit: bits=\(bits) K=\(width) rows=\(count) dtype=\(dtype)")
                             for token in 0..<count {
                                 let row = Array(roundedInput[(token * width)..<((token + 1) * width)])
                                 // Independent dense Sylvester transform; no activation-dtype
