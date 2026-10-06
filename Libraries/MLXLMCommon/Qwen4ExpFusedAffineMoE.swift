@@ -392,9 +392,14 @@ public enum Qwen4ExpFusedAffineMoE {
             // BF16 activation/result contract.
             let rows = input.size / shape.inputDimensions
             let leadingShape = Array(input.shape.dropLast())
+            // Extra verifier rows must retain the single-row expert arithmetic.
+            // Keep ordinary prefill and other model geometries on their existing routes.
+            let rowLimit = shape == qwen4ExpShape
+                && FlashVerificationScope.usesRowExactVerification(inputShape: input.shape)
+                ? 8 : maximumRows
             guard input.dtype == .bfloat16,
                 scores.dtype == .bfloat16 || scores.dtype == .float32,
-                rows >= 1, rows <= maximumRows,
+                rows >= 1, rows <= rowLimit,
                 input.size == rows * shape.inputDimensions,
                 input.dim(-1) == shape.inputDimensions,
                 indices.size == rows * shape.routes, indices.dim(-1) == shape.routes,

@@ -170,6 +170,106 @@ struct Qwen4ExpFusedAffineMoETests {
         }
     }
 
+    @Test("Flash verifier rows 2 through 8 are bit-exact for installed 2L and 4S layouts")
+    func scopedWideAffineRowsMatchSerial() throws {
+        // Unique gate/up/down schemes read from the installed 2L and 4S
+        // config.json files. Synthetic banks exercise their actual packing;
+        // full-bundle parity remains a separate runtime gate.
+        let combos: [Combo] = [
+            Combo(label: "2L_q2q2q2", gate: (2, 64), up: (2, 64), down: (2, 64)),
+            Combo(label: "2L_4S_q2q2q3", gate: (2, 64), up: (2, 64), down: (3, 64)),
+            Combo(label: "2L_down_g32", gate: (2, 64), up: (2, 64), down: (2, 32)),
+            Combo(label: "4S_q3q3q3", gate: (3, 64), up: (3, 64), down: (3, 64)),
+            Combo(label: "4S_q2q3q3", gate: (2, 64), up: (3, 64), down: (3, 64)),
+            Combo(label: "4S_q3q3q4", gate: (3, 64), up: (3, 64), down: (4, 64)),
+            Combo(label: "4S_q2q3q4", gate: (2, 64), up: (3, 64), down: (4, 64)),
+            Combo(label: "4S_q3q2q4", gate: (3, 64), up: (2, 64), down: (4, 64)),
+            Combo(label: "4S_q2q2q4", gate: (2, 64), up: (2, 64), down: (4, 64)),
+            Combo(label: "4S_gate_g32", gate: (2, 32), up: (3, 64), down: (4, 64)),
+        ]
+        for (index, combo) in combos.enumerated() {
+            let seed = UInt64(14000 + index * 20)
+            let (gate, _) = Self.makeProjection(
+                inputDims: Self.inputDims, outputDims: Self.expertDims,
+                bits: combo.gate.bits, groupSize: combo.gate.group, seed: seed)
+            let (up, _) = Self.makeProjection(
+                inputDims: Self.inputDims, outputDims: Self.expertDims,
+                bits: combo.up.bits, groupSize: combo.up.group, seed: seed + 1)
+            let (down, _) = Self.makeProjection(
+                inputDims: Self.expertDims, outputDims: Self.inputDims,
+                bits: combo.down.bits, groupSize: combo.down.group, seed: seed + 2)
+            let reducer = try #require(
+                Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down))
+            // Reuse one bank set and eight independent S1 oracles for all widths.
+            // Strided row views additionally exercise the production addressing contract.
+            let backing = MLXRandom.uniform(
+                low: -1, high: 1, [1, 16, Self.inputDims],
+                key: MLXRandom.key(seed + 3)).asType(.bfloat16)
+            let input = backing[0..., .stride(by: 2), 0...]
+            let routes = (0..<(8 * Self.topK)).map {
+                UInt32((($0 % Self.topK) * 3 + ($0 / Self.topK) * 5) % Self.experts)
+            }
+            let indices = MLXArray(routes, [1, 8, Self.topK])
+            let scores = softmax(MLXRandom.uniform(
+                low: 0, high: 1, [1, 8, Self.topK],
+                key: MLXRandom.key(seed + 4)).asType(.float32), axis: -1)
+            var goldRows: [MLXArray] = []
+            for row in 0..<8 {
+                let gold = try #require(reducer(
+                    input[0..., row..<(row + 1), 0...],
+                    indices[0..., row..<(row + 1), 0...],
+                    scores[0..., row..<(row + 1), 0...]))
+                MLX.eval(gold)
+                goldRows.append(MLXArray(data: gold.asData(access: .copy)))
+            }
+            for width in 2...8 {
+                let x = input[0..., ..<width, 0...]
+                let i = indices[0..., ..<width, 0...]
+                let s = scores[0..., ..<width, 0...]
+                let actual = try #require(FlashVerificationScope.withVerification(inputShape: [1, width]) {
+                    reducer(x, i, s)
+                })
+                let expected = concatenated(Array(goldRows.prefix(width)), axis: 1)
+                MLX.eval(actual, expected)
+                #expect(actual.dtype == expected.dtype, "\(combo.label) W\(width)")
+                #expect(actual.shape == expected.shape, "\(combo.label) W\(width)")
+                #expect(actual.asData(access: .copy).data == expected.asData(access: .copy).data,
+                    "\(combo.label) W\(width) must retain the S1 arithmetic bit-for-bit")
+            }
+            // Actual verification scope must not broaden ordinary prefill.
+            let x5 = input[0..., ..<5, 0...]
+            let i5 = indices[0..., ..<5, 0...]
+            let s5 = scores[0..., ..<5, 0...]
+            #expect(reducer(x5, i5, s5) == nil)
+            #expect(FlashVerificationScope.withVerification(inputShape: [1, 8]) {
+                reducer(x5, i5, s5)
+            } == nil, "A different scoped width must not admit this tensor")
+        }
+    }
+
+    @Test("Flash verifier scope does not widen another family's affine reducer")
+    func scopedWideRowsPreserveOtherGeometryAdmission() throws {
+        let (gate, _) = Self.makeProjection(
+            inputDims: 2048, outputDims: 512, bits: 5, groupSize: 64, seed: 16001)
+        let (up, _) = Self.makeProjection(
+            inputDims: 2048, outputDims: 512, bits: 5, groupSize: 64, seed: 16002)
+        let (down, _) = Self.makeProjection(
+            inputDims: 512, outputDims: 2048, bits: 4, groupSize: 64, seed: 16003)
+        let reducer = try #require(
+            Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down))
+        let x = MLXArray.ones([1, 5, 2048], dtype: .bfloat16)
+        let i = MLXArray((0..<40).map { UInt32($0 % 8) }, [1, 5, 8])
+        let s = MLXArray.ones([1, 5, 8], dtype: .float32) * Float(0.125)
+        #expect(reducer(x, i, s) == nil)
+        #expect(FlashVerificationScope.withVerification(inputShape: [1, 5]) {
+            reducer(x, i, s)
+        } == nil)
+        let single = try #require(reducer(
+            x[0..., ..<1, 0...], i[0..., ..<1, 0...], s[0..., ..<1, 0...]))
+        MLX.eval(single)
+        #expect(single.shape == [1, 1, 2048])
+    }
+
     @Test("native-MTP rows 2 through 4 match independent row-1 decode for every qualified layout")
     func smallRowIsolationParity() throws {
         for (comboIndex, combo) in Self.qualifiedCombos.enumerated() {

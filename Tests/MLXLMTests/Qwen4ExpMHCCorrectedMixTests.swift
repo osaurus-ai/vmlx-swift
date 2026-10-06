@@ -116,10 +116,14 @@ final class Qwen4ExpMHCCorrectedMixTests: XCTestCase {
             try Self.require(Self.exact(block[0..., row..<(row + 1), 0...], input), "Identical S4 row")
         }
         let s1 = try bridge.mix(input)
+        let ordinaryBefore = try bridge.mix(block)
+        eval(ordinaryBefore.mixed, ordinaryBefore.injection)
         let s4 = try FlashVerificationScope.withVerification(inputShape: [1, 4]) {
             try bridge.mix(block)
         }
         eval(s1.mixed, s1.injection, s4.mixed, s4.injection)
+        let ordinaryAfter = try bridge.mix(block)
+        eval(ordinaryAfter.mixed, ordinaryAfter.injection)
         try Self.require(Self.exact(s1.mixed, gold1), "Current actual S1 equals immutable original S1")
         let oldStages1 = Dictionary(uniqueKeysWithValues: bridge.stages(input))
         let oldStages4 = Dictionary(uniqueKeysWithValues: bridge.stages(block))
@@ -127,6 +131,14 @@ final class Qwen4ExpMHCCorrectedMixTests: XCTestCase {
         let old4 = try XCTUnwrap(oldStages4["mixed"])
         let oldInjection = try XCTUnwrap(oldStages4["injection"])
         eval(old1, old4, oldInjection)
+        try Self.require(Self.exact(ordinaryBefore.mixed, old4)
+            && Self.exact(ordinaryBefore.injection, oldInjection),
+            "Unscoped short prefill preserves original eager arithmetic")
+        try Self.require(Self.exact(ordinaryAfter.mixed, old4)
+            && Self.exact(ordinaryAfter.injection, oldInjection),
+            "Verifier scope cannot leak into subsequent short prefill")
+        try Self.require(!Self.exact(ordinaryAfter.mixed, s4.mixed),
+            "Saved negative control distinguishes prefill and exact verifier dispatch")
         // stages() deliberately retains the ORIGINAL actual module up Linear,
         // including old matmul dispatch, sigmoid/product/mean. It is a control,
         // never the corrected production mix implementation.

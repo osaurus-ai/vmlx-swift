@@ -1902,7 +1902,9 @@ enum Qwen35Language {
                 && [inProjQKV, inProjZ, inProjB, inProjA, outProj].allSatisfy { module in
                     guard jangAllowsRawQuantizedProjection(module),
                         let q = module as? QuantizedLinear else { return false }
-                    return q.bits == 4 && q.groupSize == 64 && q.mode == .affine
+                    return (q.bits == 4 || q.bits == 6 || q.bits == 8)
+                        && q.bits == (inProjQKV as? QuantizedLinear)?.bits
+                        && q.groupSize == 64 && q.mode == .affine
                         && q.scales.dtype == .float16 && q.biases?.dtype == .float16
                         && q.bias == nil
                 }
