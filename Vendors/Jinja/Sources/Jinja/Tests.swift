@@ -517,7 +517,11 @@ public enum Tests {
         return Tests.builtIn[testName] != nil
     }
 
-    /// Tests if two inputs point to the same memory address (identity test).
+    /// Tests singleton identity without invoking ordering comparison.
+    /// Value is a Swift value type: primitive same-type comparisons retain
+    /// their existing value semantics; container allocation identity is not
+    /// represented. In particular, a schema object is never the true/false
+    /// singleton, and Python's bool/int distinction must not be coerced.
     @Sendable public static func sameas(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -530,7 +534,14 @@ public enum Tests {
         )
 
         guard let a = arguments["a"], let b = arguments["b"] else { return false }
-        return try a.compare(to: b) == 0
+        switch (a, b) {
+        case let (.boolean(lhs), .boolean(rhs)): return lhs == rhs
+        case (.null, .null): return true
+        case let (.int(lhs), .int(rhs)): return lhs == rhs
+        case let (.double(lhs), .double(rhs)): return lhs == rhs
+        case let (.string(lhs), .string(rhs)): return lhs == rhs
+        default: return false
+        }
     }
 
     /// Tests if the input is in a sequence.
