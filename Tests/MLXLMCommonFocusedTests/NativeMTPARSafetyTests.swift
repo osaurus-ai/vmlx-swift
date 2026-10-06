@@ -2,10 +2,8 @@
 //  NativeMTPARSafetyTests.swift
 //  MLXLMCommonFocusedTests
 //
-//  Pins the AR-safety governor's pure decision arithmetic — a 1:1 port of
-//  the Python engine's tests/test_native_mtp_ar_safety.py so both runtimes
-//  trip on the same numbers: fast MTP holds, slow MTP trips, long-context
-//  growth does NOT false-trip, and the div-by-small/empty guards.
+//  Pins legacy Swift context-scaling arithmetic and the correctness-updated
+//  Python policy for independently confirmed mean losses. No model execution.
 //
 
 import XCTest
@@ -110,5 +108,123 @@ final class NativeMTPARSafetyTests: XCTestCase {
         XCTAssertNil(V.medianCycleMsPerToken([V.ARSafetySample(emitted: 0, wall: 0, verifyTotal: 0)]))
         let flat = [V.ARSafetySample(emitted: 3, wall: 0, verifyTotal: 0), V.ARSafetySample(emitted: 3, wall: 1, verifyTotal: 0)]
         XCTAssertNil(V.medianCycleMsPerToken(flat))
+    }
+
+    // MARK: independently confirmed mean loss (measured, unscaled AR only)
+
+    private func meanLossWindow(
+        _ state: inout V.RepeatedMeanLossState, end: Int,
+        wall: Double = 280, emitted: Int = 8, median: Double = 20,
+        baseline: Double = 25, margin: Double = 1, depth: Int = 1,
+        measured: Bool = true, scaled: Bool = false, probe: Bool = false
+    ) -> Bool {
+        state.confirm(
+            endCycle: end, windowCycles: 8, emitted: emitted, wallMs: wall,
+            medianMs: median, arMs: baseline, margin: margin, depth: depth,
+            measured: measured, scaled: scaled, probe: probe)
+    }
+
+    func testRepeatedMinorityStallsRequireTwoDisjointWindows() {
+        // Six 20ms + two 80ms one-token cycles: mean35 loses to AR25,
+        // median20 wins. The old conjunction rejects EVERY such window.
+        var state = V.RepeatedMeanLossState()
+        XCTAssertFalse(meanLossWindow(&state, end: 16))
+        XCTAssertEqual(state.pendingEndCycle, 16)
+        for end in 17..<24 {
+            XCTAssertFalse(meanLossWindow(&state, end: end), "overlap is not confirmation")
+            XCTAssertEqual(state.pendingEndCycle, 16)
+        }
+        XCTAssertTrue(meanLossWindow(&state, end: 24))
+        XCTAssertNil(state.pendingEndCycle)
+    }
+
+    func testOneOffStallThenIndependentWinOrEqualityClearsConfirmation() {
+        for settledCost in [160.0, 200.0] {
+            var state = V.RepeatedMeanLossState()
+            XCTAssertFalse(meanLossWindow(&state, end: 16))
+            // A cheap overlapping observation must not move the pending fence.
+            XCTAssertFalse(meanLossWindow(&state, end: 20, wall: settledCost))
+            XCTAssertEqual(state.pendingEndCycle, 16)
+            XCTAssertFalse(meanLossWindow(&state, end: 24, wall: settledCost))
+            XCTAssertNil(state.pendingEndCycle)
+            XCTAssertFalse(meanLossWindow(&state, end: 32))
+            XCTAssertEqual(state.pendingEndCycle, 32, "new loss needs fresh confirmation")
+        }
+    }
+
+    func testReferenceChangesCannotReuseLossConfirmation() {
+        for change in ["baseline", "margin", "depth"] {
+            var state = V.RepeatedMeanLossState()
+            XCTAssertFalse(meanLossWindow(&state, end: 16))
+            XCTAssertFalse(meanLossWindow(
+                &state, end: 24, baseline: change == "baseline" ? 30 : 25,
+                margin: change == "margin" ? 1.1 : 1, depth: change == "depth" ? 2 : 1))
+            XCTAssertEqual(state.pendingEndCycle, 24)
+        }
+    }
+
+    func testDepthResetExcludesMixedDepthWindowAndRequiresTwoNewWindows() {
+        var state = V.RepeatedMeanLossState()
+        XCTAssertFalse(meanLossWindow(&state, end: 16, depth: 3))
+        state.reset(afterCycle: 18)
+        XCTAssertFalse(meanLossWindow(&state, end: 24, depth: 2))
+        XCTAssertNil(state.pendingEndCycle, "window includes cycles before the depth switch")
+        XCTAssertFalse(meanLossWindow(&state, end: 26, depth: 2))
+        XCTAssertEqual(state.pendingEndCycle, 26)
+        XCTAssertTrue(meanLossWindow(&state, end: 34, depth: 2))
+    }
+
+    func testUnmeasuredScaledAndProbeWindowsCannotConfirm() {
+        for excluded in ["unmeasured", "scaled", "probe"] {
+            var state = V.RepeatedMeanLossState()
+            XCTAssertFalse(meanLossWindow(&state, end: 16))
+            XCTAssertFalse(meanLossWindow(
+                &state, end: 24, measured: excluded != "unmeasured",
+                scaled: excluded == "scaled", probe: excluded == "probe"))
+            XCTAssertNil(state.pendingEndCycle)
+            XCTAssertFalse(meanLossWindow(&state, end: 32))
+            XCTAssertEqual(state.pendingEndCycle, 32)
+        }
+    }
+
+    func testPauseOrReentryResetDoesNotCarryLoss() {
+        var state = V.RepeatedMeanLossState()
+        XCTAssertFalse(meanLossWindow(&state, end: 16))
+        state.reset(afterCycle: 16)
+        XCTAssertFalse(meanLossWindow(&state, end: 24))
+        XCTAssertTrue(meanLossWindow(&state, end: 32))
+    }
+
+    func testTokenWeightedWinningCostDoesNotArmDespiteLosingMedian() {
+        var state = V.RepeatedMeanLossState()
+        // Five 30ms single-token cycles + three 100ms ten-token cycles:
+        // median30 loses, but total450ms /35 tokens wins against AR25.
+        for end in 16...40 {
+            XCTAssertFalse(meanLossWindow(&state, end: end, wall: 450, emitted: 35, median: 30))
+            XCTAssertNil(state.pendingEndCycle)
+        }
+    }
+
+    func testUniformLossKeepsImmediateMedianDecisionWithoutConfirmation() {
+        var state = V.RepeatedMeanLossState()
+        XCTAssertFalse(meanLossWindow(&state, end: 16, wall: 240, median: 30))
+        XCTAssertNil(state.pendingEndCycle)
+        XCTAssertNotNil(V.windowedARVerdict(
+            arStepMs: 25, firstVerifyMs: 0, windowCycles: 8,
+            deltaEmitted: 8, deltaWallMs: 240, deltaVerifyMs: 0, margin: 1))
+        XCTAssertGreaterThan(V.medianCycleMsPerToken(ring(Array(repeating: 30, count: 8),
+                                                        emittedPerCycle: 1)) ?? 0, 25,
+                             "existing median conjunction owns immediate loss")
+    }
+
+    func testInvalidMeanLossSamplesNeverArmOrConfirm() {
+        for (wall, emitted, baseline) in [(0.0, 8, 25.0), (280, 0, 25),
+                                           (280, 8, 0), (.infinity, 8, 25)] {
+            var state = V.RepeatedMeanLossState()
+            XCTAssertFalse(meanLossWindow(&state, end: 16))
+            XCTAssertFalse(meanLossWindow(&state, end: 24, wall: wall, emitted: emitted,
+                                           baseline: baseline))
+            XCTAssertNil(state.pendingEndCycle)
+        }
     }
 }

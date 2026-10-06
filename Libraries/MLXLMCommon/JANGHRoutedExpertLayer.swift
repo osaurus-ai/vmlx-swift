@@ -56,7 +56,9 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 input.reshaped(tokens, inputDimensions),
                 indices: indices.reshaped(tokens, routes),
                 scores: scores.reshaped(tokens, routes).asType(.float32),
-                outputDType: input.dtype)
+                outputDType: input.dtype,
+                forceDecode: FlashVerificationScope.usesMappedDecode(
+                    inputShape: input.shape, routes: routes))
             precondition(result.shape == [tokens, inputDimensions] && result.dtype == input.dtype,
                          "JANGH routed output violates admitted architecture")
             return result.reshaped(input.shape)

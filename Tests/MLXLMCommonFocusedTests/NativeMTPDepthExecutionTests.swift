@@ -250,3 +250,142 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
                      hiddenStates: MLXArray.zeros([1, length, 4]))
     }
 }
+
+#if DEBUG
+extension NativeMTPDepthExecutionTests {
+    func testRepeatedMeanLossInvokesActualAdjacentOrAROwnerPreservingQueue() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires actual governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            for depth in 1...3 {
+                let model = DepthDispatchTarget(sequence: true)
+                var parameters = GenerateParameters(maxTokens: 96, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                var now = 100.0
+                iterator.testingSeedMeasuredGovernor(depth: depth, now: now)
+                let original = iterator.testingGovernorSnapshot
+                let pattern = [20.0, 20, 20, 20, 20, 20, 80, 80]
+                for duration in pattern {
+                    now += duration / 1000
+                    iterator.testingFeedGovernorCycle(now: now)
+                }
+                XCTAssertEqual(iterator.testingGovernorSnapshot.depth, depth)
+                XCTAssertFalse(iterator.testingGovernorSnapshot.paused)
+                XCTAssertEqual(iterator.testingGovernorSnapshot.pendingLossEnd, 16)
+                for (index, duration) in pattern.enumerated() {
+                    now += duration / 1000
+                    iterator.testingFeedGovernorCycle(now: now)
+                    if index < 7 {
+                        XCTAssertEqual(iterator.testingGovernorSnapshot.depth, depth)
+                        XCTAssertFalse(iterator.testingGovernorSnapshot.paused)
+                    }
+                }
+                let result = iterator.testingGovernorSnapshot
+                XCTAssertEqual(result.depth, max(1, depth - 1))
+                XCTAssertEqual(result.paused, depth == 1)
+                XCTAssertEqual(result.trips, original.trips + (depth == 1 ? 1 : 0))
+                XCTAssertNil(result.pendingLossEnd)
+                XCTAssertEqual(result.pendingTokens, original.pendingTokens,
+                               "governor transition cannot drop or replace committed queued tokens")
+            }
+        }
+    }
+
+    func testActualARReentryClearsMeanLossAndRetainsProbeContract() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires actual governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(sequence: true)
+            var parameters = GenerateParameters(maxTokens: 96, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 1)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 1)
+            var now = 100.0
+            iterator.testingSeedMeasuredGovernor(depth: 1, now: now)
+            let queued = iterator.testingGovernorSnapshot.pendingTokens
+            for duration in Array(repeating: [Double]([20, 20, 20, 20, 20, 20, 80, 80]), count: 2).flatMap({ $0 }) {
+                now += duration / 1000
+                iterator.testingFeedGovernorCycle(now: now)
+            }
+            XCTAssertTrue(iterator.testingGovernorSnapshot.paused)
+            for index in 0..<16 {
+                now += 0.025
+                try iterator.testingMeasuredARStep(now: now)
+                XCTAssertEqual(iterator.testingGovernorSnapshot.paused, index < 15)
+            }
+            XCTAssertEqual(iterator.testingGovernorSnapshot.depth, 1)
+            XCTAssertEqual(iterator.testingGovernorSnapshot.probeCycles, 6)
+            XCTAssertNil(iterator.testingGovernorSnapshot.pendingLossEnd)
+            for _ in 0..<6 {
+                now += 0.010
+                iterator.testingFeedGovernorCycle(now: now)
+            }
+            XCTAssertEqual(iterator.testingGovernorSnapshot.resumes, 1)
+            XCTAssertFalse(iterator.testingGovernorSnapshot.paused)
+            XCTAssertEqual(iterator.testingGovernorSnapshot.probeCycles, 0)
+            XCTAssertNil(iterator.testingGovernorSnapshot.pendingLossEnd)
+            XCTAssertEqual(iterator.testingGovernorSnapshot.pendingTokens, queued)
+        }
+    }
+}
+#endif
+
+
+/// Shape/scope checks only: no MLX arrays, model loading, or GPU work.
+final class FlashVerificationScopeAdmissionTests: XCTestCase {
+    func testOrdinaryCallsAreNotAdmitted() {
+        for rows in 1...9 {
+            XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 2560]))
+        }
+    }
+
+    func testOnlyMatchingSmallVerificationRowsAreAdmitted() {
+        for rows in 2...8 {
+            FlashVerificationScope.withVerification(inputShape: [1, rows]) {
+                XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 2560]))
+                for invalid in [[1, 1, 2560], [1, 9, 2560], [2, rows, 2560],
+                                [1, rows + 1, 2560], [1, rows, 0], [1, rows, -1],
+                                [1, rows], [rows, 2560], [1, rows, 1, 2560], []] {
+                    XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: invalid))
+                }
+            }
+            XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 2560]))
+        }
+    }
+
+    func testInvalidVerificationEntryShapesDoNotEstablishScope() {
+        for shape in [[], [1], [1, 1], [1, 9], [2, 2], [1, 2, 2560], [0, 2], [1, -2]] {
+            FlashVerificationScope.withVerification(inputShape: shape) {
+                XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+            }
+        }
+    }
+
+    func testNestedScopeRestoresOuterRows() {
+        FlashVerificationScope.withVerification(inputShape: [1, 2]) {
+            FlashVerificationScope.withVerification(inputShape: [1, 4]) {
+                XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 4, 2560]))
+                XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+            }
+            FlashVerificationScope.withVerification(inputShape: [1, 1]) {
+                XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+            }
+            XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+        }
+    }
+
+    func testThrowRestoresScope() {
+        enum Stop: Error { case expected }
+        XCTAssertThrowsError(try FlashVerificationScope.withVerification(inputShape: [1, 2]) {
+            XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+            throw Stop.expected
+        })
+        XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 2, 2560]))
+    }
+}

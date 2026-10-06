@@ -279,8 +279,18 @@ enum Qwen4ExpCompiledGDNInputs {
         eps: Float,
         groupSize: Int,
         bits: Int,
-        mode: QuantizationMode
+        mode: QuantizationMode,
+        batchedRows: Bool = false
     ) -> MLXArray? {
+        #if DEBUG
+        let batchAddressing = batchedRows
+        #else
+        let batchAddressing = false
+        #endif
+        guard !batchedRows || (batchAddressing && (2...8).contains(output.dim(0))
+            && output.ndim == 4 && gate.shape == output.shape
+            && outWeight.ndim == 2 && outScales.ndim == 2 && outBiases.shape == outScales.shape)
+        else { return nil }
         let metadataDType = outScales.dtype
         let supported =
             enabled && !CompiledDecodeTrace.isActive && output.dim(1) == 1
@@ -308,7 +318,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
 
         let key = [
-            "tail", String(output.dim(-1)), String(gate.dim(-1)),
+            batchAddressing ? "tail-batched-m1" : "tail", String(output.dim(-1)), String(gate.dim(-1)),
             sigmoidGate ? "sigmoid" : "silu",
             String(describing: output.dtype),
             String(describing: gate.dtype),
@@ -328,7 +338,9 @@ enum Qwen4ExpCompiledGDNInputs {
                     .asType(args[0].dtype)
                 let projected = quantizedMM(
                     gated.reshaped(gated.dim(0), gated.dim(1), -1),
-                    args[3], scales: args[4], biases: args[5],
+                    batchAddressing ? args[3][.newAxis, 0..., 0...] : args[3],
+                    scales: batchAddressing ? args[4][.newAxis, 0..., 0...] : args[4],
+                    biases: batchAddressing ? args[5][.newAxis, 0..., 0...] : args[5],
                     transpose: true, groupSize: groupSize, bits: bits, mode: mode)
                 return [projected]
             }
@@ -1473,7 +1485,11 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
-            downProj(_vlmCompiledSwiGLU(gateProj(x), upProj(x)))
+            let gate = qwen4ExpProjection(gateProj, x)
+            let up = qwen4ExpProjection(upProj, x)
+            let activated = _vlmCompiledSwiGLU(gate, up)
+            let result = qwen4ExpProjection(downProj, activated)
+            return result
         }
     }
 
@@ -1589,11 +1605,11 @@ enum Qwen35Language {
         }
 
         private func ensureFusedDecodeInputProjection(
-            _ inputs: MLXArray
+            _ inputs: MLXArray, exactRowVerifier: Bool = false
         ) -> FusedDecodeInputProjection? {
             guard
                 RuntimeEnvironment.value("VMLX_QWEN4_EXP_FUSE_DECODE_INPUTS") != "0",
-                fuseDecodeInputProjections, inputs.dim(1) == 1,
+                fuseDecodeInputProjections, inputs.dim(1) == 1 || exactRowVerifier,
                 !CompiledDecodeTrace.isActive
             else { return nil }
 
@@ -1640,11 +1656,15 @@ enum Qwen35Language {
             return fusedDecodeInputProjection
         }
 
-        private func fusedDecodeInputs(_ inputs: MLXArray) -> [MLXArray]? {
+        private func fusedDecodeInputs(
+            _ inputs: MLXArray, exactRowVerifier: Bool = false
+        ) -> [MLXArray]? {
             // Uniform-scheme fast path: the existing whole-4 fusion and its
             // native BF16-affine kernel, byte-for-byte the shipped behavior
             // (Flash Next / qwen4_exp bundles land here).
-            if let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(inputs) {
+            if let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(
+                inputs, exactRowVerifier: exactRowVerifier)
+            {
                 let splitIndices = [
                     convDim, convDim + valueDim, convDim + valueDim + numVHeads,
                 ]
@@ -1828,7 +1848,9 @@ enum Qwen35Language {
                 headVDim: headVDim)
         }
 
-        private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
+        private func compiledDecodeTail(
+            _ output: MLXArray, gate: MLXArray, batchedRows: Bool = false
+        ) -> MLXArray? {
             guard fuseDecodeInputProjections,
                 jangAllowsRawQuantizedProjection(outProj),
                 let quantized = outProj as? QuantizedLinear,
@@ -1841,7 +1863,7 @@ enum Qwen35Language {
                 outWeight: quantized.weight, outScales: quantized.scales,
                 outBiases: biases, eps: norm.eps,
                 groupSize: quantized.groupSize, bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode, batchedRows: batchedRows)
         }
 
         /// One-shot (per process) diagnostic for a discarded incompatible
@@ -1869,6 +1891,21 @@ enum Qwen35Language {
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
+            // Exact-row target verification only; AR and ordinary prefill retain their paths.
+            let exactRowVerifier = FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape)
+                && verifyTileFamily == Qwen4ExpVerifyTile.Family.qwen4Exp
+                && recordPrefixCommitStates && B == 1 && (2...8).contains(S)
+                && NativeMTPVerifierStatePolicy.mode == .inputCaptureStaged
+                && !CompiledDecodeTrace.isActive && inputs.dtype == .bfloat16
+                && hiddenSize == 2560 && numVHeads == 48 && numKHeads == 16
+                && headKDim == 128 && headVDim == 128
+                && [inProjQKV, inProjZ, inProjB, inProjA, outProj].allSatisfy { module in
+                    guard jangAllowsRawQuantizedProjection(module),
+                        let q = module as? QuantizedLinear else { return false }
+                    return q.bits == 4 && q.groupSize == 64 && q.mode == .affine
+                        && q.scales.dtype == .float16 && q.biases?.dtype == .float16
+                        && q.bias == nil
+                }
 
             // A restored cache (paged/hybrid restore, prefix commit) can hand
             // back a slot whose shape no longer matches this layer — an
@@ -1888,6 +1925,7 @@ enum Qwen35Language {
                 convState = MLXArray.zeros(
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
+
 
             // Staged verify (compiled DFlash 2): committed cache slots and
             // offset stay UNTOUCHED for the whole forward; everything the
@@ -1920,7 +1958,7 @@ enum Qwen35Language {
                     cache[0] = tail.dtype == inputs.dtype ? tail : tail.asType(inputs.dtype)
                 }
             } else {
-                let fusedInputs = fusedDecodeInputs(inputs)
+                let fusedInputs = fusedDecodeInputs(inputs, exactRowVerifier: exactRowVerifier)
                 var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { inProjQKV($0) }
                 z = (fusedInputs?[1] ?? verifyTiled(inputs) { inProjZ($0) }).reshaped(
                     B, S, numVHeads, headVDim)
@@ -1943,7 +1981,8 @@ enum Qwen35Language {
                     }
                 }
 
-                let convOut = silu(conv1d(convInput))
+                let convolution = conv1d(convInput)
+                let convOut = silu(convolution)
                 let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
                 let q = split[0].reshaped(B, S, numKHeads, headKDim)
                 let k = split[1].reshaped(B, S, numKHeads, headKDim)
@@ -1976,6 +2015,7 @@ enum Qwen35Language {
                         * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
                 }
             }
+
 
             // Same defense as the conv slot: a mis-restored recurrent state
             // with the wrong rank/head dims crashes inside `gatedDeltaUpdate`
@@ -2068,14 +2108,27 @@ enum Qwen35Language {
             // outProj is a row-independent matmul, so the whole output stage
             // may run at padded M and be sliced back afterwards. All cache
             // and staging writes above already saw only the real rows.
-            return verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
+            if exactRowVerifier {
+                let rows = (0..<S).map { row -> MLXArray in
+                    let rowOutput = out[0..., row..<(row + 1), 0..., 0...]
+                    let rowGate = z[0..., row..<(row + 1), 0..., 0...]
+                    if let tail = compiledDecodeTail(rowOutput, gate: rowGate) { return tail }
+                    // Match the existing S1 fallback when its compiled tail is unavailable.
+                    let normed = norm(rowOutput, gate: rowGate)
+                    return outProj(normed.reshaped(normed.dim(0), normed.dim(1), -1))
+                }
+                let result = concatenated(rows, axis: 1)
+                return result
+            }
+            let result = verifyTiledOutput(out, gate: z) { paddedOut, paddedGate in
                 if let tail = compiledDecodeTail(paddedOut, gate: paddedGate) {
                     return tail
                 }
                 let normed = norm(paddedOut, gate: paddedGate)
-                return outProj(
-                    normed.reshaped(normed.dim(0), normed.dim(1), -1))
+                let projectionInput = normed.reshaped(normed.dim(0), normed.dim(1), -1)
+                return outProj(projectionInput)
             }
+            return result
         }
 
         /// Verify-tile M-pad for this layer's row-independent projections; a
@@ -2345,6 +2398,21 @@ enum Qwen35Language {
 
         private func compiledRouter(_ x: MLXArray) -> (MLXArray, MLXArray)? {
             guard compileDecodeRegions else { return nil }
+            // Preserve the actual AR router region for each admitted verification row.
+            // Keep expert evaluation batched; do not change selection or sampling.
+            if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+                !CompiledDecodeTrace.isActive, x.dtype == .bfloat16,
+                !(gate is QuantizedLinear), gate.bias == nil
+            {
+                var indices: [MLXArray] = []
+                var scores: [MLXArray] = []
+                for row in MLX.split(x, parts: x.dim(1), axis: 1) {
+                    guard let result = compiledRouter(row) else { return nil }
+                    indices.append(result.0)
+                    scores.append(result.1)
+                }
+                return (MLX.concatenated(indices, axis: 1), MLX.concatenated(scores, axis: 1))
+            }
             if let quantized = gate as? QuantizedLinear,
                 let biases = quantized.biases
             {
@@ -2475,15 +2543,17 @@ enum Qwen35Language {
                 return result
             }
             if let eagerCombined, let shared = compiledSharedExpert(x) {
-                return eagerCombined + shared
+                let result = eagerCombined + shared
+                return result
             }
             let combined =
                 eagerCombined
                 ?? (routed! * scores[.ellipsis, .newAxis]).sum(axis: -2)
             let sharedY = sharedExpert(x)
-            let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)
-
-            return combined + gatedSharedY
+            let sharedGate = sharedExpertGate(x)
+            let gatedSharedY = compiledSigmoidGate(sharedGate, sharedY)
+            let result = combined + gatedSharedY
+            return result
         }
     }
 
@@ -3955,3 +4025,80 @@ extension Qwen35: JangHadamardRuntimeModel {
         }
     }
 }
+
+#if DEBUG
+/// Saved-operand diagnostic only. No model construction or production dispatch changes.
+final class Qwen4ExpGDNReplayBridge {
+    private let inputs: [QuantizedLinear]
+    private let output: QuantizedLinear
+    private let norm: Qwen35Language.RMSNormGated
+    private let eps: Float
+
+    init(weights: [String: MLXArray], eps: Float) throws {
+        let names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"]
+        let expected = Set(names.flatMap { n in ["\(n).weight", "\(n).scales", "\(n).biases"] } + ["norm.weight"])
+        guard expected.isSubset(of: Set(weights.keys)), eps > 0 else {
+            throw NSError(domain: "GDNReplay exact affine bank contract", code: 1)
+        }
+        var modules: [QuantizedLinear] = []
+        for (index, name) in names.enumerated() {
+            let w = weights[name + ".weight"]!
+            let s = weights[name + ".scales"]!
+            let b = weights[name + ".biases"]!
+            let dimensions = [(10240, 2560), (6144, 2560), (48, 2560), (48, 2560), (2560, 6144)][index]
+            guard w.shape == [dimensions.0, dimensions.1 / 8], w.dtype == .uint32,
+                s.shape == [dimensions.0, dimensions.1 / 64], s.dtype == .float16,
+                b.shape == s.shape, b.dtype == .float16
+            else { throw NSError(domain: "GDNReplay q4/g64/F16 bank geometry", code: 2) }
+            modules.append(QuantizedLinear(
+                weight: w, scales: s, biases: b, groupSize: 64, bits: 4, mode: .affine))
+        }
+        let normWeight = weights["norm.weight"]!
+        guard normWeight.shape == [128], normWeight.dtype == .bfloat16 else {
+            throw NSError(domain: "GDNReplay norm geometry", code: 3)
+        }
+        inputs = Array(modules.prefix(4))
+        output = modules[4]
+        norm = Qwen35Language.RMSNormGated(dimensions: 128, eps: eps, sigmoidGate: true)
+        try norm.update(parameters: ModuleParameters.unflattened(["weight": normWeight]), verify: .all)
+        self.eps = eps
+    }
+
+    func projections(_ x: MLXArray, grouped: Bool) -> [MLXArray] {
+        if grouped {
+            let result = Qwen4ExpBF16Affine.dense(
+                x, concatenated(inputs.map(\.weight), axis: 0),
+                scales: concatenated(inputs.map(\.scales), axis: 0),
+                biases: concatenated(inputs.map { $0.biases! }, axis: 0),
+                groupSize: 64, bits: 4, mode: .affine)
+            return MLX.split(result, indices: [10240, 16384, 16432], axis: -1)
+        }
+        return inputs.map { $0(x) }
+    }
+
+    func batchedTail(_ x: MLXArray, gate: MLXArray) throws -> MLXArray {
+        guard x.ndim == 4, x.dim(0) == 1, (2...8).contains(x.dim(1)), gate.shape == x.shape,
+            let result = Qwen4ExpCompiledGDNInputs.callTail(
+                output: x.reshaped(x.dim(1), 1, x.dim(2), x.dim(3)),
+                gate: gate.reshaped(gate.dim(1), 1, gate.dim(2), gate.dim(3)),
+                sigmoidGate: true, normWeight: norm.weight,
+                outWeight: output.weight, outScales: output.scales, outBiases: output.biases!,
+                eps: eps, groupSize: 64, bits: 4, mode: .affine, batchedRows: true)
+        else { throw NSError(domain: "GDNReplay batched compiled tail unavailable", code: 5) }
+        return result.reshaped(1, x.dim(1), -1)
+    }
+
+    func tail(_ x: MLXArray, gate: MLXArray, compiled: Bool) throws -> MLXArray {
+        if compiled {
+            guard let result = Qwen4ExpCompiledGDNInputs.callTail(
+                output: x, gate: gate, sigmoidGate: true, normWeight: norm.weight,
+                outWeight: output.weight, outScales: output.scales, outBiases: output.biases!,
+                eps: eps, groupSize: 64, bits: 4, mode: .affine)
+            else { throw NSError(domain: "GDNReplay actual compiled tail unavailable", code: 4) }
+            return result
+        }
+        let normalized = norm(x, gate: gate)
+        return output(normalized.reshaped(normalized.dim(0), normalized.dim(1), -1))
+    }
+}
+#endif

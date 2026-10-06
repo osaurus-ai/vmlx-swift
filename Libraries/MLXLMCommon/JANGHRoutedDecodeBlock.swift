@@ -40,7 +40,8 @@ final class JANGHRoutedDecodeBlock {
     /// row order never changes the original token/slot score association.
     func routed(
         _ input: MLXArray, indices: MLXArray, scores: MLXArray,
-        outputDType: DType, backend: JANGHPrefillKernel.Backend? = nil
+        outputDType: DType, backend: JANGHPrefillKernel.Backend? = nil,
+        forceDecode: Bool = false
     ) throws -> MLXArray {
         guard input.ndim >= 2, indices.ndim == input.ndim,
             Array(indices.shape.dropLast()) == Array(input.shape.dropLast()),
@@ -49,7 +50,7 @@ final class JANGHRoutedDecodeBlock {
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH routed shape") }
         let width = input.dim(-1), routes = indices.dim(-1)
         let flat = input.reshaped(-1, width), ids = indices.reshaped(-1, routes)
-        if indices.size < 64 {
+        if indices.size < 64 || forceDecode {
             return try callAsFunction(flat, indices: ids, scores: scores.reshaped(ids.shape), outputDType: outputDType)
                 .reshaped(input.shape)
         }

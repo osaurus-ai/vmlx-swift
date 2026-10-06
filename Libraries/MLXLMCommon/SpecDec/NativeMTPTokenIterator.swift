@@ -105,9 +105,9 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `3` since the
-    /// staged verifier's measured D3 win — see the cap-site comment; the D2
-    /// ceiling era is over). A host that asks past the cap sees the clamped
+    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `5`).
+    /// This bound is separate from the request's adaptive policy.
+    /// A host that asks past the cap sees the clamped
     /// value here — which is the point of surfacing it, since that gap is
     /// otherwise invisible without reading stderr.
     public let depth: Int
@@ -223,7 +223,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let speculativeSampler: SpeculativeSamplingController
     let maxTokens: Int?
     let depth: Int
-    private var currentDepth: Int
+    private var currentDepth: Int {
+        didSet {
+            if currentDepth != oldValue {
+                arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+            }
+        }
+    }
     /// True when this iterator warm-started from restored cache rows. The
     /// aligned head cache starts cold in that state, so early acceptance
     /// windows under-read — the adaptive controller widens its first
@@ -450,6 +456,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let wall: TimeInterval
         let verifyTotal: TimeInterval
     }
+    private var arSafetyMeanLoss = RepeatedMeanLossState()
     private var arSafetyRing: [ARSafetySample] = []
     private var arSafetyEmittedTotal = 0
     /// Wall of one TRUE single-token AR step measured after eval — the first
@@ -2083,9 +2090,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     // MARK: - AR-safety governor
 
     /// The pure decision: does a windowed MTP ms/token lose to the
-    /// context-scaled AR baseline? Mirrors the Python engine's
-    /// `_native_mtp_windowed_ar_verdict` exactly so both runtimes trip on the
-    /// same arithmetic. nil = MTP holds. Guards: zero/negative deltas never
+    /// context-scaled AR baseline? The legacy verify-time scaling is retained;
+    /// measured-reference repeated-loss confirmation is handled separately.
+    /// nil = MTP holds. Guards: zero/negative deltas never
     /// divide; `firstVerifyMs <= 0` disables context scaling (baseline stays
     /// the seed AR step).
     struct ARSafetyVerdict: Equatable {
@@ -2116,6 +2123,63 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return ARSafetyVerdict(mtpMsPerToken: mtpMsPerToken, arBaselineMs: baseline)
     }
 
+    /// Confirms two disjoint mean-losing windows against an unchanged measured
+    /// AR reference. An isolated outlier still receives the median veto. This
+    /// state belongs to one iterator; it never changes request/profile identity.
+    struct RepeatedMeanLossState {
+        private struct Reference: Equatable {
+            let arMs: Double
+            let margin: Double
+            let depth: Int
+        }
+        private var reference: Reference?
+        private(set) var pendingEndCycle: Int?
+        private var minimumStartCycle = 0
+
+        mutating func reset(afterCycle: Int = 0) {
+            reference = nil
+            pendingEndCycle = nil
+            minimumStartCycle = afterCycle
+        }
+
+        mutating func confirm(
+            endCycle: Int, windowCycles: Int, emitted: Int, wallMs: Double,
+            medianMs: Double, arMs: Double, margin: Double, depth: Int,
+            measured: Bool = true, scaled: Bool = false, probe: Bool = false
+        ) -> Bool {
+            guard measured, !scaled, !probe, arMs > 0, margin > 0,
+                windowCycles > 0, emitted > 0, wallMs > 0,
+                arMs.isFinite, margin.isFinite, wallMs.isFinite, medianMs.isFinite
+            else {
+                reference = nil
+                pendingEndCycle = nil
+                return false
+            }
+            let nextReference = Reference(arMs: arMs, margin: margin, depth: depth)
+            if reference != nextReference {
+                reference = nextReference
+                pendingEndCycle = nil
+            }
+            let startCycle = endCycle - windowCycles
+            // A depth transition may leave the legacy timing ring populated.
+            // Never use its mixed-depth samples to confirm a mean-only loss.
+            guard startCycle >= minimumStartCycle else { return false }
+            let threshold = arMs * margin
+            let meanLoses = wallMs - Double(emitted) * threshold > 0
+            if let pending = pendingEndCycle {
+                // Overlapping windows are not independent observations, even
+                // if one has temporarily become cheap as the stall rolls out.
+                guard startCycle >= pending else { return false }
+                pendingEndCycle = nil
+                return meanLoses
+            }
+            if meanLoses && medianMs <= threshold {
+                pendingEndCycle = endCycle
+            }
+            return false
+        }
+    }
+
     private var arSafetyWindowForRequest: Int {
         // A restored prefix starts with a cold aligned-head cache, but the
         // 8-cycle warmup already excludes those cycles from the judgement
@@ -2124,8 +2188,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     /// Median per-cycle ms/token over the ring. A single stalled cycle
-    /// (allocator hiccup, page-in) can push the window MEAN over the margin;
-    /// the median must agree before a trip counts as a sustained loss.
+    /// (allocator hiccup, page-in) can push the window MEAN over the margin.
+    /// Median agreement permits an immediate trip; independently repeated mean
+    /// losses against measured AR can also confirm a sustained loss.
     static func medianCycleMsPerToken(_ ring: [ARSafetySample]) -> Double? {
         var perCycle: [Double] = []
         perCycle.reserveCapacity(Swift.max(ring.count - 1, 0))
@@ -2209,21 +2274,30 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if let live = arSafetyLiveStepSec,
             tokenCount - arSafetyLastMeasuredToken < 512 {
             let arMs = live * 1000
-            if mtpMs > arMs, median > arMs {
+            let confirmedMeanLoss = arSafetyMeanLoss.confirm(
+                endCycle: verifyCalls, windowCycles: window, emitted: emitted,
+                wallMs: wallMs, medianMs: median, arMs: arMs, margin: 1,
+                depth: currentDepth)
+            if (mtpMs > arMs && median > arMs) || confirmedMeanLoss {
                 arSafetyDemoteOrPause(reason: String(
                     format: "ar_safety_fresh_loss(mtp=%.1fms/tok median=%.1fms live_ar=%.1fms depth=%d)",
-                    mtpMs, median, arMs, currentDepth))
+                    mtpMs, median, arMs, currentDepth)
+                    + (confirmedMeanLoss ? " confirmed_mean_loss=true" : ""))
             }
-        } else if let verdict = Self.windowedARVerdict(
-            arStepMs: seed * 1000,
-            firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
-            windowCycles: window, deltaEmitted: emitted, deltaWallMs: wallMs,
-            deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
-            margin: Self.arSafetyMargin),
-            median > verdict.arBaselineMs * Self.arSafetyMargin {
-            arSafetyDemoteOrPause(reason: String(
-                format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
-                verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+        } else {
+            // Seed-only/context-scaled references cannot confirm mean losses.
+            arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+            if let verdict = Self.windowedARVerdict(
+                arStepMs: seed * 1000,
+                firstVerifyMs: (arSafetyFirstVerifySec ?? 0) * 1000,
+                windowCycles: window, deltaEmitted: emitted, deltaWallMs: wallMs,
+                deltaVerifyMs: (newest.verifyTotal - oldest.verifyTotal) * 1000,
+                margin: Self.arSafetyMargin),
+                median > verdict.arBaselineMs * Self.arSafetyMargin {
+                arSafetyDemoteOrPause(reason: String(
+                    format: "ar_safety_windowed(mtp=%.1fms/tok ar=%.1fms depth=%d)",
+                    verdict.mtpMsPerToken, verdict.arBaselineMs, currentDepth))
+            }
         }
     }
 
@@ -2245,6 +2319,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         adaptiveDepthDownshiftCount += 1
         adaptiveWallClockDemotes += 1
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         adaptiveWindow.removeAll(keepingCapacity: true)
         lastAdaptiveCycleTimestamp = nil
         arSafetyFirstVerifySec = nil
@@ -2271,6 +2346,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         arSafetyProbeCyclesRemaining = 0
         arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         adaptiveWindow.removeAll(keepingCapacity: true)
         lastAdaptiveCycleTimestamp = nil
         adaptiveFallbackReason = reason
@@ -2326,6 +2402,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpCacheRefreshCount += 1
         currentDepth = probe ? 1 : depth
         arSafetyRing.removeAll(keepingCapacity: true)
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
         arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
         arSafetyProbeStartedEmitted = arSafetyEmittedTotal
@@ -3133,10 +3210,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         for _ in 0 ..< depth {
             let out = model.nativeMTPForward(
                 hiddenStates: hidden,
-                nextTokenIds: tokenInput(token),
+                nextTokenIds: Self.tokenInput(token),
                 cache: mtpCache)
             forwardCount += 1
-            let draft = sampleLast(
+            let draft = Self.sampleLast(
                 logits: out.logits,
                 sampler: sampler,
                 speculativeSampler: speculativeSampler,
@@ -3152,7 +3229,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if !speculativeSampler.isGreedy {
                 probabilities.append(draft.probabilities)
             }
-            hidden = lastHidden(out.hiddenStates)
+            hidden = Self.lastHidden(out.hiddenStates)
             token = draft.token
         }
 
@@ -3363,3 +3440,53 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return tokens[.newAxis, 0...]
     }
 }
+
+#if DEBUG
+// Qualification adapter only. No serving call sites. Synthetic costs enter the
+// actual stateful governor; this does not simulate target/cache computation.
+extension NativeMTPTokenIterator {
+    struct GovernorTestSnapshot {
+        let depth: Int
+        let paused: Bool
+        let pendingTokens: [Int]
+        let pendingLossEnd: Int?
+        let probeCycles: Int
+        let trips: Int
+        let resumes: Int
+    }
+
+    var testingGovernorSnapshot: GovernorTestSnapshot {
+        .init(depth: currentDepth, paused: arSafetyPaused, pendingTokens: pendingTokens,
+              pendingLossEnd: arSafetyMeanLoss.pendingEndCycle,
+              probeCycles: arSafetyProbeCyclesRemaining, trips: arSafetyTrips,
+              resumes: arSafetyResumes)
+    }
+
+    mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
+        verifyCalls = Self.arSafetyWarmupCycles
+        currentDepth = depth
+        arSafetyMeanLoss.reset(afterCycle: verifyCalls)
+        arSafetySeedStepSec = 0.025
+        arSafetyLiveStepSec = 0.025
+        arSafetyLastMeasuredToken = tokenCount
+        arSafetyEmittedTotal = 0
+        arSafetyRing = [.init(emitted: 0, wall: now, verifyTotal: targetVerifyTime)]
+        arSafetyPaused = false
+        arSafetyProbeCyclesRemaining = 0
+    }
+
+    mutating func testingFeedGovernorCycle(now: TimeInterval) {
+        verifyCalls += 1
+        NativeMTPClock.$testingNow.withValue(now) {
+            arSafetyAfterVerifyCycle(accepted: 0)
+        }
+    }
+
+    mutating func testingMeasuredARStep(now: TimeInterval) throws {
+        guard let token = nextMain else { throw NativeMTPRuntimeError.verifierProducedNoTokens }
+        NativeMTPClock.$testingNow.withValue(now) {
+            arSafetyAfterARStep(stepSec: 0.025, hidden: MLXArray.zeros([1, 1, 4]), nextToken: token)
+        }
+    }
+}
+#endif

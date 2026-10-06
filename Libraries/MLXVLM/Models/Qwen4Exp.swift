@@ -6,6 +6,39 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+
+
+enum Qwen4ExpRowExactProjection {
+    /// Preserve qualified q8 single-row addressing for actual Flash verification.
+    static func q8Projection(_ module: Linear, _ x: MLXArray) -> MLXArray? {
+        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+            !CompiledDecodeTrace.isActive, x.ndim == 3, x.dim(0) == 1,
+            (2...8).contains(x.dim(1)), x.dtype == .bfloat16,
+            jangAllowsRawQuantizedProjection(module),
+            let q = module as? QuantizedLinear,
+            q.bits == 8, q.groupSize == 64, q.mode == .affine, q.bias == nil,
+            q.weight.ndim == 2, q.scales.dtype == .float16,
+            let biases = q.biases, biases.dtype == .float16
+        else { return nil }
+        let rows = x.dim(1)
+        // Leading singleton bank dimension broadcasts without physical copies.
+        // MLX currently promotes metadata/activations to F32 here; retain the
+        // existing QuantizedLinear BF16 output contract. Cost is unmeasured.
+        return quantizedMM(
+            x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis, 0..., 0...],
+            scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
+            groupSize: 64, bits: 8, mode: .affine)
+            .reshaped(1, rows, q.weight.dim(0)).asType(x.dtype)
+    }
+
+
+}
+
+/// Uses the qualified affine route only inside actual Flash target verification.
+func qwen4ExpProjection(_ module: Linear, _ x: MLXArray) -> MLXArray {
+    Qwen4ExpRowExactProjection.q8Projection(module, x) ?? module(x)
+}
+
 public struct Qwen4ExpConfiguration: Codable, Sendable {
     struct JangMetadata: Codable, Sendable {
         let normConvention: String?
@@ -218,7 +251,8 @@ private final class Qwen4ExpGroupedRMSNorm: Module {
         let original = x.shape
         let grouped = x.reshaped(Array(original.dropLast()) + [-1, groupSize])
         let normalized = MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: eps)
-        return normalized.reshaped(original) * weight
+        let result = normalized.reshaped(original) * weight
+        return result
     }
 }
 
@@ -443,8 +477,19 @@ private final class Qwen4ExpGatedResidual: Module {
     }
 
     func mix(_ hyper: MLXArray, normalizedInput: MLXArray? = nil) -> (MLXArray, MLXArray?) {
+        let joinedVerifyProjection = FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape)
+            && combines && hcCount == 4 && hiddenSize == 2560
+            && hyper.dim(2) == 10240
+            && (normalizedInput.map { $0.shape == hyper.shape && $0.dtype == hyper.dtype } ?? true)
+            && hyper.dtype == .bfloat16 && norm.weight.dtype == .bfloat16
+            && !(mixDown is QuantizedLinear) && mixDown.bias == nil
+            && mixDown.weight.shape == [320, 10240] && mixDown.weight.dtype == .bfloat16
+            && inject != nil && !(inject! is QuantizedLinear) && inject!.bias == nil
+            && inject!.weight.shape == [4, 10240] && inject!.weight.dtype == .bfloat16
+            && !CompiledDecodeTrace.isActive
         var fused: FusedInputProjection?
-        if Self.fuseDecodeInputs, combines, Qwen4ExpCompiledMHC.supportsShape(hyper),
+        if Self.fuseDecodeInputs, combines,
+            (Qwen4ExpCompiledMHC.supportsShape(hyper) || joinedVerifyProjection),
             !CompiledDecodeTrace.isActive
         {
             fused = fusedProjection(for: hyper)
@@ -501,7 +546,14 @@ private final class Qwen4ExpGatedResidual: Module {
             let combined: MLXArray
             switch fused {
             case .dense(let weight):
-                combined = matmul(normalized, weight.transposed())
+                if joinedVerifyProjection {
+                    let rows = normalized.dim(1)
+                    combined = matmul(
+                        broadcast(weight, to: [rows, 324, 10240]),
+                        normalized.reshaped(rows, 10240, 1)).reshaped(1, rows, 324)
+                } else {
+                    combined = matmul(normalized, weight.transposed())
+                }
             case .affine(
                 let weight, let scales, let biases, let groupSize, let bits, let mode):
                 combined = Qwen4ExpBF16Affine.dense(
@@ -512,14 +564,41 @@ private final class Qwen4ExpGatedResidual: Module {
             mixedDown = parts[0]
             injected = parts[1]
         } else {
-            mixedDown = mixDown(normalized)
+            if FlashVerificationScope.usesRowExactVerification(inputShape: normalized.shape),
+                !CompiledDecodeTrace.isActive, normalized.ndim == 3,
+                normalized.dim(0) == 1, (2...8).contains(normalized.dim(1)),
+                normalized.dtype == .bfloat16, mixDown.weight.dtype == .bfloat16,
+                !(mixDown is QuantizedLinear), mixDown.bias == nil,
+                normalized.dim(2) == 10240, mixDown.weight.shape == [320, 10240]
+            {
+                let rows = normalized.dim(1)
+                mixedDown = matmul(
+                    broadcast(mixDown.weight, to: [rows, 320, 10240]),
+                    normalized.reshaped(rows, 10240, 1)
+                ).reshaped(1, rows, 320)
+            } else {
+                mixedDown = mixDown(normalized)
+            }
             injected = inject.map { $0(normalized) }
         }
-        var weights = silu(mixedDown / Float(hcCount))
-        weights = sigmoid(mixUp(weights))
+        let scaled = mixedDown / Float(hcCount)
+        var weights = silu(scaled)
+        let projected: MLXArray
+        if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape),
+            combines, hcCount == 4, hiddenSize == 2560,
+            !(mixUp is QuantizedLinear), mixUp.bias == nil,
+            let rowInvariant = Qwen4ExpHCUpProjection.project(weights, weight: mixUp.weight)
+        {
+            projected = rowInvariant
+        } else {
+            projected = mixUp(weights)
+        }
+        weights = sigmoid(projected)
             .reshaped(Array(weights.shape.dropLast()) + [hcCount, hiddenSize])
         let grouped = normalized.reshaped(Array(normalized.shape.dropLast()) + [hcCount, hiddenSize])
-        let mixed = (weights * grouped).mean(axis: -2).asType(hyper.dtype)
+        let product = weights * grouped
+        let reduced = product.mean(axis: -2)
+        let mixed = reduced.asType(hyper.dtype)
         let injection = injected.map {
             (2 * sigmoid($0 / Float(hcCount))).asType(hyper.dtype)
         }
@@ -820,10 +899,13 @@ private final class Qwen4ExpPLE: Module {
 
         let text = config.base.textConfiguration
         let extras = config.extras
-        let key = normKey(keyProj(embedding)).reshaped(batch, length, extras.hcCount, text.hiddenSize)
-        let value = valueProj(embedding)
+        let rawKey = qwen4ExpProjection(keyProj, embedding)
+        let value = qwen4ExpProjection(valueProj, embedding)
+        let key = normKey(rawKey).reshaped(batch, length, extras.hcCount, text.hiddenSize)
         let query = normQuery(hidden).reshaped(batch, length, extras.hcCount, text.hiddenSize)
-        var gate = (key * query).sum(axis: -1, keepDims: true) / sqrt(Float(text.hiddenSize))
+        let product = key * query
+        let gateSum = product.sum(axis: -1, keepDims: true)
+        var gate = gateSum / sqrt(Float(text.hiddenSize))
         gate = sqrt(maximum(abs(gate), MLXArray(Float(1e-6)))) * sign(gate)
         // `maximum(abs(gate), 1e-6)` intentionally evaluates the nonlinear
         // gate in F32. Do not let that precision island promote the PLE value
@@ -860,7 +942,8 @@ private final class Qwen4ExpPLE: Module {
                 * convWeight[0..., tap]
         }
         gated = gated + silu(convolved).asType(gated.dtype)
-        return gated.asType(hidden.dtype)
+        let result = gated.asType(hidden.dtype)
+        return result
     }
 
     /// Resolve the disk-backed PLE rows before entering an MLX compile
@@ -955,7 +1038,7 @@ private final class Qwen4ExpQSAIndexer: Module {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
-        let qk = Qwen4ExpVerifyTile.padded(x) { projection($0) }
+        let qk = Qwen4ExpVerifyTile.padded(x) { qwen4ExpProjection(projection, $0) }
         let split = MLX.split(
             qk, indices: [extras.indexerNHeads * extras.indexerHeadDim], axis: -1)
         let rawKeys = split[1]
@@ -1089,17 +1172,15 @@ private final class Qwen4ExpAttention: Module {
         // weight matmuls, so their M dimension may be padded to the NAX tile
         // and sliced back before any reshape, rope, cache, or SDPA touches
         // the rows. Off by default; see `Qwen4ExpVerifyTile`.
-        let qg = Qwen4ExpVerifyTile.padded(x) { qProj($0) }
-            .reshaped(B, S, text.attentionHeads, headDim * 2)
+        let rawQueryGate = Qwen4ExpVerifyTile.padded(x) { qwen4ExpProjection(qProj, $0) }
+        let qg = rawQueryGate.reshaped(B, S, text.attentionHeads, headDim * 2)
             .split(parts: 2, axis: -1)
         var query = qNorm(qg[0]).transposed(0, 2, 1, 3)
         let gate = qg[1].reshaped(B, S, -1)
-        var key = kNorm(
-            Qwen4ExpVerifyTile.padded(x) { kProj($0) }
-                .reshaped(B, S, text.kvHeads, headDim)
-        ).transposed(0, 2, 1, 3)
-        let value = Qwen4ExpVerifyTile.padded(x) { vProj($0) }
-            .reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
+        let rawKey = Qwen4ExpVerifyTile.padded(x) { qwen4ExpProjection(kProj, $0) }
+        var key = kNorm(rawKey.reshaped(B, S, text.kvHeads, headDim)).transposed(0, 2, 1, 3)
+        let rawValue = Qwen4ExpVerifyTile.padded(x) { qwen4ExpProjection(vProj, $0) }
+        let value = rawValue.reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
@@ -1136,11 +1217,30 @@ private final class Qwen4ExpAttention: Module {
             if let sparseMask { causal = MLX.logicalAnd(causal, sparseMask) }
             mask = .array(causal)
         }
-        let output = attentionWithCacheUpdate(
-            queries: query, keys: key, values: value, cache: cache,
-            scale: scale, mask: mask)
-            .transposed(0, 2, 1, 3).reshaped(B, S, -1)
-        return Qwen4ExpVerifyTile.padded(output * sigmoid(gate)) { oProj($0) }
+        let attended: MLXArray
+        if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+            (3...8).contains(S), B == 1, let cache,
+            case .array(let causal) = mask
+        {
+            let (cachedKeys, cachedValues) = cache.update(keys: key, values: value)
+            var chunks: [MLXArray] = []
+            for start in stride(from: 0, to: S, by: 2) {
+                let end = min(start + 2, S)
+                chunks.append(MLXFast.scaledDotProductAttention(
+                    queries: query[0..., 0..., start..<end, 0...],
+                    keys: cachedKeys, values: cachedValues, scale: scale,
+                    mask: .array(causal[0..., 0..., start..<end, 0...])))
+            }
+            attended = concatenated(chunks, axis: 2)
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: query, keys: key, values: value, cache: cache,
+                scale: scale, mask: mask)
+        }
+        let output = attended.transposed(0, 2, 1, 3).reshaped(B, S, -1)
+        let gated = output * sigmoid(gate)
+        let result = Qwen4ExpVerifyTile.padded(gated) { qwen4ExpProjection(oProj, $0) }
+        return result
     }
 }
 
@@ -1316,9 +1416,10 @@ private final class Qwen4ExpDecoderLayer: Module {
         {
             return ForwardResult(hidden: prepared.residual, normalizedNext: prepared.normalized)
         }
-        return ForwardResult(
+        let result = ForwardResult(
             hidden: mlpResidual.combine(hyper, block: block, injection: mlpInject!),
             normalizedNext: nil)
+        return result
     }
 }
 
@@ -1521,7 +1622,13 @@ private final class Qwen4ExpTextModel: Module {
             enabled: gdnQKNormEnabled, shape: inputIds.shape,
             autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
             externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
-        let earlySubmit = Qwen4ExpEarlySubmission.allows(
+        let verifyEarlySubmit = inputIds.ndim == 2 && inputIds.dim(0) == 1
+            && (2...8).contains(inputIds.dim(1))
+            && FlashVerificationScope.usesRowExactVerification(
+                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize])
+            && recordPrefixCommitStates && pleEmbeddings == nil
+            && !CompiledDecodeTrace.isActive
+        let earlySubmit = verifyEarlySubmit || Qwen4ExpEarlySubmission.allows(
             enabled: earlySubmissionEnabled, shape: inputIds.shape,
             autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
             externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
@@ -1532,8 +1639,8 @@ private final class Qwen4ExpTextModel: Module {
             ? Qwen4ExpRotaryContext() : nil
         if earlySubmit, !reportedEarlySubmit {
             reportedEarlySubmit = true
-            NSLog("[Qwen4Exp] early-submit active stride=1 rows=1 layers=%d caller_stream=1 outer_compile=0 ar_only=1",
-                layers.count)
+            NSLog("[Qwen4Exp] early-submit active stride=1 rows=%d scope=%@ layers=%d caller_stream=1 outer_compile=0 admitted=ar_s1+flash_verify_s2_8",
+                inputIds.dim(1), verifyEarlySubmit ? "flash_verify" : "ar", layers.count)
         }
         var plePrefetches: [Int: Qwen4ExpPLE.Prefetch] = [:]
         for (index, layer) in layers.enumerated() {
@@ -2003,7 +2110,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         // Verify-tile (workplan W2a): at verify width every lm_head row costs
         // a full qmv stream of the 5120x248320 head; padding M to the NAX
         // tile streams it once for all rows. Off by default.
-        let logits = Qwen4ExpVerifyTile.padded(headInput) { head($0) }
+        let logits = Qwen4ExpRowExactProjection.q8Projection(head, headInput)
+            ?? Qwen4ExpVerifyTile.padded(headInput) { head($0) }
         let result: MLXArray
         guard let computeDType = config.declaredComputeDType,
             logits.dtype != computeDType
@@ -2053,12 +2161,13 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func nativeBackboneMTPVerifyForward(
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let forward = textModel.forward(
-            inputs, cache: cache, recordPrefixCommitStates: true,
-            positionOffset: ropeDelta(for: cache))
-        return NativeMTPForwardResult(
-            logits: projectToLogits(forward.mixed),
-            hiddenStates: forward.preMixer)
+        return FlashVerificationScope.withVerification(inputShape: inputs.shape) {
+            let forward = textModel.forward(
+                inputs, cache: cache, recordPrefixCommitStates: true,
+                positionOffset: ropeDelta(for: cache))
+            return NativeMTPForwardResult(
+                logits: projectToLogits(forward.mixed), hiddenStates: forward.preMixer)
+        }
     }
 
     public func nativeMTPForward(
@@ -2359,3 +2468,131 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
 public enum Qwen4ExpJANGHError: Error {
     case invalidCustomTensorExclusions
 }
+
+#if DEBUG
+/// Uses the actual runtime class and raw, already-sanitized layer parameters.
+/// No model construction, cache, tokenization or sampler. Diagnostic decomposition
+/// must match the actual mix endpoints before its intermediate arrays can be interpreted.
+final class Qwen4ExpMHCSubstageBridge {
+    private let residual: Qwen4ExpGatedResidual
+    private let width: Int
+
+    init(config: Qwen4ExpConfiguration, parameters: [String: MLXArray]) throws {
+        let text = config.base.textConfiguration
+        let extras = config.extras
+        guard text.hiddenSize == 2560, extras.hcCount == 4, extras.hcLowrank == 320,
+            config.declaredComputeDType == .bfloat16,
+            config.jangMetadata?.normConvention?.lowercased() == "runtime_plus1_applied"
+        else { throw NSError(domain: "MHCReplay unsupported bundle contract", code: 1) }
+        width = text.hiddenSize * extras.hcCount
+        let shapes = [
+            "hc_norm.weight": [width],
+            "input_mix_weight_down.weight": [extras.hcLowrank, width],
+            "input_mix_weight_up.weight": [width, extras.hcLowrank],
+            "block_inject_weight.weight": [extras.hcCount, width],
+        ]
+        guard Set(parameters.keys) == Set(shapes.keys),
+            shapes.allSatisfy({ name, shape in
+                parameters[name]?.shape == shape && parameters[name]?.dtype == .bfloat16
+            })
+        else { throw NSError(domain: "MHCReplay requires exact four dense BF16 banks", code: 2) }
+        residual = Qwen4ExpGatedResidual(config)
+        try residual.update(parameters: ModuleParameters.unflattened(parameters), verify: .all)
+    }
+
+    var parameters: [String: MLXArray] {
+        [
+            "hc_norm.weight": residual.norm.weight,
+            "input_mix_weight_down.weight": residual.mixDown.weight,
+            "input_mix_weight_up.weight": residual.mixUp.weight,
+            "block_inject_weight.weight": residual.inject!.weight,
+        ]
+    }
+
+    func mix(_ input: MLXArray) throws -> (mixed: MLXArray, injection: MLXArray) {
+        guard input.shape == [1, 1, width] || input.shape == [1, 2, width] || input.shape == [1, 4, width],
+            input.dtype == .bfloat16
+        else { throw NSError(domain: "MHCReplay input geometry", code: 3) }
+        let result = residual.mix(input)
+        guard let injection = result.1 else {
+            throw NSError(domain: "MHCReplay missing actual injection output", code: 4)
+        }
+        return (result.0, injection)
+    }
+
+    /// Diagnostic-only decomposition of the eager separate route. Uses actual
+    /// loaded projection/norm modules; retaining intermediates may change graph
+    /// scheduling, so the test MUST calibrate both outputs against mix().
+    func stages(_ input: MLXArray) -> [(String, MLXArray)] {
+        let grouped = input.reshaped(Array(input.shape.dropLast()) + [4, 2560])
+        let rms = MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: residual.norm.eps)
+            .reshaped(input.shape)
+        let normProduct = rms * residual.norm.weight
+        let normalized = residual.norm(input)
+        let down = residual.mixDown(normalized)
+        let injectionProjection = residual.inject!(normalized)
+        let scaled = down / Float(4)
+        let activated = silu(scaled)
+        let up = residual.mixUp(activated)
+        let gates = sigmoid(up)
+        let product = gates.reshaped(Array(up.shape.dropLast()) + [4, 2560])
+            * normalized.reshaped(Array(normalized.shape.dropLast()) + [4, 2560])
+        let mixed = product.mean(axis: -2).asType(input.dtype)
+        let injection = (2 * sigmoid(injectionProjection / Float(4))).asType(input.dtype)
+        return [
+            ("rms", rms), ("norm_product", normProduct), ("normalized", normalized),
+            ("down", down), ("scaled", scaled), ("silu", activated), ("up", up),
+            ("sigmoid", gates), ("product", product.reshaped(input.shape)), ("mixed", mixed),
+            ("injection_projection", injectionProjection), ("injection", injection),
+        ]
+    }
+
+    /// Current eager route with admitted HC up helper; old stages() remains an
+    /// immutable negative-control donor. Endpoints require saved calibration.
+    func currentPlainStages(
+        _ input: MLXArray, groupedInput: Bool = false, batchedDown: Bool = false
+    ) -> [(String, MLXArray)] {
+        let grouped = input.reshaped(Array(input.shape.dropLast()) + [4, 2560])
+        let rms = MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: residual.norm.eps)
+            .reshaped(input.shape)
+        let normProduct = rms * residual.norm.weight
+        let normalized = residual.norm(input)
+        func downProjection(_ weight: MLXArray) -> MLXArray {
+            guard batchedDown, input.dim(1) > 1 else {
+                return matmul(normalized, weight.transposed())
+            }
+            let rows = input.dim(1)
+            return matmul(
+                broadcast(weight, to: [rows, weight.dim(0), weight.dim(1)]),
+                normalized.reshaped(rows, weight.dim(1), 1)
+            ).reshaped(1, rows, weight.dim(0))
+        }
+        let down: MLXArray
+        let injectionProjection: MLXArray
+        if groupedInput {
+            let weight = concatenated([residual.mixDown.weight, residual.inject!.weight], axis: 0)
+            let combined = downProjection(weight)
+            let parts = MLX.split(combined, indices: [320], axis: -1)
+            down = parts[0]
+            injectionProjection = parts[1]
+        } else {
+            down = batchedDown ? downProjection(residual.mixDown.weight) : residual.mixDown(normalized)
+            injectionProjection = residual.inject!(normalized)
+        }
+        let scaled = down / Float(4)
+        let activated = silu(scaled)
+        let up = Qwen4ExpHCUpProjection.project(activated, weight: residual.mixUp.weight) ?? residual.mixUp(activated)
+        let gates = sigmoid(up)
+        let product = gates.reshaped(Array(up.shape.dropLast()) + [4, 2560])
+            * normalized.reshaped(Array(normalized.shape.dropLast()) + [4, 2560])
+        let mixed = product.mean(axis: -2).asType(input.dtype)
+        let injection = (2 * sigmoid(injectionProjection / Float(4))).asType(input.dtype)
+        return [
+            ("rms", rms), ("norm_product", normProduct), ("normalized", normalized),
+            ("down", down), ("scaled", scaled), ("silu", activated), ("up", up),
+            ("sigmoid", gates), ("product", product.reshaped(input.shape)), ("mixed", mixed),
+            ("injection_projection", injectionProjection), ("injection", injection),
+        ]
+    }
+}
+#endif

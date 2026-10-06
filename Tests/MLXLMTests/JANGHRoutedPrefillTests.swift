@@ -23,10 +23,11 @@ final class JANGHRoutedPrefillTests: XCTestCase {
         return Bank(bits: bits, words: words,
                     scales: (0 ..< experts * width).map { Float16(Float($0 % 3 + 1) / 16) })
     }
-    private func fixture(_ directory: URL, inputRotation: Bool, outputRotation: Bool)
+    private func fixture(_ directory: URL, inputRotation: Bool, outputRotation: Bool,
+                         bits: [Int] = [2, 3, 4])
         throws -> (JANGHMappedBanks, [Bank]) {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let banks = [bank(2, seed: 5), bank(3, seed: 11), bank(4, seed: 19)]
+        let banks = [bank(bits[0], seed: 5), bank(bits[1], seed: 11), bank(bits[2], seed: 19)]
         var books: [String: Any] = [:], quant: [String: Any] = [:], headers: [String: Any] = [:]
         var map: [String: String] = [:], dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var payload = Data()
@@ -171,6 +172,99 @@ final class JANGHRoutedPrefillTests: XCTestCase {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    func testFlashVerificationScopeAdmissionAndRestoration() {
+        XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
+        FlashVerificationScope.withVerification(inputShape: [1, 7]) {
+            XCTAssertTrue(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
+            XCTAssertTrue(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 63))
+            for shape in [[7, 64], [2, 7, 64], [1, 6, 64], [1, 8, 64]] {
+                XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: shape, routes: 10))
+            }
+            for routes in [0, 64, 65] {
+                XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: routes))
+            }
+            for shape in [[1, 1], [1, 9], [2, 7]] {
+                FlashVerificationScope.withVerification(inputShape: shape) {
+                    XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
+                }
+                XCTAssertTrue(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
+            }
+        }
+        XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
+    }
+
+    func testFlashScopePreservesUnsupportedGeometryAndPrefillRoutes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (banks, _) = try fixture(directory, inputRotation: false, outputRotation: false)
+        let layer = try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
+            inputDimensions: width, activationLimit: nil)
+        for (shape, routeCount) in [([1, 2, width], 64), ([2, 7, width], 10), ([1, 9, width], 10)] {
+            let tokens = shape[0] * shape[1]
+            let x = MLXArray((0..<tokens * width).map { Float($0 % 17 - 8) / 128 }, shape).asType(.bfloat16)
+            let ids = MLXArray((0..<tokens * routeCount).map { UInt32($0 % experts) }, [shape[0], shape[1], routeCount])
+            let scores = MLXArray((0..<tokens * routeCount).map { Float($0 % 7) / 64 }, ids.shape)
+            let baseline = layer.callRouted(x, indices: ids, scores: scores)
+            let scoped = FlashVerificationScope.withVerification(inputShape: Array(shape.prefix(2))) {
+                layer.callRouted(x, indices: ids, scores: scores)
+            }
+            XCTAssertEqual(scoped.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                           baseline.asType(.float32).asArray(Float.self).map(\.bitPattern))
+        }
+    }
+
+    func testFlashMappedVerificationThresholdIsExactlySerialDecode() throws {
+        // Pairwise coverage: every admitted bit width occurs in every projection
+        // role; all activation dtypes and rotation combinations are represented.
+        let cases: [([Int], DType, Bool, Bool)] = [
+            ([2, 3, 4], .float16, false, false),
+            ([3, 4, 6], .bfloat16, true, false),
+            ([4, 6, 8], .float32, false, true),
+            ([6, 8, 2], .float16, true, true),
+            ([8, 2, 3], .bfloat16, false, false),
+        ]
+        for (caseIndex, configuration) in cases.enumerated() {
+            let (bits, dtype, inputRotation, outputRotation) = configuration
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let (banks, _) = try fixture(directory, inputRotation: inputRotation,
+                                         outputRotation: outputRotation, bits: bits)
+            let layer = try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
+                inputDimensions: width, activationLimit: caseIndex.isMultiple(of: 2) ? nil : 0.7)
+            for count in [6, 7, 8] {
+                for reversed in [false, true] {
+                    let routeCount = 10
+                    let values = (0..<count * width).map { Float(($0 * 11 + caseIndex) % 31 - 15) / 128 }
+                    let pattern: [UInt32] = [2, 0, 2, 1, 0, 1, 2, 0, 1, 2]
+                    let ids = (0..<count * routeCount).map { pattern[reversed ? 9 - $0 % 10 : $0 % 10] }
+                    let weights = (0..<count * routeCount).map { index -> Float in
+                        let slot = reversed ? 9 - index % 10 : index % 10
+                        return Float((slot * 3 + index / 10) % 13) / 64
+                    }
+                    let x = MLXArray(values, [1, count, width]).asType(dtype)
+                    let indices = MLXArray(ids, [1, count, routeCount])
+                    let scores = MLXArray(weights, [1, count, routeCount])
+                    let actual = FlashVerificationScope.withVerification(inputShape: [1, count]) {
+                        layer.callRouted(x, indices: indices, scores: scores)
+                    }
+                    var expected = [Float]()
+                    for row in 0..<count {
+                        let rowX = MLXArray(Array(values[row * width..<(row + 1) * width]), [1, 1, width]).asType(dtype)
+                        let rowIDs = MLXArray(Array(ids[row * routeCount..<(row + 1) * routeCount]), [1, 1, routeCount])
+                        let rowScores = MLXArray(Array(weights[row * routeCount..<(row + 1) * routeCount]), [1, 1, routeCount])
+                        expected += layer.callRouted(rowX, indices: rowIDs, scores: rowScores).asType(.float32).asArray(Float.self)
+                    }
+                    XCTAssertEqual(actual.shape, [1, count, width])
+                    XCTAssertEqual(actual.dtype, dtype)
+                    // Comparing F32 bit patterns preserves signed zero and exact
+                    // F16/BF16 values without a tolerance or reduction oracle.
+                    XCTAssertEqual(actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                                   expected.map(\.bitPattern), "case \(caseIndex), S\(count), reordered \(reversed)")
                 }
             }
         }
