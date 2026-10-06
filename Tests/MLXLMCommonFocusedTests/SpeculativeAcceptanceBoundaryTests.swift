@@ -1,5 +1,6 @@
 import MLX
 import XCTest
+
 @testable import MLXLMCommon
 
 /// Exact rejection-sampling boundaries, using the actual accept/correct owner.
@@ -14,7 +15,10 @@ final class SpeculativeAcceptanceBoundaryTests: XCTestCase {
             draftToken: MLXArray([UInt32(0)]),
             targetProbabilities: MLXArray(target)[.newAxis, .ellipsis],
             draftProbabilities: MLXArray(draft)[.newAxis, .ellipsis],
-            acceptanceRoll: { draws += 1; return roll })
+            acceptanceRoll: {
+                draws += 1
+                return roll
+            })
     }
 
     func testZeroProbabilityRejectsZeroDrawAndUsesResidual() {
@@ -23,14 +27,16 @@ final class SpeculativeAcceptanceBoundaryTests: XCTestCase {
         XCTAssertEqual(draws, 1, "zero acceptance still consumes the original RNG draw")
         XCTAssertEqual(result.acceptanceProbability, 0)
         XCTAssertFalse(result.accepted)
-        XCTAssertEqual(result.correction?.item(Int.self), 1,
-                       "target-impossible proposal0 must be replaced by residual token1")
+        XCTAssertEqual(
+            result.correction?.item(Int.self), 1,
+            "target-impossible proposal0 must be replaced by residual token1")
     }
 
     func testEqualityAtInteriorThresholdRejects() {
         var draws = 0
-        let result = decision(target: [0.25, 0.75], draft: [0.5, 0.5],
-                              roll: 0.5, draws: &draws)
+        let result = decision(
+            target: [0.25, 0.75], draft: [0.5, 0.5],
+            roll: 0.5, draws: &draws)
         XCTAssertEqual(draws, 1)
         XCTAssertEqual(result.acceptanceProbability, 0.5)
         XCTAssertFalse(result.accepted)
@@ -39,8 +45,9 @@ final class SpeculativeAcceptanceBoundaryTests: XCTestCase {
 
     func testImmediatelyBelowThresholdAccepts() {
         var draws = 0
-        let result = decision(target: [0.25, 0.75], draft: [0.5, 0.5],
-                              roll: Float(0.5).nextDown, draws: &draws)
+        let result = decision(
+            target: [0.25, 0.75], draft: [0.5, 0.5],
+            roll: Float(0.5).nextDown, draws: &draws)
         XCTAssertEqual(draws, 1)
         XCTAssertEqual(result.acceptanceProbability, 0.5)
         XCTAssertTrue(result.accepted)
@@ -49,8 +56,9 @@ final class SpeculativeAcceptanceBoundaryTests: XCTestCase {
 
     func testImmediatelyAboveThresholdRejects() {
         var draws = 0
-        let result = decision(target: [0.25, 0.75], draft: [0.5, 0.5],
-                              roll: Float(0.5).nextUp, draws: &draws)
+        let result = decision(
+            target: [0.25, 0.75], draft: [0.5, 0.5],
+            roll: Float(0.5).nextUp, draws: &draws)
         XCTAssertEqual(draws, 1)
         XCTAssertFalse(result.accepted)
         XCTAssertEqual(result.correction?.item(Int.self), 1)
