@@ -855,6 +855,7 @@ let package = Package(
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
                 "ProposalHeadStampTests.swift",
+                "SpeculativeAcceptanceBoundaryTests.swift",
                 "NativeMTPARSafetyTests.swift",
                 "NativeMTPDemotionHeadHistory119Tests.swift",
                 "NativeMTPDemotionCompatibilityTests.swift",

@@ -797,6 +797,26 @@ public struct SpeculativeSamplingController {
         targetProbabilities: MLXArray,
         draftProbabilities: MLXArray
     ) -> AcceptanceDecision {
+        acceptOrCorrect(
+            draftToken: draftToken,
+            targetProbabilities: targetProbabilities,
+            draftProbabilities: draftProbabilities,
+            acceptanceRoll: {
+                withRandomState(acceptanceState) {
+                    MLXRandom.uniform(0.0 ..< 1.0).item(Float.self)
+                }
+            })
+    }
+
+    /// The production path supplies the original RNG draw; tests supply exact
+    /// representable endpoints. The draw stays AFTER the alpha>=1 fast path
+    /// and is consumed exactly once even when alpha is zero.
+    func acceptOrCorrect(
+        draftToken: MLXArray,
+        targetProbabilities: MLXArray,
+        draftProbabilities: MLXArray,
+        acceptanceRoll: () -> Float
+    ) -> AcceptanceDecision {
         let p = probability(targetProbabilities, token: draftToken)
         let q = probability(draftProbabilities, token: draftToken)
 
@@ -814,10 +834,10 @@ public struct SpeculativeSamplingController {
                 correction: nil)
         }
 
-        let roll = withRandomState(acceptanceState) {
-            MLXRandom.uniform(0.0 ..< 1.0).item(Float.self)
-        }
-        if roll <= acceptanceProbability {
+        let roll = acceptanceRoll()
+        // The draw's half-open interval includes zero. Equality must reject,
+        // otherwise alpha=0 can emit a token outside the target's support.
+        if roll < acceptanceProbability {
             return AcceptanceDecision(
                 accepted: true,
                 acceptanceProbability: acceptanceProbability,
