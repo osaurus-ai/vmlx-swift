@@ -178,6 +178,122 @@ final class UnitWeightCache: @unchecked Sendable {
     }
 }
 
+/// One quantized matmul for several projections that read the same input
+/// (q/k/v, gate/up). K2 bundles stamp each role group at one scheme
+/// (JANG_4M q/k/v 5-bit, gate/up 4-bit; JANGH7 8-bit / 6-bit), so the rows
+/// concatenate into a single weight and one dispatch replaces two or three.
+///
+/// RAM: the members are repointed at row views of the fused buffers, so the
+/// weights exist once — the originals are released, not kept for prefill.
+/// Exactness: each output row is the same dot product over K in the same
+/// order; `testFusedProjectionsAreBitIdentical` pins decode and prefill.
+/// `VMLX_K2_FUSED_PROJECTIONS=0` is the same-binary control.
+final class K2FusedProjection: @unchecked Sendable {
+    nonisolated(unsafe) static var enabledOverride: Bool?
+    /// Number of fused projections built in this process (tests, diagnostics).
+    nonisolated(unsafe) static var builtCount = 0
+    static var enabled: Bool {
+        enabledOverride ?? (RuntimeEnvironment.value("VMLX_K2_FUSED_PROJECTIONS") != "0")
+    }
+
+    /// Mirrors MLXNN's internal `QuantizedRuntime.propagatePromotedOutput`.
+    static let propagatePromotedOutput =
+        ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
+
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray?
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+    let splitIndices: [Int]
+
+    private init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?, groupSize: Int, bits: Int,
+        mode: QuantizationMode, splitIndices: [Int]
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.splitIndices = splitIndices
+    }
+
+    static func make(_ members: [Linear]) -> K2FusedProjection? {
+        guard enabled, !CompiledDecodeTrace.isActive, members.count >= 2 else { return nil }
+        let quantized = members.compactMap { $0 as? QuantizedLinear }
+        guard quantized.count == members.count, let first = quantized.first,
+            quantized.allSatisfy({
+                $0.groupSize == first.groupSize && $0.bits == first.bits && $0.mode == first.mode
+                    && $0.bias == nil && ($0.biases == nil) == (first.biases == nil)
+                    && $0.weight.dtype == first.weight.dtype
+                    && $0.scales.dtype == first.scales.dtype
+                    && $0.biases?.dtype == first.biases?.dtype
+            })
+        else { return nil }
+        let rows = quantized.map { $0.weight.dim(0) }
+        let weight = concatenated(quantized.map(\.weight), axis: 0)
+        let scales = concatenated(quantized.map(\.scales), axis: 0)
+        let biases = first.biases == nil ? nil : concatenated(quantized.map { $0.biases! }, axis: 0)
+        eval([weight, scales] + (biases.map { [$0] } ?? []))
+        // Repoint every member at its row range of the fused buffers (views:
+        // contiguous row slices share the buffer), dropping the originals.
+        var start = 0
+        var views: [MLXArray] = []
+        for (member, count) in zip(quantized, rows) {
+            let range = start ..< start + count
+            var parameters: [String: MLXArray] = [
+                "weight": weight[range], "scales": scales[range],
+            ]
+            if let biases { parameters["biases"] = biases[range] }
+            views.append(contentsOf: parameters.values)
+            member.update(parameters: ModuleParameters.unflattened(parameters))
+            start += count
+        }
+        eval(views)
+        var splits: [Int] = []
+        var running = 0
+        for count in rows.dropLast() {
+            running += count
+            splits.append(running)
+        }
+        builtCount += 1
+        return K2FusedProjection(
+            weight: weight, scales: scales, biases: biases, groupSize: first.groupSize,
+            bits: first.bits, mode: first.mode, splitIndices: splits)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> [MLXArray] {
+        var y = quantizedMM(
+            x, weight, scales: scales, biases: biases, transpose: true,
+            groupSize: groupSize, bits: bits, mode: mode)
+        // Same output-dtype pin as QuantizedLinear.callAsFunction.
+        if !Self.propagatePromotedOutput, y.dtype != x.dtype,
+            x.dtype == .bfloat16 || x.dtype == .float16
+        {
+            y = y.asType(x.dtype)
+        }
+        return split(y, indices: splitIndices, axis: -1)
+    }
+}
+
+/// Lazily built once per module; held outside the Module property graph so
+/// it is never reflected as parameters (the members keep the views).
+final class K2FusionSlot: @unchecked Sendable {
+    private var attempted = false
+    private var fused: K2FusedProjection?
+    func get(_ build: () -> K2FusedProjection?) -> K2FusedProjection? {
+        if attempted { return fused }
+        // Never build (eval) inside a compile trace; try again next call.
+        guard !CompiledDecodeTrace.isActive else { return nil }
+        attempted = true
+        fused = build()
+        return fused
+    }
+}
+
 final class K2Attention: Module {
     let heads: Int, kvHeads: Int, scale: Float
     let rope: RoPE
@@ -185,6 +301,7 @@ final class K2Attention: Module {
     @ModuleInfo(key: "k_proj") var wk: Linear
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
+    private let qkvFusion = K2FusionSlot()
     init(_ c: K2HorizonConfiguration) {
         heads = c.attentionHeads
         kvHeads = c.kvHeads
@@ -199,9 +316,11 @@ final class K2Attention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
-        var q = wq(x).reshaped(B, L, heads, -1).transposed(0, 2, 1, 3)
-        var k = wk(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-        let v = wv(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        let projected: [MLXArray] =
+            qkvFusion.get({ K2FusedProjection.make([wq, wk, wv]) })?(x) ?? [wq(x), wk(x), wv(x)]
+        var q = projected[0].reshaped(B, L, heads, -1).transposed(0, 2, 1, 3)
+        var k = projected[1].reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        let v = projected[2].reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
         q = applyRotaryPosition(rope, to: q, cache: cache)
         k = applyRotaryPosition(rope, to: k, cache: cache)
         let o = attentionWithCacheUpdate(
@@ -214,12 +333,18 @@ final class K2DenseMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
     @ModuleInfo(key: "down_proj") var down: Module
+    private let gateUpFusion = K2FusionSlot()
     init(_ d: Int, _ h: Int, down: JANGHDenseLinear? = nil) {
         _gate.wrappedValue = Linear(d, h, bias: false)
         _up.wrappedValue = Linear(d, h, bias: false)
         _down.wrappedValue = down ?? Linear(h, d, bias: false)
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { (down as! UnaryLayer)(silu(gate(x)) * up(x)) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let parts = gateUpFusion.get({ K2FusedProjection.make([gate, up]) })?(x) {
+            return (down as! UnaryLayer)(silu(parts[0]) * parts[1])
+        }
+        return (down as! UnaryLayer)(silu(gate(x)) * up(x))
+    }
 }
 
 /// Dense MLP stored as a one-expert routed stack (JANGH bundles).
