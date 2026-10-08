@@ -339,7 +339,7 @@ public class ToolCallProcessor {
             let inlineText = leadingTextBeforeToolCall + chunk
             leadingTextBeforeToolCall = ""
 
-            if let callIndex = firstInlineActionJSONToolCallStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineActionJSONToolCallStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .actionJSON
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -357,13 +357,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineActionJSONToolCallStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineActionJSONToolCallStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlineEmbeddedAPIToolJSONStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineEmbeddedAPIToolJSONStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .embeddedAPIToolJSON
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -381,13 +381,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineEmbeddedAPIToolJSONStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineEmbeddedAPIToolJSONStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlinePythonicCallListStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlinePythonicCallListStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .functionCall
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -403,13 +403,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlinePythonicCallListStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlinePythonicCallListStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlineFunctionToolCallStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineFunctionToolCallStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .functionCall
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -425,13 +425,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineFunctionToolCallStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineFunctionToolCallStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlineRequestToolXMLToolCallStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineRequestToolXMLToolCallStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .requestToolXML
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -449,13 +449,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineRequestToolXMLToolCallStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineRequestToolXMLToolCallStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlineBareNameJSONToolCallStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineBareNameJSONToolCallStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .bareNameJSON
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -471,13 +471,13 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineBareNameJSONToolCallStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineBareNameJSONToolCallStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
             }
 
-            if let callIndex = firstInlineBareNameKeyValueToolCallStart(in: inlineText) {
+            if let callIndex = outsideOpenJSONObject(firstInlineBareNameKeyValueToolCallStart(in: inlineText), in: inlineText) {
                 let leading = String(inlineText[..<callIndex])
                 inlineToolCallKind = .bareNameKeyValue
                 toolCallBuffer = String(inlineText[callIndex...])
@@ -495,7 +495,7 @@ public class ToolCallProcessor {
                     leading, afterConfirmedToolCall: state == .normal)
             }
 
-            if let pendingIndex = partialInlineBareNameKeyValueToolCallStart(in: inlineText) {
+            if let pendingIndex = outsideOpenJSONObject(partialInlineBareNameKeyValueToolCallStart(in: inlineText), in: inlineText) {
                 let visible = String(inlineText[..<pendingIndex])
                 leadingTextBeforeToolCall = String(inlineText[pendingIndex...])
                 return visible.isEmpty ? nil : visible
@@ -509,7 +509,9 @@ public class ToolCallProcessor {
                 toolCallBuffer = jsonPart
                 state = .collectingInlineToolCall
 
-                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                if jsonObjectComplete(toolCallBuffer),
+                    let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                {
                     recordToolCall(toolCall)
                     toolCallBuffer = ""
                     state = .normal
@@ -632,9 +634,86 @@ public class ToolCallProcessor {
         case .actionJSON, .requestToolXML, .embeddedAPIToolJSON, .bareNameKeyValue,
             .bareJSONArray:
             return inlineToolCallComplete(text)
-        case .json, .functionCall, .bareCall, .bareNameJSON:
+        case .json:
+            // Parsers repair a missing closing brace or two at END of stream
+            // (`parseJSONObjectWithOptionalEOFBrace`). Mid-stream that repair
+            // turned `{"name": "get_weather", "parameters": {` into a
+            // committed call with EMPTY arguments, and the rest of the object
+            // leaked as visible text (Llama 3 inline JSON). Parse only once the
+            // object has closed; truncated objects still reach the repair via
+            // `processEOS` → `parseEOS`.
+            return jsonObjectComplete(text)
+        case .functionCall, .bareCall, .bareNameJSON:
             return true
         }
+    }
+
+    /// A detector position that falls INSIDE a JSON object which has opened
+    /// but not closed yet is not a call start: it is a fragment of that
+    /// object (`{"name": "calc` is the tool name inside a Llama 3 JSON call,
+    /// `"expression": "r = 3` a string value). Claiming it split the object
+    /// apart and the whole call leaked as text. Objects that already closed
+    /// before the position (`Use {x} then get_weather(...)`) do not count.
+    private func outsideOpenJSONObject(_ index: String.Index?, in text: String) -> String.Index? {
+        guard let index else { return nil }
+        var cursor = text.startIndex
+        while cursor < index, let open = text[cursor..<index].firstIndex(of: "{") {
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var position = open
+            var closedAt: String.Index?
+            while position < text.endIndex {
+                let ch = text[position]
+                if inString {
+                    if escaped { escaped = false } else if ch == "\\" { escaped = true } else if ch == "\"" { inString = false }
+                } else if ch == "\"" {
+                    inString = true
+                } else if ch == "{" {
+                    depth += 1
+                } else if ch == "}" {
+                    depth -= 1
+                    if depth == 0 { closedAt = position; break }
+                }
+                position = text.index(after: position)
+            }
+            guard let closedAt, closedAt < index else { return nil }
+            cursor = text.index(after: closedAt)
+        }
+        return index
+    }
+
+    /// True once the first top-level JSON object in `text` has closed,
+    /// ignoring braces inside string literals (an argument such as
+    /// `"if (a) {"` must not count).
+    private func jsonObjectComplete(_ text: String) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var opened = false
+        for ch in text {
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if ch == "\\" {
+                    escaped = true
+                } else if ch == "\"" {
+                    inString = false
+                }
+                continue
+            }
+            switch ch {
+            case "\"": inString = true
+            case "{":
+                depth += 1
+                opened = true
+            case "}":
+                depth -= 1
+                if opened, depth == 0 { return true }
+            default: break
+            }
+        }
+        return false
     }
 
     private func bareCallBracesBalanced(_ text: String) -> Bool {
