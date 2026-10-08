@@ -115,6 +115,28 @@ final class K2HorizonModelTests: XCTestCase {
         }
     }
 
+    /// Cold grouped normalization through the unscoped compile closure used by
+    /// BatchCompile.compileForward. No checkpoint or model allocation is needed.
+    func testColdGroupedNormBatchCompileTrace() throws {
+        try MLXMetalTestLock.withLock {
+            let norm = K2GroupedRMSNorm(dimensions: 8, groups: 4, eps: 1e-6)
+            let x = MLXArray([Float(1), 2, 3, 4, 5, 6, 7, 8], [1, 1, 8])
+            eval(x, norm.weight)
+            // Do not run norm eagerly first: that would conceal a cold-cache
+            // eval during tracing by warming the dtype/count entry.
+            let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile {
+                (args: [MLXArray]) -> [MLXArray] in [norm(args[0])]
+            }
+            let actual = forward([x])[0]
+            eval(actual)
+            let expected = MLXFast.rmsNorm(
+                x.reshaped([1, 1, 4, 2]), weight: MLXArray.ones([2]), eps: 1e-6
+            ).reshaped(x.shape) * norm.weight
+            XCTAssertEqual(actual.shape, x.shape)
+            XCTAssertTrue(MLX.all(actual .== expected).item(Bool.self))
+        }
+    }
+
     private func deterministicModel(dtype: DType = .float32) throws -> K2HorizonModel {
         let model = try K2HorizonModel(configuration())
         var weights: [String: MLXArray] = [:]
