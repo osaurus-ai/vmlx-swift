@@ -87,6 +87,56 @@ final class K2HorizonModelTests: XCTestCase {
         }
     }
 
+    /// Fused q/k/v and gate/up must reproduce the separate projections bit for
+    /// bit (prefill and cached decode) and must not keep a second copy of the
+    /// weights alive.
+    func testFusedProjectionsAreBitIdenticalAndMemoryNeutral() throws {
+        try MLXMetalTestLock.withLock {
+            defer { K2FusedProjection.enabledOverride = nil }
+            let c = try configuration([
+                "hidden_size": 128, "intermediate_size": 256, "head_dim": 32,
+                "num_attention_heads": 4, "num_key_value_heads": 2,
+            ])
+            func run(fused: Bool) throws -> (logits: [MLXArray], weightBytes: Int, delta: Int) {
+                K2FusedProjection.enabledOverride = fused
+                let builtBefore = K2FusedProjection.builtCount
+                defer {
+                    // 2 layers x (q/k/v + gate/up) when fused, none otherwise.
+                    XCTAssertEqual(K2FusedProjection.builtCount - builtBefore, fused ? 4 : 0)
+                }
+                let model = try deterministicModel(dtype: .bfloat16, configuration: c)
+                quantize(model: model, groupSize: 64, bits: 5)
+                eval(model.parameters())
+                let weightBytes = model.parameters().flattenedValues().reduce(0) { $0 + $1.nbytes }
+                MLX.Memory.clearCache()
+                let before = MLX.Memory.activeMemory
+                let tokens = MLXArray([Int32(1), 5, 7, 3, 11, 6, 2, 9, 4], [1, 9])
+                let cache = model.newCache(parameters: nil)
+                var logits = [model(tokens[0..., 0 ..< 6], cache: cache)]
+                for i in 6 ..< 9 { logits.append(model(tokens[0..., i ..< i + 1], cache: cache)) }
+                eval(logits)
+                MLX.Memory.clearCache()
+                let delta = MLX.Memory.activeMemory - before
+                XCTAssertEqual(
+                    model.parameters().flattenedValues().reduce(0) { $0 + $1.nbytes }, weightBytes,
+                    "parameter bytes changed after fusion")
+                return (logits, weightBytes, delta)
+            }
+            let plain = try run(fused: false)
+            let fused = try run(fused: true)
+            for (a, b) in zip(plain.logits, fused.logits) {
+                XCTAssertEqual(a.shape, b.shape)
+                XCTAssertTrue(
+                    MLX.all(a.view(dtype: .uint16) .== b.view(dtype: .uint16)).item(Bool.self),
+                    "fused logits differ")
+            }
+            // No second copy of the weights: the fused run's resident growth
+            // (KV cache + logits) stays within a small fraction of the weights.
+            XCTAssertLessThan(fused.delta - plain.delta, plain.weightBytes / 10,
+                "fusion kept extra weight memory: plain \(plain.delta) fused \(fused.delta) weights \(plain.weightBytes)")
+        }
+    }
+
     /// The cached unit weight must not change a single bit versus building
     /// `ones` per call (the previous implementation).
     func testGroupedNormCachedUnitWeightIsBitIdentical() throws {
@@ -115,8 +165,10 @@ final class K2HorizonModelTests: XCTestCase {
         }
     }
 
-    private func deterministicModel(dtype: DType = .float32) throws -> K2HorizonModel {
-        let model = try K2HorizonModel(configuration())
+    private func deterministicModel(
+        dtype: DType = .float32, configuration c: K2HorizonConfiguration? = nil
+    ) throws -> K2HorizonModel {
+        let model = try K2HorizonModel(c ?? configuration())
         var weights: [String: MLXArray] = [:]
         for (name, parameter) in model.parameters().flattened() {
             let seed: Int = name.utf8.reduce(0) { $0 + Int($1) }
