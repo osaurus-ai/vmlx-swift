@@ -69,7 +69,8 @@ struct K2HorizonJANGHPreparation {
         }
         if let dense {
             return try K2HorizonModel(
-                configuration, routedFactory: nil, denseDown: dense.makeProjections(),
+                configuration, routedFactory: nil,
+                denseDown: dense.makeProjections(fastDecode: true),
                 excludedSafetensorsKeys: dense.excludedTensorNames)
         }
         let banks = try routed!.makeRoutedExperts(activationLimit: nil)

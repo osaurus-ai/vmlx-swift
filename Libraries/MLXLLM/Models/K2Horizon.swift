@@ -138,6 +138,12 @@ public struct K2HorizonConfiguration: Codable, Sendable {
 final class K2GroupedRMSNorm: Module, UnaryLayer {
     let weight: MLXArray
     let groups: Int, eps: Float
+    /// The per-group unit weight `MLXFast.rmsNorm` requires. Built once per
+    /// dtype and reused: creating it inside `callAsFunction` added a fill
+    /// kernel to every norm (73 per decoded token on the 7B). Same values,
+    /// same call, so the output is bit-identical. Held outside the Module
+    /// property graph so it is never mistaken for a checkpoint parameter.
+    private let unitWeights = UnitWeightCache()
     init(dimensions: Int, groups: Int, eps: Float) {
         weight = MLXArray.ones([dimensions])
         self.groups = groups
@@ -149,8 +155,26 @@ final class K2GroupedRMSNorm: Module, UnaryLayer {
         let d = shape.removeLast()
         let y = MLXFast.rmsNorm(
             x.reshaped(shape + [groups, d / groups]),
-            weight: MLXArray.ones([d / groups], dtype: x.dtype), eps: eps)
+            weight: unitWeights.ones(count: d / groups, dtype: x.dtype), eps: eps)
         return y.reshaped(x.shape) * weight
+    }
+}
+
+final class UnitWeightCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var arrays: [String: MLXArray] = [:]
+    func ones(count: Int, dtype: DType) -> MLXArray {
+        // `eval` is illegal inside a compile trace; a traced graph builds its
+        // constant once anyway, so trace without touching the cache.
+        if CompiledDecodeTrace.isActive { return MLXArray.ones([count], dtype: dtype) }
+        let key = "\(count)|\(dtype)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = arrays[key] { return cached }
+        let created = MLXArray.ones([count], dtype: dtype)
+        eval(created)
+        arrays[key] = created
+        return created
     }
 }
 
