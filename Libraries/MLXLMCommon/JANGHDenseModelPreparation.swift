@@ -150,10 +150,17 @@ public final class JANGHDenseModelPreparation {
             partition.customModules.flatMap { [$0 + ".tq2_packed", $0 + ".tq2_scales"] })
     }
 
-    public func makeProjections() throws -> [Int: JANGHDenseLinear] {
+    /// K2 dense-down projections. `fastDecode` admits the bit-exact fast QMV
+    /// for single-row decode (each geometry/dtype is compared bitwise against
+    /// the generic kernel before use, falling back on any mismatch). The
+    /// prefill tile is unchanged: the dense split-K tile is speed-first, not
+    /// bitwise, and K2 has not been qualified on it.
+    public func makeProjections(fastDecode: Bool = false) throws -> [Int: JANGHDenseLinear] {
         let banks = try JANGHMappedBanks(source: source)
         return try modules.mapValues {
-            try JANGHDenseLinear(banks: banks, module: $0, inputDimensions: inputDimensions)
+            try JANGHDenseLinear(
+                banks: banks, module: $0, inputDimensions: inputDimensions,
+                fastDecode: fastDecode)
         }
     }
 }
@@ -180,7 +187,8 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
 
     init(
         banks: JANGHMappedBanks, module: String, inputDimensions: Int,
-        sortedThreshold: Int = 64, qwen35Optimizations: Bool = false
+        sortedThreshold: Int = 64, qwen35Optimizations: Bool = false,
+        fastDecode: Bool? = nil
     ) throws {
         self.sortedThreshold = Swift.max(1, sortedThreshold)
         let bank = try banks.projection(module)
@@ -196,7 +204,7 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
         let bits = banks.contract.projections[module]!.bits
         let book = banks.contract.codebooks[bits]
         fast =
-            (qwen35Optimizations && book != nil
+            ((fastDecode ?? qwen35Optimizations) && book != nil
                 && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
             ? JANGHDenseFastQMV(bits: bits, alpha: book!.alpha, beta: book!.beta) : nil
         fastKey =
