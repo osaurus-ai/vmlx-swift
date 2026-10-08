@@ -209,6 +209,17 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
+    /// Greedy requests on targets that require it verify with one-token
+    /// forwards (bit-identical to AR) and stop at the first rejection.
+    /// Sampled requests always verify in one batched forward: rejection
+    /// sampling preserves the target distribution under either rounding.
+    private let sequentialVerify: Bool
+    /// Diagnostic only (`VMLX_DFLASH2_SYNC_PHASE_TIMING=1`): drain the GPU at
+    /// each phase edge so draft/verify seconds are GPU work, not the host
+    /// waiting on an earlier dispatch. Serializes the pipeline; never on in
+    /// normal runs.
+    private let syncPhaseTiming =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_SYNC_PHASE_TIMING"] == "1"
     /// Per-cycle verify width chooser (nil = fixed `blockSize`).
     private var widthChooser: DFlash2WidthChooser?
 
@@ -393,7 +404,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // DFlash2 decodes only through multi-row verify forwards. MLX's quantized matmul switches
         // kernels with the row count; the lane matmul (LaneQMM.swift, Metal 4 matrix units) costs about
         // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
-        if !target.requiresSequentialDFlash2Verification {
+        // Sequential verification keeps the ordinary decode kernels, so the
+        // lane matmul is installed only when this request verifies batched.
+        let sequential = target.requiresSequentialDFlash2Verification
+            && effectiveParameters.temperature <= 0
+        self.sequentialVerify = sequential
+        if !sequential {
             LaneQMM.installForDFlash2Target(target)
         }
 
@@ -760,7 +776,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // makes the commit lazy and an in-flight verify abandonable, so it
         // is what verify prefetch needs. Compiling the traced forward is a
         // separate opt-in below.
-        if !target.requiresSequentialDFlash2Verification,
+        if !sequential,
             target is DFlash2StagedVerifyRollbackModel,
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_STAGED_VERIFY"] != "0"
         {
@@ -1031,6 +1047,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // credits collapsing to one host sync per cycle for a large share
         // of its speedup — this loop previously paid three.
         asyncEval(proposal.tokens)
+        if syncPhaseTiming { eval(proposal.tokens) }
         stats.draftSeconds += Date.timeIntervalSinceReferenceDate - draftStart
 
         // The sliding clip inside drafter attention can advance the cache
@@ -1078,13 +1095,40 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var logits: MLXArray
         var greedyTargetIds: MLXArray? = nil
         let newHidden: MLXArray
-        if target.requiresSequentialDFlash2Verification {
-            let result = target.sequentialDFlash2Verify(
-                verifyInput, cache: cache, captureLayerIDs: captureLayerIDs)
-            logits = result.logits
+        var verifyRows = verifyInput.dim(1)
+        if sequentialVerify {
+            // One-token forwards, in the AR decode shape. A row whose argmax
+            // disagrees with the next draft token is the last one that can be
+            // committed, so later rows are never computed (the old path ran
+            // every row and trimmed them again).
+            let draftIDs = draftTokens.reshaped(-1).asArray(Int32.self)
+            var rowLogits: [MLXArray] = []
+            var rowTargets: [MLXArray] = []
+            var rowHidden: [Int: [MLXArray]] = [:]
+            var input = Int32(lastToken)
+            for row in 0 ..< verifyInput.dim(1) {
+                let result = target.callAsFunction(
+                    MLXArray([input]).reshaped(1, 1), cache: cache,
+                    captureLayerIDs: captureLayerIDs)
+                let targetID = argMax(result.logits, axis: -1)
+                eval(targetID)
+                rowLogits.append(result.logits)
+                rowTargets.append(targetID)
+                for id in captureLayerIDs {
+                    rowHidden[id, default: []].append(result.capturedHiddenStates[id]!)
+                }
+                guard row < draftIDs.count, targetID.item(Int32.self) == draftIDs[row] else {
+                    break
+                }
+                input = draftIDs[row]
+            }
+            verifyRows = rowLogits.count
+            logits = concatenated(rowLogits, axis: 1)
+            greedyTargetIds = concatenated(rowTargets, axis: 1)
             newHidden = extractContextFeature(
-                captured: result.capturedHiddenStates, targetLayerIDs: orderedLayerIDs)
-            stats.sequentialVerificationSteps += verifyInput.dim(1)
+                captured: rowHidden.mapValues { concatenated($0, axis: 1) },
+                targetLayerIDs: orderedLayerIDs)
+            stats.sequentialVerificationSteps += verifyRows
         } else if stagedCycle {
             if !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
@@ -1138,6 +1182,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         } else {
             asyncEval(logits, newHidden)
         }
+        if syncPhaseTiming {
+            if let greedyTargetIds { eval(greedyTargetIds, newHidden) } else { eval(logits, newHidden) }
+        }
         let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
         stats.verifySeconds += cycleVerifySeconds
         stats.verifyCalls += 1
@@ -1146,7 +1193,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             blockSize: bs,
             proposal: proposal,
             draftTokens: draftTokens,
-            verifyRows: verifyInput.dim(1),
+            verifyRows: verifyRows,
             logits: logits,
             greedyTargetIds: greedyTargetIds,
             newHidden: newHidden,
