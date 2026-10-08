@@ -74,6 +74,15 @@ public protocol HiddenStateCaptureModel: LanguageModel {
 
     /// Whether `recordPrefixCommitStates: true` is actually honoured.
     var supportsCapturingPrefixCommitRecording: Bool { get }
+
+    /// Dense targets whose multi-row quantized kernels change greedy token
+    /// choices can require verification using ordinary one-token forwards.
+    /// This preserves the decode numerical path at a throughput cost.
+    var requiresSequentialDFlash2Verification: Bool { get }
+    /// Most DFlash targets follow the Python last-token prefill split.
+    /// Targets using LLMModel.prepare's whole final chunk can opt out so
+    /// their first logits and KV rows match ordinary Swift generation.
+    var dflash2PrefillSeparatesFinalToken: Bool { get }
 }
 
 extension HiddenStateCaptureModel {
@@ -96,6 +105,28 @@ extension HiddenStateCaptureModel {
     }
 
     public var supportsCapturingPrefixCommitRecording: Bool { false }
+    public var requiresSequentialDFlash2Verification: Bool { false }
+    public var dflash2PrefillSeparatesFinalToken: Bool { true }
+
+    /// Verify a proposed chain using the same forward shape as AR decode.
+    /// Only trimmable dense caches are supported; rejected suffixes are
+    /// subsequently trimmed by the iterator's existing commit path.
+    public func sequentialDFlash2Verify(
+        _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        precondition(inputs.dim(1) > 0 && cache.allSatisfy { $0.isTrimmable })
+        var logits: [MLXArray] = []
+        var hidden: [Int: [MLXArray]] = [:]
+        for i in 0 ..< inputs.dim(1) {
+            let result = callAsFunction(
+                inputs[0..., i ..< (i + 1)], cache: cache, captureLayerIDs: captureLayerIDs)
+            logits.append(result.logits)
+            for id in captureLayerIDs {
+                hidden[id, default: []].append(result.capturedHiddenStates[id]!)
+            }
+        }
+        return (concatenated(logits, axis: 1), hidden.mapValues { concatenated($0, axis: 1) })
+    }
 }
 
 /// Given a target model that conforms to ``HiddenStateCaptureModel``,

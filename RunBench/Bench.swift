@@ -596,6 +596,10 @@ struct Bench {
             try await runRowCostBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DIPLODOC"] ?? "0") == "1" {
+            try await runDiplodocusQualification(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_SPEED"] ?? "0") == "1" {
             try await runSpeedProbe(modelPath: modelPath)
             return

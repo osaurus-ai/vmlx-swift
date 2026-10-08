@@ -72,6 +72,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     /// Cycles verified as a draft TREE (DFlash2Tree.swift) instead of a chain.
     public var treeCycles: Int = 0
     public var verifyCalls: Int = 0
+    /// One-token target forwards used by numerical-compatibility verification.
+    public var sequentialVerificationSteps: Int = 0
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
     public var emittedTokens: Int = 0
@@ -81,7 +83,7 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var verifySeconds: Double = 0
     public var commitSeconds: Double = 0
 
-    /// Mean number of tokens committed per target forward. 1.0 means the
+    /// Mean number of tokens committed per verification cycle. 1.0 means the
     /// drafter contributed nothing; the ceiling is `blockSize`.
     public var acceptanceLength: Double {
         verifyCalls > 0 ? Double(emittedTokens) / Double(verifyCalls) : 0
@@ -391,7 +393,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // DFlash2 decodes only through multi-row verify forwards. MLX's quantized matmul switches
         // kernels with the row count; the lane matmul (LaneQMM.swift, Metal 4 matrix units) costs about
         // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
-        LaneQMM.installForDFlash2Target(target)
+        if !target.requiresSequentialDFlash2Verification {
+            LaneQMM.installForDFlash2Target(target)
+        }
 
         self.target = target
         self.drafter = drafter
@@ -756,7 +760,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // makes the commit lazy and an in-flight verify abandonable, so it
         // is what verify prefetch needs. Compiling the traced forward is a
         // separate opt-in below.
-        if target is DFlash2StagedVerifyRollbackModel,
+        if !target.requiresSequentialDFlash2Verification,
+            target is DFlash2StagedVerifyRollbackModel,
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_STAGED_VERIFY"] != "0"
         {
             self.useStagedVerify = true
@@ -818,7 +823,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // Leave the final token to its own chunk so the last logits
             // row is the one the first sample comes from, matching the
             // reference's `min(step_size, remaining - 1)`.
-            var take = remaining == 1 ? 1 : Swift.min(step, remaining - 1)
+            var take = target.dflash2PrefillSeparatesFinalToken
+                ? (remaining == 1 ? 1 : Swift.min(step, remaining - 1))
+                : Swift.min(step, remaining)
             // Force a chunk edge at the capture boundary so the snapshot
             // is the state after EXACTLY that many tokens — a snapshot
             // taken mid-chunk would describe a prefix no key ever matches.
@@ -1071,7 +1078,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var logits: MLXArray
         var greedyTargetIds: MLXArray? = nil
         let newHidden: MLXArray
-        if stagedCycle {
+        if target.requiresSequentialDFlash2Verification {
+            let result = target.sequentialDFlash2Verify(
+                verifyInput, cache: cache, captureLayerIDs: captureLayerIDs)
+            logits = result.logits
+            newHidden = extractContextFeature(
+                captured: result.capturedHiddenStates, targetLayerIDs: orderedLayerIDs)
+            stats.sequentialVerificationSteps += verifyInput.dim(1)
+        } else if stagedCycle {
             if !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.

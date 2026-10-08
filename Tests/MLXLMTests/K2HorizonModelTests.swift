@@ -349,4 +349,97 @@ final class K2HorizonModelTests: XCTestCase {
         let c = try configuration(["mlp_layout": "dense_jangh_down"])
         XCTAssertThrowsError(try K2HorizonModel(c))
     }
+
+    func testDFlashCaptureUsesBlockOutputsAndSharedUntiedHead() throws {
+        try MLXMetalTestLock.withLock {
+            try Device.withDefaultDevice(.cpu) {
+                let target = try deterministicModel()
+                let ids = MLXArray([Int32(1), 5, 7], [1, 3])
+                let result = target(ids, cache: nil, captureLayerIDs: [0, 1])
+                XCTAssertEqual(Set(result.capturedHiddenStates.keys), [0, 1])
+                let reference = MLXArray(
+                    scalarReference(model: target, ids: [1, 5, 7]), [1, 3, 64])
+                XCTAssertLessThan(abs(result.logits - reference).max().item(Float.self), 2e-4)
+                let plain = target(ids, cache: nil)
+                XCTAssertTrue(all(plain .== result.logits).item(Bool.self))
+                XCTAssertTrue(target(ids, cache: nil, captureLayerIDs: []).capturedHiddenStates.isEmpty)
+
+                var hidden = target.embed(ids)
+                XCTAssertTrue(all(hidden .== target.model.embedTokens(ids)).item(Bool.self))
+                let mask = createAttentionMask(h: hidden, cache: nil)
+                for (index, layer) in target.model.layers.enumerated() {
+                    hidden = layer(hidden, mask: mask, cache: nil)
+                    XCTAssertTrue(
+                        all(hidden .== result.capturedHiddenStates[index]!).item(Bool.self))
+                }
+                let feature = extractContextFeature(
+                    captured: result.capturedHiddenStates, targetLayerIDs: [1, 0])
+                XCTAssertTrue(all(feature .== concatenated([
+                    result.capturedHiddenStates[1]!, result.capturedHiddenStates[0]!,
+                ], axis: -1)).item(Bool.self))
+                XCTAssertTrue(all(
+                    target.projectToLogits(target.model.norm(hidden)) .== result.logits
+                ).item(Bool.self))
+            }
+        }
+    }
+
+    func testDFlashCapturedVerifySuffixCanBeTrimmedAndContinued() throws {
+        try MLXMetalTestLock.withLock {
+            try Device.withDefaultDevice(.cpu) {
+                let target = try deterministicModel()
+                let cache = target.newCache(parameters: nil)
+                let prefix = MLXArray([Int32(1), 5, 7], [1, 3])
+                eval(target(prefix, cache: cache, captureLayerIDs: [0, 1]).logits)
+                let proposals = MLXArray([Int32(3), 11, 6], [1, 3])
+                eval(target(proposals, cache: cache, captureLayerIDs: [0, 1]).logits)
+                // Accept the first proposal, reject the remaining two.
+                XCTAssertEqual(trimPromptCache(cache, numTokens: 2), 2)
+                XCTAssertTrue(cache.allSatisfy { $0.offset == 4 })
+                let next = MLXArray([Int32(2)], [1, 1])
+                let continued = target(next, cache: cache, captureLayerIDs: [0, 1])
+                let fresh = target.newCache(parameters: nil)
+                eval(target(MLXArray([Int32(1), 5, 7, 3], [1, 4]), cache: fresh))
+                let expected = target(next, cache: fresh, captureLayerIDs: [0, 1])
+                XCTAssertLessThan(
+                    abs(continued.logits - expected.logits).max().item(Float.self), 2e-4)
+                for index in [0, 1] {
+                    XCTAssertLessThan(abs(
+                        continued.capturedHiddenStates[index]! - expected.capturedHiddenStates[index]!
+                    ).max().item(Float.self), 2e-4)
+                }
+                XCTAssertTrue(cache.allSatisfy { $0.offset == 5 })
+            }
+        }
+    }
+
+    func testDFlashSequentialVerificationMatchesARAndRollback() throws {
+        try MLXMetalTestLock.withLock {
+            try Device.withDefaultDevice(.cpu) {
+                let target = try deterministicModel()
+                XCTAssertTrue(target.requiresSequentialDFlash2Verification)
+                XCTAssertFalse(target.dflash2PrefillSeparatesFinalToken)
+                let cache = target.newCache(parameters: nil)
+                let reference = target.newCache(parameters: nil)
+                let prefix = MLXArray([Int32(1), 5, 7], [1, 3])
+                eval(target(prefix, cache: cache), target(prefix, cache: reference))
+                let verified = target.sequentialDFlash2Verify(
+                    MLXArray([Int32(3), 11, 6], [1, 3]), cache: cache, captureLayerIDs: [0, 1])
+                var expected: [MLXArray] = []
+                for token: Int32 in [3, 11, 6] {
+                    let logits = target(MLXArray([token], [1, 1]), cache: reference)
+                    eval(logits)
+                    expected.append(logits)
+                }
+                XCTAssertTrue(all(verified.logits .== concatenated(expected, axis: 1)).item(Bool.self))
+                XCTAssertEqual(verified.capturedHiddenStates[0]?.dim(1), 3)
+                XCTAssertEqual(verified.capturedHiddenStates[1]?.dim(1), 3)
+                XCTAssertEqual(trimPromptCache(cache, numTokens: 2), 2)
+                XCTAssertEqual(trimPromptCache(reference, numTokens: 2), 2)
+                let next = MLXArray([Int32(2)], [1, 1])
+                XCTAssertTrue(all(target(next, cache: cache) .== target(next, cache: reference)).item(Bool.self))
+                XCTAssertTrue(cache.allSatisfy { $0.offset == 5 })
+            }
+        }
+    }
 }

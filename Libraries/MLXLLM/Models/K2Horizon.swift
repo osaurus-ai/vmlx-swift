@@ -282,17 +282,33 @@ public final class K2HorizonModelInner: Module {
             dimensions: c.hiddenSize, groups: c.layerNormGroups, eps: c.rmsNormEps)
     }
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunctionCapturing(inputs, cache: cache, captureLayerIDs: []).0
+    }
+
+    func callAsFunctionCapturing(
+        _ inputs: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
         var h = embedTokens(inputs)
         let mask = createAttentionMask(h: h, cache: cache?.first)
-        for (i, layer) in layers.enumerated() { h = layer(h, mask: mask, cache: cache?[i]) }
-        return norm(h)
+        var captured: [Int: MLXArray] = [:]
+        captured.reserveCapacity(captureLayerIDs.count)
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+            // DFlash indexes decoder OUTPUTS before the final grouped norm.
+            if captureLayerIDs.contains(i) { captured[i] = h }
+        }
+        return (norm(h), captured)
     }
 }
 
-public final class K2HorizonModel: Module, LLMModel, KVCacheDimensionProvider {
+public final class K2HorizonModel: Module, LLMModel, KVCacheDimensionProvider,
+    HiddenStateCaptureModel, TokenEmbedderModel
+{
     public typealias RoutedFactory = (Int) throws -> (Module & WeightedRoutedExpertLayer)
     public let vocabularySize: Int
     public let kvHeads: [Int]
+    public var requiresSequentialDFlash2Verification: Bool { true }
+    public var dflash2PrefillSeparatesFinalToken: Bool { false }
     let configuration: K2HorizonConfiguration
     let excludedSafetensorsKeys: Set<String>
     public let model: K2HorizonModelInner
@@ -322,8 +338,24 @@ public final class K2HorizonModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let h = model(inputs, cache: cache)
-        if let lmHead { return lmHead(h) }
-        return model.embedTokens.asLinear(h)
+        return projectToLogits(h)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        let (h, captured) = model.callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        return (projectToLogits(h), captured)
+    }
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        model.embedTokens(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead { return lmHead(hidden) }
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

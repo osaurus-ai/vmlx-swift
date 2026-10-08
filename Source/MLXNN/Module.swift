@@ -665,7 +665,10 @@ open class Module {
                 // - var modules: [TransformerBlock]
                 //      - recurse into
 
-                switch values.first {
+                // Sparse replacements can begin after array index zero (for
+                // example, only layer 1 supports a selected quantized kernel).
+                // Leading holes do not determine the container update kind.
+                switch values.first(where: { if case .none = $0 { return false }; return true }) {
                 case .value:
                     // update array
                     var newModules = [Module]()
@@ -715,6 +718,8 @@ open class Module {
                                 base: describeType(self), key: key)
                         }
                     }
+                case .none:
+                    break
                 default:
                     throw UpdateError.unexpectedStructure(key: key, item: self.description)
                 }
