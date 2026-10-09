@@ -117,4 +117,52 @@ final class QwenImage21Tests: XCTestCase {
         XCTAssertTrue(store.hasKey("text_encoder", "language_model.embed_tokens.weight"))
         XCTAssertFalse(store.hasKey("transformer", "language_model.embed_tokens.weight"))
     }
+
+    // MARK: Turbo
+
+    func testTurboBundlesRouteToTheTurboEntryBeforeQwenImage21() {
+        for name in [
+            "Qwen-Image-2.1-Turbo-mflux-8bit", "OsaurusAI/Qwen-Image-2.1-Turbo-mflux-4bit",
+            "qwen-image-21-turbo", "Qwen-Image-2.1-Turbo",
+        ] {
+            XCTAssertEqual(MLXStudioModelStore.canonicalName(for: name), "qwen-image-2.1-turbo", name)
+        }
+        XCTAssertEqual(MLXStudioModelStore.canonicalName(for: "Qwen-Image-2.1-mflux-8bit"), "qwen-image-2.1")
+        // Z-Image-Turbo is not a Qwen-Image-2.1 bundle.
+        XCTAssertEqual(MLXStudioModelStore.canonicalName(for: "Z-Image-Turbo-mflux-4bit"), "z-image-turbo")
+    }
+
+    func testTurboRegistryDefaultsAreEightStepsWithoutCFG() throws {
+        _ = QwenImage21._register
+        let entry = try XCTUnwrap(ModelRegistry.lookup(name: "qwen-image-2.1-turbo"))
+        XCTAssertEqual(entry.kind, .imageGen)
+        XCTAssertEqual(entry.defaultSteps, 8)
+        XCTAssertEqual(entry.defaultGuidance, 1.0)
+        let fuzzy = try XCTUnwrap(ModelRegistry.lookupFuzzy(name: "Qwen-Image-2.1-Turbo-mflux-6bit"))
+        XCTAssertEqual(fuzzy.name, "qwen-image-2.1-turbo")
+        XCTAssertEqual(fuzzy.defaultSteps, 8)
+    }
+
+    /// The Turbo bundle's model_index.json carries `sample_sigmas`; they are used unshifted with a
+    /// terminal 0 (diffusers FlowMatchEulerDiscreteScheduler with shift 1.0, no dynamic or terminal shift).
+    func testSampleSigmasFromModelIndexAreUsedUnshiftedWithTerminalZero() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("q21-turbo-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let grid: [Double] = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+        let index: [String: Any] = ["_class_name": "QwenImage21Pipeline", "sample_sigmas": grid]
+        try JSONSerialization.data(withJSONObject: index).write(to: dir.appendingPathComponent("model_index.json"))
+        let parsed = try XCTUnwrap(QwenImage21Schedule.sampleSigmas(modelPath: dir))
+        XCTAssertEqual(parsed.count, 8)
+        let sigmas = QwenImage21Schedule.sigmas(grid: parsed).asArray(Float.self)
+        XCTAssertEqual(sigmas.count, 9)
+        for (a, b) in zip(sigmas, grid + [0]) { XCTAssertEqual(Double(a), b, accuracy: 1e-6) }
+        // A Qwen-Image-2.1 bundle (no grid) keeps the shifted linear schedule.
+        let plain = FileManager.default.temporaryDirectory
+            .appendingPathComponent("q21-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["_class_name": "QwenImage21Pipeline"])
+            .write(to: plain.appendingPathComponent("model_index.json"))
+        XCTAssertNil(QwenImage21Schedule.sampleSigmas(modelPath: plain))
+    }
 }
