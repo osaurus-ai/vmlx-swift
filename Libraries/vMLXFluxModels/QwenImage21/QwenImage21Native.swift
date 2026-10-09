@@ -18,6 +18,7 @@
 //   - timestep quantized through bf16 before the time embedding
 //
 
+import CoreFoundation
 import Foundation
 @preconcurrency import MLX
 import MLXNN
@@ -1114,13 +1115,26 @@ enum QwenImage21Schedule {
     /// nodes). Diffusers (PR #14950) passes it to FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas:);
     /// with the Turbo scheduler config (shift 1.0, no dynamic shifting, no terminal shift) the nodes are
     /// used unchanged and a terminal 0 is appended. Nil when the bundle defines no grid (Qwen-Image-2.1).
-    static func sampleSigmas(modelPath: URL) -> [Float]? {
+    static func sampleSigmas(modelPath: URL) throws -> [Float]? {
         let url = modelPath.appendingPathComponent("model_index.json")
-        guard let data = try? Data(contentsOf: url),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let values = json["sample_sigmas"] as? [NSNumber], values.count >= 2
-        else { return nil }
-        return values.map { $0.floatValue }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FluxError.invalidRequest("Qwen-Image-2.1 model_index.json must be an object.")
+        }
+        guard let raw = json["sample_sigmas"] else { return nil }
+        guard let values = raw as? [NSNumber], values.count >= 2,
+            values.allSatisfy({ CFGetTypeID($0) != CFBooleanGetTypeID() })
+        else {
+            throw FluxError.invalidRequest("sample_sigmas must contain at least two numeric sigma nodes.")
+        }
+        let grid = values.map { $0.floatValue }
+        guard grid.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 1 }),
+            zip(grid, grid.dropFirst()).allSatisfy({ $0.0 > $0.1 })
+        else {
+            throw FluxError.invalidRequest("sample_sigmas must be finite, strictly decreasing nodes in (0, 1].")
+        }
+        return grid
     }
 
     /// Fixed grid + terminal 0, unshifted.
@@ -1199,9 +1213,9 @@ final class QwenImage21Pipeline: @unchecked Sendable {
     /// Fixed sampling grid from the bundle (Turbo); nil = shifted linear schedule over `steps`.
     let sampleSigmas: [Float]?
 
-    init(modelPath: URL, loaded: LoadedWeights) async throws {
+    init(modelPath: URL, loaded: LoadedWeights, sampleSigmas: [Float]?) async throws {
         cfg = try QwenImage21Config.load(modelPath)
-        sampleSigmas = QwenImage21Schedule.sampleSigmas(modelPath: modelPath)
+        self.sampleSigmas = sampleSigmas
         let store = MFluxStore(loaded)
         transformer = try QwenImage21Transformer(store: store, cfg: cfg)
         textEncoder = try QwenImage21TextEncoder(store: store, cfg: cfg)

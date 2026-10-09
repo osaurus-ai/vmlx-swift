@@ -33,7 +33,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             defaultGuidance: 1.0,
             loader: { path, quant in
                 _ = QwenImage21._register
-                return try await QwenImage21(modelPath: path, quantize: quant)
+                return try await QwenImage21(modelPath: path, quantize: quant, requiresFixedSchedule: true)
             }
         ))
     }()
@@ -47,16 +47,21 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     public let quantize: Int?
     private let pipeline: QwenImage21Pipeline
 
-    public init(modelPath: URL, quantize: Int?) async throws {
+    public init(modelPath: URL, quantize: Int?, requiresFixedSchedule: Bool = false) async throws {
         self.modelPath = modelPath
         self.quantize = quantize
         _ = Self._register
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
             throw FluxError.weightsNotFound(modelPath)
         }
+        // Validate scheduling metadata before allocating any model weights.
+        let grid = try QwenImage21Schedule.sampleSigmas(modelPath: modelPath)
+        if requiresFixedSchedule && grid == nil {
+            throw FluxError.localModelIncomplete(modelPath, reasons: ["Turbo requires model_index.json sample_sigmas"])
+        }
         let loaded = try WeightLoader.load(from: modelPath)
         try QwenImage21BundleValidator.validate(modelPath, loaded: loaded)
-        self.pipeline = try await QwenImage21Pipeline(modelPath: modelPath, loaded: loaded)
+        self.pipeline = try await QwenImage21Pipeline(modelPath: modelPath, loaded: loaded, sampleSigmas: grid)
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {

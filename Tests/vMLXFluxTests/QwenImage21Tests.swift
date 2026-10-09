@@ -152,7 +152,7 @@ final class QwenImage21Tests: XCTestCase {
         let grid: [Double] = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
         let index: [String: Any] = ["_class_name": "QwenImage21Pipeline", "sample_sigmas": grid]
         try JSONSerialization.data(withJSONObject: index).write(to: dir.appendingPathComponent("model_index.json"))
-        let parsed = try XCTUnwrap(QwenImage21Schedule.sampleSigmas(modelPath: dir))
+        let parsed = try XCTUnwrap(try QwenImage21Schedule.sampleSigmas(modelPath: dir))
         XCTAssertEqual(parsed.count, 8)
         let sigmas = QwenImage21Schedule.sigmas(grid: parsed).asArray(Float.self)
         XCTAssertEqual(sigmas.count, 9)
@@ -163,6 +163,31 @@ final class QwenImage21Tests: XCTestCase {
         try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: ["_class_name": "QwenImage21Pipeline"])
             .write(to: plain.appendingPathComponent("model_index.json"))
-        XCTAssertNil(QwenImage21Schedule.sampleSigmas(modelPath: plain))
+        XCTAssertNil(try QwenImage21Schedule.sampleSigmas(modelPath: plain))
     }
+    func testMalformedFixedGridFailsInsteadOfUsingTheBaseSchedule() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for raw in ["null", "[]", "[1]", "[true, false]", "[1, 0.5, 0.7]", "[1, 1]",
+                    "[1, 0]", "[1, -0.2]", "[2, 0.5]", "[1, 1e100]", "[1, \"bad\"]"] {
+            try Data("{\"sample_sigmas\":\(raw)}".utf8).write(to: dir.appendingPathComponent("model_index.json"))
+            XCTAssertThrowsError(try QwenImage21Schedule.sampleSigmas(modelPath: dir), raw)
+        }
+    }
+
+    func testTurboLoaderRejectsMissingGridBeforeLoadingWeights() async throws {
+        _ = QwenImage21._register
+        let entry = try XCTUnwrap(ModelRegistry.lookup(name: "qwen-image-2.1-turbo"))
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            _ = try await entry.loader(dir, 4)
+            XCTFail("Turbo must not fall back to the base schedule")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("sample_sigmas"), "\(error)")
+        }
+    }
+
 }
