@@ -82,6 +82,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var draftSeconds: Double = 0
     public var verifySeconds: Double = 0
     public var commitSeconds: Double = 0
+    /// Wall seconds spent in autoregressive steps (fallback, chooser width 1, disabled drafter).
+    public var arSeconds: Double = 0
 
     /// Mean number of tokens committed per verification cycle. 1.0 means the
     /// drafter contributed nothing; the ceiling is `blockSize`.
@@ -214,6 +216,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Sampled requests always verify in one batched forward: rejection
     /// sampling preserves the target distribution under either rounding.
     private let sequentialVerify: Bool
+    /// Target context rows from AR steps the drafter has not read yet, concatenated once when it
+    /// next drafts (a per-step concat chained one lazy copy per step).
+    private var arContextRows: [MLXArray] = []
     /// Diagnostic only (`VMLX_DFLASH2_SYNC_PHASE_TIMING=1`): drain the GPU at
     /// each phase edge so draft/verify seconds are GPU work, not the host
     /// waiting on an earlier dispatch. Serializes the pipeline; never on in
@@ -406,8 +411,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
         // Sequential verification keeps the ordinary decode kernels, so the
         // lane matmul is installed only when this request verifies batched.
+        // VMLX_DFLASH2_BATCHED_GREEDY=1 (diagnostic): measure greedy acceptance with batched/tree verify on a target
+        // that declares sequential verification. Output is then not bit-identical to AR.
         let sequential = target.requiresSequentialDFlash2Verification
             && effectiveParameters.temperature <= 0
+            && ProcessInfo.processInfo.environment["VMLX_DFLASH2_BATCHED_GREEDY"] != "1"
         self.sequentialVerify = sequential
         if !sequential {
             LaneQMM.installForDFlash2Target(target)
@@ -415,6 +423,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
         self.target = target
         self.drafter = drafter
+        LaneQMM.installForDFlash2Drafter(drafter)
         self.orderedLayerIDs = config.targetLayerIds
         self.captureLayerIDs = Set(config.targetLayerIds)
         self.cache = cache ?? target.newCache(parameters: effectiveParameters)
@@ -896,9 +905,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
                     format:
-                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
+                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs ar=%.2fs arFallback=%d widths=%@\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
-                    stats.verifySeconds, stats.commitSeconds,
+                    stats.verifySeconds, stats.commitSeconds, stats.arSeconds,
                     stats.autoregressiveFallbackTokens,
                     stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
                         .joined(separator: ","))
@@ -1376,6 +1385,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// in-attention clip advance the cache offset past its physical fill (the same offset/fill desync as the old
     /// init shift).
     private mutating func clipDrafterContext() {
+        foldARContextRows()
         guard let limit = drafterContextLimit, contextHidden.dim(1) > limit else { return }
         let skip = contextHidden.dim(1) - limit
         draftPositionBase += (draftCache.first?.offset ?? 0) + skip
@@ -1400,6 +1410,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private mutating func runTreeCycle(rows: Int, cycleStart: TimeInterval) -> Bool? {
         guard rows >= 2, let treeTarget = target as? DFlash2TreeVerifyModel else { return nil }
         abandonInFlightVerify(keepLattice: true)
+        foldARContextRows()
 
         // MARK: draft — one drafter forward, one small readback, host best-first search
         let draftStart = Date.timeIntervalSinceReferenceDate
@@ -1519,6 +1530,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// offset were never touched. Must run before ANY path that persists
     /// or reuses the cache, or unverified draft positions leak into a
     /// stored prefix.
+    private mutating func foldARContextRows() {
+        guard !arContextRows.isEmpty else { return }
+        let width = arContextRows[0].dim(-1)
+        let prior = contextHidden.dim(1) > 0 && contextHidden.dim(-1) == width ? [contextHidden] : []
+        contextHidden = concatenated(prior + arContextRows, axis: 1)
+        arContextRows.removeAll(keepingCapacity: true)
+    }
+
     private mutating func abandonInFlightVerify(keepLattice: Bool = false) {
         if pendingLattice != nil, !keepLattice {
             pendingLattice = nil
@@ -1680,6 +1699,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Single-token target step. Used when the remaining budget cannot
     /// fill a block and as the safety valve when acceptance cannot run.
     private mutating func runAutoregressiveStep() -> Bool {
+        let arStart = Date.timeIntervalSinceReferenceDate
+        defer { stats.arSeconds += Date.timeIntervalSinceReferenceDate - arStart }
         // A plain step reads and advances the same cache an in-flight
         // verify has already speculatively extended.
         abandonInFlightVerify()
@@ -1692,8 +1713,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         MLX.eval(sampled, hidden)
         let token = sampled.reshaped(-1)[0].item(Int.self)
         // Rows the drafter has not read yet accumulate across consecutive AR steps.
-        contextHidden = contextHidden.dim(1) > 0 && contextHidden.dim(-1) == hidden.dim(-1)
-            ? concatenated([contextHidden, hidden], axis: 1) : hidden
+        arContextRows.append(hidden)
         lastToken = token
         pendingTokens = [token]
         pendingIndex = 0

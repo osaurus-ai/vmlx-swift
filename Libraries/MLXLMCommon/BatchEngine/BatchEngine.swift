@@ -531,6 +531,12 @@ public actor BatchEngine {
             )
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
+        if parameters.draftStrategy?.usesUno == true {
+            Self.logger.error(
+                "Rejected BatchEngine.submit Uno request: Uno drafts and verifies through the target's own cache, which a shared batched slot cannot express; use BatchEngine.generate for the exclusive path."
+            )
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
 
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
@@ -728,6 +734,19 @@ public actor BatchEngine {
         // batched decode path — the request still succeeds, just without
         // any speculation, which is the worst kind of failure because it
         // looks exactly like success.
+        // Uno runs inside TokenIterator on the solo path for the same reason: its two-pass cycle owns
+        // the target cache. Requests it cannot serve exactly decode AR there (TokenIterator logs why).
+        if parameters.draftStrategy?.usesUno == true {
+            guard canStartExclusiveSoloPath else {
+                Self.logger.error(
+                    "Rejected BatchEngine.generate Uno request: Uno is an exclusive solo path.")
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            }
+            return startSoloFastPath(
+                input: input,
+                parameters: parameters,
+                promptTail: promptTail)
+        }
         if parameters.draftStrategy?.usesDFlash2 == true,
             DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
         {

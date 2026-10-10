@@ -596,6 +596,18 @@ struct Bench {
             try await runRowCostBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DIPLODOC_ROWEXACT"] ?? "0") == "1" {
+            try await runK2RowExactness(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_FWD_SWEEP"] ?? "0") == "1" {
+            try await runK2ForwardSweep(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_COMPONENTS"] ?? "0") == "1" {
+            try await runDiplodocusComponentCosts(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_DIPLODOC"] ?? "0") == "1" {
             try await runDiplodocusQualification(modelPath: modelPath)
             return

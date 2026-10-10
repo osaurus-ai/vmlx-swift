@@ -127,7 +127,7 @@ extension LaneQMM {
         let block = mp <= rowBlock ? mp : rowBlock
         let edge = mp % block != 0 ? 1 : 0
         let y: MLXArray
-        if bits == 8, group == 64, direct8Enabled {
+        if bits == 8, group == 64 || group == 128, direct8Enabled {
             y =
                 kernel(
                     tiled ? "main8_tiled" : "main8", body: tiled ? main8TiledSource : main8Source,
@@ -178,11 +178,25 @@ extension LaneQMM {
 
     // MARK: install
 
+    /// Group size the lane kernels run `q` at, or nil when it is not lane-readable. The packed weight
+    /// does not depend on the group size (MLX packs along K; scales live apart), so an affine group of
+    /// 128 is exactly two groups of 64 sharing one scale/bias. 4-bit and direct 8-bit kernels index
+    /// scales by GS and read 128 natively; the 5/6-bit bytes kernel is fixed at 64 and gets each 128
+    /// group's scale and bias twice (identical dequantization).
+    static func laneGroup(for q: QuantizedLinear) -> Int? {
+        switch (q.bits, q.groupSize) {
+        case (4, 32), (4, 64), (4, 128): return q.groupSize
+        case (5, 64), (6, 64), (8, 64): return 64
+        case (8, 128): return direct8Enabled ? 128 : 64
+        case (5, 128), (6, 128): return 64
+        default: return nil
+        }
+    }
+
     /// Whether the lane matmul reads this QuantizedLinear (affine, bf16 scales, supported width/group).
     static func takes(_ q: QuantizedLinear) -> Bool {
         guard type(of: q) == QuantizedLinear.self, q.mode == .affine, readableBits.contains(q.bits),
-            q.bits >= 4,
-            (q.bits == 4 ? [32, 64] : [64]).contains(q.groupSize),
+            q.bits >= 4, laneGroup(for: q) != nil,
             q.scales.dtype == .bfloat16, let b = q.biases, b.dtype == .bfloat16,
             q.weight.dtype == .uint32, q.weight.ndim == 2
         else { return false }
@@ -193,6 +207,28 @@ extension LaneQMM {
     nonisolated(unsafe) private static var installedTargets: Set<ObjectIdentifier> = []
     nonisolated(unsafe) private static var laneFlatTargets: [ObjectIdentifier: Bool] = [:]
 
+    nonisolated(unsafe) private static var installedDrafters: Set<ObjectIdentifier> = []
+
+    /// Install on a DFlash2 drafter once per process (`VMLX_LANE_QMM_DRAFTER=0` keeps MLX: A/B control).
+    ///
+    /// Every draft forward is an 8-16-row block, where MLX's quantized matmul leaves its 1-row bandwidth
+    /// behind (27B MLP shape, 4-bit g64, 925 MHz: 1 row 0.10 ms, 8 rows 0.27 ms, 16 rows 0.18-0.46 ms;
+    /// lane 0.12-0.13 ms at 8-16 rows). The drafter's numerics never reach the target's tokens: only
+    /// how many proposals are accepted.
+    public static func installForDFlash2Drafter(_ drafter: Any) {
+        guard ProcessInfo.processInfo.environment["VMLX_LANE_QMM"] != "0",
+            ProcessInfo.processInfo.environment["VMLX_LANE_QMM_DRAFTER"] != "0",
+            let module = drafter as? Module
+        else { return }
+        lock.lock()
+        let fresh = installedDrafters.insert(ObjectIdentifier(module)).inserted
+        lock.unlock()
+        guard fresh else { return }
+        let report = install(model: module, tile: true, untiledMinRows: minRows)
+        FileHandle.standardError.write(Data(
+            "[LaneQMM] drafter lane=\(report.lane) tiled=\(report.tiled) skipped=\(report.skipped)\n".utf8))
+    }
+
     /// Whether `target`'s verify cost is lane-flat (set by ``installForDFlash2Target``).
     public static func isLaneFlat(_ target: Any) -> Bool {
         guard let module = target as? Module else { return false }
@@ -202,7 +238,9 @@ extension LaneQMM {
     }
     nonisolated(unsafe) public private(set) static var lastInstallReport: InstallReport?
 
-    /// Install on a DFlash2 target once per process (VMLX_LANE_QMM=0 opts out).
+    /// Install on a DFlash2 target once per process (VMLX_LANE_QMM=0 opts out). A target conforming
+    /// to ``LaneQMMTargetPolicy`` chooses tiling and the untiled row threshold from its own measured
+    /// row costs; other targets keep the defaults below.
     public static func installForDFlash2Target(_ target: Any) {
         guard ProcessInfo.processInfo.environment["VMLX_LANE_QMM"] != "0",
             let module = target as? Module
@@ -218,12 +256,15 @@ extension LaneQMM {
         // and those must keep MLX's packed layout. Default "safe" tiles every other lane module (attention,
         // dense MLP: 27B JANG_4D 8-row forward 74.0 -> 67.4 ms with everything tiled). VMLX_LANE_QMM_TILED=0
         // tiles nothing; =1 tiles everything (diagnostic: corrupts S=1 output on models with direct readers).
+        let policy = target as? LaneQMMTargetPolicy
         let tiling = ProcessInfo.processInfo.environment["VMLX_LANE_QMM_TILED"]
+            ?? (policy.map { $0.laneQMMTiled ? nil : "0" } ?? nil)
         let report = install(
             model: module, tile: tiling != "0",
             tileFilter: { path in
                 tiling == "1" || !directWeightReaderPaths.contains { path.contains($0) }
-            })
+            },
+            untiledMinRows: policy?.laneQMMUntiledMinRows ?? minRows)
         lastInstallReport = report
         // Lane-flat = every packed (uint32) weight of the language model now runs on the lane, so verify
         // cost is ~flat in rows. JANGH codebook MLPs (Qwen3.8-27B JANGH2) keep it False.
@@ -267,14 +308,15 @@ extension LaneQMM {
 
     /// Below this many rows an UNTILED lane module runs MLX's quantized matmul (qmv), which is faster
     /// there (27B JANG_4D 1-row forward: qmv 48.9 ms vs lane 61.4 ms). VMLX_LANE_QMM_MIN_ROWS overrides.
-    static let minRows =
+    public static let minRows =
         Int(ProcessInfo.processInfo.environment["VMLX_LANE_QMM_MIN_ROWS"] ?? "") ?? 4
 
     /// Route `model`'s plain affine QuantizedLinear layers through the lane matmul (per-module swap; other
     /// models in the process keep MLX). Tiles weights in ~2 GB batches so the old layout is freed promptly.
     @discardableResult
     public static func install(
-        model: Module, tile: Bool = true, tileFilter: (String) -> Bool = { _ in true }
+        model: Module, tile: Bool = true, tileFilter: (String) -> Bool = { _ in true },
+        untiledMinRows: Int = minRows
     ) -> InstallReport {
         var report = InstallReport()
         guard available() else { return report }
@@ -291,17 +333,23 @@ extension LaneQMM {
                 report.skipped += 1
                 continue
             }
-            let sbt = packScales(q.scales, qb)
+            let group = laneGroup(for: q)!
+            let repeats = q.groupSize / group
+            let sbt = repeats == 1
+                ? packScales(q.scales, qb)
+                : packScales(
+                    repeated(q.scales, count: repeats, axis: 1), repeated(qb, count: repeats, axis: 1))
             var w = q.weight
             var isTiled = false
             if tile, tileFilter(path), w.dim(0) % nt == 0 {
-                w = tileWeight(w, bits: q.bits, group: q.groupSize)
+                w = tileWeight(w, bits: q.bits, group: group)
                 isTiled = true
                 report.tiled += 1
             }
             let lane = LaneQuantizedLinear(
                 weight: w, bias: q.bias, scales: q.scales, biases: qb,
-                groupSize: q.groupSize, bits: q.bits, sbt: sbt, tiled: isTiled)
+                groupSize: q.groupSize, bits: q.bits, sbt: sbt, tiled: isTiled, laneGroup: group,
+                untiledMinRows: untiledMinRows)
             updates.append((path, lane))
             pending.append(contentsOf: [sbt, w])
             pendingBytes += sbt.nbytes + 2 * w.nbytes
@@ -326,14 +374,22 @@ extension LaneQMM {
 public final class LaneQuantizedLinear: QuantizedLinear {
     let laneSBT: MLXArray
     let laneTiled: Bool
+    /// Group size of `laneSBT` and of the tiled layout (``LaneQMM/laneGroup(for:)``); the module's own
+    /// `groupSize`/`scales` stay the bundle's, for MLX's matmul on wide calls.
+    let laneGroup: Int
+    /// Untiled modules run MLX's matmul below this many rows (``LaneQMM/minRows`` unless the target's
+    /// ``LaneQMMTargetPolicy`` measured a different crossover).
+    let laneUntiledMinRows: Int
 
     init(
         weight: MLXArray, bias: MLXArray?, scales: MLXArray, biases: MLXArray, groupSize: Int,
         bits: Int,
-        sbt: MLXArray, tiled: Bool
+        sbt: MLXArray, tiled: Bool, laneGroup: Int? = nil, untiledMinRows: Int = LaneQMM.minRows
     ) {
         self.laneSBT = sbt
         self.laneTiled = tiled
+        self.laneGroup = laneGroup ?? groupSize
+        self.laneUntiledMinRows = untiledMinRows
         super.init(
             weight: weight, bias: bias, scales: scales, biases: biases, groupSize: groupSize,
             bits: bits, mode: .affine)
@@ -343,13 +399,13 @@ public final class LaneQuantizedLinear: QuantizedLinear {
         var rows = 1
         for d in x.shape.dropLast() { rows *= d }
         var y: MLXArray
-        if rows <= LaneQMM.maxRows && x.dtype == .bfloat16 && (laneTiled || rows >= LaneQMM.minRows)
+        if rows <= LaneQMM.maxRows && x.dtype == .bfloat16 && (laneTiled || rows >= laneUntiledMinRows)
         {
             y = LaneQMM.laneMatmul(
-                x, weight: weight, sbt: laneSBT, bits: bits, group: groupSize,
+                x, weight: weight, sbt: laneSBT, bits: bits, group: laneGroup,
                 tiled: laneTiled)
         } else {
-            let w = laneTiled ? LaneQMM.untileWeight(weight, bits: bits, group: groupSize) : weight
+            let w = laneTiled ? LaneQMM.untileWeight(weight, bits: bits, group: laneGroup) : weight
             y = quantizedMM(
                 x, w, scales: scales, biases: biases, transpose: true, groupSize: groupSize,
                 bits: bits, mode: .affine)
@@ -357,4 +413,13 @@ public final class LaneQuantizedLinear: QuantizedLinear {
         if let bias { y = y + bias }
         return y
     }
+}
+
+/// Lane matmul placement measured per target family. Tiled modules run the lane for every row
+/// count, so a target whose one-row step is a plain QuantizedLinear decode pays the lane's 1-row cost
+/// on ordinary AR for the rest of the process; such targets install untiled and start the lane where
+/// it beats MLX's matmul.
+public protocol LaneQMMTargetPolicy {
+    var laneQMMTiled: Bool { get }
+    var laneQMMUntiledMinRows: Int { get }
 }

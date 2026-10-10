@@ -112,6 +112,14 @@ public enum DraftStrategy: @unchecked Sendable {
     /// through the loader; otherwise the iterator refuses to start.
     case nativeMTP(depth: Int, verifierMode: String? = nil)
 
+    /// IFM Uno self-speculation (`Uno.swift`): the target drafts with its own weights plus a
+    /// conditional-LoRA diffusion adapter, then verifies with base weights (lossless).
+    ///
+    /// - Parameters:
+    ///   - adapterPath: PEFT adapter directory (`adapter_config.json` + `adapter_model.safetensors`).
+    ///   - blockSize: rows per draft/verify forward (`nil` = 8). A cycle commits 2...blockSize+1 tokens.
+    case uno(adapterPath: URL, blockSize: Int? = nil)
+
     /// Discriminator usable as a stable dictionary key / log label.
     /// Does not expose associated values.
     public var kindName: String {
@@ -122,6 +130,7 @@ public enum DraftStrategy: @unchecked Sendable {
         case .ddtree: return "ddtree"
         case .dflash2: return "dflash2"
         case .nativeMTP: return "native_mtp"
+        case .uno: return "uno"
         }
     }
 
@@ -131,8 +140,14 @@ public enum DraftStrategy: @unchecked Sendable {
     public var usesBlockDiffusion: Bool {
         switch self {
         case .dflash, .ddtree: return true
-        case .none, .autoregressive, .nativeMTP, .dflash2: return false
+        case .none, .autoregressive, .nativeMTP, .dflash2, .uno: return false
         }
+    }
+
+    /// True when this strategy runs IFM Uno self-speculation inside `TokenIterator`.
+    public var usesUno: Bool {
+        if case .uno = self { return true }
+        return false
     }
 
     /// True when this strategy runs the DFlash 2 decode loop

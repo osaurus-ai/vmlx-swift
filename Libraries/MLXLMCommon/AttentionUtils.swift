@@ -170,3 +170,55 @@ public func attentionWithCacheUpdate(
         )
     }
 }
+
+/// Causal attention for a short multi-row query (a speculative draft or verify block) over a long
+/// cached context, run as row chunks the vector SDPA kernel accepts.
+///
+/// MLX's fused SDPA uses its vector kernel only while `queryLength * gqaFactor <= 32` (8 rows at
+/// GQA 4). Past that it takes the tiled full-attention kernel, which parallelises over query tiles:
+/// a 12-row block is one tile per head walking every key serially, so its cost grows with the
+/// context far faster than the vector kernel's. K2 Horizon 7B, 12-row forward, M5 Max:
+///
+///     cached tokens      256     2,304    8,192
+///     one fused call    20.4 ms  30.4     59.3
+///     8 + 4 row chunks  21.0     28.1     44.3
+///
+/// Chunk `[a, b)` attends to keys `[0, kL - qL + b)`. The causal mask is bottom-right aligned, so
+/// query `a + i` sees exactly the keys up to `kL - qL + a + i`, as in one call over all rows; an
+/// explicit `(…, qL, kL)` mask is sliced to the same rows and keys. Every chunk runs the vector
+/// kernel that 1-row decoding runs, and carries its precision (relative RMS error against a
+/// float32 reference within 3% of per-position decode calls, bf16 and f16).
+/// Returns nil for shapes that do not need or cannot take chunking.
+public func chunkedVectorAttention(
+    queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray? {
+    let (H, qL, kL) = (queries.dim(1), queries.dim(2), keys.dim(2))
+    let kvH = keys.dim(1)
+    guard kvH > 0, H % kvH == 0, kL >= qL else { return nil }
+    let rowsPerChunk = min(8, 32 / (H / kvH))
+    guard rowsPerChunk >= 1, qL > rowsPerChunk else { return nil }
+    let maskArray: MLXArray?
+    switch mask {
+    case .causal: maskArray = nil
+    case .array(let array):
+        guard array.ndim >= 2, array.dim(-2) == qL, array.dim(-1) == kL else { return nil }
+        maskArray = array
+    default: return nil
+    }
+    var outputs: [MLXArray] = []
+    var start = 0
+    while start < qL {
+        let end = min(qL, start + rowsPerChunk)
+        let visible = kL - qL + end
+        outputs.append(
+            MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., start ..< end, 0...],
+                keys: keys[0..., 0..., ..<visible, 0...],
+                values: values[0..., 0..., ..<visible, 0...],
+                scale: scale,
+                mask: maskArray.map { .array($0[.ellipsis, start ..< end, ..<visible]) } ?? .causal))
+        start = end
+    }
+    return concatenated(outputs, axis: 2)
+}
