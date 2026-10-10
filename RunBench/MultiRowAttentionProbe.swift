@@ -13,14 +13,18 @@ import MLXLMCommon
 func runMultiRowAttentionProbe() {
     let env = ProcessInfo.processInfo.environment
     let blocksList = (env["K2MT_MRBLOCKS"] ?? "32,64,128").split(separator: ",").compactMap { Int($0) }
-    let scale: Float = 0.08838834764831845
+    // K2MT_MR_SHAPE = "kvHeads,gqa,headDim,layers" (default K2 Horizon 7B: 8,4,128,36; Qwen3.8 27B: 4,6,256,16).
+    let shape = (env["K2MT_MR_SHAPE"] ?? "8,4,128,36").split(separator: ",").compactMap { Int($0) }
+    let (hkv, gqa, dim, layers) = (shape[0], shape[1], shape[2], shape[3])
+    let scale = Float(1 / Double(dim).squareRoot())
+    let rowsList = (env["K2MT_MR_ROWS"] ?? "1,4,8,12,16").split(separator: ",").compactMap { Int($0) }
     for ctx in [2048, 14336, 32768] {
         let cap = (ctx / 256 + 1) * 256
-        let kb = (0 ..< 36).map { _ in MLXRandom.normal([1, 8, cap, 128]).asType(.bfloat16) }
-        let vb = (0 ..< 36).map { _ in MLXRandom.normal([1, 8, cap, 128]).asType(.bfloat16) }
+        let kb = (0 ..< layers).map { _ in MLXRandom.normal([1, hkv, cap, dim]).asType(.bfloat16) }
+        let vb = (0 ..< layers).map { _ in MLXRandom.normal([1, hkv, cap, dim]).asType(.bfloat16) }
         eval(kb); eval(vb)
-        for qL in [1, 4, 8, 12, 16] {
-            let q = (MLXRandom.normal([1, 32, qL, 128]) * 1.5).asType(.bfloat16)
+        for qL in rowsList {
+            let q = (MLXRandom.normal([1, hkv * gqa, qL, dim]) * 1.5).asType(.bfloat16)
             eval(q)
             let k0 = kb[0][0..., 0..., ..<ctx, 0...], v0 = vb[0][0..., 0..., ..<ctx, 0...]
             let mask: MLXFast.ScaledDotProductAttentionMaskMode = qL == 1 ? .none : .causal
@@ -40,10 +44,10 @@ func runMultiRowAttentionProbe() {
                 for _ in 0 ..< 15 { let t0 = Date(); eval(body()); t.append(Date().timeIntervalSince(t0)) }
                 t.sort(); return t[7]
             }
-            // 36 chained layers: next layer's queries depend on this layer's output.
+            // chained layers: next layer's queries depend on this layer's output.
             let tm = time {
                 var x = q
-                for l in 0 ..< 36 {
+                for l in 0 ..< layers {
                     x = MLXFast.scaledDotProductAttention(
                         queries: x, keys: kb[l][0..., 0..., ..<ctx, 0...], values: vb[l][0..., 0..., ..<ctx, 0...],
                         scale: scale, mask: mask)
@@ -54,7 +58,7 @@ func runMultiRowAttentionProbe() {
             for nb in blocksList {
                 let t = time {
                     var x = q
-                    for l in 0 ..< 36 {
+                    for l in 0 ..< layers {
                         x = MultiRowDecodeAttention.attend(
                             queries: x, keys: kb[l][0..., 0..., ..<ctx, 0...], values: vb[l][0..., 0..., ..<ctx, 0...],
                             scale: scale, blocks: nb)

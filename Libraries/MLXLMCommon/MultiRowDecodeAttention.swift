@@ -42,32 +42,40 @@ public enum MultiRowDecodeAttention {
         switch mask {
         case .causal: return true
         case .array(let m):
-            return arrayMaskIsCausal && m.ndim == 2 && m.dim(0) == queryLength && m.dim(1) == keyLength
+            // [L, N] or [1, 1, L, N]: one causal mask shared by every head (leading dims of 1 only).
+            guard arrayMaskIsCausal, m.ndim >= 2, m.ndim <= 4,
+                m.dim(-2) == queryLength, m.dim(-1) == keyLength
+            else { return false }
+            return m.shape.dropLast(2).allSatisfy { $0 == 1 }
         default: return false
         }
     }
 
     public static func eligible(queries: MLXArray, keys: MLXArray, values: MLXArray) -> Bool {
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4, queries.dim(0) == 1,
-            queries.dim(3) == 128, keys.dim(3) == 128, values.dim(3) == 128,
+            queries.dim(3) == 128 || queries.dim(3) == 256, keys.dim(3) == queries.dim(3),
+            values.dim(3) == queries.dim(3),
             queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16
         else { return false }
         let qL = queries.dim(2), hq = queries.dim(1), hkv = keys.dim(1)
         guard qL >= 2, qL <= 16, hkv > 0, hq % hkv == 0, keys.dim(2) >= qL else { return false }
-        return (hq / hkv) * qL <= 64
+        return (hq / hkv) * qL <= 256
     }
 
     static let pass1Source = """
-        // MMA flash-decoding over L query rows. Threadgroup = (kv head, key block), 8 simdgroups; simdgroup sg owns pairs
-        // [8sg, 8sg+8) of the P = gqa*L (query head, row) pairs. Per 32-key tile: S = Q·Kᵀ (8x8 fp32 MMA), row softmax
-        // in threadgroup memory, O += P·V (fp32 MMA). K staged transposed, V row-major, both bf16.
-        const int D = 128;
-        const int TK = 32;
+        // MMA flash-decoding over L query rows. Threadgroup = (kv head, key block, pair group), 8 simdgroups; simdgroup sg
+        // owns pairs [PB + 8sg, PB + 8sg + 8) of the P = gqa*L (query head, row) pairs, PB = 64 * pair group. Per TK-key
+        // tile: S = Q·Kᵀ (8x8 fp32 MMA), row softmax in threadgroup memory, O += P·V (fp32 MMA). K staged transposed,
+        // V row-major, both bf16. D and TK are template constants so every fragment loop fully unrolls.
         const int KS = TK + 2;      // ushort stride of transposed K rows (dims)
         const int VS = D + 8;       // ushort stride of V rows (keys)
+        const int DC = D / 8;       // 8-wide dim chunks
+        const int KB = TK / 8;      // 8-wide key chunks
+        const int KPL = TK / 4;     // keys per lane in the softmax
         int h = threadgroup_position_in_grid.x;
         int blk = threadgroup_position_in_grid.y;
         int nblk = threadgroups_per_grid.y;
+        int PB = threadgroup_position_in_grid.z * 64;
         uint tid = thread_position_in_threadgroup.x;
         int sg = tid / 32;
         ushort lane = tid % 32;
@@ -82,7 +90,7 @@ public enum MultiRowDecodeAttention {
         per = ((per + TK - 1) / TK) * TK;
         int t0 = blk * per;
         int t1 = min(N, t0 + per);
-        bool active = sg * 8 < P;
+        bool active = PB + sg * 8 < P;
 
         threadgroup ushort Kt[D * KS];
         threadgroup ushort Vt[TK * VS];
@@ -93,11 +101,10 @@ public enum MultiRowDecodeAttention {
         const short fm = (qid & 4) + ((lane / 2) % 4);
         const short fn = (qid & 2) * 2 + (lane % 2) * 2;
 
-        // Q fragments (8 rows x 128 dims) in registers, pre-scaled.
-        simdgroup_matrix<float, 8, 8> Qf[16];
-        simdgroup_matrix<float, 8, 8> Of[16];
-        int prow = sg * 8 + fm;
-        _Pragma("clang loop unroll(full)") for (int c = 0; c < 16; c++) {
+        simdgroup_matrix<float, 8, 8> Qf[DC];
+        simdgroup_matrix<float, 8, 8> Of[DC];
+        int prow = PB + sg * 8 + fm;
+        _Pragma("clang loop unroll(full)") for (int c = 0; c < DC; c++) {
             float2 e = float2(0);
             if (active && prow < P) {
                 size_t qb = ((size_t)h * P + prow) * D + c * 8 + fn;
@@ -106,18 +113,21 @@ public enum MultiRowDecodeAttention {
             Qf[c].thread_elements()[0] = e.x; Qf[c].thread_elements()[1] = e.y;
             Of[c] = simdgroup_matrix<float, 8, 8>(0);
         }
-        // Row softmax state: lanes 4r..4r+3 own row r of this simdgroup.
         int srow = lane / 4;
-        int spair = sg * 8 + srow;
-        int limit = N - qL + (spair % max(qL, 1));   // inclusive key limit for this pair's row
+        int spair = PB + sg * 8 + srow;
+        // Visibility: every prefix key (key < N - qL); inside the L-row window, the keys whose bit is set in
+        // win[row] (bit a = window row a). A linear chain is win[row] = (1 << (row + 1)) - 1; a draft tree sets the
+        // rows on the row's own root path.
+        int wstart = N - qL;
+        uint wbits = spair < P ? win[spair % qL] : 0u;
         float m = -INFINITY, l = 0;
 
         const device ushort* kw = (const device ushort*)k;
         const device ushort* vw = (const device ushort*)v;
         for (int tb = t0; tb < t1; tb += TK) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int w = tid; w < TK * 16; w += 256) {        // 16 x uint4 (8 bf16) per key row
-                int key = w / 16, c8 = (w % 16) * 8;
+            for (int w = tid; w < TK * DC; w += 256) {        // DC x uint4 (8 bf16) per key row
+                int key = w / DC, c8 = (w % DC) * 8;
                 int t = min(tb + key, N - 1);
                 uint4 kv4 = *((const device uint4*)(kw + h * kh + t * kr + c8));
                 uint4 vv4 = *((const device uint4*)(vw + h * vh + t * vr + c8));
@@ -130,13 +140,11 @@ public enum MultiRowDecodeAttention {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (!active) continue;
-            // S = Q Kᵀ : 4 key blocks of 8.
-            simdgroup_matrix<float, 8, 8> Sf[4];
-            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < 4; kb++) Sf[kb] = simdgroup_matrix<float, 8, 8>(0);
-            _Pragma("clang loop unroll(full)") for (int c = 0; c < 16; c++) {
-                _Pragma("clang loop unroll(full)") for (int kb = 0; kb < 4; kb++) {
+            simdgroup_matrix<float, 8, 8> Sf[KB];
+            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < KB; kb++) Sf[kb] = simdgroup_matrix<float, 8, 8>(0);
+            _Pragma("clang loop unroll(full)") for (int c = 0; c < DC; c++) {
+                _Pragma("clang loop unroll(full)") for (int kb = 0; kb < KB; kb++) {
                     simdgroup_matrix<float, 8, 8> kf;
-                    // element (dim c*8+fm, key kb*8+fn+i)
                     const threadgroup ushort* kp = Kt + (c * 8 + fm) * KS + kb * 8 + fn;
                     kf.thread_elements()[0] = float(as_type<bfloat>(kp[0]));
                     kf.thread_elements()[1] = float(as_type<bfloat>(kp[1]));
@@ -144,15 +152,15 @@ public enum MultiRowDecodeAttention {
                 }
             }
             threadgroup float* Sp = St + sg * 8 * TK;
-            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < 4; kb++) simdgroup_store(Sf[kb], Sp + kb * 8, TK);
+            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < KB; kb++) simdgroup_store(Sf[kb], Sp + kb * 8, TK);
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            // Softmax for row srow over 8 keys per lane.
-            float sv[8];
+            float sv[KPL];
             float tmax = -INFINITY;
-            _Pragma("clang loop unroll(full)") for (int i = 0; i < 8; i++) {
-                int kk = (lane % 4) * 8 + i;
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < KPL; i++) {
+                int kk = (lane % 4) * KPL + i;
                 int key = tb + kk;
-                bool ok = spair < P && key < t1 && key <= limit;
+                bool ok = spair < P && key < t1
+                    && (key < wstart || ((wbits >> uint(key - wstart)) & 1u) != 0u);
                 sv[i] = ok ? Sp[srow * TK + kk] : -INFINITY;
                 tmax = max(tmax, sv[i]);
             }
@@ -161,10 +169,10 @@ public enum MultiRowDecodeAttention {
             float mn = max(m, tmax);
             float corr = (mn == -INFINITY) ? 1.0f : ((m == -INFINITY) ? 0.0f : fast::exp(m - mn));
             float ps = 0;
-            _Pragma("clang loop unroll(full)") for (int i = 0; i < 8; i++) {
+            _Pragma("clang loop unroll(full)") for (int i = 0; i < KPL; i++) {
                 float pv = (sv[i] == -INFINITY) ? 0.0f : fast::exp(sv[i] - mn);
                 ps += pv;
-                Sp[srow * TK + (lane % 4) * 8 + i] = pv;
+                Sp[srow * TK + (lane % 4) * KPL + i] = pv;
             }
             ps += simd_shuffle_xor(ps, 1);
             ps += simd_shuffle_xor(ps, 2);
@@ -172,17 +180,15 @@ public enum MultiRowDecodeAttention {
             m = mn;
             if (lane % 4 == 0) Corr[sg * 8 + srow] = corr;
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            // Rescale O rows, then O += P V.
             float cr = Corr[sg * 8 + fm];
-            _Pragma("clang loop unroll(full)") for (int dc = 0; dc < 16; dc++) {
+            _Pragma("clang loop unroll(full)") for (int dc = 0; dc < DC; dc++) {
                 Of[dc].thread_elements()[0] *= cr; Of[dc].thread_elements()[1] *= cr;
             }
-            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < 4; kb++) {
+            _Pragma("clang loop unroll(full)") for (int kb = 0; kb < KB; kb++) {
                 simdgroup_matrix<float, 8, 8> pf;
                 simdgroup_load(pf, Sp + kb * 8, TK);
-                _Pragma("clang loop unroll(full)") for (int dc = 0; dc < 16; dc++) {
+                _Pragma("clang loop unroll(full)") for (int dc = 0; dc < DC; dc++) {
                     simdgroup_matrix<float, 8, 8> vf;
-                    // element (key kb*8+fm, dim dc*8+fn+i)
                     const threadgroup ushort* vp = Vt + (kb * 8 + fm) * VS + dc * 8 + fn;
                     vf.thread_elements()[0] = float(as_type<bfloat>(vp[0]));
                     vf.thread_elements()[1] = float(as_type<bfloat>(vp[1]));
@@ -197,7 +203,7 @@ public enum MultiRowDecodeAttention {
         }
         if (prow < P) {
             size_t o = ((size_t)h * P + prow) * nblk + blk;
-            _Pragma("clang loop unroll(full)") for (int dc = 0; dc < 16; dc++) {
+            _Pragma("clang loop unroll(full)") for (int dc = 0; dc < DC; dc++) {
                 pacc[o * D + dc * 8 + fn] = Of[dc].thread_elements()[0];
                 pacc[o * D + dc * 8 + fn + 1] = Of[dc].thread_elements()[1];
             }
@@ -205,7 +211,6 @@ public enum MultiRowDecodeAttention {
     """
 
     static let pass2Source = """
-        const int D = 128;
         int pr = threadgroup_position_in_grid.x;     // (query head, row) flattened
         uint d = thread_position_in_threadgroup.x;
         int nblk = meta[0];
@@ -222,27 +227,52 @@ public enum MultiRowDecodeAttention {
     """
 
     static let pass1 = MLXFast.metalKernel(
-        name: "vmlx_multirow_attn_pass1", inputNames: ["q", "k", "v", "meta", "sc"],
+        name: "vmlx_multirow_attn_pass1", inputNames: ["q", "k", "v", "meta", "sc", "win"],
         outputNames: ["pm", "pl", "pacc"], source: pass1Source, ensureRowContiguous: false)
     static let pass2 = MLXFast.metalKernel(
         name: "vmlx_multirow_attn_pass2", inputNames: ["pm", "pl", "pacc", "meta"], outputNames: ["out"],
         source: pass2Source, ensureRowContiguous: false)
 
-    /// queries [1, Hq, L, 128]; keys/values [1, Hkv, N, 128] (last dim contiguous). Returns [1, Hq, L, 128].
+    /// Lower-triangular window bits for an L-row linear chain.
+    public static func causalWindowBits(_ rows: Int) -> MLXArray {
+        MLXArray((0 ..< rows).map { UInt32((UInt64(1) << UInt64($0 + 1)) - 1) })
+    }
+
+    /// Window bits from row-to-window-row visibility (`allowed[r][a]`), e.g. a draft tree's root paths.
+    public static func windowBits(_ allowed: [[Bool]]) -> MLXArray {
+        MLXArray(allowed.map { row in
+            row.enumerated().reduce(UInt32(0)) { $0 | ($1.element ? UInt32(1) << UInt32($1.offset) : 0) }
+        })
+    }
+
+    /// Forwards served by the kernel in this process (diagnostic; read by RunBench).
+    nonisolated(unsafe) public static var servedCalls = 0
+
+    /// queries [1, Hq, L, D] (D = 128 or 256); keys/values [1, Hkv, N, D] (last dim contiguous). Returns [1, Hq, L, D].
+    ///
+    /// `windowBits` (uint32 [L]): bit a of row r set = row r sees window row a (the last L keys). nil = causal chain.
     public static func attend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, blocks: Int? = nil
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, windowBits: MLXArray? = nil,
+        blocks: Int? = nil
     ) -> MLXArray {
+        servedCalls += 1
         let q = contiguous(queries)
-        let hq = q.dim(1), qL = q.dim(2), hkv = keys.dim(1), n = keys.dim(2)
+        let hq = q.dim(1), qL = q.dim(2), d = q.dim(3), hkv = keys.dim(1), n = keys.dim(2)
+        let pairs = (hq / hkv) * qL
+        let pairGroups = (pairs + 63) / 64
+        // Threadgroup memory: K tile D*(TK+2) + V tile TK*(D+8) ushorts + 8*8*TK floats — TK=16 keeps D=256 under 32 KB.
+        let tk = d == 128 ? 32 : 16
         let nb = blocks ?? (n < 4096 ? 32 : 64)
         let p = pass1(
-            [q, keys, values, MLXArray([Int32(n), Int32(qL), Int32(hq / hkv)]), MLXArray([scale])],
-            grid: (hkv * 256, nb, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[hq * qL, nb], [hq * qL, nb], [hq * qL, nb, 128]],
+            [q, keys, values, MLXArray([Int32(n), Int32(qL), Int32(hq / hkv)]), MLXArray([scale]),
+             windowBits ?? causalWindowBits(qL)],
+            template: [("D", d), ("TK", tk)],
+            grid: (hkv * 256, nb, pairGroups), threadGroup: (256, 1, 1),
+            outputShapes: [[hq * qL, nb], [hq * qL, nb], [hq * qL, nb, d]],
             outputDTypes: [.float32, .float32, .float32])
         return pass2(
-            [p[0], p[1], p[2], MLXArray([Int32(nb)])], template: [("OutT", q.dtype)],
-            grid: (hq * qL * 128, 1, 1), threadGroup: (128, 1, 1), outputShapes: [[1, hq, qL, 128]],
+            [p[0], p[1], p[2], MLXArray([Int32(nb)])], template: [("OutT", q.dtype), ("D", d)],
+            grid: (hq * qL * d, 1, 1), threadGroup: (d, 1, 1), outputShapes: [[1, hq, qL, d]],
             outputDTypes: [q.dtype])[0]
     }
 }

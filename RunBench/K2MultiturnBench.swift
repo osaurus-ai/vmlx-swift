@@ -204,6 +204,10 @@ func runK2MultiturnBench(modelPath: String) async throws {
             fallback: GenerateParameters(maxTokens: maxTokens))
         p.maxTokens = maxTokens
         if env["K2MT_GREEDY"] == "1" { p.temperature = 0; p.topP = 1; p.topK = 0 }
+        if let drafter = env["K2MT_DFLASH2"] {
+            p.draftStrategy = .dflash2(
+                drafterPath: URL(fileURLWithPath: drafter), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))
+        }
         let diskBefore = diskBytes()
         let start = Date()
         var first: Date?
@@ -244,6 +248,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
             "mlx_cache_mb": Double(Memory.cacheMemory) / 1_048_576,
             "t_start": iso.string(from: start), "t_end": iso.string(from: streamEnd),
             "reasoning_chars": reasoning.count, "text_chars": text.count,
+            "multirow_calls": MultiRowDecodeAttention.servedCalls, "text_sha": String(text.hashValue),
         ]
         if stamps.count > 600 {
             // Event rate per 512-event window (one event ~ one token at streamInterval 1).
@@ -252,6 +257,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
             while i + 512 < stamps.count { w.append(String(format: "%.1f", 512 / stamps[i + 512].timeIntervalSince(stamps[i]))); i += 512 }
             print("K2MT_WINDOWS turn=\(turn) events=\(stamps.count) rates=\(w.joined(separator: ","))")
         }
+        if let dump = env["K2MT_TEXT_DUMP"] { try? text.write(toFile: dump, atomically: true, encoding: .utf8) }
         let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
         print("K2MT_TURN " + String(decoding: data, as: UTF8.self))
         messages.append(["role": "assistant", "content": text])
