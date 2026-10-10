@@ -203,12 +203,45 @@ func runK2MultiturnBench(modelPath: String) async throws {
             i += 1
         }
     }
+    var previousPrompt: [Int32] = []
     for turn in 0 ..< min(turns, asks.count) {
         let ask = turn == 0 && !pad.isEmpty ? "Reference module:\n```python\n\(pad)```\n\n" + asks[turn] : asks[turn]
         messages.append(["role": "user", "content": ask])
         nonisolated(unsafe) let input = try await context.processor.prepare(input: UserInput(
             messages: messages, additionalContext: ["reasoning_effort": effort]))
         let promptTokens = input.text.tokens.size
+        // Longest common prefix with the previous turn's prompt: what a prefix cache can reuse at most.
+        let tokenList = input.text.tokens.reshaped(-1).asArray(Int32.self)
+        var lcp = 0
+        while lcp < min(tokenList.count, previousPrompt.count), tokenList[lcp] == previousPrompt[lcp] { lcp += 1 }
+        if env["K2MT_LCP_DUMP"] == "1", lcp < previousPrompt.count {
+            let lo = max(0, lcp - 8)
+            let prevTail = Array(previousPrompt[lo ..< min(previousPrompt.count, lcp + 12)])
+            let curTail = Array(tokenList[lo ..< min(tokenList.count, lcp + 12)])
+            print("K2MT_LCP turn=\(turn) lcp=\(lcp) prev=\(previousPrompt.count)")
+            print("  prev: \(context.tokenizer.decode(tokenIds: prevTail.map(Int.init)).debugDescription)")
+            print("  cur:  \(context.tokenizer.decode(tokenIds: curTail.map(Int.init)).debugDescription)")
+        }
+        previousPrompt = tokenList
+        if env["K2MT_BOUNDARY_DEBUG"] == "1", let ctl = context.tokenizer as? any GenerationPromptControllableTokenizer {
+            let ctx: [String: any Sendable] = ["reasoning_effort": effort]
+            let prepared = K2HorizonTemplateContract.prepare(messages: messages, modelType: "k2_horizon")
+            func show(_ label: String, _ msgs: [[String: any Sendable]], gen: Bool) {
+                do {
+                    let t = try ctl.applyChatTemplate(messages: msgs, tools: nil, additionalContext: ctx, addGenerationPrompt: gen)
+                    var l = 0
+                    while l < min(t.count, tokenList.count), Int32(t[l]) == tokenList[l] { l += 1 }
+                    print("K2MT_BDBG turn=\(turn) \(label) count=\(t.count) lcp_with_prompt=\(l) head=\(t.prefix(6)) prompt_head=\(tokenList.prefix(6))")
+                } catch { print("K2MT_BDBG turn=\(turn) \(label) ERROR \(error)") }
+            }
+            show("gen", prepared, gen: true)
+            show("nogen", prepared, gen: false)
+            var probe = prepared; probe.append(["role": "assistant", "content": "0"])
+            show("probe_raw", probe, gen: false)
+            show("probe_prepared", K2HorizonTemplateContract.prepare(messages: probe, modelType: "k2_horizon"), gen: false)
+            let b = canonicalChatCacheBoundaries(tokenizer: context.tokenizer, messages: prepared, tools: nil, additionalContext: ctx, promptTokens: tokenList.map(Int.init))
+            print("K2MT_BDBG turn=\(turn) canonical all=\(b.all) stable=\(b.stable) input_all=\(input.cachePrefixTokenCounts)")
+        }
         var p = GenerateParameters(
             generationConfig: context.configuration.generationDefaults,
             fallback: GenerateParameters(maxTokens: maxTokens))
@@ -250,7 +283,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         let stats = coordinator?.snapshotStats()
         let row: [String: Any] = [
-            "arm": arm, "turn": turn, "prompt_tokens": promptTokens, "gen_tokens": genTokens,
+            "arm": arm, "turn": turn, "prompt_tokens": promptTokens, "lcp_prev_prompt": lcp, "gen_tokens": genTokens,
             "ttft_s": first.map { $0.timeIntervalSince(start) } ?? -1,
             "prompt_time_s": promptTime, "decode_tps": tps, "gen_time_s": genTime,
             "turn_wall_s": streamEnd.timeIntervalSince(start),
