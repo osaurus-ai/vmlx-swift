@@ -13,7 +13,7 @@ import MLXLLM
 /// drops reasoning (what the chat template replays). One JSON line per turn.
 ///
 /// Env: K2MT_ARM=app|ram|none · K2MT_TURNS (10) · K2MT_MAX_TOKENS (400) · K2MT_EFFORT (high) · K2MT_OUT (dir) ·
-/// K2MT_GREEDY=1
+/// K2MT_GREEDY=1 · K2MT_UNO=<adapter dir> (Uno, adaptive unless K2MT_BLOCK) · K2MT_LONG=1 (long-output asks)
 func runK2MultiturnBench(modelPath: String) async throws {
     let env = ProcessInfo.processInfo.environment
     let arm = env["K2MT_ARM"] ?? "app"
@@ -147,7 +147,17 @@ func runK2MultiturnBench(modelPath: String) async throws {
     let coordinator = container.cacheCoordinator
     print("K2MT_START arm=\(arm) disk=\(coordinator?.config.enableDiskCache ?? false) turns=\(turns) max_tokens=\(maxTokens)")
 
-    let asks = [
+    let longAsks = [
+        "Write a complete, detailed tutorial on implementing a key-value store in Python: design, full code for every component (storage engine, write-ahead log, compaction, an HTTP API), and tests. Be thorough and long.",
+        "Now extend the store with replication: explain leader election and log shipping in depth, then give the full code changes.",
+        "Rewrite the whole storage engine as an LSM tree with memtables, SSTables and bloom filters. Show all the code and explain every part.",
+        "Write a long, careful performance analysis of the store: every operation's complexity, I/O behaviour, and benchmarks you would run, with code for the benchmarks.",
+        "Write extensive documentation for the project: README, architecture overview, API reference with examples for every endpoint, and an operations guide.",
+        "Review all the code we wrote so far for bugs and race conditions; list each issue and give the corrected code in full.",
+        "Explain how you would port the store to Rust, with the full Rust code for the storage engine and WAL.",
+        "Write a final comprehensive study guide covering everything in this conversation, with headings, code, and exercises.",
+    ]
+    let asks = env["K2MT_LONG"] == "1" ? longAsks : [
         "Write a detailed explanation of how a hash map handles collisions, with a short Python example.",
         "Now compare open addressing and separate chaining in a table, then explain when each is better.",
         "Write a Python class implementing a hash map with linear probing and resizing.",
@@ -204,11 +214,16 @@ func runK2MultiturnBench(modelPath: String) async throws {
             fallback: GenerateParameters(maxTokens: maxTokens))
         p.maxTokens = maxTokens
         if env["K2MT_GREEDY"] == "1" { p.temperature = 0; p.topP = 1; p.topK = 0 }
+        if let uno = env["K2MT_UNO"] {
+            p.draftStrategy = .uno(
+                adapterPath: URL(fileURLWithPath: uno), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))
+        }
         if let drafter = env["K2MT_DFLASH2"] {
             p.draftStrategy = .dflash2(
                 drafterPath: URL(fileURLWithPath: drafter), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))
         }
         let diskBefore = diskBytes()
+        let uno0 = (UnoProcessCounters.cycles, UnoProcessCounters.committedTokens, UnoProcessCounters.arSteps)
         let start = Date()
         var first: Date?
         var stamps: [Date] = []
@@ -248,7 +263,10 @@ func runK2MultiturnBench(modelPath: String) async throws {
             "mlx_cache_mb": Double(Memory.cacheMemory) / 1_048_576,
             "t_start": iso.string(from: start), "t_end": iso.string(from: streamEnd),
             "reasoning_chars": reasoning.count, "text_chars": text.count,
-            "multirow_calls": MultiRowDecodeAttention.servedCalls, "text_sha": String(text.hashValue),
+            "multirow_calls": MultiRowDecodeAttention.servedCalls,
+            "uno_cycles": UnoProcessCounters.cycles - uno0.0,
+            "uno_cycle_tokens": UnoProcessCounters.committedTokens - uno0.1,
+            "uno_ar_steps": UnoProcessCounters.arSteps - uno0.2, "text_sha": String(text.hashValue),
         ]
         if stamps.count > 600 {
             // Event rate per 512-event window (one event ~ one token at streamInterval 1).

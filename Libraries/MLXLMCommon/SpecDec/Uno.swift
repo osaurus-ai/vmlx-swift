@@ -218,6 +218,16 @@ enum UnoWidthPlan {
     /// GPU computes n+1), so one step is timed only as part of a stretch, from an idle GPU to the
     /// sync that waits for the stretch's last forward.
     static let arStretch = 8
+    /// Longest AR stretch (consecutive AR choices double the stretch from `arStretch`). Each stretch
+    /// ends in one host sync; at 8 steps that drained the pipelined AR loop once per 8 tokens and
+    /// Uno-on-AR ran below plain AR (K2 long reasoning, 1-3 % speculative: 68-70 vs 74-80 tok/s).
+    /// `VMLX_UNO_AR_STRETCH_MAX=<n>` overrides (A/B tool; 8 = the old fixed stretch).
+    static let maxARStretch: Int = {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_UNO_AR_STRETCH_MAX"], let n = Int(raw) {
+            return Swift.max(arStretch, n)
+        }
+        return 128
+    }()
 
     /// Cost bucket for a cycle starting with `keys` cached tokens: one bucket below 1,024, then one
     /// per doubling.
@@ -263,6 +273,13 @@ public struct UnoGenerationStats: Sendable, Equatable {
     public var tokensPerCycle: Double { cycles > 0 ? Double(committedTokens) / Double(cycles) : 0 }
 }
 
+/// Process-wide Uno counters (diagnostics: benches read deltas per request).
+public enum UnoProcessCounters {
+    nonisolated(unsafe) public static var cycles = 0
+    nonisolated(unsafe) public static var committedTokens = 0
+    nonisolated(unsafe) public static var arSteps = 0
+}
+
 /// One Ψ-Spec linear cycle at a time over a target cache. Owned by the token iterator.
 struct UnoDecoder {
     static let traceEnabled = ProcessInfo.processInfo.environment["VMLX_UNO_TRACE"] == "1"
@@ -296,12 +313,44 @@ struct UnoDecoder {
     mutating func observeAR(steps: Int, seconds: Double) {
         guard steps > 0, seconds > 0 else { return }
         stats.arSteps += steps
+        UnoProcessCounters.arSteps += steps
         chooser?.observe(verifyWidth: 1, tokens: 1, seconds: seconds / Double(steps), count: steps)
         if Self.traceEnabled, let chooser {
             FileHandle.standardError.write(Data(String(
                 format: "[Uno] ar_stretch steps=%d ms_per_step=%.2f chooser %@\n", steps,
                 seconds * 1000 / Double(steps), chooser.traceDescription).utf8))
         }
+    }
+
+    /// Compile every speculative shape once, on a scratch cache, before the first request decodes.
+    /// The first 8-row K2 forward compiles a kernel for ~1.8 s; without this it landed inside the first
+    /// Uno response (a 2,000-token reply: 75 vs 82 tok/s for AR, the whole gap at low acceptance).
+    static func prewarm(model: any LanguageModel, mask: UnoRowMask, widths: [Int], temperature: Float) {
+        let cache = model.newCache(parameters: nil)
+        let prefix = MLXArray((0 ..< 32).map { Int32(1000 + $0 * 7) }).reshaped(1, 32)
+        eval(model(LMInput.Text(tokens: prefix), cache: cache, state: nil).logits)
+        for L in widths where L > 1 {
+            let tokens = MLXArray((0 ..< L).map { Int32(2000 + $0 * 13) }).reshaped(1, L)
+            var rows = [Float](repeating: 1, count: L)
+            rows[0] = 0
+            mask.rows = MLXArray(rows).reshaped(1, L, 1).asType(.bfloat16)
+            let draft = MultiRowDecodeAttention.withLinearChainMask {
+                model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
+            }.logits[0].asType(.float32)
+            mask.rows = nil
+            eval(draft)
+            for layer in cache { _ = layer.trim(L) }
+            let verify = MultiRowDecodeAttention.withLinearChainMask {
+                model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
+            }.logits[0].asType(.float32)
+            if temperature > 0 {
+                eval(DFlash2Sampling.probabilities(verify, temperature: temperature, topP: 0.95))
+            } else {
+                eval(argMax(verify, axis: -1))
+            }
+            for layer in cache { _ = layer.trim(L) }
+        }
+        Memory.clearCache()
     }
 
     private func forward(_ tokens: [Int], cache: [KVCache]) -> MLXArray {
@@ -428,6 +477,8 @@ struct UnoDecoder {
         stats.cycles += 1
         stats.cyclesByWidth[L, default: 0] += 1
         stats.committedTokens += committed.count
+        UnoProcessCounters.cycles += 1
+        UnoProcessCounters.committedTokens += committed.count
         stats.acceptedProposals += accepted
         stats.proposedTokens += proposals.count
         return committed

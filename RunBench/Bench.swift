@@ -608,6 +608,10 @@ struct Bench {
             try await runDiplodocusComponentCosts(modelPath: modelPath)
             return
         }
+        if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
+            try await runK2MultiturnBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_DIPLODOC"] ?? "0") == "1" {
             try await runDiplodocusQualification(modelPath: modelPath)
             return

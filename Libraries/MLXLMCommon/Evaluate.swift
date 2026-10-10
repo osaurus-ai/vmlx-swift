@@ -1694,6 +1694,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Ordinary steps left in the current AR stretch, and when it started (`UnoWidthPlan.arStretch`).
     private var unoARSteps = 0
     private var unoARStretch: (start: Double, steps: Int)?
+    /// Length of the next AR stretch: doubles while the chooser keeps choosing AR (each stretch ends in
+    /// a host read of the pending token, which drains the pipelined AR loop), back to
+    /// `UnoWidthPlan.arStretch` after a speculative cycle.
+    private var unoARStretchLength = UnoWidthPlan.arStretch
     /// Uno counters for the request (nil when the request did not run Uno).
     public var unoGenerationStats: UnoGenerationStats? { uno?.stats }
     private var compiledStepCount = 0
@@ -2457,6 +2461,24 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // Draft and verify are multi-row forwards; the target's lane policy keeps 1-row AR
                 // on its ordinary kernels.
                 LaneQMM.installForDFlash2Target(target)
+                // `VMLX_UNO_PREWARM=1`: compile every speculative shape before the first request
+                // decodes. Off by default: measured, it only MOVES the one-time ~1.8 s compile from
+                // mid-stream into the first request's TTFT (0.75 → 4.2 s at a ~450 MHz clock). Its
+                // right home is a background warm-up when the host app loads the model.
+                if ProcessInfo.processInfo.environment["VMLX_UNO_PREWARM"] == "1",
+                    DFlash2WidthCostTable.shared(
+                        for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
+                        tracksClock: ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0"
+                    ).claimPrewarm()
+                {
+                    let start = Date.timeIntervalSinceReferenceDate
+                    UnoDecoder.prewarm(
+                        model: target, mask: mask,
+                        widths: pinned.map { [$0] } ?? UnoWidthPlan.candidates,
+                        temperature: parameters.temperature)
+                    Self.logger.info(
+                        "Uno prewarm \(Int((Date.timeIntervalSinceReferenceDate - start) * 1000)) ms")
+                }
                 uno = UnoDecoder(
                     model: target, mask: mask, blockSize: blockSize,
                     maskTokenBound: target.unoNoiseTokenBound,
@@ -2518,11 +2540,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard remaining >= 4, !decoder.stopTokenIDs.contains(seed) else { return nil }
         decoder.prepare(keys: cache.first?.offset ?? 0)
         if decoder.wantsAR {
-            // This call's ordinary step is the stretch's first.
-            unoARSteps = UnoWidthPlan.arStretch - 1
-            unoARStretch = (Date.timeIntervalSinceReferenceDate, UnoWidthPlan.arStretch)
+            // This call's ordinary step is the stretch's first. Never past the budget's end: the
+            // stretch must close (and be timed) inside this request.
+            let steps = Swift.max(1, Swift.min(unoARStretchLength, remaining - 1))
+            unoARSteps = steps - 1
+            unoARStretch = (Date.timeIntervalSinceReferenceDate, steps)
+            unoARStretchLength = Swift.min(unoARStretchLength * 2, UnoWidthPlan.maxARStretch)
             return nil
         }
+        unoARStretchLength = UnoWidthPlan.arStretch
         let committed = decoder.cycle(
             seed: seed, cache: cache, maxCommit: Swift.min(remaining - 1, 1 << 20))
         unoQueue = Array(committed.dropLast())

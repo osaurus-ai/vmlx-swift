@@ -76,6 +76,18 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
         }
     }
 
+    private var prewarmed = false
+
+    /// True exactly once per table (per living target and namespace): the caller compiles the
+    /// speculative shapes then (`UnoDecoder.prewarm`).
+    func claimPrewarm() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if prewarmed { return false }
+        prewarmed = true
+        return true
+    }
+
     func cost(of width: Int, bucket: Int = 0) -> Double? {
         lock.lock()
         defer { lock.unlock() }
