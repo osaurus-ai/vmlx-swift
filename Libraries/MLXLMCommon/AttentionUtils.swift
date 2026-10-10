@@ -125,6 +125,17 @@ public func attentionWithCacheUpdate(
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
 
+        // Opt-in multi-row decode attention for 2–16-row speculative blocks (see MultiRowDecodeAttention). Causal,
+        // or an array mask the caller declared linear-chain causal; plain KVCacheSimple only (compile-path caches return full fixed-size buffers that need their mask).
+        if MultiRowDecodeAttention.enabled, type(of: cache) == KVCacheSimple.self,
+            MultiRowDecodeAttention.eligible(queries: queries, keys: cachedKeys, values: cachedValues),
+            MultiRowDecodeAttention.maskAllowed(
+                mask, queryLength: queries.dim(2), keyLength: cachedKeys.dim(2))
+        {
+            return MultiRowDecodeAttention.attend(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale)
+        }
+
         // Stage 2 (iter 9): when the caller passes `.none`, give the cache
         // a chance to contribute a mask. Most caches (KVCacheSimple,
         // RotatingKVCache, TurboQuantKVCache) return `.none` for n=1 decode

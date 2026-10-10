@@ -588,6 +588,10 @@ struct Bench {
             try await runRowExactBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
+            try await runK2MultiturnBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_ROWCOST"] ?? "0") == "1" {
             try await runRowCostBench(modelPath: modelPath)
             return
