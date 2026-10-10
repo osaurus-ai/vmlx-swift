@@ -30,6 +30,24 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     private var cost: [Key: Double] = [:]
     private var warm: Set<Int> = []
 
+    /// Clock-tracking mode (Uno). The M5 GPU clock drifts by 2x within one response (1.5 GHz to
+    /// ~600 MHz under sustained load), and each width's cost was refreshed only when that width ran,
+    /// so the chooser compared an AR step timed in a slow moment against a cycle timed in a fast one
+    /// (or the reverse) and parked on the wrong side: K2 Uno, sampled prose, AR priced at 23.9 ms
+    /// while it ran at 16.8; once on AR, the speculative costs stayed frozen. Here
+    /// `cost = base[width] × scale`: `scale` is one shared slowdown factor that EVERY observation
+    /// moves (fast EMA), `base` is each width's cost relative to it (slow EMA). Decisions compare
+    /// `base` ratios, which the clock does not move, and an AR re-time is paired with the
+    /// speculative cycles just before it.
+    let tracksClock: Bool
+    private var scale = 1.0
+    static let scaleRate = 0.25
+    static let baseRate = 0.05
+
+    init(tracksClock: Bool = false) {
+        self.tracksClock = tracksClock
+    }
+
     /// `bucket` separates costs that depend on more than the width (Uno: context length, see
     /// `UnoWidthPlan.contextBucket`). The warm-up discard is per width: it is kernel compilation.
     func observe(width: Int, seconds: Double, bucket: Int = 0) {
@@ -40,6 +58,17 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
             return
         }
         let key = Key(width: width, bucket: bucket)
+        if tracksClock {
+            guard let base = cost[key] else {
+                cost[key] = seconds / scale
+                return
+            }
+            // One outlier (a compile, a page fault) moves the scale by at most 2x.
+            let ratio = Swift.min(Swift.max(seconds / (base * scale), 0.5), 2)
+            scale *= 1 + Self.scaleRate * (ratio - 1)
+            cost[key] = base + Self.baseRate * (seconds / scale - base)
+            return
+        }
         if let c = cost[key] {
             cost[key] = c + 0.25 * (seconds - c)
         } else {
@@ -50,7 +79,7 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     func cost(of width: Int, bucket: Int = 0) -> Double? {
         lock.lock()
         defer { lock.unlock() }
-        return cost[Key(width: width, bucket: bucket)]
+        return cost[Key(width: width, bucket: bucket)].map { tracksClock ? $0 * scale : $0 }
     }
 
     /// Per-position acceptance evidence (decayed trials and hits) left by the latest chooser that
@@ -90,16 +119,16 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
 
     /// One table per living target and decoding method (`namespace`): a DFlash2 cycle and an Uno
     /// cycle of the same width are different work.
-    static func shared(for target: AnyObject, widths: [Int], namespace: String = "dflash2")
-        -> DFlash2WidthCostTable
-    {
+    static func shared(
+        for target: AnyObject, widths: [Int], namespace: String = "dflash2", tracksClock: Bool = false
+    ) -> DFlash2WidthCostTable {
         tablesLock.lock()
         defer { tablesLock.unlock() }
         let key = TableKey(target: ObjectIdentifier(target), namespace: namespace)
         // ObjectIdentifier can be reused after a model unloads. Preserve learned costs only
         // for the same living target, without keeping its weights resident.
         if let entry = tables[key], entry.target === target { return entry.table }
-        let t = DFlash2WidthCostTable()
+        let t = DFlash2WidthCostTable(tracksClock: tracksClock)
         tables[key] = Entry(target: target, table: t)
         return t
     }
@@ -133,6 +162,15 @@ struct DFlash2WidthChooser {
     /// Start from, and keep updating, the acceptance evidence stored in `costs`, so a request opens
     /// with what this target has been accepting rather than the prior.
     private let sharesAcceptance: Bool
+    /// A probe that beats the width it left earns the next decision (Uno; see `observe`).
+    private let rewardsWinningProbes: Bool
+    /// Per-cycle decay of acceptance evidence. Uno uses 0.95 (~20 cycles of memory): its
+    /// acceptance is bursty (runs of 0-2 then 15/15 on the same text), and with 0.85 (~7 cycles) a
+    /// few low cycles priced speculation under AR on text where every width beats AR. Replay of
+    /// recorded K2 width-16 acceptance (any width w accepts min(a16, w-1): the noise rows are
+    /// causal), spec costs 1.0/1.2/1.4x: on_invoice 109/91/84 tok/s at 0.85, 112/94/82 at 0.95
+    /// (best fixed width 106/88/76, AR 78).
+    private let decay: Double
 
     /// Candidate widths: (trained, 2*trained) when the target's verify cost is lane-flat, else
     /// (min(5, trained), trained, 2*trained). `VMLX_DFLASH2_BLOCK=<n>` pins one width (A/B tool).
@@ -152,13 +190,16 @@ struct DFlash2WidthChooser {
 
     init(
         widths: [Int], costs: DFlash2WidthCostTable, bonusTokens: Double = 0, initial: Int? = nil,
-        sharesAcceptance: Bool = false
+        sharesAcceptance: Bool = false, rewardsWinningProbes: Bool = false,
+        decay: Double = DFlash2WidthChooser.decay
     ) {
+        self.decay = decay
         self.widths = widths.sorted()
         self.width = initial.flatMap { w in widths.contains(w) ? w : nil }
             ?? self.widths.first(where: { $0 > 1 }) ?? self.widths[0]
         self.bonusTokens = bonusTokens
         self.sharesAcceptance = sharesAcceptance
+        self.rewardsWinningProbes = rewardsWinningProbes
         let top = self.widths.last ?? 2
         if sharesAcceptance, let stored = costs.storedAcceptance(count: top) {
             self.trials = stored.trials
@@ -190,6 +231,17 @@ struct DFlash2WidthChooser {
         return (w > 1 ? expectedTokens(w) + bonusTokens : 1) / c
     }
 
+    /// Trace: "w:rate/expected/cost" per width (rate nil = untimed in this bucket).
+    var traceDescription: String {
+        widths.map { w in
+            let c = costs.cost(of: w, bucket: costBucket)
+            return String(
+                format: "%d:%@/%.2f/%@", w, rate(w).map { String(format: "%.0f", $0) } ?? "-",
+                w > 1 ? expectedTokens(w) + bonusTokens : 1,
+                c.map { String(format: "%.1f", $0 * 1000) } ?? "-")
+        }.joined(separator: " ") + " next=\(width) bucket=\(costBucket)"
+    }
+
     /// Move to cost bucket `bucket` before a cycle. Widths not yet timed there are timed first;
     /// otherwise the best width by that bucket's costs is chosen.
     mutating func setCostBucket(_ bucket: Int) {
@@ -204,7 +256,9 @@ struct DFlash2WidthChooser {
     }
 
     /// One finished cycle: `tokens` emitted (accepted + 1) in `seconds` wall time at `verifyWidth` rows.
-    mutating func observe(verifyWidth: Int, tokens: Int, seconds: Double) {
+    /// `count` > 1: that many identical AR steps timed together (one cost observation, `count` cycles
+    /// toward the next re-time).
+    mutating func observe(verifyWidth: Int, tokens: Int, seconds: Double, count: Int = 1) {
         guard seconds > 0, widths.contains(verifyWidth) else { return }  // clipped final block
         let accepted = tokens - 1
         let lastVerified = min(accepted + 1, verifyWidth - 1)
@@ -215,8 +269,8 @@ struct DFlash2WidthChooser {
         // 93 DFlash cycles among 548). Re-exploration still comes from the periodic probe.
         if lastVerified >= 1 {
             for k in 1 ..< trials.count {
-                trials[k] *= Self.decay
-                hits[k] *= Self.decay
+                trials[k] *= decay
+                hits[k] *= decay
             }
         }
         if lastVerified >= 1 {
@@ -227,7 +281,7 @@ struct DFlash2WidthChooser {
         }
         if sharesAcceptance, lastVerified >= 1 { costs.storeAcceptance(trials: trials, hits: hits) }
         costs.observe(width: verifyWidth, seconds: seconds, bucket: costBucket)
-        cycles += 1
+        cycles += count
         lastTimed[verifyWidth] = cycles
         guard widths.count > 1 else { return }
         if let unseen = widths.first(where: { costs.cost(of: $0, bucket: costBucket) == nil }) {
@@ -236,10 +290,19 @@ struct DFlash2WidthChooser {
         }
         let best = widths.max { rate($0)! < rate($1)! } ?? width
         if let probe = probing, probe.width == verifyWidth {
-            probeInterval = best == probe.from
-                ? min(probeInterval * 2, Self.maxProbeInterval) : Self.probeEvery
+            // A probe that itself ran faster than the width it left earns the next decision too.
+            // While the chooser sits on AR, a probe is the only source of acceptance evidence, and
+            // one good cycle moves a decayed estimate only part of the way: with the backoff alone,
+            // recovered acceptance after a dip was found 1-2 probes per 100+ tokens (K2 Uno,
+            // sampled prose). A losing drafter's probes lose, so its backoff is unchanged.
+            let realized = Double(verifyWidth > 1 ? tokens : 1)
+                + (verifyWidth > 1 ? bonusTokens : 0)
+            let won = best != probe.from
+                || (rewardsWinningProbes
+                    && (rate(probe.from).map { realized / seconds > $0 } ?? false))
+            probeInterval = won ? Self.probeEvery : min(probeInterval * 2, Self.maxProbeInterval)
             probing = nil
-            nextProbe = cycles + probeInterval
+            nextProbe = best == probe.from && won ? cycles : cycles + probeInterval
         }
         if probing == nil, cycles >= nextProbe {
             let others = widths.filter { $0 != best }

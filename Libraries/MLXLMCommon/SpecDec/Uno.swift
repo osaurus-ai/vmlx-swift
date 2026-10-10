@@ -296,8 +296,11 @@ struct UnoDecoder {
     mutating func observeAR(steps: Int, seconds: Double) {
         guard steps > 0, seconds > 0 else { return }
         stats.arSteps += steps
-        for _ in 0 ..< steps {
-            chooser?.observe(verifyWidth: 1, tokens: 1, seconds: seconds / Double(steps))
+        chooser?.observe(verifyWidth: 1, tokens: 1, seconds: seconds / Double(steps), count: steps)
+        if Self.traceEnabled, let chooser {
+            FileHandle.standardError.write(Data(String(
+                format: "[Uno] ar_stretch steps=%d ms_per_step=%.2f chooser %@\n", steps,
+                seconds * 1000 / Double(steps), chooser.traceDescription).utf8))
         }
     }
 
@@ -419,6 +422,9 @@ struct UnoDecoder {
         chooser?.observe(
             verifyWidth: L, tokens: accepted + 1,
             seconds: Date.timeIntervalSinceReferenceDate - draftStart)
+        if Self.traceEnabled, let chooser {
+            FileHandle.standardError.write(Data("[Uno] chooser \(chooser.traceDescription)\n".utf8))
+        }
         stats.cycles += 1
         stats.cyclesByWidth[L, default: 0] += 1
         stats.committedTokens += committed.count

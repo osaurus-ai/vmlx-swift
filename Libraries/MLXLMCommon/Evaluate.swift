@@ -2469,10 +2469,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                     uno?.chooser = DFlash2WidthChooser(
                         widths: UnoWidthPlan.candidates,
                         costs: .shared(
-                            for: target, widths: UnoWidthPlan.candidates, namespace: "uno"),
+                            for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
+                            // `VMLX_UNO_CLOCK_TRACK=0`: per-width EMA costs (A/B control).
+                            tracksClock: ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0"),
                         bonusTokens: 1,
                         initial: UnoWidthPlan.declaredWidth(adapterDirectory: adapterPath) ?? 8,
-                        sharesAcceptance: true)
+                        sharesAcceptance: true,
+                        // `VMLX_UNO_PROBE_REWARD=0`: plain probe backoff (A/B control).
+                        rewardsWinningProbes: ProcessInfo.processInfo.environment["VMLX_UNO_PROBE_REWARD"] != "0",
+                        // `VMLX_UNO_DECAY=<x>`: acceptance-evidence decay (A/B tool; 0.85 = DFlash2's).
+                        decay: ProcessInfo.processInfo.environment["VMLX_UNO_DECAY"].flatMap(Double.init) ?? 0.95)
                 }
                 unoStartOffset = cache.map(\.offset).max() ?? 0
                 return nil

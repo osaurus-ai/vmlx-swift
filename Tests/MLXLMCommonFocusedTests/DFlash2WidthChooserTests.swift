@@ -157,4 +157,71 @@ final class DFlash2WidthChooserTests: XCTestCase {
         let fresh = request({ $0 == 0 ? 0 : 4 }, cycles: 40, shares: false)
         XCTAssertLessThan(fresh, shared, "the fresh prior is what flipped to AR")
     }
+
+    /// Uno over a drifting GPU clock (M5: 1.5 GHz to ~600 MHz within one response). Each width's cost
+    /// is refreshed only when that width runs, so speculative costs timed in a slow patch were
+    /// compared with AR steps timed after the clock recovered, and the chooser parked on AR
+    /// (K2 Uno sampled prose, live trace). World: base costs AR 12.2 ms, width 16 57 ms, a cycle
+    /// accepts 5 of 15 → 7 tokens per cycle with the seed row, 1.5x AR at ANY clock. The clock runs
+    /// 2x slow for the first 60 decisions, during which acceptance dips to zero for 8 cycles
+    /// (correctly sending the chooser to AR); then the clock and acceptance recover.
+    /// AR stretches are 8 steps observed together, as `UnoDecoder.observeAR` does.
+    private func driftingClock(tracksClock: Bool, rewards: Bool) -> (spec: Int, ar: Int) {
+        let costs = DFlash2WidthCostTable(tracksClock: tracksClock)
+        var chooser = DFlash2WidthChooser(
+            widths: [1, 16], costs: costs, bonusTokens: 1, initial: 16, rewardsWinningProbes: rewards)
+        let base: [Int: Double] = [1: 0.0122, 16: 0.057]
+        var decision = 0
+        var specAfter = 0
+        var arAfter = 0
+        var specRun = 0
+        while decision < 460 {
+            let w = chooser.width
+            let slow = decision < 60
+            let clock = slow ? 2.0 : 1.0
+            if w == 1 {
+                if !slow { arAfter += 8 }
+                chooser.observe(
+                    verifyWidth: 1, tokens: 1, seconds: base[1]! * clock, count: 8)
+            } else {
+                specRun += 1
+                let dip = slow && specRun > 20
+                if !slow { specAfter += 1 }
+                chooser.observe(
+                    verifyWidth: 16, tokens: dip ? 1 : 6, seconds: base[16]! * clock)
+            }
+            decision += 1
+        }
+        return (specAfter, arAfter)
+    }
+
+    func testClockDriftDoesNotParkUnoOnAR() {
+        var runs: [String: (spec: Int, ar: Int)] = [:]
+        for track in [false, true] {
+            for reward in [false, true] {
+                runs["track=\(track) reward=\(reward)"] = driftingClock(tracksClock: track, rewards: reward)
+            }
+        }
+        print("UNO_CLOCK \(runs.sorted { $0.key < $1.key })")
+        let shipped = runs["track=true reward=true"]!
+        let old = runs["track=false reward=false"]!
+        // After recovery speculation is 1.5x AR: nearly every decision must speculate.
+        XCTAssertGreaterThan(shipped.spec, 360, "shipped: \(shipped)")
+        XCTAssertLessThan(old.spec, 100, "control: the old chooser parks on AR: \(old)")
+    }
+
+    /// The scale is shared: timing only AR at a new clock moves every width's cost with it, while
+    /// each width keeps its cost relative to AR.
+    func testClockScaleMovesEveryWidth() {
+        let costs = DFlash2WidthCostTable(tracksClock: true)
+        for _ in 0 ..< 2 { costs.observe(width: 1, seconds: 0.012) }
+        for _ in 0 ..< 2 { costs.observe(width: 16, seconds: 0.057) }
+        let ratio = costs.cost(of: 16)! / costs.cost(of: 1)!
+        for _ in 0 ..< 40 { costs.observe(width: 1, seconds: 0.024) }
+        XCTAssertEqual(costs.cost(of: 1)!, 0.024, accuracy: 0.0015)
+        // AR-only timings cannot tell "AR got slower" from "the clock did": most of the change goes
+        // to the shared scale (rate 0.25 vs 0.05), a bounded share to AR's own base.
+        XCTAssertEqual(costs.cost(of: 16)! / costs.cost(of: 1)!, ratio, accuracy: 0.2 * ratio)
+        XCTAssertGreaterThan(costs.cost(of: 16)!, 0.09)
+    }
 }
