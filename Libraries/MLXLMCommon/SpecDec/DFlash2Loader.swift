@@ -106,6 +106,8 @@ public enum DFlash2Loader {
         }
 
         MLX.eval(model)
+        // Load time, not first request: tiling and kernel compilation would otherwise land on it.
+        LaneQMM.installForDFlash2Drafter(model)
         return model
     }
 

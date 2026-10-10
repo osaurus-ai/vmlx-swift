@@ -203,6 +203,48 @@ extension LaneQMM {
     nonisolated(unsafe) public private(set) static var lastInstallReport: InstallReport?
 
     /// Install on a DFlash2 target once per process (VMLX_LANE_QMM=0 opts out).
+    nonisolated(unsafe) private static var installedDrafters: Set<ObjectIdentifier> = []
+
+    /// Opt-in (`VMLX_LANE_QMM_DRAFTER=1`): route a DFlash2 drafter's quantized projections through the lane
+    /// matmul, once per drafter, at load.
+    ///
+    /// Every draft forward is an 8-16-row block, where MLX's quantized matmul leaves its 1-row bandwidth
+    /// behind (27B MLP shape, 4-bit g64 at ~925 MHz: 1 row 0.10 ms, 8 rows 0.27 ms, 16 rows 0.18-0.46 ms;
+    /// lane 0.12-0.13 ms at 8-16 rows). Qwen3.8-27B JANG_4D greedy code probes, warm: draft time per
+    /// request -45..-65 %, end-to-end +7-8 % (long 15k-token context ~71.5 -> ~77.5 tok/s, 3 rounds).
+    ///
+    /// Opt-in because it is not output-neutral on targets whose verify is not row-exact (27B): the
+    /// drafter's rounding changes which rows are verified together, and a near-tie can then resolve
+    /// differently. Greedy text stays deterministic but differs from the stock drafter's.
+    public static func installForDFlash2Drafter(_ drafter: Any) {
+        guard ProcessInfo.processInfo.environment["VMLX_LANE_QMM_DRAFTER"] == "1",
+            ProcessInfo.processInfo.environment["VMLX_LANE_QMM"] != "0",
+            let module = drafter as? Module
+        else { return }
+        lock.lock()
+        let fresh = installedDrafters.insert(ObjectIdentifier(module)).inserted
+        lock.unlock()
+        guard fresh else { return }
+        let start = Date()
+        let report = install(model: module, tile: true)
+        // Compile the lane kernels for the drafter's shapes now (8- and 16-row blocks): left to the first
+        // request, compilation cost it ~10 % (27B: 72-77 vs 80-85 tok/s with the install already at load).
+        var warmed = Set<String>()
+        for (_, m) in module.leafModules().flattened() {
+            guard let lane = m as? LaneQuantizedLinear else { continue }
+            let k = lane.weight.dim(1) * 32 / lane.bits
+            let key = "\(lane.weight.dim(0))x\(k)b\(lane.bits)t\(lane.laneTiled)"
+            guard warmed.insert(key).inserted else { continue }
+            for rows in [8, 16] {
+                MLX.eval(lane(MLXArray.zeros([rows, k], dtype: .bfloat16)))
+            }
+        }
+        FileHandle.standardError.write(Data(String(
+            format: "[LaneQMM] DFlash2 drafter lane=%d tiled=%d skipped=%d warmed=%d shapes (%.2fs)\n",
+            report.lane, report.tiled, report.skipped, warmed.count,
+            Date().timeIntervalSince(start)).utf8))
+    }
+
     public static func installForDFlash2Target(_ target: Any) {
         guard ProcessInfo.processInfo.environment["VMLX_LANE_QMM"] != "0",
             let module = target as? Module
