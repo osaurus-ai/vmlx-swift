@@ -372,6 +372,11 @@ extension LaneQMM {
 /// other dtypes run MLX's own quantized matmul on the MLX-layout weight, rebuilt per call when tiled (one
 /// weight copy per call: ~2-3 % of a 2048-row chunk, measured in Python).
 public final class LaneQuantizedLinear: QuantizedLinear {
+    /// `VMLX_QUANTIZED_OUTPUT_PROMOTE=1` (as for `QuantizedLinear`): keep MLX's promoted output.
+    /// Read once: this module runs ~250 times per token.
+    static let propagatePromotedOutput =
+        ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
+
     let laneSBT: MLXArray
     let laneTiled: Bool
     /// Group size of `laneSBT` and of the tiled layout (``LaneQMM/laneGroup(for:)``); the module's own
@@ -411,6 +416,16 @@ public final class LaneQuantizedLinear: QuantizedLinear {
                 bits: bits, mode: .affine)
         }
         if let bias { y = y + bias }
+        // Same dtype contract as `QuantizedLinear`: a half-precision activation stays half. Against
+        // fp16 scales MLX promotes `quantizedMM` to fp32, and the lane kernel writes bf16; either
+        // would otherwise change the residual stream and KV cache dtype of a model whose decode
+        // runs through this module (fp32 doubles every KV byte).
+        let inputDType = x.dtype
+        if !Self.propagatePromotedOutput, y.dtype != inputDType,
+            inputDType == .bfloat16 || inputDType == .float16
+        {
+            y = y.asType(inputDType)
+        }
         return y
     }
 }

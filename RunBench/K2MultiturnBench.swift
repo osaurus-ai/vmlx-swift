@@ -26,9 +26,29 @@ func runK2MultiturnBench(modelPath: String) async throws {
     try FileManager.default.createDirectory(at: diskDir, withIntermediateDirectories: true)
 
     let modelDir = URL(fileURLWithPath: modelPath)
+    // K2MT_RESOLVE=1: resolve load configuration and draft strategy from the bundle exactly as the
+    // osaurus load path does (native MTP heads, a bundled DFlash 2 drafter or Uno adapter).
+    var resolvedStrategy: DraftStrategy? = nil
+    var loadConfiguration = LoadConfiguration.osaurusProduction
+    if env["K2MT_RESOLVE"] == "1" {
+        let settings = VMLXServerRuntimeSettings()
+        let configData = try? Data(contentsOf: modelDir.appendingPathComponent("config.json"))
+        let jang = try? JangLoader.loadConfig(at: modelDir)
+        let status = try? MTPBundleInspector.inspect(modelDirectory: modelDir, jangConfig: jang)
+        loadConfiguration = settings.resolvedLoadConfiguration(
+            base: .osaurusProduction, configData: configData, jangConfig: jang, status: status)
+        resolvedStrategy = settings.resolvedMTPDraftStrategy(
+            configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
+        print("K2MT_RESOLVED strategy=\(String(describing: resolvedStrategy)) nativeMTP=\(loadConfiguration.nativeMTP)")
+    }
     let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .osaurusProduction
+        from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: loadConfiguration
     ).0
+    if case .uno(let adapter, _)? = resolvedStrategy {
+        let t0 = Date()
+        let ms = try UnoWarmup.prepare(model: context.model, adapterDirectory: adapter)
+        print("K2MT_UNO_WARMUP ms=\(ms.map(String.init) ?? "nil") wall_ms=\(Int(Date().timeIntervalSince(t0) * 1000))")
+    }
     if env["K2MT_SDPA"] == "1" {
         // Attention alone, 36 layers x (32q/8kv x 128, bf16), decode L=1. Contiguous KV vs a slice of a larger buffer (KVCacheSimple).
         do {
@@ -69,6 +89,11 @@ func runK2MultiturnBench(modelPath: String) async throws {
         return
     }
     if env["K2MT_MULTIROW"] == "1" { runMultiRowAttentionProbe(); return }
+    if env["K2MT_ROWS"] != nil, let uno = env["K2MT_PREP_UNO"] {
+        // Diagnostic: forward cost after the Uno load warm-up (adapter + lane routing installed).
+        _ = try UnoWarmup.prepare(model: context.model, adapterDirectory: URL(fileURLWithPath: uno))
+        print("K2MT_ROWS prepared Uno adapter + lane")
+    }
     if env["K2MT_ROWS"] != nil {
         // Forward cost vs query rows (speculative verify/draft shape) at fixed context. Trim back after each timing.
         let model = context.model
@@ -221,7 +246,8 @@ func runK2MultiturnBench(modelPath: String) async throws {
         let ask = turn == 0 && !pad.isEmpty ? "Reference module:\n```python\n\(pad)```\n\n" + asks[turn] : asks[turn]
         messages.append(["role": "user", "content": ask])
         nonisolated(unsafe) let input = try await context.processor.prepare(input: UserInput(
-            messages: messages, additionalContext: ["reasoning_effort": effort]))
+            messages: messages,
+            additionalContext: effort == "none" ? nil : ["reasoning_effort": effort]))
         let promptTokens = input.text.tokens.size
         // Longest common prefix with the previous turn's prompt: what a prefix cache can reuse at most.
         let tokenList = input.text.tokens.reshaped(-1).asArray(Int32.self)
@@ -260,6 +286,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
             fallback: GenerateParameters(maxTokens: maxTokens))
         p.maxTokens = maxTokens
         if env["K2MT_GREEDY"] == "1" { p.temperature = 0; p.topP = 1; p.topK = 0 }
+        if let resolvedStrategy { p.draftStrategy = resolvedStrategy }
         if let uno = env["K2MT_UNO"] {
             p.draftStrategy = .uno(
                 adapterPath: URL(fileURLWithPath: uno), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))

@@ -380,6 +380,10 @@ public final class K2HorizonModelInner: Module {
         callAsFunctionCapturing(inputs, cache: cache, captureLayerIDs: []).0
     }
 
+    /// VMLX_K2_DFLASH_TAP_INPUT=1 (diagnostic): capture each tap layer's INPUT instead of its output.
+    /// Read once, not per forward.
+    static let tapInput = ProcessInfo.processInfo.environment["VMLX_K2_DFLASH_TAP_INPUT"] == "1"
+
     func callAsFunctionCapturing(
         _ inputs: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
     ) -> (MLXArray, [Int: MLXArray]) {
@@ -387,8 +391,7 @@ public final class K2HorizonModelInner: Module {
         let mask = createAttentionMask(h: h, cache: cache?.first)
         var captured: [Int: MLXArray] = [:]
         captured.reserveCapacity(captureLayerIDs.count)
-        // VMLX_K2_DFLASH_TAP_INPUT=1 (diagnostic): capture each tap layer's INPUT instead of its output.
-        let tapInput = ProcessInfo.processInfo.environment["VMLX_K2_DFLASH_TAP_INPUT"] == "1"
+        let tapInput = Self.tapInput
         for (i, layer) in layers.enumerated() {
             if tapInput, captureLayerIDs.contains(i) { captured[i] = h }
             h = layer(h, mask: mask, cache: cache?[i])
