@@ -96,11 +96,11 @@ public enum WeightBacking {
         MLX.eval(members.flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) })
     }
 
-    /// The packed weights of `members` — the bulk of their bytes — for ``copyWouldReplace(_:)``.
-    /// Scales and biases are deliberately not consulted: a model can materialize its weights while
-    /// keeping its (f16, ~1/8 the size at 4-bit/g64) affine metadata file-backed. Flash-Next does,
-    /// and fusing there measured +5 % decode for +0.6 GB (the metadata copy) on a 54 GB model.
+    /// Everything a fused copy of `members` duplicates: packed weights, scales and biases. ALL of it
+    /// must be replaceable. (Flash-Next materializes its weights but keeps its f16 affine metadata
+    /// file-backed; fusing there kept a +0.6 GB metadata copy for +5 % decode, and Eric's rule is no
+    /// resident memory above the model's size for a speedup, 2026-10-11.)
     public static func storage(of members: [QuantizedLinear]) -> [MLXArray] {
-        members.map(\.weight)
+        members.flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
     }
 }

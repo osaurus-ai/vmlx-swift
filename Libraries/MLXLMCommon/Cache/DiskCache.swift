@@ -1130,24 +1130,15 @@ public final class DiskCache: @unchecked Sendable {
         // process-wide critical section as materialization and safetensors IO.
         MLXDiskCacheIOLock.shared.lock()
         defer { MLXDiskCacheIOLock.shared.unlock() }
-        trace.mark("before-validation")
-        let nonFinite = Self.nonFiniteTensorNames(in: arrays)
-        trace.mark("validation")
-        if !nonFinite.isEmpty {
-            lock.lock()
-            refusedNonFiniteStores += 1
-            lock.unlock()
-            FileHandle.standardError.write(Data(
-                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
-                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
-            return
-        }
-
         lock.lock()
         defer { lock.unlock() }
         trace.mark("locks-acquired")
-        stores += 1
+        // The two skips (already in flight, already validated on disk) come BEFORE the non-finite
+        // screen: the screen evaluates and reduces the whole payload (and materializes a lazy
+        // snapshot copy), which a store that is then skipped never needed. Before 2026-10-11 the
+        // screen ran first. A skipped store counts in `stores` as before; a refused one does not.
         if inflight[hash] != nil {
+            stores += 1
             // The same content-addressed payload is already on its way to disk.
             storeSkips += 1
             return
@@ -1177,6 +1168,7 @@ public final class DiskCache: @unchecked Sendable {
            indexed.fileSize == current.size,
            current.size > 0
         {
+            stores += 1
             storeSkips += 1
             _touchEntryLocked(hash: hash)
             _claimOwnershipLocked(
@@ -1192,6 +1184,17 @@ public final class DiskCache: @unchecked Sendable {
             }
             return
         }
+        trace.mark("before-validation")
+        let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+        trace.mark("validation")
+        if !nonFinite.isEmpty {
+            refusedNonFiniteStores += 1
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+            return
+        }
+        stores += 1
         // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
         if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
             return
@@ -1215,7 +1218,21 @@ public final class DiskCache: @unchecked Sendable {
         let tEval = Date()
         trace.mark("materialize")
         if behind, let tensors = SafetensorsByteWriter.tensors(from: arrays) {
-            let bytes = tensors.reduce(0) { $0 + $1.data.count }
+            let bytes = tensors.reduce(0) { $0 + $1.byteCount }
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // Payload shape of the handoff: strided = non-contiguous views written in place.
+                var strided = 0
+                var stridedBytes = 0
+                for tensor in tensors {
+                    if case .strided = tensor.payload {
+                        strided += 1
+                        stridedBytes += tensor.byteCount
+                    }
+                }
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-write-behind] enqueue count=\(tokenCount) tensors=\(tensors.count) "
+                        + "strided=\(strided) stridedBytes=\(stridedBytes) bytes=\(bytes)\n").utf8))
+            }
             let geometry = Self.recurrentGeometry(arrays)
             inflight[hash] = InflightWrite(
                 arrays: arrays, tokenCount: tokenCount, bytes: bytes, geometry: geometry)

@@ -105,9 +105,33 @@ extension LaneQMM {
     // MARK: matmul
 
     /// x (..., K) bf16 times packed `weight` (N, K*bits/32) transposed; at most `maxRows` rows.
+    /// Scales from a packed (K/group, N, 2) `sbt` (see ``packScales``).
     public static func laneMatmul(
         _ x: MLXArray, weight: MLXArray, sbt: MLXArray, bits: Int,
         group: Int = 64, tiled: Bool
+    ) -> MLXArray {
+        laneMatmul(x, weight: weight, scaleSource: .packed(sbt), bits: bits, group: group, tiled: tiled)
+    }
+
+    /// Same matmul reading the module's OWN (N, K/scaleGroup) bf16 `scales` and `biases` in place: no
+    /// packed copy. Bit-identical to the `sbt` form (same values, same arithmetic).
+    public static func laneMatmul(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray, scaleGroup: Int,
+        bits: Int, group: Int = 64, tiled: Bool
+    ) -> MLXArray {
+        laneMatmul(
+            x, weight: weight, scaleSource: .direct(scales, biases, scaleGroup: scaleGroup), bits: bits,
+            group: group, tiled: tiled)
+    }
+
+    enum ScaleSource {
+        case packed(MLXArray)
+        case direct(MLXArray, MLXArray, scaleGroup: Int)
+    }
+
+    static func laneMatmul(
+        _ x: MLXArray, weight: MLXArray, scaleSource: ScaleSource, bits: Int,
+        group: Int, tiled: Bool
     ) -> MLXArray {
         let k = x.dim(-1)
         let n = weight.dim(0)
@@ -126,17 +150,35 @@ extension LaneQMM {
         let sk = splitK(n: n, k: k)
         let block = mp <= rowBlock ? mp : rowBlock
         let edge = mp % block != 0 ? 1 : 0
+        // Scale operands: the packed SBt, or S and B in place (+ their group geometry as constants).
+        let scaleInputs: [String]
+        let scaleArrays: [MLXArray]
+        let scaleConstants: [(String, Int)]
+        let suffix: String
+        switch scaleSource {
+        case .packed(let sbt):
+            scaleInputs = ["SBt"]; scaleArrays = [sbt]; scaleConstants = []; suffix = ""
+        case .direct(let scales, let biases, let scaleGroup):
+            precondition(scaleGroup % group == 0, "lane: scale group must be a multiple of the lane group")
+            scaleInputs = ["S", "B"]; scaleArrays = [scales, biases]
+            scaleConstants = [("SKG", k / scaleGroup), ("SREP", scaleGroup / group)]
+            suffix = "_direct"
+        }
+        func source(_ body: String) -> String { suffix.isEmpty ? body : directScales(body) }
+        let inputs = ["X", "XS", "Wq"] + scaleInputs + ["mdims"]
+        let args = [x2, xs, weight] + scaleArrays + [mdims]
         let y: MLXArray
         if bits == 8, group == 64 || group == 128, direct8Enabled {
             y =
                 kernel(
-                    tiled ? "main8_tiled" : "main8", body: tiled ? main8TiledSource : main8Source,
-                    inputs: ["X", "XS", "Wq", "SBt", "mdims"], outputs: ["Y"],
+                    (tiled ? "main8_tiled" : "main8") + suffix,
+                    body: source(tiled ? main8TiledSource : main8Source),
+                    inputs: inputs, outputs: ["Y"],
                     constants: [
                         ("TMR", block / 16), ("N", n), ("K", k), ("NT", nt), ("SK", sk),
                         ("GS", group), ("EDGE", edge),
-                    ])(
-                    [x2, xs, weight, sbt, mdims],
+                    ] + scaleConstants)(
+                    args,
                     grid: (((n + nt - 1) / nt) * 32 * sk, (mp + block - 1) / block, 1),
                     threadGroup: (32 * sk, 1, 1), outputShapes: [[m, n]], outputDTypes: [.bfloat16])[
                     0]
@@ -144,26 +186,27 @@ extension LaneQMM {
             precondition(bits > 4 && group == 64, "lane bytes kernel: 5/6/8-bit, groups of 64")
             y =
                 kernel(
-                    "bytes", body: bytesSource, inputs: ["X", "XS", "Wq", "SBt", "mdims"],
+                    "bytes" + suffix, body: source(bytesSource), inputs: inputs,
                     outputs: ["Y"],
                     constants: [
                         ("TMR", block / 16), ("N", n), ("K", k), ("NT", nt), ("SK", sk),
                         ("BITS", bits), ("TILED", tiled ? 1 : 0),
-                    ])(
-                    [x2, xs, weight, sbt, mdims],
+                    ] + scaleConstants)(
+                    args,
                     grid: (((n + nt - 1) / nt) * 32 * sk, (mp + block - 1) / block, 1),
                     threadGroup: (32 * sk, 1, 1), outputShapes: [[m, n]], outputDTypes: [.bfloat16])[
                     0]
         } else {
             y =
                 kernel(
-                    tiled ? "main_tiled" : "main", body: tiled ? mainTiledSource : mainSource,
-                    inputs: ["X", "XS", "Wq", "SBt", "mdims"], outputs: ["Y"],
+                    (tiled ? "main_tiled" : "main") + suffix,
+                    body: source(tiled ? mainTiledSource : mainSource),
+                    inputs: inputs, outputs: ["Y"],
                     constants: [
                         ("TMR", block / 16), ("N", n), ("K", k), ("NT", nt), ("SK", sk),
                         ("GS", group), ("EDGE", edge),
-                    ])(
-                    [x2, xs, weight, sbt, mdims],
+                    ] + scaleConstants)(
+                    args,
                     grid: (((n + nt - 1) / nt) * 32 * sk, (mp + block - 1) / block, 1),
                     threadGroup: (32 * sk, 1, 1), outputShapes: [[m, n]], outputDTypes: [.bfloat16])[
                     0]
@@ -173,6 +216,17 @@ extension LaneQMM {
 
     /// 8-bit weights straight from device memory (`main8*`); `VMLX_LANE_QMM_DIRECT8=0` keeps the
     /// widening bytes kernel.
+    /// `VMLX_LANE_QMM_SBT=1` / `=0`: force the packed SBt copy on / off for every lane module (A/B).
+    /// Unset: the target's ``LaneQMMTargetPolicy/laneQMMPackedScales`` (packed for drafters and for
+    /// targets without a policy).
+    static let packedScalesOverride: Bool? = {
+        switch ProcessInfo.processInfo.environment["VMLX_LANE_QMM_SBT"] {
+        case "1": return true
+        case "0": return false
+        default: return nil
+        }
+    }()
+
     nonisolated(unsafe) static var direct8Enabled =
         ProcessInfo.processInfo.environment["VMLX_LANE_QMM_DIRECT8"] != "0"
 
@@ -271,7 +325,8 @@ extension LaneQMM {
             tileFilter: { path in
                 tiling == "1" || !directWeightReaderPaths.contains { path.contains($0) }
             },
-            untiledMinRows: policy?.laneQMMUntiledMinRows ?? minRows)
+            untiledMinRows: policy?.laneQMMUntiledMinRows ?? minRows,
+            packedScales: policy?.laneQMMPackedScales ?? true)
         lastInstallReport = report
         // Lane-flat = every packed (uint32) weight of the language model now runs on the lane, so verify
         // cost is ~flat in rows. JANGH codebook MLPs (Qwen3.8-27B JANGH2) keep it False.
@@ -323,8 +378,9 @@ extension LaneQMM {
     @discardableResult
     public static func install(
         model: Module, tile: Bool = true, tileFilter: (String) -> Bool = { _ in true },
-        untiledMinRows: Int = minRows
+        untiledMinRows: Int = minRows, packedScales policyPacked: Bool = true
     ) -> InstallReport {
+        let packedScales = packedScalesOverride ?? policyPacked
         var report = InstallReport()
         guard available() else { return report }
         var updates: [(String, Module)] = []
@@ -342,10 +398,16 @@ extension LaneQMM {
             }
             let group = laneGroup(for: q)!
             let repeats = q.groupSize / group
-            let sbt = repeats == 1
-                ? packScales(q.scales, qb)
-                : packScales(
-                    repeated(q.scales, count: repeats, axis: 1), repeated(qb, count: repeats, axis: 1))
+            // Packed SBt = a (K/GS, N, 2) bf16 COPY of the module's scales and biases, kept next to the
+            // originals (+1.6 GB on Qwen3.8-27B JANG_4D). Without it the kernels read scales in place
+            // (`directScales`, bit-identical, ~2x slower per verify matmul). Per-target choice, see
+            // `LaneQMMTargetPolicy.laneQMMPackedScales`.
+            let sbt: MLXArray? =
+                !packedScales ? nil
+                : repeats == 1
+                    ? packScales(q.scales, qb)
+                    : packScales(
+                        repeated(q.scales, count: repeats, axis: 1), repeated(qb, count: repeats, axis: 1))
             var w = q.weight
             var isTiled = false
             if tile, tileFilter(path), w.dim(0) % nt == 0, WeightBacking.copyWouldReplace([w]) {
@@ -358,8 +420,12 @@ extension LaneQMM {
                 groupSize: q.groupSize, bits: q.bits, sbt: sbt, tiled: isTiled, laneGroup: group,
                 untiledMinRows: untiledMinRows)
             updates.append((path, lane))
-            pending.append(contentsOf: [sbt, w])
-            pendingBytes += sbt.nbytes + 2 * w.nbytes
+            pending.append(w)
+            pendingBytes += 2 * w.nbytes
+            if let sbt {
+                pending.append(sbt)
+                pendingBytes += sbt.nbytes
+            }
             report.lane += 1
             if pendingBytes >= 2 << 30 {
                 eval(pending)
@@ -384,7 +450,8 @@ public final class LaneQuantizedLinear: QuantizedLinear {
     static let propagatePromotedOutput =
         ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
 
-    let laneSBT: MLXArray
+    /// Packed (K/group, N, 2) scales, or nil (default): the kernels read `scales`/`biases` in place.
+    let laneSBT: MLXArray?
     let laneTiled: Bool
     /// Group size of `laneSBT` and of the tiled layout (``LaneQMM/laneGroup(for:)``); the module's own
     /// `groupSize`/`scales` stay the bundle's, for MLX's matmul on wide calls.
@@ -396,7 +463,7 @@ public final class LaneQuantizedLinear: QuantizedLinear {
     init(
         weight: MLXArray, bias: MLXArray?, scales: MLXArray, biases: MLXArray, groupSize: Int,
         bits: Int,
-        sbt: MLXArray, tiled: Bool, laneGroup: Int? = nil, untiledMinRows: Int = LaneQMM.minRows
+        sbt: MLXArray?, tiled: Bool, laneGroup: Int? = nil, untiledMinRows: Int = LaneQMM.minRows
     ) {
         self.laneSBT = sbt
         self.laneTiled = tiled
@@ -413,9 +480,15 @@ public final class LaneQuantizedLinear: QuantizedLinear {
         var y: MLXArray
         if rows <= LaneQMM.maxRows && x.dtype == .bfloat16 && (laneTiled || rows >= laneUntiledMinRows)
         {
-            y = LaneQMM.laneMatmul(
-                x, weight: weight, sbt: laneSBT, bits: bits, group: laneGroup,
-                tiled: laneTiled)
+            if let laneSBT {
+                y = LaneQMM.laneMatmul(
+                    x, weight: weight, sbt: laneSBT, bits: bits, group: laneGroup,
+                    tiled: laneTiled)
+            } else {
+                y = LaneQMM.laneMatmul(
+                    x, weight: weight, scales: scales, biases: biases!, scaleGroup: groupSize,
+                    bits: bits, group: laneGroup, tiled: laneTiled)
+            }
         } else {
             let w = laneTiled ? LaneQMM.untileWeight(weight, bits: bits, group: laneGroup) : weight
             y = quantizedMM(
@@ -444,4 +517,13 @@ public final class LaneQuantizedLinear: QuantizedLinear {
 public protocol LaneQMMTargetPolicy {
     var laneQMMTiled: Bool { get }
     var laneQMMUntiledMinRows: Int { get }
+    /// Whether lane modules keep a packed (K/group, N, 2) copy of their scales and biases (faster
+    /// kernels, extra memory = 1/8 of the 4-bit weight bytes) or read them in place. Default true; a
+    /// target sets false where the in-place read measured the same end-to-end speed (see
+    /// `LaneQMMSources.directScales`).
+    var laneQMMPackedScales: Bool { get }
+}
+
+extension LaneQMMTargetPolicy {
+    public var laneQMMPackedScales: Bool { true }
 }

@@ -92,6 +92,37 @@ func runK2MultiturnBench(modelPath: String) async throws {
         return
     }
     if env["K2MT_MULTIROW"] == "1" { runMultiRowAttentionProbe(); return }
+    if env["K2MT_LANEBENCH"] == "1" {
+        // Lane matmul at Qwen3.8-27B shapes, 4-bit g64: packed SBt scales vs in-place scales. Median of 101.
+        for (nOut, kIn) in [(6144, 5120), (5120, 6144), (17408, 5120), (5120, 17408)] {
+            for rows in [8, 16] {
+                let w = (MLXRandom.normal([nOut, kIn]) * 0.04).asType(.bfloat16)
+                let (q, s0, b0) = MLX.quantized(w, groupSize: 64, bits: 4)
+                let s = s0.asType(.bfloat16), b = b0!.asType(.bfloat16)
+                let sbt = LaneQMM.packScales(s, b)
+                let x = MLXRandom.normal([rows, kIn]).asType(.bfloat16)
+                eval(q, s, b, sbt, x)
+                func time(_ f: () -> MLXArray) -> Double {
+                    for _ in 0 ..< 10 { eval(f()) }
+                    var t: [Double] = []
+                    for _ in 0 ..< 101 {
+                        let t0 = Date(); eval(f()); t.append(Date().timeIntervalSince(t0) * 1000)
+                    }
+                    return t.sorted()[50]
+                }
+                let packed = time { LaneQMM.laneMatmul(x, weight: q, sbt: sbt, bits: 4, group: 64, tiled: false) }
+                let inPlace = time {
+                    LaneQMM.laneMatmul(x, weight: q, scales: s, biases: b, scaleGroup: 64, bits: 4, group: 64, tiled: false)
+                }
+                let mlx = time {
+                    quantizedMM(x, q, scales: s, biases: b, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+                }
+                print(String(format: "K2MT_LANEBENCH n=%d k=%d rows=%d packed_ms=%.3f inplace_ms=%.3f mlx_ms=%.3f",
+                    nOut, kIn, rows, packed, inPlace, mlx))
+            }
+        }
+        return
+    }
     if env["K2MT_MEMPROBE"] == "1" {
         // Where does memory beyond the weights come from? Live MLX memory and the model's own
         // parameter bytes, after each stage, with caches dropped and the buffer pool cleared.

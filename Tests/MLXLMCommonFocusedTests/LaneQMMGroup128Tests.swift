@@ -28,6 +28,53 @@ final class LaneQMMGroup128Tests: XCTestCase {
         return diff / max(scale, 1e-6)
     }
 
+    /// The in-place scale read (default since 2026-10-11, no packed SBt copy) is bit-identical to the
+    /// packed form for every kernel: 4-bit at groups 32/64/128, the 5/6-bit bytes kernel at 64 and 128
+    /// (scale index g / 2), direct and widened 8-bit, tiled and untiled, 1...128 rows.
+    func testInPlaceScalesAreBitIdenticalToPackedScales() throws {
+        try FocusedMLXTestSupport.withLock {
+            guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
+            MLXRandom.seed(1011)
+            defer { LaneQMM.direct8Enabled = true }
+            let cases: [(bits: Int, groupSize: Int)] = [
+                (4, 32), (4, 64), (4, 128), (5, 64), (6, 64), (6, 128), (8, 64), (8, 128),
+            ]
+            for (bits, groupSize) in cases {
+                for direct8 in bits == 8 ? [true, false] : [true] {
+                    LaneQMM.direct8Enabled = direct8
+                    for (n, k) in [(256, 1024), (1024, 4096)] {
+                        let w = (MLXRandom.normal([n, k]) * 0.04).asType(.bfloat16)
+                        let (q, s0, b0) = MLX.quantized(w, groupSize: groupSize, bits: bits)
+                        let s = s0.asType(.bfloat16), b = b0!.asType(.bfloat16)
+                        let layer = QuantizedLinear(
+                            weight: q, bias: nil, scales: s, biases: b, groupSize: groupSize, bits: bits,
+                            mode: .affine)
+                        let group = try XCTUnwrap(LaneQMM.laneGroup(for: layer))
+                        let repeats = groupSize / group
+                        let sbt = repeats == 1
+                            ? LaneQMM.packScales(s, b)
+                            : LaneQMM.packScales(
+                                repeated(s, count: repeats, axis: 1), repeated(b, count: repeats, axis: 1))
+                        let tiledQ = LaneQMM.tileWeight(q, bits: bits, group: group)
+                        for rows in [1, 3, 8, 17, 33, 128] {
+                            let x = MLXRandom.normal([rows, k]).asType(.bfloat16)
+                            for (weight, tiled) in [(q, false), (tiledQ, true)] {
+                                let packed = LaneQMM.laneMatmul(
+                                    x, weight: weight, sbt: sbt, bits: bits, group: group, tiled: tiled)
+                                let inPlace = LaneQMM.laneMatmul(
+                                    x, weight: weight, scales: s, biases: b, scaleGroup: groupSize,
+                                    bits: bits, group: group, tiled: tiled)
+                                XCTAssertTrue(
+                                    arrayEqual(packed, inPlace).item(Bool.self),
+                                    "bits \(bits) gs \(groupSize) direct8 \(direct8) (\(n),\(k)) rows \(rows) tiled \(tiled)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Lane output against an fp32 matmul of the exact dequantized weight, for every row count the
     /// verify uses, tiled and untiled. MLX's own quantized matmul is measured against the same
     /// reference so the bound reflects bf16 output rounding, not a lane-specific allowance.

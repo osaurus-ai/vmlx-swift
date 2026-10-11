@@ -2,7 +2,8 @@
 // Portions adapted from TensorFold 0.6.6 (https://github.com/ashhart/TensorFold, Apache-2.0;
 // Copyright 2026 TensorFold contributors), src/tensorfold/kernels/qwen/dense/v1/lane_qmm.py and
 // lane_widen.py at commit cb2ebf0, via vMLX Python vmlx_engine/metal/lane_qmm.py (commit 4554485c1).
-// The Metal kernel sources below are byte-identical to the Python port.
+// The Metal kernel sources below are byte-identical to the Python port; the `directScales` variants
+// (default since 2026-10-11) differ only in reading scales/biases in place instead of a packed SBt copy.
 //
 // Row-independent affine quantized matmul for 1...128 rows on the M5 matrix units ("lane matmul").
 //
@@ -306,4 +307,35 @@ public enum LaneQMM {
                 }
           }
         """#
+
+    // MARK: direct scale variants (no packed SBt copy)
+
+    /// The SBt scale read of every lane kernel, replaced by a read of the module's OWN scales and biases,
+    /// (N, SKG) bf16 each, scale group `g / SREP` (SREP = 2 when a group-128 bundle runs the 64-value
+    /// bytes kernel). Same values, same arithmetic: bit-identical to the SBt kernel, and no packed
+    /// (K/GS, N, 2) copy (1.6 GB on Qwen3.8-27B JANG_4D).
+    /// COST, measured 2026-10-11 at 27B shapes, 4-bit g64, 8-16 rows: 0.42-0.54 ms vs 0.18-0.30 ms
+    /// packed. It is the per-group instruction count, not memory traffic: a variant with NO scale loads
+    /// (constants) still took 0.44 ms, and a coalesced per-lane load + simd_shuffle variant 0.45-0.57 ms.
+    /// So this is a per-target choice (``LaneQMMTargetPolicy/laneQMMPackedScales``): the 27B keeps
+    /// the packed copy (DFlash2 decode 22-32 vs 13-20 tok/s, i.e. AR speed or below without it);
+    /// Diplodocus/K2 Uno reads in place (same speed, -250 MB).
+    static func directScales(_ source: String) -> String {
+        let edits = [
+            ("const device uint4* sbv = (const device uint4*)SBt;",
+             "// scales and biases read in place: S, B are (N, SKG) bf16"),
+            ("const uint4 q = colok[f] ? sbv[(g * N + n0 + f * 16 + fn) / 4] : uint4(0);", ""),
+            ("const vec<bfloat, 8> v = as_type<vec<bfloat, 8>>(q);", ""),
+            ("for (int j = 0; j < 4; j++) { s[f][j] = float(v[2 * j]); bb[f][j] = float(v[2 * j + 1]); }",
+             "for (int j = 0; j < 4; j++) { const int64_t o = (int64_t)(n0 + f * 16 + fn + j) * SKG + g / SREP; "
+                + "s[f][j] = colok[f] ? float(S[o]) : 0.0f; bb[f][j] = colok[f] ? float(B[o]) : 0.0f; }"),
+        ]
+        var replaced = source
+        for (old, new) in edits {
+            precondition(replaced.contains(old), "lane source: \(old) not found")
+            replaced = replaced.replacingOccurrences(of: old, with: new)
+        }
+        precondition(!replaced.contains("SBt") && !replaced.contains("sbv"), "lane source: SBt left")
+        return replaced
+    }
 }

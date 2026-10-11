@@ -494,6 +494,9 @@ extension K2HorizonModel: LoRAModel {
 /// from 8 rows.
 extension K2HorizonModel: LaneQMMTargetPolicy {
     public var laneQMMTiled: Bool { false }
+    /// In-place scales: Diplodocus preview 3 Uno decode measured the same with and without the packed
+    /// copy (47-58 vs 50-59 tok/s, 3 rounds, identical text) and the copy is 250 MB (2026-10-11).
+    public var laneQMMPackedScales: Bool { false }
     public var laneQMMUntiledMinRows: Int { 8 }
 }
 

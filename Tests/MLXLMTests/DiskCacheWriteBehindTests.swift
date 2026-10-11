@@ -46,6 +46,48 @@ struct DiskCacheWriteBehindTests {
         }
     }
 
+    /// A `..<offset` slice of a step-padded KV buffer (what a live or trimmed cache's `state` returns)
+    /// is written run by run from the buffer itself, no host copy, and the file is byte-for-byte the
+    /// one a contiguous copy produces. Offsets deliberately not multiples of the 256-token step.
+    @Test func stridedKVSliceWritesTheSameBytesAsAContiguousCopy() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("strided")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            for (capacity, offset) in [(512, 300), (1024, 777), (768, 257)] {
+                let buffer = (MLXRandom.normal([1, 4, capacity, 128]) * 3).asType(.bfloat16)
+                let values = (MLXRandom.normal([1, 4, capacity, 128])).asType(.bfloat16)
+                let keys = buffer[.ellipsis, ..<offset, 0...]
+                let vals = values[.ellipsis, ..<offset, 0...]
+                eval(keys, vals)
+                let arrays = ["k": keys, "v": vals, "meta": MLXArray([Int32(offset)])]
+                let tensors = try #require(SafetensorsByteWriter.tensors(from: arrays))
+                let strided = tensors.filter {
+                    if case .strided = $0.payload { return true }
+                    return false
+                }
+                #expect(strided.map(\.name).sorted() == ["k", "v"], "capacity \(capacity) offset \(offset)")
+                let viewURL = dir.appendingPathComponent("view-\(offset).safetensors")
+                try SafetensorsByteWriter.write(tensors, metadata: ["format": "mlx"], to: viewURL)
+
+                let owned = ["k": keys * 1, "v": vals * 1, "meta": MLXArray([Int32(offset)])]
+                eval(Array(owned.values))
+                let ownedTensors = try #require(SafetensorsByteWriter.tensors(from: owned))
+                #expect(ownedTensors.allSatisfy {
+                    if case .contiguous = $0.payload { return true }
+                    return false
+                })
+                let copyURL = dir.appendingPathComponent("copy-\(offset).safetensors")
+                try SafetensorsByteWriter.write(ownedTensors, metadata: ["format": "mlx"], to: copyURL)
+
+                #expect(try Data(contentsOf: viewURL) == Data(contentsOf: copyURL), "offset \(offset)")
+                let loaded = try loadArrays(url: viewURL)
+                #expect(arrayEqual(try #require(loaded["k"]), keys).item(Bool.self))
+                #expect(arrayEqual(try #require(loaded["v"]), vals).item(Bool.self))
+            }
+        }
+    }
+
     @Test func inFlightEntryIsServedFromMemoryThenPersisted() throws {
         try MLXMetalTestLock.withLock {
             let dir = root("inflight")
