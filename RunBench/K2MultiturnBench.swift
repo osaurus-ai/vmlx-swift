@@ -242,12 +242,33 @@ func runK2MultiturnBench(modelPath: String) async throws {
     }
     memoryLine("after_load")
     var previousPrompt: [Int32] = []
+    let mediaAsks = [
+        "Describe this image in detail: what is shown, any text, and the colors.",
+        "Now listen to this audio clip. What do you hear? Transcribe any speech.",
+        "Compare the image from my first message with the audio clip: is there any connection? Answer in a short paragraph.",
+        "Summarize everything we discussed in two sentences.",
+    ]
+    var chatHistory: [Chat.Message] = [.system("You are a precise assistant. Answer completely.")]
     for turn in 0 ..< min(turns, asks.count) {
         let ask = turn == 0 && !pad.isEmpty ? "Reference module:\n```python\n\(pad)```\n\n" + asks[turn] : asks[turn]
         messages.append(["role": "user", "content": ask])
-        nonisolated(unsafe) let input = try await context.processor.prepare(input: UserInput(
-            messages: messages,
-            additionalContext: effort == "none" ? nil : ["reasoning_effort": effort]))
+        // K2MT_IMAGE / K2MT_AUDIO: a structured chat whose turn 0 carries the image and turn 1 the
+        // audio (both stay in history), then text follow-ups: media-salted cache entries.
+        let mediaMode = env["K2MT_IMAGE"] != nil || env["K2MT_AUDIO"] != nil
+        if mediaMode {
+            var userMsg = Chat.Message.user(mediaAsks[min(turn, mediaAsks.count - 1)])
+            if turn == 0, let image = env["K2MT_IMAGE"] {
+                userMsg = .user(mediaAsks[0], images: [.url(URL(fileURLWithPath: image))])
+            } else if turn == 1, let audio = env["K2MT_AUDIO"] {
+                userMsg = .user(mediaAsks[1], audios: [.url(URL(fileURLWithPath: audio))])
+            }
+            chatHistory.append(userMsg)
+        }
+        nonisolated(unsafe) let input = try await context.processor.prepare(input: mediaMode
+            ? UserInput(chat: chatHistory, additionalContext: effort == "none" ? nil : ["reasoning_effort": effort])
+            : UserInput(
+                messages: messages,
+                additionalContext: effort == "none" ? nil : ["reasoning_effort": effort]))
         let promptTokens = input.text.tokens.size
         // Longest common prefix with the previous turn's prompt: what a prefix cache can reuse at most.
         let tokenList = input.text.tokens.reshaped(-1).asArray(Int32.self)
@@ -353,6 +374,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
         let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
         print("K2MT_TURN " + String(decoding: data, as: UTF8.self))
         messages.append(["role": "assistant", "content": text])
+        chatHistory.append(.assistant(text))
     }
     // Idle floor: every background write landed, then 3 s of nothing (what the app sits at between turns).
     _ = coordinator?.waitForPendingDiskWrites()
