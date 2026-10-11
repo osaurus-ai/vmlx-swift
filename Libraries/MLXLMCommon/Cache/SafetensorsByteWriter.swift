@@ -166,9 +166,29 @@ enum SafetensorsByteWriter {
         return header
     }
 
+    /// `VMLX_CACHE_WRITEV=0`: one `write` per tensor/run (pre-2026-10-11 behavior, A/B control).
+    static let gatheredWrites = ProcessInfo.processInfo.environment["VMLX_CACHE_WRITEV"] != "0"
+
     /// Write `tensors` to `url` (created; must not exist). Returns the file size.
+    ///
+    /// Default: the header and every tensor run go out as gathered `writev` calls (up to `IOV_MAX`
+    /// segments and 1 GiB each, resumed on short writes) instead of one `FileHandle.write` per tensor.
+    /// A boundary file carries a few hundred tensors (hybrids: ~400, many of them tiny I32 layer tags);
+    /// this is the Python W1 idea (`os.writev` per payload file). Bytes on disk are identical.
+    /// Measured 2026-10-11 (RunBench `K2MT_IOBENCH=1`, alternating arms, page-cache-bound writes):
+    /// K2-sized 4.1 GB / 145 tensors 397 -> 334 ms median (5 rounds); 0.79 GB / 257 tensors
+    /// 103 -> 57 ms (5 rounds). The writer thread finishes each queued store sooner, so the write-behind
+    /// queue (and the payload memory it holds) drains sooner.
     @discardableResult
     static func write(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
+        if gatheredWrites {
+            return try writeGathered(tensors, metadata: metadata, to: url)
+        }
+        return try writePerTensor(tensors, metadata: metadata, to: url)
+    }
+
+    /// One `write` per tensor (per strided run) through `FileHandle`.
+    static func writePerTensor(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
         let header = try header(for: tensors, metadata: metadata)
         guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
             throw WriteError.cannotCreate(url.lastPathComponent)
@@ -191,5 +211,88 @@ enum SafetensorsByteWriter {
             size += tensor.byteCount
         }
         return size
+    }
+
+    enum GatheredWriteError: Error { case openFailed(Int32), writeFailed(Int32), noProgress }
+
+    /// Bytes per `writev` call (Darwin rejects a call past a 32-bit total). Tests lower it to exercise
+    /// split segments and multi-call files.
+    nonisolated(unsafe) static var maxGatheredCallBytes = 1 << 30
+
+    static func writeGathered(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
+        let header = try header(for: tensors, metadata: metadata)
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        guard fd >= 0 else { throw GatheredWriteError.openFailed(errno) }
+        defer { close(fd) }
+        // Every segment points into memory that outlives this call: the header `Data` (kept below),
+        // contiguous tensor `Data`, or a strided run of an MLX buffer the caller keeps alive.
+        var segments: [(UnsafeRawPointer, Int)] = []
+        var keep: [Data] = [header]
+        var owned: [UnsafeMutableRawPointer] = []
+        defer { owned.forEach { $0.deallocate() } }
+        var total = 0
+        func add(_ data: Data) {
+            guard !data.isEmpty else { return }
+            // Foundation stores small `Data` inline: a pointer from `withUnsafeBytes` is only valid
+            // inside the closure. Copy anything small into memory owned by this call; larger `Data`
+            // (heap or no-copy MLX buffer, kept alive by `keep`) is referenced in place.
+            if data.count <= 4096 {
+                let copy = UnsafeMutableRawPointer.allocate(byteCount: data.count, alignment: 16)
+                data.copyBytes(to: copy.assumingMemoryBound(to: UInt8.self), count: data.count)
+                owned.append(copy)
+                segments.append((UnsafeRawPointer(copy), data.count))
+                return
+            }
+            keep.append(data)
+            data.withUnsafeBytes { raw in
+                if let base = raw.baseAddress { segments.append((base, data.count)) }
+            }
+        }
+        add(header)
+        for tensor in tensors where tensor.byteCount > 0 {
+            switch tensor.payload {
+            case .contiguous(let data):
+                add(data)
+            case .strided(let base, let chunkBytes, let offsets):
+                for offset in offsets { segments.append((base + offset, chunkBytes)) }
+            }
+        }
+        return try withExtendedLifetime(keep) {
+            var index = 0
+            var consumed = 0  // bytes of segments[index] already written
+            // Darwin `writev` rejects (EINVAL) a call whose lengths sum past a 32-bit int, so each call
+            // carries at most `maxCallBytes` (a larger segment is written in pieces).
+            let maxCallBytes = maxGatheredCallBytes
+            while index < segments.count {
+                var iov: [iovec] = []
+                var callBytes = 0
+                var k = 0
+                while index + k < segments.count, iov.count < Int(IOV_MAX), callBytes < maxCallBytes {
+                    let (base, length) = segments[index + k]
+                    let skip = k == 0 ? consumed : 0
+                    let take = min(length - skip, maxCallBytes - callBytes)
+                    iov.append(iovec(iov_base: UnsafeMutableRawPointer(mutating: base + skip), iov_len: take))
+                    callBytes += take
+                    if take < length - skip { break }
+                    k += 1
+                }
+                let written = iov.withUnsafeBufferPointer { writev(fd, $0.baseAddress, Int32($0.count)) }
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    throw GatheredWriteError.writeFailed(errno)
+                }
+                if written == 0 { throw GatheredWriteError.noProgress }
+                total += written
+                // Advance past fully written segments; keep the offset into a partial one.
+                var left = written + consumed
+                consumed = 0
+                while index < segments.count, left >= segments[index].1 {
+                    left -= segments[index].1
+                    index += 1
+                }
+                consumed = left
+            }
+            return total
+        }
     }
 }

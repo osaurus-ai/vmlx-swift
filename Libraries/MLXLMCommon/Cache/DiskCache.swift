@@ -645,6 +645,42 @@ public final class DiskCache: @unchecked Sendable {
     }
 
 
+    /// OFF by default; `VMLX_CACHE_READAHEAD=1` enables it (A/B only).
+    ///
+    /// Measured 2026-10-11 (RunBench `K2MT_IOBENCH=1`, files proven cold with `mincore` = 0 % resident,
+    /// alternating arms): K2-sized 4.1 GB / 145 tensors, plain 325 ms vs read-ahead 405 ms (5/5 rounds
+    /// slower); 0.79 GB / 257 tensors, 62 vs 87 ms. MLX's `ParallelFileReader` already reads a cold
+    /// cache file at ~12.7 GB/s; the extra kernel read-ahead only competes with it. Python's R2 helps
+    /// there because its tier is hundreds of tiny block files read one by one; Swift restores one large
+    /// file. Do not enable by default without a measurement that beats these.
+    static let readAheadEnabled = ProcessInfo.processInfo.environment["VMLX_CACHE_READAHEAD"] == "1"
+
+    /// Ask the kernel to start reading the whole payload file before MLX loads it.
+    ///
+    /// `loadArraysAndMetadata` maps nothing: each tensor is a lazy load that `pread`s its own byte range
+    /// when the restore evaluates it, one tensor after another. When the file is not in the page cache
+    /// (after an app restart, or after macOS dropped file pages under memory pressure next to a large
+    /// model), every tensor then waits for its own SSD read. `F_RDADVISE` queues asynchronous read-ahead
+    /// for the whole file up front (Python R2's idea, `F_RDADVISE` / `POSIX_FADV_WILLNEED`), so the reads
+    /// overlap. A hint only: no data is loaded into the process, nothing is retained, and a file already
+    /// in the page cache costs one `fcntl` per GiB.
+    static func adviseReadAhead(url: URL, force: Bool = false) {
+        guard readAheadEnabled || force else { return }
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > 0 else { return }
+        let size = Int(info.st_size)
+        var offset = 0
+        while offset < size {
+            let count = min(size - offset, 1 << 30)
+            var advice = radvisory(ra_offset: off_t(offset), ra_count: Int32(count))
+            _ = fcntl(fd, F_RDADVISE, &advice)
+            offset += count
+        }
+    }
+
     /// Whether queued write-behind bytes are within ``inflightByteBudget``.
     var hasWriteBehindRoom: Bool {
         lock.lock()
@@ -1658,6 +1694,7 @@ public final class DiskCache: @unchecked Sendable {
                     reason: String(cString: strerror(code)))
             }
             try loadFaultForTesting?(url)
+            Self.adviseReadAhead(url: url)
             let (arrays, _) = try loadArraysAndMetadata(url: url)
             // A record written before the store-side check (or by a build that
             // computed NaN) must never be restored: it is removed on first touch

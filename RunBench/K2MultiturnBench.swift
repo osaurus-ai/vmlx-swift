@@ -92,6 +92,15 @@ func runK2MultiturnBench(modelPath: String) async throws {
         return
     }
     if env["K2MT_MULTIROW"] == "1" { runMultiRowAttentionProbe(); return }
+    if env["K2MT_IOBENCH"] == "1" {
+        // SSD cache file I/O mechanisms, no model: gathered vs per-tensor writes, cold restore +/- read-ahead.
+        try DiskCacheIOProbe.run(
+            directory: URL(fileURLWithPath: env["K2MT_IO_DIR"] ?? NSTemporaryDirectory() + "k2mt-io"),
+            layers: Int(env["K2MT_IO_LAYERS"] ?? "36") ?? 36, heads: Int(env["K2MT_IO_HEADS"] ?? "8") ?? 8,
+            tokens: Int(env["K2MT_IO_TOKENS"] ?? "28000") ?? 28000, dim: Int(env["K2MT_IO_DIM"] ?? "128") ?? 128,
+            rounds: Int(env["K2MT_IO_ROUNDS"] ?? "3") ?? 3)
+        return
+    }
     if env["K2MT_LANEBENCH"] == "1" {
         // Lane matmul at Qwen3.8-27B shapes, 4-bit g64: packed SBt scales vs in-place scales. Median of 101.
         for (nOut, kIn) in [(6144, 5120), (5120, 6144), (17408, 5120), (5120, 17408)] {

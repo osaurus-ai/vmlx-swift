@@ -88,6 +88,42 @@ struct DiskCacheWriteBehindTests {
         }
     }
 
+    /// The gathered (`writev`) writer produces exactly the per-tensor writer's bytes for tiny inline
+    /// tensors, large contiguous ones and strided KV views, including when a call must stop mid-segment
+    /// (forced 4 KB / 7,777-byte call limits so every path of the resume loop runs).
+    @Test func gatheredWritesMatchPerTensorWritesByteForByte() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("gathered")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let saved = SafetensorsByteWriter.maxGatheredCallBytes
+            defer { SafetensorsByteWriter.maxGatheredCallBytes = saved }
+            let buffer = (MLXRandom.normal([1, 4, 640, 128]) * 2).asType(.bfloat16)
+            let arrays: [String: MLXArray] = [
+                "kv_0_keys": buffer[.ellipsis, ..<333, 0...],
+                "kv_0_values": MLXRandom.normal([1, 4, 333, 128]).asType(.bfloat16),
+                "__layer_kind_0__": MLXArray([Int32(1)]),
+                "__offset__": MLXArray([Int32(333)]),
+                "flags": MLXArray([UInt8(1), 0, 1]),
+                "empty": MLXArray.zeros([1, 0, 3], dtype: .float16),
+            ]
+            eval(Array(arrays.values))
+            let tensors = try #require(SafetensorsByteWriter.tensors(from: arrays))
+            let reference = dir.appendingPathComponent("per-tensor.safetensors")
+            try SafetensorsByteWriter.writePerTensor(tensors, metadata: ["format": "mlx"], to: reference)
+            let expected = try Data(contentsOf: reference)
+            for limit in [1 << 30, 4096, 7_777] {
+                SafetensorsByteWriter.maxGatheredCallBytes = limit
+                let url = dir.appendingPathComponent("gathered-\(limit).safetensors")
+                let size = try SafetensorsByteWriter.writeGathered(tensors, metadata: ["format": "mlx"], to: url)
+                #expect(size == expected.count, "limit \(limit)")
+                #expect(try Data(contentsOf: url) == expected, "limit \(limit)")
+            }
+            let loaded = try loadArrays(url: dir.appendingPathComponent("gathered-4096.safetensors"))
+            #expect(arrayEqual(try #require(loaded["kv_0_keys"]), arrays["kv_0_keys"]!).item(Bool.self))
+        }
+    }
+
     @Test func inFlightEntryIsServedFromMemoryThenPersisted() throws {
         try MLXMetalTestLock.withLock {
             let dir = root("inflight")
