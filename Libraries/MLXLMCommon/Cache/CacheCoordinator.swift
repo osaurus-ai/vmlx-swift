@@ -1602,10 +1602,15 @@ public final class CacheCoordinator: @unchecked Sendable {
                 return
             }
         }
-        // Write-behind (see DiskCache) only for pure-KV families: a hybrid's companion links onto
-        // the KV row inside this critical section, so its KV row must exist before return. When the
-        // write is deferred, what follows the row (early-companion adoption, the quota pass and the
-        // capacity-pressure record) runs on the writer once the row has landed, under the same lock.
+        // Write-behind (see DiskCache) unless THIS call also stores a separate recurrent companion:
+        // that companion links onto the KV row inside this critical section ("KV first" below), so
+        // the row must exist before return. Hybrids whose recurrent state is native in the KV file
+        // (Qwen3.8 / Flash-Next / 27B GatedDeltaNet: `storesCompanion == false`) write one file and
+        // link nothing, so they write behind too: their single boundary save was the whole
+        // end-of-turn wait (Flash-Next 0.52 s, 27B 1.08 s per boundary at 10.8k tokens, 800 MB/s).
+        // When the write is deferred, what follows the row (early-companion adoption, the quota pass
+        // and the capacity-pressure record) runs on the writer once the row has landed, under the
+        // same lock.
         var deferred = false
         if let diskArrays, !diskArrays.isEmpty {
             let isHybrid = isHybrid
@@ -1618,7 +1623,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 isStableRoot: isStableRoot,
                 isResumeBoundary: isResumeBoundary,
                 isPostAnswer: isPostAnswer,
-                allowWriteBehind: !isHybrid,
+                allowWriteBehind: !storesCompanion,
                 afterPublish: { [self] in
                     if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.lock() }
                     defer { if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.unlock() } }

@@ -77,16 +77,14 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
         }
     }
 
-    private var prewarmed = false
+    private var warmupSteps: Set<String> = []
 
-    /// True exactly once per table (per living target and namespace): the caller compiles the
-    /// speculative shapes then (`UnoDecoder.prewarm`).
-    func claimPrewarm() -> Bool {
+    /// True exactly once per warm-up step per table (per living target and namespace): the caller
+    /// runs that step then (`UnoWarmup.prepare(step:...)`).
+    func claimWarmupStep(_ step: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        if prewarmed { return false }
-        prewarmed = true
-        return true
+        return warmupSteps.insert(step).inserted
     }
 
     /// Widths whose kernels are already compiled (`UnoDecoder.prewarm` at model load): their
@@ -392,7 +390,17 @@ struct DFlash2WidthChooser {
         }
         if probing == nil, cycles >= nextProbe {
             let others = widths.filter { $0 != best }
-            let probe = others.min { (lastTimed[$0] ?? -1) < (lastTimed[$1] ?? -1) } ?? best
+            let probe: Int
+            if lazyExploration, best == 1,
+                let likeliest = others.filter({ rate($0) != nil }).max(by: { rate($0)! < rate($1)! })
+            {
+                // On AR, re-time the speculative width most likely to win (by its estimate), not
+                // the one timed longest ago: at long context that was often a 12-16-row block that
+                // cost 230-455 ms per probe on K2 and could not win anyway.
+                probe = likeliest
+            } else {
+                probe = others.min { (lastTimed[$0] ?? -1) < (lastTimed[$1] ?? -1) } ?? best
+            }
             probing = (probe, best)
             width = probe
         } else {

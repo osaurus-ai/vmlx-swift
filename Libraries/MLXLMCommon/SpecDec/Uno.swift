@@ -310,33 +310,83 @@ public struct UnoGenerationStats: Sendable, Equatable {
 /// Load-time preparation for Uno, so a request never pays it.
 ///
 /// The first 8+-row K2 forward compiles the lane matmul kernel (~1.8 s on an M5 Max, longer on older
-/// chips). Done inside a request it stalls the first Uno response mid-stream; done at request setup it
-/// lands in that request's TTFT. A host calls `prepare` right after loading a model whose bundle
-/// declares an Uno adapter, inside the container's exclusive access (MLX state is not shared across
-/// concurrent evaluations). It installs the adapter and lane routing, compiles every candidate
-/// width's draft and verify shapes on a scratch cache, and marks those widths warm in the target's
-/// shared cost table so the chooser keeps their first timing. Idempotent per target.
+/// chips), and the first speculative block past 4,096 cached keys compiles the multi-row attention
+/// kernel's long variant (~0.5 s). Inside a request both stall the reply. The work is split into
+/// small steps (`UnoWarmup.Step`) so a host can run them in the background after load and release the
+/// GPU between steps: a message sent meanwhile waits for at most one step, never the whole warm-up
+/// (all steps at once delayed the first message by 4.7 s on an M5 Max). A step not yet run when a
+/// request needs it simply compiles on use. Each step runs inside the host's exclusive model access
+/// (MLX state is not shared across concurrent evaluations) and is idempotent per target.
 public enum UnoWarmup {
     static var tracksClock: Bool { ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0" }
 
-    /// Returns the milliseconds spent, or nil when nothing was done (not an Uno target, already
-    /// prepared). Throws when the adapter cannot be loaded or does not fit the target.
+    public enum Step: Hashable, Sendable, CustomStringConvertible {
+        /// Draft and verify at this many rows over a short context (compiles the row-count shapes).
+        case width(Int)
+        /// One 8-row draft and verify over 4,160 cached keys (compiles the long-context attention).
+        case longContext
+
+        public var description: String {
+            switch self {
+            case .width(let w): return "width\(w)"
+            case .longContext: return "long-context"
+            }
+        }
+    }
+
+    /// Steps in the order a request is likely to need them: the bundle's declared width first (the
+    /// chooser's first speculative width), 8, the long-context variant, then the rest.
+    public static func steps(adapterDirectory: URL) -> [Step] {
+        let declared = UnoWidthPlan.declaredWidth(adapterDirectory: adapterDirectory) ?? 8
+        var widths = [declared, 8] + UnoWidthPlan.candidates.filter { $0 > 1 }
+        widths = widths.reduce(into: []) { if !$0.contains($1), $1 > 1 { $0.append($1) } }
+        var out: [Step] = widths.prefix(2).map { .width($0) }
+        out.append(.longContext)
+        out += widths.dropFirst(2).map { .width($0) }
+        return out
+    }
+
+    /// Run one step. Installs the adapter and lane routing the first time. Returns the
+    /// milliseconds spent, or nil when nothing was done (not an Uno target, step already done).
     @discardableResult
-    public static func prepare(model: any LanguageModel, adapterDirectory: URL, temperature: Float = 1)
-        throws -> Int?
-    {
+    public static func prepare(
+        step: Step, model: any LanguageModel, adapterDirectory: URL, temperature: Float = 1
+    ) throws -> Int? {
         guard let target = model as? any UnoSelfSpeculativeModel else { return nil }
         let table = DFlash2WidthCostTable.shared(
             for: target, widths: UnoWidthPlan.candidates, namespace: "uno", tracksClock: tracksClock)
-        guard table.claimPrewarm() else { return nil }
+        guard table.claimWarmupStep(step.description) else { return nil }
         let start = Date.timeIntervalSinceReferenceDate
         let adapter = try UnoAdapterResolver.shared.adapter(at: adapterDirectory)
         let mask = try target.installUnoAdapter(adapter)
         LaneQMM.installForDFlash2Target(target)
-        UnoDecoder.prewarm(
-            model: target, mask: mask, widths: UnoWidthPlan.candidates, temperature: temperature)
-        table.markWarm(UnoWidthPlan.candidates)
+        switch step {
+        case .width(let w):
+            UnoDecoder.prewarm(
+                model: target, mask: mask, widths: [w], contextTokens: 32, temperature: temperature)
+            table.markWarm([w])
+        case .longContext:
+            UnoDecoder.prewarm(
+                model: target, mask: mask, widths: [8], contextTokens: 4_160, temperature: temperature)
+        }
         return Int((Date.timeIntervalSinceReferenceDate - start) * 1000)
+    }
+
+    /// Every step at once (benches, `VMLX_UNO_PREWARM=1`). Returns the milliseconds spent, or nil when
+    /// nothing was left to do.
+    @discardableResult
+    public static func prepare(model: any LanguageModel, adapterDirectory: URL, temperature: Float = 1)
+        throws -> Int?
+    {
+        var total: Int?
+        for step in steps(adapterDirectory: adapterDirectory) {
+            if let ms = try prepare(
+                step: step, model: model, adapterDirectory: adapterDirectory, temperature: temperature)
+            {
+                total = (total ?? 0) + ms
+            }
+        }
+        return total
     }
 }
 
@@ -392,10 +442,18 @@ struct UnoDecoder {
     /// Compile every speculative shape once, on a scratch cache, before the first request decodes.
     /// The first 8-row K2 forward compiles a kernel for ~1.8 s; without this it landed inside the first
     /// Uno response (a 2,000-token reply: 75 vs 82 tok/s for AR, the whole gap at low acceptance).
-    static func prewarm(model: any LanguageModel, mask: UnoRowMask, widths: [Int], temperature: Float) {
+    static func prewarm(
+        model: any LanguageModel, mask: UnoRowMask, widths: [Int], contextTokens: Int, temperature: Float
+    ) {
         let cache = model.newCache(parameters: nil)
-        let prefix = MLXArray((0 ..< 32).map { Int32(1000 + $0 * 7) }).reshaped(1, 32)
-        eval(model(LMInput.Text(tokens: prefix), cache: cache, state: nil).logits)
+        var filled = 0
+        while filled < contextTokens {
+            let n = Swift.min(1_024, contextTokens - filled)
+            let chunk = MLXArray((0 ..< n).map { Int32(1000 + (($0 + filled) * 7919) % 50_000) })
+                .reshaped(1, n)
+            eval(model(LMInput.Text(tokens: chunk), cache: cache, state: nil).logits)
+            filled += n
+        }
         for L in widths where L > 1 {
             let tokens = MLXArray((0 ..< L).map { Int32(2000 + $0 * 13) }).reshaped(1, L)
             var rows = [Float](repeating: 1, count: L)
