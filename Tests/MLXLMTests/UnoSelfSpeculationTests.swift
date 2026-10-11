@@ -158,9 +158,11 @@ final class UnoSelfSpeculationTests: XCTestCase {
         XCTAssertThrowsError(try UnoAdapter.load(from: dir), "missing layer scale must fail")
     }
 
-    /// With no pinned width the chooser runs: it times every candidate (AR stretches included)
-    /// and the response still has the requested length.
-    func testAdaptiveWidthTimesEveryCandidate() throws {
+    /// With no pinned width the chooser runs: it times AR and at least one speculative width, and
+    /// the response still has the requested length. (Lazy exploration: a width whose estimate
+    /// cannot beat AR is not forced through a cycle, so with this random-weight model's near-zero
+    /// acceptance most candidates are never run; that is the point.)
+    func testAdaptiveWidthTimesARAndASpeculativeWidth() throws {
         let model = try model()
         var p = GenerateParameters(maxTokens: 400, temperature: 1, topP: 1)
         p.draftStrategy = .uno(adapterPath: try adapterDirectory(), blockSize: nil)
@@ -168,9 +170,9 @@ final class UnoSelfSpeculationTests: XCTestCase {
         let run = try generate(model, parameters: p, count: 400)
         XCTAssertEqual(run.tokens.count, 400)
         let stats = try XCTUnwrap(run.iterator.unoGenerationStats)
-        for width in UnoWidthPlan.candidates where width > 1 {
-            XCTAssertGreaterThan(stats.cyclesByWidth[width] ?? 0, 0, "width \(width) never ran: \(stats)")
-        }
+        XCTAssertGreaterThan(
+            stats.cyclesByWidth.filter { $0.key > 1 }.values.reduce(0, +), 0,
+            "no speculative width ever ran: \(stats)")
         XCTAssertGreaterThan(stats.arSteps, 0, "the AR option was never timed: \(stats)")
     }
 

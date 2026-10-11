@@ -134,6 +134,12 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         return
     }
+    if let uno = env["K2MT_UNO"], env["K2MT_UNO_WARMUP"] == "1" {
+        // What the host does after load (osaurus: MLXBatchAdapter.warmupUnoAtLoad).
+        let t0 = Date()
+        let ms = try UnoWarmup.prepare(model: context.model, adapterDirectory: URL(fileURLWithPath: uno))
+        print("K2MT_UNO_WARMUP ms=\(ms.map(String.init) ?? "nil") wall_ms=\(Int(Date().timeIntervalSince(t0) * 1000))")
+    }
     let container = ModelContainer(context: context)
     if arm != "none" {
         var config = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
@@ -203,6 +209,13 @@ func runK2MultiturnBench(modelPath: String) async throws {
             i += 1
         }
     }
+    func memoryLine(_ label: String) {
+        print(String(
+            format: "K2MT_MEM %@ footprint_mb=%.0f mlx_active_mb=%.0f mlx_cache_mb=%.0f mlx_peak_mb=%.0f",
+            label, footprintMB(), Double(Memory.activeMemory) / 1_048_576,
+            Double(Memory.cacheMemory) / 1_048_576, Double(Memory.peakMemory) / 1_048_576))
+    }
+    memoryLine("after_load")
     var previousPrompt: [Int32] = []
     for turn in 0 ..< min(turns, asks.count) {
         let ask = turn == 0 && !pad.isEmpty ? "Reference module:\n```python\n\(pad)```\n\n" + asks[turn] : asks[turn]
@@ -274,8 +287,9 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         let streamEnd = Date()
         // Store settle: SSD bytes stable for 1 s (max 20 s) after the stream ends.
+        // K2MT_NO_SETTLE=1: send the next turn at once (an instant tool / auto-continue).
         var last = diskBytes(), stableSince = Date(), settleEnd = Date()
-        while Date().timeIntervalSince(streamEnd) < 20 {
+        while env["K2MT_NO_SETTLE"] != "1", Date().timeIntervalSince(streamEnd) < 20 {
             try await Task.sleep(nanoseconds: 250_000_000)
             let now = diskBytes()
             if now != last { last = now; stableSince = Date() }
@@ -313,4 +327,8 @@ func runK2MultiturnBench(modelPath: String) async throws {
         print("K2MT_TURN " + String(decoding: data, as: UTF8.self))
         messages.append(["role": "assistant", "content": text])
     }
+    // Idle floor: every background write landed, then 3 s of nothing (what the app sits at between turns).
+    _ = coordinator?.waitForPendingDiskWrites()
+    try await Task.sleep(nanoseconds: 3_000_000_000)
+    memoryLine("idle_after_turns")
 }

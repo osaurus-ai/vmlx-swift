@@ -224,4 +224,53 @@ final class DFlash2WidthChooserTests: XCTestCase {
         XCTAssertEqual(costs.cost(of: 16)! / costs.cost(of: 1)!, ratio, accuracy: 0.2 * ratio)
         XCTAssertGreaterThan(costs.cost(of: 16)!, 0.09)
     }
+
+    /// A machine where Uno loses (an older chip: a speculative cycle costs 6.5 AR steps and commits ~4
+    /// tokens). Context grows through six cost buckets. With lazy exploration every bucket opens on AR
+    /// and untimed widths are priced from estimates, so speculative cycles are only the sparse
+    /// re-time probes; the old chooser timed every width in every bucket (plus warm-up cycles).
+    private func losingMachine(lazy: Bool) -> (spec: Int, specTokens: Int, arTokens: Int, firstInBucket: [Int]) {
+        let costs = DFlash2WidthCostTable(tracksClock: true)
+        var chooser = DFlash2WidthChooser(
+            widths: [1, 5, 8, 12, 16], costs: costs, bonusTokens: 1, initial: 5,
+            sharesAcceptance: true, rewardsWinningProbes: true, decay: 0.95, lazyExploration: lazy)
+        var spec = 0, specTokens = 0, arTokens = 0
+        var firstInBucket: [Int] = []
+        var tokens = 0
+        var bucket = 0
+        while tokens < 12_000 {
+            let b = min(5, tokens / 2_000)
+            if b != bucket || tokens == 0 {
+                bucket = b
+                chooser.setCostBucket(b)
+                firstInBucket.append(chooser.width)
+            }
+            let ar = 0.0125 * (1 + 0.1 * Double(b))
+            let w = chooser.width
+            if w == 1 {
+                chooser.observe(verifyWidth: 1, tokens: 1, seconds: ar, count: 8)
+                tokens += 8
+                arTokens += 8
+            } else {
+                let accepted = min(w - 1, 2)
+                chooser.observe(verifyWidth: w, tokens: accepted + 1, seconds: ar * (6 + 0.1 * Double(w)))
+                tokens += accepted + 2
+                spec += 1
+                specTokens += accepted + 2
+            }
+        }
+        return (spec, specTokens, arTokens, firstInBucket)
+    }
+
+    func testLazyExplorationKeepsALosingMachineOnAR() {
+        let lazy = losingMachine(lazy: true)
+        let eager = losingMachine(lazy: false)
+        print("UNO_LOSING lazy spec=\(lazy.spec) first=\(lazy.firstInBucket) eager spec=\(eager.spec) first=\(eager.firstInBucket)")
+        // Every bucket after the first opens on AR (the first opens on AR too: AR is timed first).
+        XCTAssertEqual(lazy.firstInBucket, Array(repeating: 1, count: lazy.firstInBucket.count))
+        // Speculative cycles: only probes, under 2 % of tokens.
+        XCTAssertLessThan(Double(lazy.specTokens) / Double(lazy.specTokens + lazy.arTokens), 0.02, "\(lazy)")
+        XCTAssertLessThan(lazy.spec, eager.spec, "control: eager exploration times every width per bucket")
+    }
 }
+
