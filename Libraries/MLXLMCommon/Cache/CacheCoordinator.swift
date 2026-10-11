@@ -247,6 +247,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         } else {
             self.diskCache = nil
         }
+        self.diskCache?.writeBehind = config.diskWriteBehind
         self.diskRootKey = self.diskCache?.cacheDir.standardizedFileURL.path
 
         self.ssmStateCache = SSMStateCache(
@@ -1601,8 +1602,14 @@ public final class CacheCoordinator: @unchecked Sendable {
                 return
             }
         }
+        // Write-behind (see DiskCache) only for pure-KV families: a hybrid's companion links onto
+        // the KV row inside this critical section, so its KV row must exist before return. When the
+        // write is deferred, what follows the row (early-companion adoption, the quota pass and the
+        // capacity-pressure record) runs on the writer once the row has landed, under the same lock.
+        var deferred = false
         if let diskArrays, !diskArrays.isEmpty {
-            diskCache?.store(
+            let isHybrid = isHybrid
+            deferred = diskCache?.store(
                 tokens: tokens,
                 arrays: diskArrays,
                 mediaSalt: mediaSalt,
@@ -1610,11 +1617,24 @@ public final class CacheCoordinator: @unchecked Sendable {
                 chainId: chainId,
                 isStableRoot: isStableRoot,
                 isResumeBoundary: isResumeBoundary,
-                isPostAnswer: isPostAnswer)
-            if !storesCompanion {
+                isPostAnswer: isPostAnswer,
+                allowWriteBehind: !isHybrid,
+                afterPublish: { [self] in
+                    if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.lock() }
+                    defer { if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.unlock() } }
+                    adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
+                    if usesCombinedQuota {
+                        enforceCombinedDiskQuotaLocked(activeChain: chainId)
+                    } else {
+                        enforceCombinedDiskQuota(activeChain: chainId)
+                    }
+                    diskCache?.reconcileCapacityPressure(chainId: chainId, requiresCompanion: isHybrid)
+                }) ?? false
+            if !deferred, !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
         }
+        if deferred { return }
 
         // KV first: the companion store reports what it wrote to the index
         // before it returns (still inside this critical section), and links
@@ -2115,6 +2135,14 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func releaseVolatile() {
         pagedCache?.clear()
         ssmStateCache.clear()
+    }
+
+    /// Wait for disk stores still being written in the background (``DiskCache`` write-behind) to
+    /// reach disk and the index. Unload, shutdown and app quit call this so an entry published as
+    /// stored is durable before the process lets go of it. A timeout only logs.
+    @discardableResult
+    public func waitForPendingDiskWrites(timeout: TimeInterval = 30) -> Bool {
+        diskCache?.waitForPendingWrites(timeout: timeout) ?? true
     }
 
     /// Clear all cache tiers, releasing all cached data.

@@ -1690,6 +1690,8 @@ public actor BatchEngine {
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
         StreamOrDevice.default.stream.synchronize()
+        // Background disk-cache writes of the last turns must land before the model goes.
+        cacheCoordinator?.waitForPendingDiskWrites()
         if shouldPurgeSoloMediaWorkingSet {
             Memory.clearCache()
             stepsSinceMemoryPurge = 0

@@ -1062,7 +1062,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 legacyGB: diskMaxSizeGB,
                 directory: diskDir))
 
-        return CacheCoordinatorConfig(
+        var config = CacheCoordinatorConfig(
             usePagedCache: reuseEnabled && cache.pagedKV.enabled,
             enableDiskCache: diskEnabled,
             pagedBlockSize: cache.pagedKV.blockSize ?? 64,
@@ -1075,6 +1075,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             defaultKVMode: cache.defaultKVMode,
             defaultMaxKVSize: cache.defaultMaxKVSize,
             longPromptMultiplier: cache.longPromptMultiplier)
+        // Serving: the end of a turn or tool call never waits for SSD writes (see DiskCache).
+        config.diskWriteBehind = true
+        return config
     }
 
     /// Automatic uses a share of free space plus this cache's own payloads.
