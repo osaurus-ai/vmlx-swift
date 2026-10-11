@@ -620,7 +620,10 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Bytes allowed in flight before a store waits for older writes (back-pressure: the old
     /// synchronous behavior, never a refusal). One eighth of physical memory.
-    static var inflightByteBudget: Int { Int(ProcessInfo.processInfo.physicalMemory / 8) }
+    static var inflightByteBudget: Int {
+        inflightByteBudgetOverrideForTesting ?? Int(ProcessInfo.processInfo.physicalMemory / 8)
+    }
+    nonisolated(unsafe) static var inflightByteBudgetOverrideForTesting: Int?
 
     /// Number of stores whose file is still being written.
     public var pendingWriteCount: Int {
@@ -641,6 +644,24 @@ public final class DiskCache: @unchecked Sendable {
         return settled
     }
 
+
+    /// Whether queued write-behind bytes are within ``inflightByteBudget``.
+    var hasWriteBehindRoom: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inflightBytes <= Self.inflightByteBudget
+    }
+
+    /// Stores that found the budget full and wrote synchronously instead of queueing.
+    public private(set) var writeBehindBudgetFallbacks = 0
+
+    /// Block until queued write-behind bytes fit the budget. Call ONLY while holding no lock the
+    /// writer needs (`CombinedDiskCacheQuotaLock`, this cache's lock): the writer must be able to
+    /// finish and publish what is queued.
+    public func waitForWriteBehindRoom() {
+        guard writesBehind else { return }
+        waitForInflightBudget()
+    }
 
     private func waitForInflightBudget() {
         let budget = Self.inflightByteBudget
@@ -1082,9 +1103,18 @@ public final class DiskCache: @unchecked Sendable {
         defer { trace.mark("return") }
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return }
         let tokenCount = tokens.count
-        let behind = writesBehind && allowWriteBehind
-        if behind {
-            waitForInflightBudget()
+        // NEVER wait for the in-flight budget here. Callers hold `CombinedDiskCacheQuotaLock` across
+        // this call, and the writer's `afterPublish` takes that same lock after each write: waiting
+        // here for the writer to drain deadlocked the engine (live 2026-10-11, Diplodocus K2 in the
+        // osaurus app, ~4.3 GB stores at 800 MB/s, four queued: the turn never finished). Callers
+        // wait for room BEFORE taking their locks (`waitForWriteBehindRoom()`); if the budget is still
+        // full at this point the store is written synchronously instead of queued.
+        var behind = writesBehind && allowWriteBehind
+        if behind, !hasWriteBehindRoom {
+            behind = false
+            lock.lock()
+            writeBehindBudgetFallbacks += 1
+            lock.unlock()
         }
         let rowKind = Self.rowKind(
             stableRoot: isStableRoot, resumeBoundary: isResumeBoundary, postAnswer: isPostAnswer)

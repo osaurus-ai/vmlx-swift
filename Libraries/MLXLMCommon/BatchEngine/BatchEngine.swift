@@ -4032,10 +4032,38 @@ public actor BatchEngine {
             // so the live cache may be one token behind the visible text.
             // Store the growing-chat boundary only when the cache offset proves
             // it covers prompt + generated tokens exactly enough to resume.
-            let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
-            if !usesCanonicalHybridBoundary,
+            //
+            // Two extensions (2026-10-11), both measured in-app on Qwen3.8-27B: a 16,384-token
+            // reasoning answer was followed by a user turn whose prompt held that whole answer, and
+            // the next turn restored the 14,159-token boundary and re-prefilled 16,558 tokens (TTFT
+            // 36.7 s) because no post-answer entry existed:
+            //   1. A length stop (`.length`) ends right after sampling a token that was never fed, so
+            //      the live cache covers prompt + generated - 1. Store exactly that.
+            //   2. Path-dependent hybrids (`usesCanonicalHybridBoundary`) stored only the stripped
+            //      prompt boundary, on the grounds that the next prompt's rendering of the answer is
+            //      not guaranteed to match the generated ids. Matching is the only thing that can
+            //      make an exact hybrid boundary hit, and a miss costs nothing but the file; so store
+            //      the live state when it sits EXACTLY on the boundary (recurrent state cannot be
+            //      trimmed) and the store writes behind (no separate recurrent companion; the
+            //      companion path is synchronous and would lengthen "finishing up").
+            //   `VMLX_POST_ANSWER_EXTENDED=0` restores the previous policy.
+            let extendedPostAnswer =
+                ProcessInfo.processInfo.environment["VMLX_POST_ANSWER_EXTENDED"] != "0"
+            let generatedBoundaryTokens: [Int] = {
+                if reason == .length, extendedPostAnswer, slot.generatedTokenIds.count > 1 {
+                    return promptTokens + slot.generatedTokenIds.dropLast()
+                }
+                return promptTokens + slot.generatedTokenIds
+            }()
+            let hybridPostAnswerAllowed =
+                extendedPostAnswer
+                && !coordinator.requiresSeparateRecurrentPayload
+                && cacheBoundaryLeafOffsets(slot.cache).allSatisfy {
+                    $0 == generatedBoundaryTokens.count
+                }
+            if !usesCanonicalHybridBoundary || hybridPostAnswerAllowed,
                !isReusablePrefixWarmup,
-               reason == .stop,
+               reason == .stop || (extendedPostAnswer && reason == .length),
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),
                !slot.generatedTokenIds.isEmpty,
@@ -4045,6 +4073,11 @@ public actor BatchEngine {
                     tokens: generatedBoundaryTokens,
                     snapshot: slot.cache,
                     label: "post-answer")
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/store] label=post-answer count=\(generatedBoundaryTokens.count) "
+                            + "reason=\(reason) hybrid=\(usesCanonicalHybridBoundary)\n").utf8))
+                }
             } else if !slot.generatedTokenIds.isEmpty {
                 Self.logger.debug(
                     "Skipped post-answer cache entry for slot \(slot.id.description, privacy: .public): reason=\(String(describing: reason), privacy: .public) generated=\(slot.generatedTokenIds.count) cacheOffset=\((slot.cache.map(\.offset).max() ?? 0), privacy: .public)"

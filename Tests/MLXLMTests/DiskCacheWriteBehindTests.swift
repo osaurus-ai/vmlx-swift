@@ -186,6 +186,46 @@ struct DiskCacheWriteBehindTests {
         }
     }
 
+    /// Regression (live hang, Diplodocus K2 in the osaurus app, 2026-10-11): with the in-flight budget
+    /// full and the queue over it by more than the next write, a store waited for the writer while
+    /// holding `CombinedDiskCacheQuotaLock`, and the writer's `afterPublish` waited for that lock.
+    /// Sizes: 4 KB then two 8 KB stores fill a 12 KB budget to 20 KB; finishing the 4 KB write leaves
+    /// 16 KB, still over, so the fourth store keeps waiting while the writer needs the lock.
+    @Test func fullWriteBehindBudgetDoesNotDeadlockCoordinatorStores() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("budget-deadlock")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            DiskCache.inflightByteBudgetOverrideForTesting = 12 * 1024
+            defer { DiskCache.inflightByteBudgetOverrideForTesting = nil }
+            var config = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1, diskCacheDir: dir,
+                modelKey: "wb")
+            config.diskWriteBehind = true
+            let coordinator = CacheCoordinator(config: config)
+            let disk = try #require(coordinator.diskCache)
+            disk.writeDelayForTesting = 0.3
+            let stores: [([Int], Int)] = [
+                (Array(1 ..< 20), 1_024), (Array(21 ..< 40), 2_048), (Array(41 ..< 60), 2_048),
+                (Array(61 ..< 80), 2_048),
+            ]
+            let done = DispatchSemaphore(value: 0)
+            Thread.detachNewThread {
+                for (tokens, count) in stores {
+                    coordinator.storePersistentBoundary(
+                        tokens: tokens,
+                        diskArrays: ["keys": MLXArray.ones([count], dtype: .float32) * Float(count)],
+                        ssmStates: nil, chainId: "A", isResumeBoundary: true)
+                }
+                done.signal()
+            }
+            #expect(done.wait(timeout: .now() + 20) == .success, "stores deadlocked on a full budget")
+            #expect(coordinator.waitForPendingDiskWrites(timeout: 20))
+            for (tokens, _) in stores {
+                #expect(coordinator.hasDurableDiskEntry(tokens: tokens))
+            }
+        }
+    }
+
     /// Without the serving opt-in a coordinator keeps synchronous stores.
     @Test func coordinatorStoresSynchronouslyByDefault() throws {
         try MLXMetalTestLock.withLock {

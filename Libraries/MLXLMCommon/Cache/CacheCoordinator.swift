@@ -1563,6 +1563,10 @@ public final class CacheCoordinator: @unchecked Sendable {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
             && ssmStateCache.diskStore != nil
+        // Back-pressure for write-behind happens HERE, before the combined quota lock: the writer
+        // takes that lock in `afterPublish`, so waiting for it to drain while holding the lock is a
+        // deadlock (see `DiskCache.store`).
+        diskCache?.waitForWriteBehindRoom()
         if usesCombinedQuota {
             CombinedDiskCacheQuotaLock.shared.lock()
         }
