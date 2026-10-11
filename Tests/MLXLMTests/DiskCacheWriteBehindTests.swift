@@ -124,6 +124,71 @@ struct DiskCacheWriteBehindTests {
         }
     }
 
+    /// The Swift counterpart of the Python bf16 store fix ("bf16 KV converted through float32 on every
+    /// save"): a bf16 KV cache stored through the real coordinator path lands on disk as BF16 with the
+    /// source's exact bit patterns (-0.0, subnormal, 1e30, 3e38, max), never F32/F16, at a
+    /// partial last step (333 tokens, step 256), and restores bit-identically.
+    @Test func bf16KVStoresBitExactWithoutFloat32() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("bf16-bits")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            var config = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 1, diskCacheDir: dir,
+                modelKey: "bf16")
+            config.diskWriteBehind = true
+            let coordinator = CacheCoordinator(config: config)
+            let tokens = Array(1000 ..< 1333)
+            let specials: [UInt16] = [0x8000, 0x0001, 0x7149, 0x7F61, 0x7F7F, 0x3F80, 0xBF80, 0x0000]
+            var caches: [KVCacheSimple] = []
+            var sources: [(MLXArray, MLXArray)] = []
+            for layer in 0 ..< 2 {
+                let count = 1 * 4 * tokens.count * 64
+                var bits = (0 ..< count).map { UInt16(truncatingIfNeeded: ($0 &* 2_654_435_761 &+ layer) >> 7) & 0x7F7F }
+                for (i, v) in specials.enumerated() { bits[i * 97] = v }
+                let keys = MLXArray(bits).reshaped(1, 4, tokens.count, 64).view(dtype: .bfloat16)
+                let values = MLXArray(bits.reversed()).reshaped(1, 4, tokens.count, 64).view(dtype: .bfloat16)
+                let cache = KVCacheSimple()
+                _ = cache.update(keys: keys, values: values)
+                eval(cache.state)
+                caches.append(cache)
+                sources.append((keys, values))
+            }
+            #expect(caches[0].offset == tokens.count)
+            coordinator.storeAfterGeneration(
+                promptTokens: tokens, perLayerData: [], ssmStates: nil, cache: caches)
+            #expect(coordinator.waitForPendingDiskWrites())
+            let files = (FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)?
+                .compactMap { $0 as? URL } ?? []).filter { $0.pathExtension == "safetensors" }
+            let file = try #require(files.first)
+            let raw = try Data(contentsOf: file)
+            let headerLength = Int(raw.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) })
+            let header = try #require(
+                try JSONSerialization.jsonObject(with: raw.subdata(in: 8 ..< 8 + headerLength)) as? [String: Any])
+            let dataStart = 8 + headerLength
+            for (name, entry) in header where name != "__metadata__" {
+                let info = try #require(entry as? [String: Any])
+                let dtype = try #require(info["dtype"] as? String)
+                #expect(dtype != "F32" && dtype != "F16", "\(name) is \(dtype)")
+            }
+            for layer in 0 ..< 2 {
+                for (suffix, source) in [("keys", sources[layer].0), ("values", sources[layer].1)] {
+                    let info = try #require(header["kv_\(layer)_\(suffix)"] as? [String: Any])
+                    #expect(info["dtype"] as? String == "BF16")
+                    let offsets = try #require(info["data_offsets"] as? [Int])
+                    let onDisk = raw.subdata(in: dataStart + offsets[0] ..< dataStart + offsets[1])
+                    let expected = source.view(dtype: .uint16).asData(access: .copy).data
+                    #expect(onDisk == expected, "layer \(layer) \(suffix) bytes")
+                }
+            }
+            let restored = try #require(coordinator.diskCache?.fetch(tokens: tokens))
+            for layer in 0 ..< 2 {
+                let keys = try #require(restored["kv_\(layer)_keys"])
+                #expect(keys.dtype == .bfloat16)
+                #expect(arrayEqual(keys.view(dtype: .uint16), sources[layer].0.view(dtype: .uint16)).item(Bool.self))
+            }
+        }
+    }
+
     @Test func inFlightEntryIsServedFromMemoryThenPersisted() throws {
         try MLXMetalTestLock.withLock {
             let dir = root("inflight")
