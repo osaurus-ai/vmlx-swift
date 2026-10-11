@@ -2464,20 +2464,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // `VMLX_UNO_PREWARM=1`: compile every speculative shape before the first request
                 // decodes. Off by default: measured, it only MOVES the one-time ~1.8 s compile from
                 // mid-stream into the first request's TTFT (0.75 → 4.2 s at a ~450 MHz clock). Its
-                // right home is a background warm-up when the host app loads the model.
+                // right home is the host: `UnoWarmup.prepare` right after the model loads.
                 if ProcessInfo.processInfo.environment["VMLX_UNO_PREWARM"] == "1",
-                    DFlash2WidthCostTable.shared(
-                        for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
-                        tracksClock: ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0"
-                    ).claimPrewarm()
+                    let ms = try UnoWarmup.prepare(
+                        model: target, adapterDirectory: adapterPath, temperature: parameters.temperature)
                 {
-                    let start = Date.timeIntervalSinceReferenceDate
-                    UnoDecoder.prewarm(
-                        model: target, mask: mask,
-                        widths: pinned.map { [$0] } ?? UnoWidthPlan.candidates,
-                        temperature: parameters.temperature)
-                    Self.logger.info(
-                        "Uno prewarm \(Int((Date.timeIntervalSinceReferenceDate - start) * 1000)) ms")
+                    Self.logger.info("Uno prewarm \(ms) ms")
                 }
                 uno = UnoDecoder(
                     model: target, mask: mask, blockSize: blockSize,
@@ -2493,14 +2485,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                         costs: .shared(
                             for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
                             // `VMLX_UNO_CLOCK_TRACK=0`: per-width EMA costs (A/B control).
-                            tracksClock: ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0"),
+                            tracksClock: UnoWarmup.tracksClock),
                         bonusTokens: 1,
                         initial: UnoWidthPlan.declaredWidth(adapterDirectory: adapterPath) ?? 8,
                         sharesAcceptance: true,
                         // `VMLX_UNO_PROBE_REWARD=0`: plain probe backoff (A/B control).
                         rewardsWinningProbes: ProcessInfo.processInfo.environment["VMLX_UNO_PROBE_REWARD"] != "0",
                         // `VMLX_UNO_DECAY=<x>`: acceptance-evidence decay (A/B tool; 0.85 = DFlash2's).
-                        decay: ProcessInfo.processInfo.environment["VMLX_UNO_DECAY"].flatMap(Double.init) ?? 0.95)
+                        decay: ProcessInfo.processInfo.environment["VMLX_UNO_DECAY"].flatMap(Double.init) ?? 0.95,
+                        // `VMLX_UNO_LAZY=0`: time every width in every bucket (A/B control).
+                        lazyExploration: ProcessInfo.processInfo.environment["VMLX_UNO_LAZY"] != "0")
                 }
                 unoStartOffset = cache.map(\.offset).max() ?? 0
                 return nil

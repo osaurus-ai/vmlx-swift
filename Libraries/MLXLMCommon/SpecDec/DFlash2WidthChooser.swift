@@ -53,7 +53,8 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     func observe(width: Int, seconds: Double, bucket: Int = 0) {
         lock.lock()
         defer { lock.unlock() }
-        if !warm.contains(width) {
+        // AR (width 1) runs the ordinary decode kernels the request already compiled.
+        if !warm.contains(width), !(tracksClock && width == 1) {
             warm.insert(width)
             return
         }
@@ -86,6 +87,46 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
         if prewarmed { return false }
         prewarmed = true
         return true
+    }
+
+    /// Widths whose kernels are already compiled (`UnoDecoder.prewarm` at model load): their
+    /// first timing is kept instead of discarded.
+    func markWarm(_ widths: [Int]) {
+        lock.lock()
+        defer { lock.unlock() }
+        warm.formUnion(widths)
+    }
+
+    func isMeasured(width: Int, bucket: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cost[Key(width: width, bucket: bucket)] != nil
+    }
+
+    /// Cost of `width` in `bucket` for a chooser that explores lazily (clock-tracking tables only):
+    /// measured; else the same width measured in the nearest bucket where AR was measured too,
+    /// scaled by AR's cost ratio between the two buckets (attention grows with context for every
+    /// width alike); else the nearest measured speculative width in this bucket (optimistic for a
+    /// wider one, so a width that might win still gets tried). Nil: nothing to estimate from.
+    func estimatedCost(of width: Int, bucket: Int) -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        let s = tracksClock ? scale : 1
+        if let c = cost[Key(width: width, bucket: bucket)] { return c * s }
+        if let arHere = cost[Key(width: 1, bucket: bucket)] {
+            let others = cost.keys.filter { $0.width == width && $0.bucket != bucket }
+                .filter { cost[Key(width: 1, bucket: $0.bucket)] != nil }
+                .sorted { abs($0.bucket - bucket) < abs($1.bucket - bucket) }
+            if let near = others.first, let c = cost[near], let arThere = cost[Key(width: 1, bucket: near.bucket)],
+                arThere > 0
+            {
+                return c * (arHere / arThere) * s
+            }
+        }
+        guard width > 1 else { return nil }
+        let sameBucket = cost.keys.filter { $0.bucket == bucket && $0.width > 1 }
+            .sorted { abs($0.width - width) < abs($1.width - width) }
+        return sameBucket.first.flatMap { cost[$0] }.map { $0 * s }
     }
 
     func cost(of width: Int, bucket: Int = 0) -> Double? {
@@ -183,6 +224,15 @@ struct DFlash2WidthChooser {
     /// causal), spec costs 1.0/1.2/1.4x: on_invoice 109/91/84 tok/s at 0.85, 112/94/82 at 0.95
     /// (best fixed width 106/88/76, AR 78).
     private let decay: Double
+    /// Lazy exploration (Uno): AR is timed first in every cost bucket, and untimed speculative
+    /// widths are priced by `DFlash2WidthCostTable.estimatedCost` instead of each being forced
+    /// through a cycle. A width that cannot beat AR on its estimate is never tried outside the
+    /// periodic re-time, so on a machine or text where speculation loses, entering a new context
+    /// bucket costs nothing over ordinary decoding (before: one cycle per width per bucket, plus a
+    /// discarded warm-up cycle per width).
+    private let lazyExploration: Bool
+    /// The speculative width timed first when no speculative cost exists anywhere yet.
+    private let initialSpeculative: Int
 
     /// Candidate widths: (trained, 2*trained) when the target's verify cost is lane-flat, else
     /// (min(5, trained), trained, 2*trained). `VMLX_DFLASH2_BLOCK=<n>` pins one width (A/B tool).
@@ -203,9 +253,10 @@ struct DFlash2WidthChooser {
     init(
         widths: [Int], costs: DFlash2WidthCostTable, bonusTokens: Double = 0, initial: Int? = nil,
         sharesAcceptance: Bool = false, rewardsWinningProbes: Bool = false,
-        decay: Double = DFlash2WidthChooser.decay
+        decay: Double = DFlash2WidthChooser.decay, lazyExploration: Bool = false
     ) {
         self.decay = decay
+        self.lazyExploration = lazyExploration
         self.widths = widths.sorted()
         self.width = initial.flatMap { w in widths.contains(w) ? w : nil }
             ?? self.widths.first(where: { $0 > 1 }) ?? self.widths[0]
@@ -221,6 +272,32 @@ struct DFlash2WidthChooser {
             self.hits = Array(repeating: 0, count: top)
         }
         self.costs = costs
+        self.initialSpeculative = initial.flatMap { w in widths.contains(w) && w > 1 ? w : nil }
+            ?? self.widths.first(where: { $0 > 1 }) ?? self.widths[0]
+        if lazyExploration, let first = untimedWidth() { width = first }
+    }
+
+    /// Cost the decision uses for width `w` in the current bucket.
+    private func costOf(_ w: Int) -> Double? {
+        lazyExploration
+            ? costs.estimatedCost(of: w, bucket: costBucket) : costs.cost(of: w, bucket: costBucket)
+    }
+
+    /// The width that must be timed before rates can be compared, if any.
+    private func untimedWidth() -> Int? {
+        if lazyExploration {
+            if widths.contains(1), !costs.isMeasured(width: 1, bucket: costBucket) { return 1 }
+            if widths.contains(where: { costOf($0) == nil }) {
+                return costOf(initialSpeculative) == nil
+                    ? initialSpeculative : widths.first { costOf($0) == nil }
+            }
+            return nil
+        }
+        return widths.first(where: { costs.cost(of: $0, bucket: costBucket) == nil })
+    }
+
+    private func bestWidth() -> Int {
+        widths.filter { rate($0) != nil }.max { rate($0)! < rate($1)! } ?? width
     }
 
     func expectedTokens(_ w: Int) -> Double {
@@ -239,17 +316,18 @@ struct DFlash2WidthChooser {
 
     /// Expected tokens per second at width `w` in the current cost bucket (nil: not yet timed).
     func rate(_ w: Int) -> Double? {
-        guard let c = costs.cost(of: w, bucket: costBucket), c > 0 else { return nil }
+        guard let c = costOf(w), c > 0 else { return nil }
         return (w > 1 ? expectedTokens(w) + bonusTokens : 1) / c
     }
 
     /// Trace: "w:rate/expected/cost" per width (rate nil = untimed in this bucket).
     var traceDescription: String {
         widths.map { w in
-            let c = costs.cost(of: w, bucket: costBucket)
+            let c = costOf(w)
+            let measured = costs.isMeasured(width: w, bucket: costBucket) ? "" : "~"
             return String(
-                format: "%d:%@/%.2f/%@", w, rate(w).map { String(format: "%.0f", $0) } ?? "-",
-                w > 1 ? expectedTokens(w) + bonusTokens : 1,
+                format: "%d:%@/%.2f/%@%@", w, rate(w).map { String(format: "%.0f", $0) } ?? "-",
+                w > 1 ? expectedTokens(w) + bonusTokens : 1, c == nil ? "" : measured,
                 c.map { String(format: "%.1f", $0 * 1000) } ?? "-")
         }.joined(separator: " ") + " next=\(width) bucket=\(costBucket)"
     }
@@ -260,11 +338,7 @@ struct DFlash2WidthChooser {
         guard bucket != costBucket else { return }
         costBucket = bucket
         probing = nil
-        if let unseen = widths.first(where: { costs.cost(of: $0, bucket: bucket) == nil }) {
-            width = unseen
-        } else {
-            width = widths.max { rate($0)! < rate($1)! } ?? width
-        }
+        width = untimedWidth() ?? bestWidth()
     }
 
     /// One finished cycle: `tokens` emitted (accepted + 1) in `seconds` wall time at `verifyWidth` rows.
@@ -296,11 +370,11 @@ struct DFlash2WidthChooser {
         cycles += count
         lastTimed[verifyWidth] = cycles
         guard widths.count > 1 else { return }
-        if let unseen = widths.first(where: { costs.cost(of: $0, bucket: costBucket) == nil }) {
+        if let unseen = untimedWidth() {
             width = unseen
             return
         }
-        let best = widths.max { rate($0)! < rate($1)! } ?? width
+        let best = bestWidth()
         if let probe = probing, probe.width == verifyWidth {
             // A probe that itself ran faster than the width it left earns the next decision too.
             // While the chooser sits on AR, a probe is the only source of acceptance evidence, and

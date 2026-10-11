@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import os
 
 /// Stable engine-side contract for an Osaurus server/session settings panel.
 ///
@@ -595,6 +596,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return info
     }
 
+    static let speculationLogger = Logger(subsystem: "vmlx", category: "Speculation")
+
     /// Model types whose runtime implements the Uno conditional-LoRA pathway
     /// (``UnoSelfSpeculativeModel``).
     public static let unoModelTypes: Set<String> = ["k2_horizon"]
@@ -614,7 +617,13 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             Self.unoModelTypes.contains(modelType)
         else { return nil }
         let local = bundleDirectory.appendingPathComponent("uno", isDirectory: true)
-        return UnoAdapter.isAdapterDirectory(local) ? local : nil
+        guard FileManager.default.fileExists(atPath: local.path) else { return nil }
+        if let reason = UnoAdapter.mismatchReason(directory: local, configData: configData) {
+            Self.speculationLogger.warning(
+                "Bundled Uno adapter not used (decoding autoregressively): \(reason, privacy: .public)")
+            return nil
+        }
+        return local
     }
 
     /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.

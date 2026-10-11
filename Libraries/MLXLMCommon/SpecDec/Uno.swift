@@ -57,6 +57,40 @@ public final class UnoAdapter: @unchecked Sendable {
                 atPath: directory.appendingPathComponent("adapter_model.safetensors").path)
     }
 
+    /// Why the adapter in `directory` does not fit the target described by `configData` (its
+    /// `config.json`), or nil when it fits. Reads only small JSON files. Checks what a converted
+    /// bundle's `uno_config.json` declares: the target model type and layer count, and that the
+    /// AWQ input-scale fold file it names exists (without the fold the adapter drafts from the wrong
+    /// coordinates: lossless but low acceptance, so Uno would only cost time).
+    public static func mismatchReason(directory: URL, configData: Data?) -> String? {
+        guard isAdapterDirectory(directory) else {
+            return "\(directory.lastPathComponent) has no adapter_config.json + adapter_model.safetensors"
+        }
+        guard let configData,
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        else { return "target config.json is unreadable" }
+        let unoURL = directory.appendingPathComponent("uno_config.json")
+        guard let data = try? Data(contentsOf: unoURL),
+            let uno = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }  // a plain PEFT adapter declares nothing more to check
+        if let expected = uno["target_model_type"] as? String,
+            let actual = config["model_type"] as? String, expected != actual
+        {
+            return "adapter targets \(expected), model is \(actual)"
+        }
+        if let expected = (uno["target_hidden_layers"] as? NSNumber)?.intValue,
+            let actual = (config["num_hidden_layers"] as? NSNumber)?.intValue, expected != actual
+        {
+            return "adapter targets \(expected) layers, model has \(actual)"
+        }
+        if let scales = uno["input_scales"] as? String,
+            !FileManager.default.fileExists(atPath: directory.appendingPathComponent(scales).path)
+        {
+            return "declared input-scale fold \(scales) is missing"
+        }
+        return nil
+    }
+
     public enum LoadError: Error, LocalizedError {
         case missingConfig(URL)
         case invalidConfig(String)
@@ -271,6 +305,39 @@ public struct UnoGenerationStats: Sendable, Equatable {
     public var verifySeconds: Double = 0
     /// Committed tokens per cycle (each cycle is two target forwards).
     public var tokensPerCycle: Double { cycles > 0 ? Double(committedTokens) / Double(cycles) : 0 }
+}
+
+/// Load-time preparation for Uno, so a request never pays it.
+///
+/// The first 8+-row K2 forward compiles the lane matmul kernel (~1.8 s on an M5 Max, longer on older
+/// chips). Done inside a request it stalls the first Uno response mid-stream; done at request setup it
+/// lands in that request's TTFT. A host calls `prepare` right after loading a model whose bundle
+/// declares an Uno adapter, inside the container's exclusive access (MLX state is not shared across
+/// concurrent evaluations). It installs the adapter and lane routing, compiles every candidate
+/// width's draft and verify shapes on a scratch cache, and marks those widths warm in the target's
+/// shared cost table so the chooser keeps their first timing. Idempotent per target.
+public enum UnoWarmup {
+    static var tracksClock: Bool { ProcessInfo.processInfo.environment["VMLX_UNO_CLOCK_TRACK"] != "0" }
+
+    /// Returns the milliseconds spent, or nil when nothing was done (not an Uno target, already
+    /// prepared). Throws when the adapter cannot be loaded or does not fit the target.
+    @discardableResult
+    public static func prepare(model: any LanguageModel, adapterDirectory: URL, temperature: Float = 1)
+        throws -> Int?
+    {
+        guard let target = model as? any UnoSelfSpeculativeModel else { return nil }
+        let table = DFlash2WidthCostTable.shared(
+            for: target, widths: UnoWidthPlan.candidates, namespace: "uno", tracksClock: tracksClock)
+        guard table.claimPrewarm() else { return nil }
+        let start = Date.timeIntervalSinceReferenceDate
+        let adapter = try UnoAdapterResolver.shared.adapter(at: adapterDirectory)
+        let mask = try target.installUnoAdapter(adapter)
+        LaneQMM.installForDFlash2Target(target)
+        UnoDecoder.prewarm(
+            model: target, mask: mask, widths: UnoWidthPlan.candidates, temperature: temperature)
+        table.markWarm(UnoWidthPlan.candidates)
+        return Int((Date.timeIntervalSinceReferenceDate - start) * 1000)
+    }
 }
 
 /// Process-wide Uno counters (diagnostics: benches read deltas per request).
