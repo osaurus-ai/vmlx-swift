@@ -256,6 +256,13 @@ extension LaneQMM {
         // and those must keep MLX's packed layout. Default "safe" tiles every other lane module (attention,
         // dense MLP: 27B JANG_4D 8-row forward 74.0 -> 67.4 ms with everything tiled). VMLX_LANE_QMM_TILED=0
         // tiles nothing; =1 tiles everything (diagnostic: corrupts S=1 output on models with direct readers).
+        //
+        // A tiled weight is a re-laid-out COPY that replaces the module's weight. It is only tiled when that
+        // replacement frees the original (`WeightBacking.copyWouldReplace`). Under the shipped memory-safety
+        // loader every weight is a window into a mapped safetensors shard, which the replacement cannot
+        // release: measured 2026-10-11 on Qwen3.8-27B JANG_4D + bundled DFlash2, idle live memory after two
+        // turns 41.3 GB tiled vs 28.4 GB untiled (21.6 GB model) for ~8-10 % DFlash2 decode. DO NOT drop the
+        // replace check: resident memory must stay at the model's size (Eric, 2026-10-11).
         let policy = target as? LaneQMMTargetPolicy
         let tiling = ProcessInfo.processInfo.environment["VMLX_LANE_QMM_TILED"]
             ?? (policy.map { $0.laneQMMTiled ? nil : "0" } ?? nil)
@@ -341,7 +348,7 @@ extension LaneQMM {
                     repeated(q.scales, count: repeats, axis: 1), repeated(qb, count: repeats, axis: 1))
             var w = q.weight
             var isTiled = false
-            if tile, tileFilter(path), w.dim(0) % nt == 0 {
+            if tile, tileFilter(path), w.dim(0) % nt == 0, WeightBacking.copyWouldReplace([w]) {
                 w = tileWeight(w, bits: q.bits, group: group)
                 isTiled = true
                 report.tiled += 1

@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXHuggingFace
 import MLXLLM
 @preconcurrency import VMLXTokenizers
@@ -41,6 +42,8 @@ func runK2MultiturnBench(modelPath: String) async throws {
             configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
         print("K2MT_RESOLVED strategy=\(String(describing: resolvedStrategy)) nativeMTP=\(loadConfiguration.nativeMTP)")
     }
+    // K2MT_NO_MMAP=1: materialize weights instead of mapping the shards (memory A/B control).
+    if env["K2MT_NO_MMAP"] == "1" { loadConfiguration.useMmapSafetensors = false }
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: loadConfiguration
     ).0
@@ -89,6 +92,56 @@ func runK2MultiturnBench(modelPath: String) async throws {
         return
     }
     if env["K2MT_MULTIROW"] == "1" { runMultiRowAttentionProbe(); return }
+    if env["K2MT_MEMPROBE"] == "1" {
+        // Where does memory beyond the weights come from? Live MLX memory and the model's own
+        // parameter bytes, after each stage, with caches dropped and the buffer pool cleared.
+        let model = context.model
+        func paramBytes() -> Int {
+            model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        }
+        func line(_ stage: String) {
+            Memory.clearCache()
+            print(String(format: "K2MT_MEMPROBE %@ active_mb=%.0f cache_mb=%.0f params_mb=%.0f",
+                stage, Double(Memory.activeMemory) / 1_048_576, Double(Memory.cacheMemory) / 1_048_576,
+                Double(paramBytes()) / 1_048_576))
+        }
+        line("after_load")
+        do {
+            var mapped = 0, owned = 0, mappedMB = 0
+            for (_, m) in model.leafModules().flattened() {
+                guard let q = m as? QuantizedLinear else { continue }
+                if WeightBacking.sharesMappedShard(q.weight) { mapped += 1; mappedMB += q.weight.nbytes >> 20 } else { owned += 1 }
+            }
+            var ownedByKind: [String: Int] = [:]
+            for (path, p) in model.parameters().flattened() where !WeightBacking.sharesMappedShard(p) {
+                let kind = path.split(separator: ".").filter { Int($0) == nil }.suffix(3).joined(separator: ".")
+                ownedByKind[kind, default: 0] += p.nbytes
+            }
+            let top = ownedByKind.sorted { $0.value > $1.value }.prefix(8)
+                .map { "\($0.key)=\($0.value >> 20)" }.joined(separator: " ")
+            print("K2MT_MEMPROBE owned_params_mb=\(ownedByKind.values.reduce(0, +) >> 20) \(top)")
+            print("K2MT_MEMPROBE backing quantized_linear shard_shared=\(mapped) replaceable=\(owned) shard_shared_weight_mb=\(mappedMB)")
+        }
+        if env["K2MT_MEMPROBE_LANE"] == "1" {
+            LaneQMM.installForDFlash2Target(model)
+            line("after_lane_install")
+        }
+        for round in 1 ... 3 {
+            do {
+                let cache = model.newCache(parameters: nil)
+                let toks = MLXArray((0 ..< 512).map { Int32(1000 + ($0 * 7919) % 50_000) }).reshaped(1, 512)
+                eval(model(LMInput.Text(tokens: toks), cache: cache, state: nil).logits)
+                var tok = MLXArray([Int32(4242)]).reshaped(1, 1)
+                for _ in 0 ..< 16 {
+                    let lg = model(LMInput.Text(tokens: tok), cache: cache, state: nil).logits
+                    tok = argMax(lg[0..., -1, 0...], axis: -1).reshaped(1, 1).asType(.int32)
+                    eval(tok)
+                }
+            }
+            line("after_forward_\(round)")
+        }
+        return
+    }
     if env["K2MT_ROWS"] != nil, let uno = env["K2MT_PREP_UNO"] {
         // Diagnostic: forward cost after the Uno load warm-up (adapter + lane routing installed).
         _ = try UnoWarmup.prepare(model: context.model, adapterDirectory: URL(fileURLWithPath: uno))
@@ -370,6 +423,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
             while i + 512 < stamps.count { w.append(String(format: "%.1f", 512 / stamps[i + 512].timeIntervalSince(stamps[i]))); i += 512 }
             print("K2MT_WINDOWS turn=\(turn) events=\(stamps.count) rates=\(w.joined(separator: ","))")
         }
+        if env["K2MT_MEM_EVERY_TURN"] == "1" { memoryLine("after_turn_\(turn)") }
         if let dump = env["K2MT_TEXT_DUMP"] { try? text.write(toFile: dump, atomically: true, encoding: .utf8) }
         let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
         print("K2MT_TURN " + String(decoding: data, as: UTF8.self))

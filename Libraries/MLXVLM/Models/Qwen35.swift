@@ -1698,6 +1698,19 @@ enum Qwen35Language {
             super.init()
         }
 
+        private nonisolated(unsafe) static var didReportFusionSkipped = false
+
+        /// One line per process: the fused GDN decode projection was not built because the
+        /// projections are windows into a mapped safetensors shard (see `WeightBacking`).
+        static func reportFusionSkippedForMappedWeights() {
+            fusionDiagnosticLock.lock()
+            defer { fusionDiagnosticLock.unlock() }
+            guard !didReportFusionSkipped else { return }
+            didReportFusionSkipped = true
+            FileHandle.standardError.write(
+                Data("[Qwen4Exp] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
+        }
+
         private func ensureFusedDecodeInputProjection(
             _ inputs: MLXArray, exactRowVerifier: Bool = false
         ) -> FusedDecodeInputProjection? {
@@ -1728,11 +1741,19 @@ enum Qwen35Language {
                 else { return nil }
 
                 let quantized = modules.map { $0 as! QuantizedLinear }
+                // The fused copy must REPLACE the four projections (rebindAsRows below). Weights that
+                // are windows into a mapped shard (the shipped mmap loader) cannot be released, so the
+                // copy would be a permanent duplicate: Qwen3.8-27B +4.1 GB for ~2 % decode. Skip.
+                guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: quantized)) else {
+                    Self.reportFusionSkippedForMappedWeights()
+                    return nil
+                }
                 let weight = concatenated(quantized.map(\.weight), axis: 0)
                 let scales = concatenated(quantized.map(\.scales), axis: 0)
                 let biases = concatenated(
                     quantized.map { $0.biases ?? firstBiases }, axis: 0)
                 MLX.eval(weight, scales, biases)
+                WeightBacking.rebindAsRows(quantized, weight: weight, scales: scales, biases: biases)
                 fusedDecodeInputProjection = FusedDecodeInputProjection(
                     weight: weight, scales: scales, biases: biases,
                     groupSize: first.groupSize, bits: first.bits, mode: first.mode)
@@ -1840,6 +1861,11 @@ enum Qwen35Language {
                 })
             else { return nil }
             let q = quantizedModules.map { $0! }
+            // Same rule as the uniform path: only fuse when the copy replaces the members.
+            guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: q)) else {
+                Self.reportFusionSkippedForMappedWeights()
+                return nil
+            }
 
             func scheme(_ m: QuantizedLinear) -> String {
                 "\(m.groupSize)/\(m.bits)/\(m.mode)/\(m.scales.dtype)/\(m.biases!.dtype)"
@@ -1858,6 +1884,7 @@ enum Qwen35Language {
                     let scales = concatenated(mods.map(\.scales), axis: 0)
                     let biases = concatenated(mods.map { $0.biases! }, axis: 0)
                     MLX.eval(weight, scales, biases)
+                    WeightBacking.rebindAsRows(mods, weight: weight, scales: scales, biases: biases)
                     var splits: [Int] = []
                     var offset = 0
                     for m in mods.dropLast() {
