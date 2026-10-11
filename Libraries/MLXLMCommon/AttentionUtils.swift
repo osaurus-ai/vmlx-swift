@@ -127,7 +127,7 @@ public func attentionWithCacheUpdate(
 
         // Opt-in multi-row decode attention for 2–16-row speculative blocks (see MultiRowDecodeAttention). Causal,
         // or an array mask the caller declared linear-chain causal; plain KVCacheSimple only (compile-path caches return full fixed-size buffers that need their mask).
-        if MultiRowDecodeAttention.enabled, type(of: cache) == KVCacheSimple.self,
+        if queries.dim(2) >= 2, MultiRowDecodeAttention.active, type(of: cache) == KVCacheSimple.self,
             MultiRowDecodeAttention.eligible(queries: queries, keys: cachedKeys, values: cachedValues),
             MultiRowDecodeAttention.maskAllowed(
                 mask, queryLength: queries.dim(2), keyLength: cachedKeys.dim(2))

@@ -164,5 +164,28 @@ struct DiskCacheWriteBehindTests {
     @Test func servingConfigurationTurnsWriteBehindOn() {
         #expect(VMLXServerRuntimeSettings().cacheCoordinatorConfig(modelKey: "m").diskWriteBehind)
     }
+
+    /// The one-sum screen catches every non-finite element and never refuses a finite payload, even
+    /// one whose half-precision sum overflows (the exact recount clears it).
+    @Test func nonFiniteScreenIsExact() throws {
+        try MLXMetalTestLock.withLock {
+            func names(_ values: [Float], _ dtype: DType = .float32) -> [String] {
+                let a = MLXArray(values).asType(dtype)
+                eval(a)
+                return DiskCache.nonFiniteTensorNames(in: ["t": a])
+            }
+            #expect(names([1, 2, 3]).isEmpty)
+            #expect(names([1, .nan, 3]) == ["t(1)"])
+            #expect(names([1, .infinity, 3]) == ["t(1)"])
+            #expect(names([-.infinity, 2, 3]) == ["t(1)"])
+            #expect(names([.infinity, -.infinity, 3]) == ["t(2)"])
+            #expect(names([1, .nan, 3], .bfloat16) == ["t(1)"])
+            // 4 x 60000 is finite in fp16, but its fp16 sum overflows to inf.
+            #expect(names([60_000, 60_000, 60_000, 60_000], .float16).isEmpty)
+            #expect(DiskCache.nonFiniteTensorNames(in: [
+                "a": MLXArray([Float(1), 2]), "b": MLXArray([Float.nan, 1]), "c": MLXArray([Float(3)]),
+            ]) == ["b(1)"])
+        }
+    }
 }
 

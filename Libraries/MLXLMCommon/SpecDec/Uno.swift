@@ -401,13 +401,13 @@ struct UnoDecoder {
             var rows = [Float](repeating: 1, count: L)
             rows[0] = 0
             mask.rows = MLXArray(rows).reshaped(1, L, 1).asType(.bfloat16)
-            let draft = MultiRowDecodeAttention.withLinearChainMask {
+            let draft = MultiRowDecodeAttention.withSpeculativeBlock {
                 model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
             }.logits[0].asType(.float32)
             mask.rows = nil
             eval(draft)
             for layer in cache { _ = layer.trim(L) }
-            let verify = MultiRowDecodeAttention.withLinearChainMask {
+            let verify = MultiRowDecodeAttention.withSpeculativeBlock {
                 model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
             }.logits[0].asType(.float32)
             if temperature > 0 {
@@ -449,7 +449,7 @@ struct UnoDecoder {
         var maskValues = [Float](repeating: 1, count: L)
         maskValues[0] = 0
         mask.rows = MLXArray(maskValues).reshaped(1, L, 1).asType(.bfloat16)
-        let draftLogits = MultiRowDecodeAttention.withLinearChainMask {
+        let draftLogits = MultiRowDecodeAttention.withSpeculativeBlock {
             model(LMInput.Text(tokens: draftTokens), cache: cache, state: nil)
         }.logits[0].asType(.float32)
         mask.rows = nil
@@ -473,7 +473,7 @@ struct UnoDecoder {
 
         // Verify with base weights, on-graph from the proposal.
         let verifyStart = Date.timeIntervalSinceReferenceDate
-        let verifyLogits = MultiRowDecodeAttention.withLinearChainMask {
+        let verifyLogits = MultiRowDecodeAttention.withSpeculativeBlock {
             model(LMInput.Text(tokens: proposal.reshaped(1, L)), cache: cache, state: nil)
         }.logits[0].asType(.float32)
         let outcome: MLXArray  // host read: [proposal (L) | flags (L-1) | finals (L)]

@@ -499,18 +499,26 @@ public final class DiskCache: @unchecked Sendable {
     /// skipped. Used on both sides of the disk boundary: a record is neither
     /// written nor restored when it is not entirely finite.
     static func nonFiniteTensorNames(in arrays: [String: MLXArray], limit: Int = 4) -> [String] {
-        // One evaluation and one host read for all tensors. A per-tensor `.item()` synchronized the
-        // GPU once per tensor: 72 round trips for a K2 Horizon boundary, 33-55 ms at 6-9k tokens
-        // on every store and every disk restore, for ~1 GB of reads.
+        // Screen: one plain sum per tensor, one evaluation, one host read. A sum is non-finite
+        // exactly when an element is NaN or ±inf (NaN propagates, inf + -inf is NaN), so a payload
+        // that passes needs nothing more. This is one read of the payload; the exact count below
+        // (isFinite, int32 cast, subtract, sum) makes several full-size passes plus temporaries and
+        // cost 160-240 ms per K2 boundary at 23k tokens, on every store of every turn.
+        // A flagged sum (a real non-finite element, or a finite overflow of a half-precision sum)
+        // is recounted exactly, so a false alarm costs time but never refuses a good payload.
         let keys = arrays.keys.sorted().filter { key in
             guard let array = arrays[key] else { return false }
             return array.dtype.isFloatingPoint && array.size > 0
         }
         guard !keys.isEmpty else { return [] }
-        let counts = MLX.stacked(keys.map { (1 - MLX.isFinite(arrays[$0]!).asType(.int32)).sum() })
+        let finite = MLX.isFinite(MLX.stacked(keys.map { arrays[$0]!.sum() })).asArray(Bool.self)
+        let suspects = zip(keys, finite).filter { !$0.1 }.map(\.0)
+        guard !suspects.isEmpty else { return [] }
+        let counts = MLX.stacked(
+            suspects.map { (1 - MLX.isFinite(arrays[$0]!).asType(.int32)).sum() })
         let host = counts.asArray(Int32.self)
         var names: [String] = []
-        for (key, nonFinite) in zip(keys, host) where nonFinite > 0 {
+        for (key, nonFinite) in zip(suspects, host) where nonFinite > 0 {
             names.append("\(key)(\(nonFinite))")
             if names.count >= limit { break }
         }

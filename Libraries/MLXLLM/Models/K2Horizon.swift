@@ -268,7 +268,7 @@ final class K2Attention: Module {
         q = applyRotaryPosition(rope, to: q, cache: cache)
         k = applyRotaryPosition(rope, to: k, cache: cache)
         let o: MLXArray
-        if MultiRowDecodeAttention.enabled, L >= 2, L <= 16, let cache, type(of: cache) == KVCacheSimple.self,
+        if L >= 2, L <= 16, MultiRowDecodeAttention.active, let cache, type(of: cache) == KVCacheSimple.self,
             MultiRowDecodeAttention.maskAllowed(mask, queryLength: L, keyLength: cache.offset + L)
         {
             // Speculative draft/verify block: KV read once for all rows (see MultiRowDecodeAttention).
