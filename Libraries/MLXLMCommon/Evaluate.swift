@@ -3672,6 +3672,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
         }
 
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/post-answer] gate include=\(includeGeneratedBoundary) "
+                    + "canonicalHybrid=\(usesCanonicalHybridBoundary) warmup=\(isReusablePrefixWarmup) "
+                    + "generated=\(generatedTokenIds.count) quantize=\(needsCacheQuantization)\n").utf8))
+        }
         guard !usesCanonicalHybridBoundary,
             !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
@@ -3694,6 +3700,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             generatedTokenIds: generatedTokenIds,
             cacheOffsets: cacheBoundaryLeafOffsets(cache),
             pendingDrainedTokenId: lastForwardedTokenId)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/post-answer] prompt=\(promptTokenIds.count) generated=\(generatedTokenIds.count) "
+                    + "offsets=\(Array(Set(cacheBoundaryLeafOffsets(cache))).sorted()) "
+                    + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
+        }
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.
@@ -3719,11 +3731,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         // iterator still holds it: that is the consumed stop token.
         if uniqueOffsets == Set([base.count + 1]), let pendingDrainedTokenId {
             return base + [pendingDrainedTokenId]
-        }
-        // One token SHORT, uniform: a max-tokens stop sampled its last token without feeding it.
-        // The cache holds exactly prompt + generated - 1, so that is the key.
-        if uniqueOffsets == Set([base.count - 1]), base.count > promptTokenIds.count + 1 {
-            return Array(base.dropLast())
         }
         return maxOffset > base.count ? base : nil
     }
@@ -5365,18 +5372,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             let tailT0 = Date()
             StreamOrDevice.default.stream.synchronize()
             let tailT1 = Date()
-            // A max-tokens stop (`.length`) is an answer too: the next turn's prompt usually contains
-            // it, and without a post-answer entry that turn re-prefills the whole answer (live,
-            // Diplodocus K2: a 16,384-token first answer). Every iterator keys the entry on exactly
-            // the tokens its cache holds (`generatedBoundaryTokensAligned`, NativeMTP's offset
-            // check) and skips when it cannot; DFlash 2 stores no post-answer entry at all.
-            // `VMLX_POST_ANSWER_ON_LENGTH=0` restores the EOS-only policy.
-            let generatedBoundaryStop = stopReason == .stop
-                || (stopReason == .length
-                    && ProcessInfo.processInfo.environment["VMLX_POST_ANSWER_ON_LENGTH"] != "0")
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
-                includeGeneratedBoundary: generatedBoundaryStop
+                includeGeneratedBoundary: stopReason == .stop
                     && info.generationFailure == nil
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
