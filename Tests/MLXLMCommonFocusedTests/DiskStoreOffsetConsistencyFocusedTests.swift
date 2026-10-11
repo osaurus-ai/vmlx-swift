@@ -226,12 +226,26 @@ struct DiskStoreOffsetConsistencyFocusedTests {
                 generatedTokenIds: [4, 5],
                 cacheOffsets: [5, 6],
                 pendingDrainedTokenId: 99) == [1, 2, 3, 4, 5])
-        // Cache BEHIND the key: no valid store exists.
+        // Cache uniformly ONE behind (a max-tokens stop sampled its last token without feeding
+        // it): the cache holds exactly prompt + generated - 1, which is the key (2026-10-11).
         #expect(
             TokenIterator.generatedBoundaryTokensAligned(
                 promptTokenIds: [1, 2, 3],
                 generatedTokenIds: [4, 5],
                 cacheOffsets: [4, 4],
+                pendingDrainedTokenId: 99) == [1, 2, 3, 4])
+        // Further behind, or behind but not uniform: no valid store exists.
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5, 6],
+                cacheOffsets: [4, 4],
+                pendingDrainedTokenId: 99) == nil)
+        #expect(
+            TokenIterator.generatedBoundaryTokensAligned(
+                promptTokenIds: [1, 2, 3],
+                generatedTokenIds: [4, 5],
+                cacheOffsets: [4, 3],
                 pendingDrainedTokenId: 99) == nil)
     }
 }

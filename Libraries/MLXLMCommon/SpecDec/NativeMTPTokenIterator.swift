@@ -1238,6 +1238,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             tokens: postAnswerTokens,
                             snapshot: postAnswerSnapshot,
                             label: "post-answer")
+                    } else if offset == postAnswerTokens.count - 1,
+                        postAnswerTokens.count > promptTokenIds.count + 1
+                    {
+                        // A max-tokens stop sampled its last token without feeding it: the cache
+                        // holds exactly prompt + generated - 1 (recurrent state included).
+                        store(
+                            tokens: Array(postAnswerTokens.dropLast()),
+                            snapshot: postAnswerSnapshot,
+                            label: "post-answer")
                     } else if offset > postAnswerTokens.count {
                         let trimCount = offset - postAnswerTokens.count
                         if canTrimPromptCache(postAnswerSnapshot),
