@@ -3297,14 +3297,9 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, Safetenso
         customRoutedTensorNames: Set<String> = []
     ) throws {
         if !customRoutedTensorNames.isEmpty {
-            let expected = Set(routedExperts.keys.flatMap { layer in
-                ["gate_proj", "up_proj", "down_proj"].flatMap { role in
-                    ["tq2_packed", "tq2_scales"].map { suffix in
-                        "model.layers.\(layer).mlp.switch_mlp.\(role).\(suffix)"
-                    }
-                }
-            })
-            guard customRoutedTensorNames == expected else {
+            guard JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                customRoutedTensorNames, routedLayers: Set(routedExperts.keys))
+            else {
                 throw Glm5NextRoutedBankError.invalidCustomTensorExclusions
             }
         }

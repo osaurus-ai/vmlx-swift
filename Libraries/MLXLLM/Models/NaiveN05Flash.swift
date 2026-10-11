@@ -203,15 +203,10 @@ final class NaiveN05FlashModel: Module {
     init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
         excludedSafetensorsKeys: Set<String> = [], allowedMaskGPUArange: Bool? = nil,
         fusedRotaryApply: Bool? = nil) throws {
-        let canonicalExclusions = Set(c.routedLayers.indices.filter { c.routedLayers[$0] }.flatMap { layer in
-            ["gate_proj", "up_proj", "down_proj"].flatMap { role in
-                ["tq2_packed", "tq2_scales"].map {
-                    "model.layers.\(layer).mlp.switch_mlp.\(role).\($0)"
-                }
-            }
-        })
         guard excludedSafetensorsKeys.isEmpty
-            || (routedFactory != nil && excludedSafetensorsKeys == canonicalExclusions)
+            || (routedFactory != nil && JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                excludedSafetensorsKeys,
+                routedLayers: Set(c.routedLayers.indices.filter { c.routedLayers[$0] })))
         else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         self.excludedSafetensorsKeys = excludedSafetensorsKeys
         config = c

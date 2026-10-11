@@ -36,6 +36,9 @@ struct JANGHFormatContract: Sendable {
 
     let codebooks: [Int: Codebook]
     let projections: [String: Projection]
+    /// JANGT trellis projections ("mode": "jangt") and their code width K, keyed like `projections`. A routed layer
+    /// may mix the two formats per group (gate/up share one format and width; down may differ).
+    let trellis: [String: Double]
     private static let supportedBits: Set<Int> = [2, 3, 4, 6, 8]
 
     init(configuration data: Data) throws {
@@ -83,9 +86,37 @@ struct JANGHFormatContract: Sendable {
             else { throw ValidationError.invalid("unsupported JANGH projection \(name)") }
             modules[name] = projection
         }
-        guard !modules.isEmpty else { throw ValidationError.invalid("no JANGH projections") }
+        var trellisModules: [String: Double] = [:]
+        for (name, raw) in quantization {
+            guard let entry = raw as? [String: Any], entry["mode"] as? String == "jangt" else { continue }
+            guard let k = (entry["kbits"] as? NSNumber)?.doubleValue, JANGTCode.isSupported(k), name.contains("."),
+                ["gate_proj", "up_proj", "down_proj"].contains(String(name.split(separator: ".").last ?? ""))
+            else { throw ValidationError.invalid("unsupported JANGT projection \(name)") }
+            trellisModules[name] = k
+        }
+        if !trellisModules.isEmpty {
+            guard let jt = root["jangt"] as? [String: Any], (jt["version"] as? NSNumber)?.intValue == 1,
+                jt["code"] as? String == "v2_halfbits",
+                (jt["state_bits"] as? NSNumber)?.intValue == JANGTCode.stateBits,
+                jt["rotation"] as? String == "hadamard128-signs"
+            else { throw ValidationError.invalid("unsupported JANGT header") }
+        }
+        guard !modules.isEmpty || !trellisModules.isEmpty else {
+            throw ValidationError.invalid("no JANGH projections")
+        }
         let denseK2 = root["model_type"] as? String == "k2_horizon"
             && root["mlp_layout"] as? String == "dense_jangh_down"
+        guard !denseK2 || trellisModules.isEmpty else {
+            throw ValidationError.invalid("JANGT projections are not supported in dense K2 bundles")
+        }
+        for name in trellisModules.keys {
+            let parent = String(name[..<name.lastIndex(of: ".")!])
+            let roles = ["gate_proj", "up_proj", "down_proj"].map { parent + "." + $0 }
+            guard roles.allSatisfy({ modules[$0] != nil || trellisModules[$0] != nil }),
+                (trellisModules[roles[0]] != nil) == (trellisModules[roles[1]] != nil),
+                trellisModules[roles[0]] == trellisModules[roles[1]]
+            else { throw ValidationError.invalid("incomplete or incompatible JANGT expert \(parent)") }
+        }
         for name in modules.keys {
             if denseK2 {
                 let parts = name.split(separator: ".", omittingEmptySubsequences: false)
@@ -97,8 +128,12 @@ struct JANGHFormatContract: Sendable {
                 continue
             }
             let parent = String(name[..<name.lastIndex(of: ".")!])
+            if trellisModules[parent + ".gate_proj"] != nil {
+                continue // gate/up are trellis; the JANGT loop above checked the whole triple.
+            }
             guard let gate = modules[parent + ".gate_proj"],
-                let up = modules[parent + ".up_proj"], modules[parent + ".down_proj"] != nil,
+                let up = modules[parent + ".up_proj"],
+                modules[parent + ".down_proj"] != nil || trellisModules[parent + ".down_proj"] != nil,
                 gate.rotation == up.rotation
             else {
                 throw ValidationError.invalid("incomplete or incompatible JANGH expert \(parent)")
@@ -106,6 +141,7 @@ struct JANGHFormatContract: Sendable {
         }
         codebooks = books
         projections = modules
+        trellis = trellisModules
     }
 
     /// Cross-check the bundle's safetensor headers against architecture dimensions.

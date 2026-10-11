@@ -39,7 +39,15 @@ struct JANGHConfigurationPartition: Sendable {
         if let normalizedPrimary, let normalizedAlias,
             try Self.encode(normalizedPrimary) != Self.encode(normalizedAlias)
         {
-            throw Failure.invalid("conflicting quantization aliases")
+            // JANGHT bundles (a `jangt` header) are produced and run by a loader that reads ONLY `quantization`
+            // (vMLX Python `install_jangt(config["quantization"])`); Naive-N0.5 JANGHT2.5 ships a stale
+            // `quantization_config` copied from its JANGH2 parent. For those bundles `quantization` is the plan
+            // the producer validated. Every other custom bundle keeps refusing a conflict.
+            guard root["jangt"] is [String: Any] else {
+                throw Failure.invalid("conflicting quantization aliases")
+            }
+            LoadDiagnostics.write(Data(
+                "[JANGH] JANGHT bundle: quantization_config differs from quantization; using quantization\n".utf8))
         }
         let plan = normalizedPrimary ?? normalizedAlias!
         var header = try Self.optionalObject(root, "jangtq")
@@ -95,7 +103,7 @@ struct JANGHConfigurationPartition: Sendable {
         canonical["quantization_config"] = plan
         let customConfiguration = try Self.encode(canonical)
         let contract = try JANGHFormatContract(configuration: customConfiguration)
-        let customModules = Set(contract.projections.keys)
+        let customModules = Set(contract.projections.keys).union(contract.trellis.keys)
         // This adapter admits only the checkpoint namespace audited for routed
         // JANGH banks. Other complete triples may be valid future formats, but
         // are unsupported here (shared-expert and attention aliases in the

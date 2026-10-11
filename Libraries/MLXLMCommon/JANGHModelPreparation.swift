@@ -31,6 +31,7 @@ public final class JANGHModelPreparation {
     public let moduleByLayer: [Int: String]
     let source: JANGHMappedBanks.SourceLease
     private let hiddenSize: Int
+    private let intermediateSize: Int
     private let routesPerToken: Int
 
     /// Shared declaration gate for architecture factories. This only selects
@@ -88,16 +89,39 @@ public final class JANGHModelPreparation {
                 "JANGH custom banks do not cover the architecture sparse layers")
         }
         let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: "model.safetensors.index.json")
+        // Mixed JANGHT layers: each projection is mapped by its own format (jangtq2 codebook or jangt trellis).
+        let trellis = partition.contract.trellis
         source = try JANGHMappedBanks.SourceLease(
             directory: directory, metadata: metadata, contract: partition.contract,
-            dimensions: dimensions)
+            dimensions: dimensions.filter { trellis[$0.key] == nil },
+            trellisDimensions: dimensions.filter { trellis[$0.key] != nil })
         hiddenSize = layout.hiddenSize
+        intermediateSize = layout.intermediateSize
         routesPerToken = layout.routesPerToken
         ordinaryConfiguration = partition.ordinaryConfiguration
-        excludedTensorNames = Set(partition.customModules.flatMap {
-            [$0 + ".tq2_packed", $0 + ".tq2_scales"]
+        excludedTensorNames = Set(partition.customModules.flatMap { module in
+            trellis[module] != nil
+                ? JANGHTensorIndexPlan.trellisSuffixes.map { module + $0 }
+                : [module + ".tq2_packed", module + ".tq2_scales"]
         })
         moduleByLayer = modules
+    }
+
+    /// Architecture-side audit of the loader exclusions: every routed (layer, role) is excluded as exactly one whole
+    /// custom format — the codebook pair (`tq2_packed`, `tq2_scales`) or the JANGT trellis set — and nothing else is.
+    public static func isCanonicalRoutedExclusionSet(_ names: Set<String>, routedLayers: Set<Int>) -> Bool {
+        let codebook = ["tq2_packed", "tq2_scales"]
+        let trellis = JANGHTensorIndexPlan.trellisSuffixes.map { String($0.dropFirst()) }
+        var covered = 0
+        for layer in routedLayers {
+            for role in ["gate_proj", "up_proj", "down_proj"] {
+                let prefix = "model.layers.\(layer).mlp.switch_mlp.\(role)."
+                let format = names.contains(prefix + "tq2_packed") ? codebook : trellis
+                guard format.allSatisfy({ names.contains(prefix + $0) }) else { return false }
+                covered += format.count
+            }
+        }
+        return covered == names.count
     }
 
     /// Call only after strict ordinary quantization decoding succeeds. All banks
@@ -107,6 +131,10 @@ public final class JANGHModelPreparation {
     {
         // Explicit diagnostic only. Defaults retain the proven whole-bank route.
         if ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1" {
+            guard source.contract.trellis.isEmpty else {
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "the selected-expert diagnostic does not cover JANGT trellis layers")
+            }
             let cacheBytes = try Self.selectedDiagnosticCacheBytes(
                 environment: ProcessInfo.processInfo.environment)
             let env = ProcessInfo.processInfo.environment
@@ -120,9 +148,15 @@ public final class JANGHModelPreparation {
                                                 storage: storage)
         }
         let banks = try mapBanks()
+        let trellis = source.contract.trellis
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
-            try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
-                                       inputDimensions: hiddenSize, activationLimit: activationLimit)
+            let anyTrellis = ["gate_proj", "up_proj", "down_proj"].contains { trellis[parent + "." + $0] != nil }
+            if anyTrellis {
+                return try JANGTRoutedExpertLayer(banks: banks, parentModule: parent, hiddenSize: hiddenSize,
+                                                  intermediateSize: intermediateSize, activationLimit: activationLimit)
+            }
+            return try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
+                                              inputDimensions: hiddenSize, activationLimit: activationLimit)
         }
     }
 

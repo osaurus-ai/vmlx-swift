@@ -17,6 +17,7 @@ final class JANGHMappedBanks {
     }
     let contract: JANGHFormatContract
     private let banks: [String: Projection]
+    private let trellisBanks: [String: JANGTProjection]
 
     /// Retains verified descriptors across the metadata-to-mapping boundary.
     /// Replacing a pathname after this lease is acquired does not redirect reads.
@@ -28,8 +29,10 @@ final class JANGHMappedBanks {
         fileprivate let files: [String: FileHandle]
 
         init(directory: URL, metadata: JANGHHeaderAdapter.Snapshot,
-             contract: JANGHFormatContract, dimensions: [String: JANGHTensorIndexPlan.Dimensions]) throws {
+             contract: JANGHFormatContract, dimensions: [String: JANGHTensorIndexPlan.Dimensions],
+             trellisDimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]) throws {
             let plan = try JANGHTensorIndexPlan(contract: contract, dimensions: dimensions,
+                                               trellisDimensions: trellisDimensions,
                                                weightMap: metadata.weightMap, shards: metadata.shards)
             guard directory.isFileURL else {
                 throw JANGHFormatContract.ValidationError.invalid("JANGH mapping requires a file directory")
@@ -121,7 +124,9 @@ final class JANGHMappedBanks {
         guard try JANGHHeaderAdapter.identity(index) == metadata.indexIdentity else {
             throw JANGHFormatContract.ValidationError.invalid("JANGH index lease became stale before mapping")
         }
-        func map(_ location: JANGHTensorIndexPlan.Location) throws -> MLXArray {
+        // `named` banks register per-expert regions in the core (codebook banks only); JANGT tensors use the plain
+        // region mapping, which is the same zero-copy mmap view.
+        func map(_ location: JANGHTensorIndexPlan.Location, named: Bool = true) throws -> MLXArray {
             guard let file = files[location.shard],
                 let header = metadata.shards[location.shard]?.tensors[location.tensor],
                 header.shape.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) })
@@ -130,6 +135,8 @@ final class JANGHMappedBanks {
             switch header.dtype {
             case "U32": dtype = .uint32
             case "F16": dtype = .float16
+            case "F32": dtype = .float32
+            case "I32": dtype = .int32
             default: throw JANGHFormatContract.ValidationError.invalid("invalid JANGH mapped bank dtype")
             }
             let page = Int(getpagesize())
@@ -146,11 +153,15 @@ final class JANGHMappedBanks {
             do {
                 let status = try withError {
                     path.withCString { name in
-                        location.tensor.withCString { tensorName in
-                            mlx_array_new_mmap_file_region_named(
+                        named
+                            ? location.tensor.withCString { tensorName in
+                                mlx_array_new_mmap_file_region_named(
+                                    &array, name, UInt64(location.fileOffset), location.byteCount,
+                                    &shape, Int32(shape.count), dtype.cmlxDtype, tensorName)
+                            }
+                            : mlx_array_new_mmap_file_region(
                                 &array, name, UInt64(location.fileOffset), location.byteCount,
-                                &shape, Int32(shape.count), dtype.cmlxDtype, tensorName)
-                        }
+                                &shape, Int32(shape.count), dtype.cmlxDtype)
                     }
                 }
                 guard status == 0 else {
@@ -168,6 +179,18 @@ final class JANGHMappedBanks {
         for (module, locations) in plan.projections where modules == nil || modules!.contains(module) {
             mapped[module] = try Projection(packed: map(locations.packed), scales: map(locations.scales))
         }
+        var trellisMapped: [String: JANGTProjection] = [:]
+        if modules == nil {
+            for (module, t) in plan.trellis {
+                func plain(_ location: JANGHTensorIndexPlan.Location) throws -> MLXArray {
+                    try map(location, named: false)
+                }
+                trellisMapped[module] = try JANGTProjection(
+                    k: source.contract.trellis[module]!, packed: plain(t.packed), scale: plain(t.scale),
+                    signs: plain(t.signs), outlierColumnIndices: plain(t.outlierColumns),
+                    outlierWeights: plain(t.outlierWeights), columnScales: t.columnScales.map(plain))
+            }
+        }
         // The C++ mapper opens /dev/fd/N while these descriptors stay alive, so
         // pathname replacement cannot redirect a bank into a different inode.
         // In-place writers remain forbidden for the model's mapped lifetime;
@@ -182,6 +205,14 @@ final class JANGHMappedBanks {
         }
         self.contract = source.contract
         banks = mapped
+        trellisBanks = trellisMapped
+    }
+
+    func trellisProjection(_ module: String) throws -> JANGTProjection {
+        guard let value = trellisBanks[module] else {
+            throw JANGHFormatContract.ValidationError.invalid("unknown mapped JANGT projection")
+        }
+        return value
     }
 
     func projection(_ module: String) throws -> Projection {
