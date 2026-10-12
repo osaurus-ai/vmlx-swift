@@ -330,14 +330,22 @@ public func kdaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
+    let g = computeKDADecay(
+        fRaw: fRaw, aLog: aLog, dtBias: dtBias,
+        safeGate: safeGate, lowerBound: lowerBound)
+    return kdaRecurrence(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+/// The KDA recurrence for an already-computed per-channel decay `g` — the half of ``kdaUpdate`` a
+/// speculative rollback replays over the accepted rows (the decay depends only on each row's input).
+public func kdaRecurrence(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+    state: MLXArray? = nil, mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
     let Dv = v.dim(3)
-
-    let g = computeKDADecay(
-        fRaw: fRaw, aLog: aLog, dtBias: dtBias,
-        safeGate: safeGate, lowerBound: lowerBound)
 
     // Recurrent state stays float32 for the same cached-prefix-boundary
     // rounding reason as GatedDelta (see gatedDeltaUpdate).

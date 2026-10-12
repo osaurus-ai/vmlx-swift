@@ -227,6 +227,8 @@ public final class BailingV3KDAAttention: Module {
     /// same reason the reference keeps it as an instance attribute — it lets one layer be measured
     /// both ways without building a second one, which would have different random weights.
     public var fusedConv: Bool = KDAConvRuntime.enabled
+    /// Tests compare the one-dispatch decode step against the stock path on one layer.
+    var fusedDecodeForTesting = true
     let safeGate: Bool
     let lowerBound: Float
 
@@ -332,6 +334,25 @@ public final class BailingV3KDAAttention: Module {
                 expandedDimensions(mask, axis: -1), mixed, MLXArray.zeros(like: mixed))
         }
 
+        // One-token decode: the whole conv -> gated-norm middle in one dispatch per layer (KDAFusedDecode).
+        if fusedDecodeForTesting, T == 1, B == 1, mask == nil, safeGate, let cache, let convPrev = cache[0],
+            let statePrev = cache[1]
+        {
+            let fRaw = fProj.map { $0(x) } ?? fBProj!(fAProj!(x))
+            let gateRaw = gProj.map { $0(x) } ?? gBProj!(gAProj!(x))
+            if let fused = KDAFusedDecode.run(
+                mixed: mixed, convState: convPrev, qWeight: qConv.weight, kWeight: kConv.weight,
+                vWeight: vConv.weight, fRaw: fRaw, dtBias: dtBias, aLog: aLog, bRaw: bProj(x),
+                gateRaw: gateRaw, oNormWeight: oNorm.weight, eps: oNorm.eps, state: statePrev,
+                heads: numHeads, keyDim: headDim, lowerBound: lowerBound)
+            {
+                cache[0] = fused.conv
+                cache[1] = fused.state
+                cache.offset += 1
+                return oProj(fused.gated)
+            }
+        }
+
         let convState: MLXArray
         if let s = cache?[0] {
             convState = s
@@ -342,6 +363,7 @@ public final class BailingV3KDAAttention: Module {
         var q: MLXArray
         var k: MLXArray
         let v: MLXArray
+        var convInputForStash: MLXArray?
 
         // A decode step's input stage is three tiny convolutions, three activations and a state
         // shift — almost pure dispatch and allocation overhead, repeated in 34 of GLM-5.3's 45
@@ -362,6 +384,7 @@ public final class BailingV3KDAAttention: Module {
                 .reshaped(B, T, numHeads, headDim)
         } else {
             let convInput = concatenated([convState, mixed], axis: 1)
+            convInputForStash = convInput
             if let cache {
                 cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
             }
@@ -394,11 +417,23 @@ public final class BailingV3KDAAttention: Module {
         }
         let beta = sigmoid(bProj(x).asType(.float32))
 
-        let (y, newState) = kdaUpdate(
-            q: q, k: k, v: v, fRaw: fRaw, beta: beta,
-            aLog: aLog, dtBias: dtBias,
-            safeGate: safeGate, lowerBound: lowerBound,
-            state: cache?[1], mask: mask)
+        // DFlash 2 lazy rollback (same contract as Qwen's GatedDeltaNet): a multi-row verify keeps
+        // REFERENCES to this forward's recurrence inputs; a rejected block replays only the accepted
+        // rows (`commitVerifyStash`). Nothing is copied or evaluated unless a rejection happens.
+        let stashVerify = T > 1 && mask == nil && cache != nil && convInputForStash != nil
+            && NativeMTPVerifierStatePolicy.shouldStashVerifyInputs
+        let g = computeKDADecay(
+            fRaw: fRaw, aLog: aLog, dtBias: dtBias, safeGate: safeGate, lowerBound: lowerBound)
+        let initialState = cache?[1]
+        let (y, newState) = kdaRecurrence(
+            q: q, k: k, v: v, g: g, beta: beta, state: initialState, mask: mask)
+        if stashVerify, let cache, let convInputForStash {
+            cache.verifyInputStash = MambaCache.VerifyInputStash(
+                arrays: [q, k, v, g, beta, convInputForStash],
+                baseOffset: cache.offset, initialState: initialState, initialConvState: nil)
+        } else if T > 1, let cache {
+            cache.clearVerifyInputStash()
+        }
         if let cache {
             cache[1] = newState
             // The disk-L2 eligibility gate requires every layer's offset to
@@ -416,6 +451,33 @@ public final class BailingV3KDAAttention: Module {
         }
         let out = oNorm(y.asType(dtype), gate: gate)
         return oProj(out.reshaped(B, T, -1))
+    }
+
+    /// Roll a verified block back to its first `acceptedInputs` rows from the stash of the last
+    /// verify forward: one recurrence over the accepted rows from the pre-verify state, the conv
+    /// state at that row, and the offset. The caller trims the attention caches.
+    public func commitVerifyStash(cache: MambaCache, acceptedInputs: Int) -> Bool {
+        guard let stash = cache.verifyInputStash, stash.arrays.count == 6 else { return false }
+        defer { cache.clearVerifyInputStash() }
+        let (q, k, v, g, beta, convInput) = (
+            stash.arrays[0], stash.arrays[1], stash.arrays[2], stash.arrays[3], stash.arrays[4],
+            stash.arrays[5])
+        let blockLength = q.dim(1)
+        guard acceptedInputs > 0, acceptedInputs <= blockLength else { return false }
+        let n = acceptedInputs
+        if n < blockLength {
+            let (_, state) = kdaRecurrence(
+                q: q[0..., ..<n], k: k[0..., ..<n], v: v[0..., ..<n], g: g[0..., ..<n],
+                beta: beta[0..., ..<n], state: stash.initialState, mask: nil)
+            // convInput = [pre-verify conv rows (kernel - 1), the block's rows]: the conv state after
+            // n rows is the kernel - 1 rows ending at row n.
+            let convEnd = convInput.dim(1) - blockLength + n
+            let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+            cache[0] = convInput[0..., convStart ..< convEnd, 0...]
+            cache[1] = state
+        }
+        cache.offset = stash.baseOffset + n
+        return true
     }
 }
 

@@ -1008,7 +1008,17 @@ public class DeepseekV4HyperConnection: Module {
     ///   mixes    = x_normed @ fn.T                 # (B, L, mix_hc)
     ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
+    /// Families that measured and accepted the two-dispatch collapse (``MHCFusedDecode``) opt in per instance;
+    /// GLM-5.3 does. DeepSeek V4 keeps the compiled graph (its numerics are pinned by its own oracle tests).
+    public var fusedDecodeCollapse = false
+
     public func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+        if fusedDecodeCollapse, !CompiledDecodeTrace.isActive,
+            let fused = MHCFusedDecode.collapse(
+                h, fn: fn, scale: scale, base: base, iters: hcIters, eps: hcEps, normEps: hcNormEps)
+        {
+            return fused
+        }
         // Decode (L==1) routes through a shared compiled region — the graph is
         // identical for every layer/step, so weights ride along as inputs and
         // the host-side graph build is amortized (Python `_get_hc_pre_compiled`).

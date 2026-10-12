@@ -1,0 +1,59 @@
+// Copyright 2026 Osaurus AI. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+import Foundation
+import MLX
+import MLXLLM
+import MLXLMCommon
+
+/// GLM-5.3-Flash as a DFlash 2 target (drafter: `dflash2/` in the JANGHT bundles, 5 sliding-window
+/// qwen3 layers, block 8, taps [5, 14, 24, 33, 42]). Port of vMLX Python `glm_dflash2.GLMDFlashTarget`:
+///
+/// - taps: the completed outputs of the drafter's target layers, each the unweighted mean over the
+///   4 mHC streams (``Glm5NextLanguageModel/forwardCapturing``);
+/// - embedding and LM head shared with the drafter;
+/// - rollback: KDA layers keep their verify inputs and replay only the accepted rows on a rejection
+///   (``KDAAttention/commitVerifyStash``); MLA/DSA layers trim, the indexed cache dropping the
+///   matching indexer rows. Under input capture no per-prefix state is recorded.
+extension Glm5Next: HiddenStateCaptureModel, TokenEmbedderModel, DFlash2VerifyRollbackModel {
+
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        do {
+            let (hidden, captured) = try languageModel.forwardCapturing(
+                inputs, caches: cache, captureLayerIDs: captureLayerIDs)
+            return (projectToLogits(hidden), captured)
+        } catch {
+            // Same non-throwing contract as the token-only forward above.
+            FileHandle.standardError.write(Data("[glm5_next] capturing forward failed: \(error)\n".utf8))
+            return (MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize]), [:])
+        }
+    }
+
+    /// KDA rollback uses the verify-input stash (`input_capture`), which the DFlash 2 iterator selects
+    /// for every target conforming to ``DFlash2VerifyRollbackModel``. Per-prefix recording is not
+    /// implemented: with `VMLX_DFLASH2_INPUT_CAPTURE=0` a rejection finds no recorded state and the
+    /// iterator ends the turn instead of continuing from a wrong state.
+    public var supportsCapturingPrefixCommitRecording: Bool { true }
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        languageModel.embedTokens(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead { return lmHead(hidden) }
+        return languageModel.embedTokens.asLinear(hidden)
+    }
+
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        for index in 0 ..< languageModel.numDecoderLayers
+        where languageModel.layers[index].kind == .linearAttention {
+            guard index < cache.count, let mamba = cache[index] as? MambaCache,
+                let kda = languageModel.layers[index].linearAttention,
+                kda.commitVerifyStash(cache: mamba, acceptedInputs: acceptedInputs)
+            else { return false }
+        }
+        return true
+    }
+}
