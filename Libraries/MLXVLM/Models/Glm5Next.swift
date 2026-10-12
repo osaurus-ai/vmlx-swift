@@ -1858,6 +1858,14 @@ public final class Glm5NextMoEGate: Module {
     public func callAsFunction(
         _ x: MLXArray, correctionBias: MLXArray
     ) -> (indices: MLXArray, weights: MLXArray) {
+        if numGroups <= 1, topkGroup <= 1,
+            let routed = Glm5NextRouterKernels.route(
+                x, weight: weight, correctionBias: correctionBias, topK: topK,
+                normalize: topK > 1 && normTopkProb, scaling: routedScalingFactor)
+        {
+            // Same output contract as the graph below (weights rounded to the activation dtype).
+            return (routed.indices, routed.weights.asType(x.dtype))
+        }
         let logits = x.matmul(weight.T)
         let originalScores = sigmoid(logits.asType(.float32))
         let scoresForChoice = originalScores + correctionBias
