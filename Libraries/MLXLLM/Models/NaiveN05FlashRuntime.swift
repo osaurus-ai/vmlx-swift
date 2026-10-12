@@ -88,13 +88,25 @@ extension NaiveN05FlashModel: LLMModel {
         }
     }
 
+    /// Prefill chunk: the caller's value, except the library default (`GenerateParameters.prefillStepSize` = 512,
+    /// indistinguishable from "unset"), which becomes 4,096 — Naive-N0.5's measured best with the blocked/sparse
+    /// prefill attention and the expert-sorted tiles (5k prompt: 483-543 tok/s at 512, 608-633 at 2,048, 652-663 at
+    /// 4,096; vMLX Python also prefills N0.5 at 4,096). `VMLX_NAIVE_PREFILL_STEP=<n>` overrides both.
+    static func prefillStep(requested: Int?) -> Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_NAIVE_PREFILL_STEP"], let n = Int(raw), n > 0 {
+            return n
+        }
+        guard let requested, requested != 512 else { return 4096 }
+        return requested
+    }
+
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         try Task.checkCancellation()
         guard input.image == nil, input.video == nil, input.audio == nil
         else { throw RuntimeFailure.unsupportedInput }
         var tokens = try runtimeTokens(input.text).reshaped(-1)
         let owned = try runtimeCache(cache)
-        let step = windowSize ?? 512
+        let step = Self.prefillStep(requested: windowSize)
         guard step > 0 else { throw RuntimeFailure.invalidPrefillSize }
         // With no cache, retain the entire prompt for the generation forward.
         // Consuming chunks here would silently discard their context.

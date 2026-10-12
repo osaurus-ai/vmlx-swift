@@ -341,3 +341,55 @@ final class JANGTKernelPerfTests: XCTestCase {
         }
     }
 }
+
+/// Prefill kernel throughput at GLM-5.3 shapes: 2,048 tokens x top-8 = 16,384 expert-sorted rows over 288 experts.
+/// Diagnostic (JANGT_PERF=1). Reference (vMLX Python, M5 Max): fused gate/up 19.3 ms per layer-chunk.
+final class JANGTPrefillPerfTests: XCTestCase {
+    func testPrefillKernelTimingAtGLMShapes() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["JANGT_PERF"] == "1" && JANGTPrefillKernel.available)
+        let e = 288, d = 4096, i = 2048, rows = 16384
+        func proj(_ k: Double, out: Int, inp: Int) throws -> JANGTProjection {
+            let w = JANGTCode.wordsPerRow(inputs: inp, k: k)
+            return try JANGTProjection(
+                k: k, packed: MLXRandom.randInt(low: 0, high: Int32.max, [e, out, w]).asType(.uint32),
+                scale: MLXArray.ones([e, out]) * 0.01, signs: MLXArray.ones([inp]),
+                outlierColumnIndices: MLXArray.zeros([e, 1], dtype: .int32) - MLXArray(Int32(1)),
+                outlierWeights: MLXArray.zeros([e, out, 1], dtype: .float16), columnScales: nil)
+        }
+        let gate = try proj(2, out: i, inp: d), up = try proj(2, out: i, inp: d), down = try proj(2.5, out: d, inp: i)
+        eval(gate.packed, up.packed, down.packed)
+        // Router-like expert loads: every expert gets rows, uneven.
+        let ids = MLXArray((0 ..< rows).map { UInt32(($0 * 7919 % 9973) % e) })
+        let sorted = take(ids, argSort(ids))
+        let x = MLXRandom.normal([rows, d]).asType(.bfloat16), h = MLXRandom.normal([rows, i]).asType(.bfloat16)
+        eval(sorted, x, h)
+        func time(_ name: String, _ body: () -> MLXArray) {
+            for _ in 0 ..< 3 { eval(body()) }
+            let n = 10, t0 = Date()
+            for _ in 0 ..< n { eval(body()) }
+            print(String(format: "JANGT_PREFILL_PERF %@ %.2f ms", name, Date().timeIntervalSince(t0) / Double(n) * 1e3))
+        }
+        time("gate_up_fused") { JANGTPrefillKernel.project(x, gate, up: up, indices: sorted, limit: 10) }
+        time("gate_up_fused_rot") { JANGTPrefillKernel.project(x, gate, up: up, indices: sorted, limit: 10, rotateOutput: true) }
+        time("down_K2.5") { JANGTPrefillKernel.project(h, down, indices: sorted) }
+        let downO = try JANGTProjection(
+            k: 2.5, packed: down.packed, scale: down.scale, signs: down.signs,
+            outlierColumnIndices: MLXRandom.randInt(low: 0, high: Int32(i), [e, 8]).asType(.int32),
+            outlierWeights: (MLXRandom.normal([e, d, 8]) * 0.01).asType(.float16), columnScales: MLXArray.ones([e, i]))
+        let sv = downO.columnScales! * downO.signs.expandedDimensions(axis: 0)
+        eval(downO.outlierColumnIndices, downO.outlierWeights, sv)
+        time("rotate_rows_per_expert") { JANGTKernels.rotateRows(h, signs: sv, rowExperts: sorted) }
+        time("outliers_gather_mm") { JANGTPrefillKernel.outliers(h, downO, indices: sorted)! }
+        let y = MLXRandom.normal([rows, d]).asType(.bfloat16), w = MLXRandom.uniform(0 ..< 1, [2048, 8])
+        let order = argSort(ids)
+        eval(y, w, order)
+        time("unsort_combine") {
+            let restored = take(y, argSort(order), axis: 0).reshaped(2048, 8, d).asType(.float32)
+            return matmul(w.reshaped(2048, 1, 8), restored).reshaped(2048, d)
+        }
+        time("sort_glue") {
+            let order = argSort(ids); let s = take(ids, order); let xs = take(x, order.floorDivide(8), axis: 0)
+            return xs.sum() + s.asType(.float32).sum()
+        }
+    }
+}
