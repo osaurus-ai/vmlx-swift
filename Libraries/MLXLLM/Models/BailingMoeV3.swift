@@ -353,6 +353,34 @@ public final class BailingV3KDAAttention: Module {
             }
         }
 
+        // Speculative verify under input capture (DFlash 2's rollback contract), 2 ... 16 rows: the same middle in
+        // one dispatch per layer (KDAFusedDecode.runRows). Rollback stashes this forward's raw inputs and re-runs the
+        // kernel over the accepted rows only. Other verifier modes record per-prefix states in the stock path.
+        if fusedDecodeForTesting, T > 1, T <= KDAFusedDecode.maxRows, B == 1, mask == nil, safeGate, let cache,
+            NativeMTPVerifierStatePolicy.shouldStashVerifyInputs, let convPrev = cache[0], let statePrev = cache[1]
+        {
+            let fRaw = fProj.map { $0(x) } ?? fBProj!(fAProj!(x))
+            let gateRaw = gProj.map { $0(x) } ?? gBProj!(gAProj!(x))
+            let bRaw = bProj(x)
+            if let fused = KDAFusedDecode.runRows(
+                mixed: mixed, convState: convPrev, qWeight: qConv.weight, kWeight: kConv.weight,
+                vWeight: vConv.weight, fRaw: fRaw, dtBias: dtBias, aLog: aLog, bRaw: bRaw,
+                gateRaw: gateRaw, oNormWeight: oNorm.weight, eps: oNorm.eps, state: statePrev,
+                heads: numHeads, keyDim: headDim, lowerBound: lowerBound)
+            {
+                // `* 1`: the cache setter swaps the new state INTO the existing array object, so a bare reference
+                // would read the post-verify state at rollback. The lazy node pins the old buffer and costs
+                // nothing unless a rollback evaluates it (Qwen35's GatedDeltaNet stash does the same).
+                cache.verifyInputStash = MambaCache.VerifyInputStash(
+                    arrays: [mixed, fRaw, bRaw], baseOffset: cache.offset, initialState: statePrev * 1,
+                    initialConvState: convPrev * 1)
+                cache[0] = fused.conv
+                cache[1] = fused.state
+                cache.offset += T
+                return oProj(fused.gated)
+            }
+        }
+
         let convState: MLXArray
         if let s = cache?[0] {
             convState = s
@@ -428,9 +456,11 @@ public final class BailingV3KDAAttention: Module {
         let (y, newState) = kdaRecurrence(
             q: q, k: k, v: v, g: g, beta: beta, state: initialState, mask: mask)
         if stashVerify, let cache, let convInputForStash {
+            // `* 1`: `cache[1] = newState` below swaps the new state into the same array object, so a bare
+            // reference would hand the rollback the post-verify state (see the fused path above).
             cache.verifyInputStash = MambaCache.VerifyInputStash(
                 arrays: [q, k, v, g, beta, convInputForStash],
-                baseOffset: cache.offset, initialState: initialState, initialConvState: nil)
+                baseOffset: cache.offset, initialState: initialState.map { $0 * 1 }, initialConvState: nil)
         } else if T > 1, let cache {
             cache.clearVerifyInputStash()
         }
@@ -457,6 +487,27 @@ public final class BailingV3KDAAttention: Module {
     /// verify forward: one recurrence over the accepted rows from the pre-verify state, the conv
     /// state at that row, and the offset. The caller trims the attention caches.
     public func commitVerifyStash(cache: MambaCache, acceptedInputs: Int) -> Bool {
+        // Fused multi-row verify stash: [mixed, fRaw, bRaw] + the pre-verify state and conv state.
+        if let stash = cache.verifyInputStash, stash.arrays.count == 3 {
+            defer { cache.clearVerifyInputStash() }
+            let (mixed, fRaw, bRaw) = (stash.arrays[0], stash.arrays[1], stash.arrays[2])
+            let blockLength = mixed.dim(1)
+            guard acceptedInputs > 0, acceptedInputs <= blockLength else { return false }
+            let n = acceptedInputs
+            if n < blockLength {
+                guard let state = stash.initialState, let conv = stash.initialConvState,
+                    let replay = KDAFusedDecode.runRows(
+                        mixed: mixed[0..., ..<n], convState: conv, qWeight: qConv.weight, kWeight: kConv.weight,
+                        vWeight: vConv.weight, fRaw: fRaw[0..., ..<n], dtBias: dtBias, aLog: aLog,
+                        bRaw: bRaw[0..., ..<n], gateRaw: fRaw[0..., ..<n], oNormWeight: oNorm.weight,
+                        eps: oNorm.eps, state: state, heads: numHeads, keyDim: headDim, lowerBound: lowerBound)
+                else { return false }
+                cache[0] = replay.conv
+                cache[1] = replay.state
+            }
+            cache.offset = stash.baseOffset + n
+            return true
+        }
         guard let stash = cache.verifyInputStash, stash.arrays.count == 6 else { return false }
         defer { cache.clearVerifyInputStash() }
         let (q, k, v, g, beta, convInput) = (

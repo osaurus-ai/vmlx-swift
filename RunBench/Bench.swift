@@ -592,6 +592,10 @@ struct Bench {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_GLMCOST"] ?? "0") == "1" {
+            try await runGlm5VerifyCostBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_ROWCOST"] ?? "0") == "1" {
             try await runRowCostBench(modelPath: modelPath)
             return

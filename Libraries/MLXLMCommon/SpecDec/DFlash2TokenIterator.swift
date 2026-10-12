@@ -960,18 +960,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
         let bs = Swift.min(widthChooser?.width ?? adaptiveBlockSize ?? blockSize, budget + 1)
         if bs <= 1, !drafterDisabled, widthChooser?.width == 1 {
-            // The chooser measured AR as the faster option: time the step as width 1.
+            // The chooser measured AR as the faster option: a pipelined AR stretch, timed per step as width 1.
             let start = Date.timeIntervalSinceReferenceDate
-            let ok = runAutoregressiveStep()
-            if ok {
+            let steps = runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget))
+            if steps > 0 {
                 widthChooser!.observe(
-                    verifyWidth: 1, tokens: 1, seconds: Date.timeIntervalSinceReferenceDate - start)
-                stats.widthCycles[1, default: 0] += 1
+                    verifyWidth: 1, tokens: 1,
+                    seconds: (Date.timeIntervalSinceReferenceDate - start) / Double(steps), count: steps)
+                stats.widthCycles[1, default: 0] += steps
             }
-            return ok
+            return steps > 0
         }
         if bs <= 1 || drafterDisabled {
-            return runAutoregressiveStep()
+            return runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget)) > 0
         }
         let cycleStart = Date.timeIntervalSinceReferenceDate
         if treeMode == nil { treeMode = resolveTreeMode() }
@@ -1694,6 +1695,49 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         FileHandle.standardError.write(Data(
             "[DFlash2] block \(from) -> \(to)\(settled ? " (settled)" : "") tok/verify-s: \(rates)\n"
                 .utf8))
+    }
+
+    /// Steps per AR stretch (`VMLX_DFLASH2_AR_BURST`, default 4; 1 = the serial single step).
+    static let arBurstSteps: Int = Swift.max(
+        1, Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") ?? 4)
+
+    /// `steps` single-token target steps, pipelined: step k + 1 is built on step k's lazy token and dispatched
+    /// before step k is read back, so the GPU does not idle while the host builds the next graph (vMLX Python
+    /// c7e751d5, "a pipelined AR loop"). The serial step paid a full host sync per token: GLM-5.3 32.6 ms against
+    /// 28.7 ms for the pipelined AR arm. Every step consumes an already-committed token, so nothing here is
+    /// speculative: tokens after a stop token are dropped by the consumer exactly like accepted drafts after one.
+    /// Returns the tokens emitted (0 on failure).
+    private mutating func runAutoregressiveBurst(steps: Int) -> Int {
+        guard steps > 1 else { return runAutoregressiveStep() ? 1 : 0 }
+        let arStart = Date.timeIntervalSinceReferenceDate
+        defer { stats.arSeconds += Date.timeIntervalSinceReferenceDate - arStart }
+        abandonInFlightVerify()
+        var input = MLXArray([Int32(lastToken)]).reshaped(1, 1)
+        var sampledSteps: [MLXArray] = []
+        var hiddenSteps: [MLXArray] = []
+        for _ in 0 ..< steps {
+            let (logits, captured) = target.callAsFunction(
+                input, cache: cache, captureLayerIDs: captureLayerIDs,
+                recordPrefixCommitStates: false)
+            let hidden = extractContextFeature(captured: captured, targetLayerIDs: orderedLayerIDs)
+            let sampled = sampler.sample(logits: logits[0..., -1, 0...])
+            asyncEval(sampled, hidden)
+            sampledSteps.append(sampled)
+            hiddenSteps.append(hidden)
+            input = sampled.reshaped(1, 1).asType(.int32)
+        }
+        pendingTokens.removeAll(keepingCapacity: true)
+        for (sampled, hidden) in zip(sampledSteps, hiddenSteps) {
+            let token = sampled.reshaped(-1)[0].item(Int.self)
+            // Rows the drafter has not read yet accumulate across consecutive AR steps.
+            arContextRows.append(hidden)
+            pendingTokens.append(token)
+            lastToken = token
+        }
+        pendingIndex = 0
+        stats.emittedTokens += steps
+        stats.autoregressiveFallbackTokens += steps
+        return steps
     }
 
     /// Single-token target step. Used when the remaining budget cannot

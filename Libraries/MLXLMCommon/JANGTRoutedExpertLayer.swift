@@ -29,9 +29,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         case codebook(kernel: JANGHWeightedDownKernel, prefill: JANGHPrefillKernel, bank: JANGHMappedBanks.Projection)
     }
 
-    /// Routed (token, slot) pairs from which the expert-sorted prefill tiles run instead of the decode kernels
-    /// (vMLX Python `SORT_THRESHOLD`): > 64 so an 8-token speculative verify (8 x top-8) stays on decode.
-    static let sortThreshold = 72
+    /// Routed (token, slot) pairs from which the expert-sorted prefill tiles run instead of the decode kernels.
+    /// Measured crossover, one process alternating both routes (whole-model forward, 600-token context): GLM-5.3
+    /// JANGHT2.4 between 512 slots (tiles 497 ms, decode 434) and 768 (571 vs 618); Naive-N0.5 JANGHT2.5 between 384
+    /// (408 vs 371) and 512 (459 vs 479). The row-tiled tiles carry a ~250 ms whole-model fixed cost on sparse
+    /// batches, so the 72 vMLX Python uses (`SORT_THRESHOLD`) sent 9-16-row DFlash 2 verifies to them at 2.3-3.5x
+    /// the decode-kernel cost (GLM 9 rows: 346 vs 98 ms).
+    static let sortThreshold = 512
     /// `VMLX_JANGT_PREFILL=0` keeps the decode kernels for every batch (A/B and diagnosis).
     static let prefillEnabled = ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL"] != "0"
     private let intermediateSize: Int
