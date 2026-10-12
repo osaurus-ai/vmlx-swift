@@ -94,9 +94,17 @@ public func modelResidencyWiredTarget(
     let gib = 1024 * 1024 * 1024
     let headroom = max(16 * gib, Int((Double(modelBytes) * 0.30).rounded()))
     // Keep at least this much PHYSICAL RAM reclaimable for the OS + decode
-    // transients. 35% of RAM, floored at 8 GB — enough for the OS, the app,
-    // and a model's KV/scratch spike on the small end; scales up on big Macs.
-    let osReserve = max(8 * gib, physicalMemory / 100 * 35)
+    // transients: 35% of RAM, floored at 8 GB (enough for the OS, the app and a
+    // model's KV/scratch spike on small Macs) and capped at 24 GB. The OS does
+    // not need a third of a big machine: an uncapped 35% reserve is 44.8 GB on a
+    // 128 GB Mac, which declined to wire GLM-5.3-Flash / Naive-N0.5 JANGHT (91 GB)
+    // and left ~11 GB of their weight buffers outside the Metal residency set
+    // (MLX's default wired limit is ~75% of the working set). Metal then makes
+    // those buffers resident again on every command-buffer submission: decode
+    // measured 1.4-1.8 tok/s vs 25-26.5 with the model wired (2026-10-11,
+    // 3 alternating rounds each), at random depending on which buffers were
+    // left out. vMLX Python wires the same bundle on the same machine.
+    let osReserve = max(8 * gib, min(physicalMemory / 100 * 35, 24 * gib))
     let safeCeiling = max(0, physicalMemory - osReserve)
     let target = min(modelBytes + headroom, workingSet, safeCeiling)
     // Only raise when the whole model fits wired inside the safe ceiling.

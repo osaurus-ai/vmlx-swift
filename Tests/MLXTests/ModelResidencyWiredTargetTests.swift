@@ -14,8 +14,24 @@ struct ModelResidencyWiredTargetTests {
     private static let gib = 1024 * 1024 * 1024
     private func gb(_ n: Double) -> Int { Int(n * Double(Self.gib)) }
 
-    // Reserve mirrors the policy: 35% of physical RAM, floored at 8 GB.
-    private func osReserve(physical: Int) -> Int { max(8 * Self.gib, physical / 100 * 35) }
+    // Reserve mirrors the policy: 35% of physical RAM, floored at 8 GB, capped at 24 GB.
+    private func osReserve(physical: Int) -> Int {
+        max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
+    }
+
+    @Test("128 GB Mac: a 91 GB bundle (GLM-5.3-Flash / Naive-N0.5 JANGHT) wires with a 24 GB reserve")
+    func bigMacWiresNinetyGigabyteModel() {
+        // Measured: left at MLX's default wired limit, ~11 GB of these weights stayed outside the residency
+        // set and decode fell to 1.4-1.8 tok/s at random; wired, 25-26.5 tok/s.
+        let physical = gb(128)
+        let target = modelResidencyWiredTarget(modelBytes: gb(91), workingSet: gb(107), physicalMemory: physical)
+        #expect(target != nil)
+        if let target {
+            #expect(target >= gb(91))
+            #expect(target <= gb(107))
+            #expect(physical - target >= gb(24))
+        }
+    }
 
     @Test("16 GB Mac: a ~9 GB model is NOT wired (the #2612 regression)")
     func constrainedMacDeclinesLargeModel() {
