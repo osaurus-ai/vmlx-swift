@@ -100,6 +100,12 @@ final class NaiveN05FlashRouter: Module {
         _correction.wrappedValue = MLXArray.zeros([c.expertCount], dtype: .float32)
     }
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let routed = SigmoidRouterKernels.route(
+            x, weight: weight, correctionBias: correction, topK: config.routes,
+            normalize: config.normalizeRoutes, scaling: Float(config.routingScale))
+        {
+            return (routed.indices, routed.weights)  // fp32 weights, as below
+        }
         let probabilities = sigmoid(matmul(x.asType(.float32), weight.asType(.float32).T))
         let indices = argPartition(-(probabilities + correction.asType(.float32)), kth: config.routes - 1, axis: -1)[.ellipsis, ..<config.routes]
         var scores = takeAlong(probabilities, indices, axis: -1)

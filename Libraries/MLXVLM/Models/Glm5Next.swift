@@ -1859,7 +1859,7 @@ public final class Glm5NextMoEGate: Module {
         _ x: MLXArray, correctionBias: MLXArray
     ) -> (indices: MLXArray, weights: MLXArray) {
         if numGroups <= 1, topkGroup <= 1,
-            let routed = Glm5NextRouterKernels.route(
+            let routed = SigmoidRouterKernels.route(
                 x, weight: weight, correctionBias: correctionBias, topK: topK,
                 normalize: topK > 1 && normTopkProb, scaling: routedScalingFactor)
         {

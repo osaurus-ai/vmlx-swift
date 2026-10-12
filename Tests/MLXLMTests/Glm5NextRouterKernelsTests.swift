@@ -2,21 +2,29 @@ import Foundation
 import MLX
 import XCTest
 
-@testable import MLXVLM
+@testable import MLXLLM
 
 /// The two-launch GLM router against an fp32 reference of the graph (the bundle's router dtype is fp32): same
 /// chosen experts per row (as sets) and the same normalized, scaled weights, at 288 experts (> 256: the scratch
 /// sizing the reference once got wrong).
 final class Glm5NextRouterKernelsTests: XCTestCase {
     func testMatchesFP32Reference() throws {
+        try check(experts: 288, weightDType: .bfloat16, scaling: 2.5)  // GLM-5.3
+    }
+
+    func testMatchesFP32ReferenceNaiveShape() throws {
+        try check(experts: 256, weightDType: .float32, scaling: 1)  // Naive-N0.5: fp32 router weight
+    }
+
+    private func check(experts: Int, weightDType: DType, scaling: Float) throws {
         MLXRandom.seed(7)
-        let d = 4096, experts = 288, k = 8
-        let w = (MLXRandom.normal([experts, d]) * 0.02).asType(.bfloat16)
+        let d = 4096, k = 8
+        let w = (MLXRandom.normal([experts, d]) * 0.02).asType(weightDType)
         let bias = MLXRandom.normal([experts]) * 0.05
         for rows in [1, 8] {
             let x = MLXRandom.normal([1, rows, d]).asType(.bfloat16)
-            let routed = try XCTUnwrap(Glm5NextRouterKernels.route(
-                x, weight: w, correctionBias: bias, topK: k, normalize: true, scaling: 2.5))
+            let routed = try XCTUnwrap(SigmoidRouterKernels.route(
+                x, weight: w, correctionBias: bias, topK: k, normalize: true, scaling: scaling))
             let logits = x.asType(.float32).matmul(w.asType(.float32).T)
             let scores = sigmoid(logits)
             let choice = scores + bias
@@ -27,8 +35,11 @@ final class Glm5NextRouterKernelsTests: XCTestCase {
                 XCTAssertEqual(Set(got), Set(ref), "row \(r)")
                 let total = ref.reduce(Float(0)) { $0 + s[$1] }
                 let gotW = routed.weights[0, r].asArray(Float.self)
+                // The reference's fp32 matmul runs in TF32 under MLX defaults (10-bit mantissa); the kernel
+                // accumulates in true fp32, so weights agree to ~1e-4 relative, not bit for bit.
                 for (j, e) in got.enumerated() {
-                    XCTAssertEqual(gotW[j], s[e] / total * 2.5, accuracy: 1e-5)
+                    let want = s[e] / total * scaling
+                    XCTAssertEqual(gotW[j], want, accuracy: abs(want) * 1e-4)
                 }
             }
         }
@@ -53,11 +64,11 @@ final class Glm5NextRouterAfterEffectTests: XCTestCase {
         }
         time("matmul alone") { eval(mm()) }
         time("router then matmul (separate evals)") {
-            let r = Glm5NextRouterKernels.route(x, weight: w, correctionBias: bias, topK: 8, normalize: true, scaling: 2.5)!
+            let r = SigmoidRouterKernels.route(x, weight: w, correctionBias: bias, topK: 8, normalize: true, scaling: 2.5)!
             eval(r.indices, r.weights); eval(mm())
         }
         time("router alone") {
-            let r = Glm5NextRouterKernels.route(x, weight: w, correctionBias: bias, topK: 8, normalize: true, scaling: 2.5)!
+            let r = SigmoidRouterKernels.route(x, weight: w, correctionBias: bias, topK: 8, normalize: true, scaling: 2.5)!
             eval(r.indices, r.weights)
         }
         time("matmul alone again") { eval(mm()) }
