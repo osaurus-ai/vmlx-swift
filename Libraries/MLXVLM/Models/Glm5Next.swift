@@ -2151,7 +2151,9 @@ public final class Glm5NextSharedHead: Module {
 extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, CanonicalRequiredToolCacheModel {
 
     public var canonicalRequiredToolCacheIdentity: String {
-        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1"
+        // The fused mHC prefill computes the projection in true fp32 (the graph runs TF32), so its cold prefill is a
+        // different canonical state.
+        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1" + (MHCFusedPrefill.enabled ? "-mhcprefill1" : "")
     }
 
     public func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int? {

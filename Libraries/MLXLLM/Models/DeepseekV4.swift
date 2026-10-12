@@ -1008,13 +1008,20 @@ public class DeepseekV4HyperConnection: Module {
     ///   mixes    = x_normed @ fn.T                 # (B, L, mix_hc)
     ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
-    /// Families that measured and accepted the two-dispatch collapse (``MHCFusedDecode``) opt in per instance;
-    /// GLM-5.3 does. DeepSeek V4 keeps the compiled graph (its numerics are pinned by its own oracle tests).
+    /// Families that measured and accepted the fused mHC kernels opt in per instance: the two-dispatch collapse for
+    /// decode and verify slabs (``MHCFusedDecode``) and the prefill collapse/expand (``MHCFusedPrefill``); GLM-5.3
+    /// does. DeepSeek V4 keeps the compiled graph (its numerics are pinned by its own oracle tests).
     public var fusedDecodeCollapse = false
 
     public func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         if fusedDecodeCollapse, !CompiledDecodeTrace.isActive,
             let fused = MHCFusedDecode.collapse(
+                h, fn: fn, scale: scale, base: base, iters: hcIters, eps: hcEps, normEps: hcNormEps)
+        {
+            return fused
+        }
+        if fusedDecodeCollapse, !CompiledDecodeTrace.isActive,
+            let fused = MHCFusedPrefill.collapse(
                 h, fn: fn, scale: scale, base: base, iters: hcIters, eps: hcEps, normEps: hcNormEps)
         {
             return fused
@@ -1046,7 +1053,12 @@ public class DeepseekV4HyperConnection: Module {
     public func expand(
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
-        DeepseekV4Math.hcPost(
+        if fusedDecodeCollapse, !CompiledDecodeTrace.isActive,
+            let fused = MHCFusedPrefill.expand(blockOut: blockOut, residual: residual, post: post, comb: comb)
+        {
+            return fused
+        }
+        return DeepseekV4Math.hcPost(
             blockOut: blockOut, residual: residual, post: post, comb: comb)
     }
 }
