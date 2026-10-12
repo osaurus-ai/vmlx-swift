@@ -82,9 +82,46 @@ enum JANGTPrefillKernel {
             """
     }
 
-    /// `JANGHPrefillSource.nax` with the trellis loader, fp32 scales and word-strided rows.
-    static func naxSource(words: Int) -> String {
+    /// Fused gate/up with the layer-wide OUTLIER COLUMNS added to both accumulators before the activation (vMLX
+    /// Python `_EPI`, 2026-10-09): one pass instead of a gate pass, an up pass and two outlier matmuls. `xo` (M, NO)
+    /// fp32 = raw-basis x at the columns, for the sorted rows; `wog`/`wou` are the bundle's fp16 (E, N, NO) outlier
+    /// weights read in place (the reference keeps an fp32 copy of them; ~0.6 GB over Naive-N0.5's layers).
+    static func outlierEpilogue(_ count: Int) -> String {
+        """
+
+            {
+              for (short f = 0; f < decltype(Gt)::kNumFrags; ++f)
+                for (short e = 0; e < decltype(Gt)::kElemsPerFrag; ++e) {
+                  const short2 pos = BaseNAXFrag::get_coord(e);
+                  const int row = tm + (f / TN) * 16 + pos.y; const int col = tn + (f % TN) * 16 + pos.x;
+                  if (row < tgp_bm && col < tgp_bn) {
+                    const device float* xr_ = xo + size_t(y_row + row) * \(count);
+                    const size_t wb = (size_t(index) * N + y_col + col) * \(count);
+                    float ag = 0.0f, au = 0.0f;
+                    for (int j = 0; j < \(count); ++j) { ag += xr_[j] * float(wog[wb + j]); au += xr_[j] * float(wou[wb + j]); }
+                    Gt.val_frags[f][e] += ag; Ut.val_frags[f][e] += au;
+                  }
+                }
+            }
+
+        """
+    }
+
+    /// `JANGHPrefillSource.nax` with the trellis loader, fp32 scales and word-strided rows (and, with
+    /// `outliers` > 0, the fused outlier epilogue).
+    static func naxSource(words: Int, outliers: Int = 0) -> String {
         var s = JANGHPrefillSource.nax
+        if outliers > 0 {
+            let params = "const device uint32_t* indices, device T* y, const int M, const int N, const int K, const int EXPERTS, const float lim,"
+            // The activation loop (whitespace-insensitive: the source is an indented multi-line literal).
+            let pattern = #"if \(FUSED\) \{\s*for \(short i = 0; i < decltype\(Gt\)::kNumFrags; i\+\+\)"#
+            guard s.contains(params), let act = s.range(of: pattern, options: .regularExpression) else {
+                preconditionFailure("JANGT prefill: outlier anchors missing")
+            }
+            s.insert(contentsOf: outlierEpilogue(outliers), at: act.lowerBound)
+            s = s.replacingOccurrences(
+                of: params, with: params + " const device float* xo, const device half* wog, const device half* wou,")
+        }
         let replacements: [(String, String)] = [
             ("METAL_FUNC float tq_act(", "METAL_FUNC float jt_act("),
             ("METAL_FUNC void tq_gather_qmm_nax(", "METAL_FUNC void jt_gather_qmm_nax("),
@@ -111,9 +148,11 @@ enum JANGTPrefillKernel {
         return s
     }
 
-    private static func kernel(k: Double, words: Int, dtype: DType, fused: Bool, rotate: Bool) -> MLXFast.MLXFastKernel {
+    private static func kernel(k: Double, words: Int, dtype: DType, fused: Bool, rotate: Bool, outliers: Int = 0)
+        -> MLXFast.MLXFastKernel
+    {
         let type = dtype == .bfloat16 ? "bfloat16_t" : "half"
-        let name = "jangt_prefill_K\(JANGTKernels.kname(k))_w\(words)_\(type)_f\(fused ? 1 : 0)_r\(rotate ? 1 : 0)"
+        let name = "jangt_prefill_K\(JANGTKernels.kname(k))_w\(words)_\(type)_f\(fused ? 1 : 0)_r\(rotate ? 1 : 0)_o\(outliers)"
         lock.lock()
         defer { lock.unlock() }
         if let cached = kernels[name] { return cached }
@@ -122,13 +161,15 @@ enum JANGTPrefillKernel {
             threadgroup \(type) Wg[64 * PAD];
             threadgroup \(type) Wu[\(fused ? 64 : 1) * PAD];
             jt_gather_qmm_nax<\(type), 2, 2, \(fused), \(rotate), 64>(
-                x, wg, sg, wu, su, indices, y, meta[0], meta[1], meta[2], meta[3], lim[0], Wg, Wu,
+                x, wg, sg, wu, su, indices, y, meta[0], meta[1], meta[2], meta[3], lim[0],\(outliers > 0 ? " xo, wog, wou," : "") Wg, Wu,
                 threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
             """
         let built = MLXFast.metalKernel(
-            name: name, inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"], outputNames: ["y"],
+            name: name,
+            inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"] + (outliers > 0 ? ["xo", "wog", "wou"] : []),
+            outputNames: ["y"],
             source: source,
-            header: JANGHPrefillHeaders.nax + loaderSource(k: k, words: words) + naxSource(words: words),
+            header: JANGHPrefillHeaders.nax + loaderSource(k: k, words: words) + naxSource(words: words, outliers: outliers),
             ensureRowContiguous: false)
         kernels[name] = built
         return built
@@ -156,6 +197,29 @@ enum JANGTPrefillKernel {
              meta, MLXArray([limit])],
             grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
             outputShapes: [[m, n]], outputDTypes: [x.dtype])[0]
+    }
+
+    /// Fused gate/up for expert-sorted rows with the layer-wide outlier columns `columns` (NO,) added before the
+    /// (clamped) SwiGLU: `xr` rotated rows, `rawRows` raw-basis rows (M, K_in). Same output as two `project` passes
+    /// plus `outliers` on each, in one tile pass.
+    static func projectGateUpWithOutliers(
+        _ xr: MLXArray, rawRows: MLXArray, gate: JANGTProjection, up: JANGTProjection, columns: MLXArray,
+        indices: MLXArray, limit: Float = 0
+    ) -> MLXArray {
+        let m = xr.dim(0), kin = xr.dim(1), n = gate.outputs, count = columns.size
+        precondition(available && [.bfloat16, .float16].contains(xr.dtype) && kin == gate.inputs && kin % 64 == 0
+                     && indices.size == m && up.k == gate.k && count == gate.outlierColumns
+                     && count == up.outlierColumns, "JANGT prefill: unsupported outlier geometry")
+        let idx = indices.size < 8
+            ? concatenated([indices, broadcast(indices[(indices.size - 1)...], to: [8 - indices.size])])
+            : indices
+        let xo = take(rawRows, columns.asType(.int32), axis: 1).asType(.float32)
+        let meta = MLXArray([Int32(m), Int32(n), Int32(kin), Int32(gate.experts)])
+        return kernel(k: gate.k, words: gate.words, dtype: xr.dtype, fused: true, rotate: false, outliers: count)(
+            [contiguous(xr), gate.packed, gate.scale, up.packed, up.scale, contiguous(idx.asType(.uint32)),
+             meta, MLXArray([limit]), contiguous(xo), gate.outlierWeights, up.outlierWeights],
+            grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [xr.dtype])[0]
     }
 
     /// The outlier-column term of a projection for expert-sorted rows: rawRows (M, K_in) in the RAW basis.

@@ -116,6 +116,8 @@ func runSpeedProbe(modelPath: String) async throws {
         var p = GenerateParameters(
             maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
             repetitionPenalty: nil)
+        // BENCH_SPEED_PREFILL_STEP=<n>: prefill chunk size (the app's per-request prefillStepSize).
+        if let step = env["BENCH_SPEED_PREFILL_STEP"].flatMap(Int.init), step > 0 { p.prefillStepSize = step }
         // BENCH_SPEED_SAMPLED=1: the bundle sampler the app sends by default (Qwen3.8: T 1.0, top_p 0.95, top_k 20).
         if env["BENCH_SPEED_SAMPLED"] == "1" {
             p.temperature = 1.0

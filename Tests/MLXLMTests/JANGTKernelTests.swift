@@ -227,7 +227,7 @@ final class JANGTKernelTests: XCTestCase {
         let x = (0 ..< rows * kin).map { _ in Float(Float16(rng.normal())) }  // already "rotated" rows
         let raw = (0 ..< rows * kin).map { _ in rng.normal() }
         let limit: Float = 0.3
-        var single = [Float](), fused = [Float](), outl = [Float]()
+        var single = [Float](), fused = [Float](), outl = [Float](), fusedOut = [Float]()
         for r in 0 ..< rows {
             let e = Int(ids[r]), xr = Array(x[r * kin ..< (r + 1) * kin])
             for c in 0 ..< n {
@@ -236,9 +236,14 @@ final class JANGTKernelTests: XCTestCase {
                 single.append(g)
                 let gc = min(g, limit), uc = min(max(u, -limit), limit)
                 fused.append(gc / (1 + exp(-gc)) * uc)
-                var o: Float = 0
-                for (j, col) in gate.columns(e).enumerated() { o += raw[r * kin + col] * gate.wout[(e * n + c) * gate.outliers + j] }
+                var o: Float = 0, ou: Float = 0
+                for (j, col) in gate.columns(e).enumerated() {
+                    o += raw[r * kin + col] * gate.wout[(e * n + c) * gate.outliers + j]
+                    ou += raw[r * kin + col] * up.wout[(e * n + c) * up.outliers + j]
+                }
                 outl.append(o)
+                let go = min(g + o, limit), uo = min(max(u + ou, -limit), limit)
+                fusedOut.append(go / (1 + exp(-go)) * uo)
             }
         }
         let g = try gate.mlx(), u = try up.mlx()
@@ -246,8 +251,13 @@ final class JANGTKernelTests: XCTestCase {
         let ySingle = JANGTPrefillKernel.project(xm, g, indices: idx).asType(.float32).asArray(Float.self)
         let yFused = JANGTPrefillKernel.project(xm, g, up: u, indices: idx, limit: limit).asType(.float32).asArray(Float.self)
         let yOut = try XCTUnwrap(JANGTPrefillKernel.outliers(MLXArray(raw, [rows, kin]), g, indices: idx)).asArray(Float.self)
+        let yFusedOut = JANGTPrefillKernel.projectGateUpWithOutliers(
+            xm, rawRows: MLXArray(raw, [rows, kin]), gate: g, up: u, columns: MLXArray([Int32(3), Int32(900)]),
+            indices: idx, limit: limit).asType(.float32).asArray(Float.self)
+        let e4 = relL2(yFusedOut, fusedOut)
+        XCTAssertLessThan(e4, 2e-2, "fused gate/up with outlier epilogue")
         let e1 = relL2(ySingle, single), e2 = relL2(yFused, fused), e3 = relL2(yOut, outl)
-        print("JANGT prefill K=\(k): single rel-L2 \(e1), fused \(e2), outliers \(e3)")
+        print("JANGT prefill K=\(k): single rel-L2 \(e1), fused \(e2), outliers \(e3), fused+outliers \(e4)")
         XCTAssertLessThan(e1, 1e-2)
         XCTAssertLessThan(e2, 2e-2)
         XCTAssertLessThan(e3, 1e-3)  // fp32 gather_mm runs in TF32 under MLX defaults (as in the reference)

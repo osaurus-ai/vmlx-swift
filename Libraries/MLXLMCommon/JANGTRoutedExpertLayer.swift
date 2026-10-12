@@ -35,6 +35,9 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     /// `VMLX_JANGT_PREFILL=0` keeps the decode kernels for every batch (A/B and diagnosis).
     static let prefillEnabled = ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL"] != "0"
     private let intermediateSize: Int
+    /// The gate/up outlier columns when they are layer-wide (the same real columns for every expert, gate and up):
+    /// the fused prefill epilogue needs one column list per tile.
+    private var sharedOutlierColumns: MLXArray?
 
     private let gateUp: GateUp
     private let down: Down
@@ -73,6 +76,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let signs = gate.signs * Self.keepMask(width: hiddenSize, columns: gate.outlierColumnIndices[0 ..< 1])[0]
             eval(signs)
             gateUp = .trellis(gate: gate, up: up, signs: signs)
+            if gate.outlierColumns > 0 {
+                let g = gate.outlierColumnIndices, u = up.outlierColumnIndices
+                let first = g[0 ..< 1]
+                let shared = g.shape == u.shape && (g .== first).all().item(Bool.self)
+                    && (g .== u).all().item(Bool.self) && (first .>= MLXArray(Int32(0))).all().item(Bool.self)
+                if shared { sharedOutlierColumns = first.reshaped(-1).asType(.int32) }
+            }
             count(gate)
             count(up)
         } else {
@@ -194,6 +204,10 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 hidden = JANGTPrefillKernel.project(xr, gate, up: up, indices: sortedIDs, limit: limit,
                                                     rotateOutput: rotate)
                 hiddenRotated = rotate
+            } else if let columns = sharedOutlierColumns {
+                hidden = JANGTPrefillKernel.projectGateUpWithOutliers(
+                    xr, rawRows: take(x, tok, axis: 0), gate: gate, up: up, columns: columns,
+                    indices: sortedIDs, limit: limit)
             } else {
                 let raw = take(x, tok, axis: 0)
                 var g = JANGTPrefillKernel.project(xr, gate, indices: sortedIDs).asType(.float32)
