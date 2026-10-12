@@ -147,6 +147,7 @@ func runSpeedProbe(modelPath: String) async throws {
     struct Row {
         var cat: String
         var tokens: Int
+        var promptTokens = 0
         var decode: Double
         var ttft: Double
         var text: String
@@ -205,9 +206,11 @@ func runSpeedProbe(modelPath: String) async throws {
         let span = (first.map { last - $0 }) ?? 0
         let chunkRate = span > 0.2 && tokens > 1 ? Double(tokens - 1) / span : 0
         if !mtp.isEmpty { print("[BENCH_SPEED_MTP] \(cat) \(mtp)") }
-        return Row(
+        var row = Row(
             cat: cat, tokens: tokens, decode: decode, ttft: (first ?? t0) - t0, text: text,
             chunkRate: chunkRate)
+        row.promptTokens = send.text.tokens.size
+        return row
     }
 
     // BENCH_SPEED_IMAGES=a.png,b.png: media smoke — one turn per image ("color and digit"), the
@@ -338,8 +341,9 @@ func runSpeedProbe(modelPath: String) async throws {
             let preview = String(r.text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
             let line = String(
                 format:
-                    "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"preview\":%@}",
-                cat, r.tokens, r.decode, r.chunkRate, r.ttft, String(reflecting: preview))
+                    "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"prompt_tokens\":%d,\"prefill_tok_s\":%.1f,\"preview\":%@}",
+                cat, r.tokens, r.decode, r.chunkRate, r.ttft, r.promptTokens,
+                r.ttft > 0 ? Double(r.promptTokens) / r.ttft : 0, String(reflecting: preview))
             print("[BENCH_SPEED_ROW] " + line)
             lines.append(line)
             texts.append(r.text)

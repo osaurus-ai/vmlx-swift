@@ -20,13 +20,21 @@ import MLXNN
 public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, SupplementalModelWeights {
     private enum GateUp {
         case trellis(gate: JANGTProjection, up: JANGTProjection, signs: MLXArray)
-        case codebook(kernel: JANGHFusedGateUpKernel, gate: JANGHMappedBanks.Projection, up: JANGHMappedBanks.Projection)
+        case codebook(kernel: JANGHFusedGateUpKernel, prefill: JANGHPrefillKernel,
+                      gate: JANGHMappedBanks.Projection, up: JANGHMappedBanks.Projection)
     }
 
     private enum Down {
         case trellis(JANGTProjection, signs: MLXArray)
-        case codebook(kernel: JANGHWeightedDownKernel, bank: JANGHMappedBanks.Projection)
+        case codebook(kernel: JANGHWeightedDownKernel, prefill: JANGHPrefillKernel, bank: JANGHMappedBanks.Projection)
     }
+
+    /// Routed (token, slot) pairs from which the expert-sorted prefill tiles run instead of the decode kernels
+    /// (vMLX Python `SORT_THRESHOLD`): > 64 so an 8-token speculative verify (8 x top-8) stays on decode.
+    static let sortThreshold = 72
+    /// `VMLX_JANGT_PREFILL=0` keeps the decode kernels for every batch (A/B and diagnosis).
+    static let prefillEnabled = ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL"] != "0"
+    private let intermediateSize: Int
 
     private let gateUp: GateUp
     private let down: Down
@@ -74,6 +82,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             gateUp = .codebook(
                 kernel: try JANGHFusedGateUpKernel(contract: contract, gateModule: gateName, upModule: upName,
                                                    outputRotation: .none),
+                prefill: try JANGHPrefillKernel(contract: contract, module: gateName, upModule: upName),
                 gate: gate, up: up)
             count(gate, inputs: hiddenSize)
             count(up, inputs: hiddenSize)
@@ -91,10 +100,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             count(d)
         } else {
             let bank = try banks.projection(downName)
-            down = .codebook(kernel: try JANGHWeightedDownKernel(contract: contract, module: downName), bank: bank)
+            down = .codebook(kernel: try JANGHWeightedDownKernel(contract: contract, module: downName),
+                             prefill: try JANGHPrefillKernel(contract: contract, module: downName), bank: bank)
             count(bank, inputs: intermediateSize)
         }
         self.hiddenSize = hiddenSize
+        self.intermediateSize = intermediateSize
         self.limit = activationLimit ?? 0
         supplementalWeightBytes = bytes
         supplementalParameterCount = params
@@ -118,6 +129,15 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         let x = input.reshaped(-1, hiddenSize)
         let ids = indices.reshaped(-1, routes).asType(.uint32)
         let weights = scores.reshaped(-1, routes).asType(.float32)
+        if Self.prefillEnabled, ids.size >= Self.sortThreshold, JANGTPrefillKernel.available,
+            [.bfloat16, .float16].contains(input.dtype)
+        {
+            do {
+                return try prefill(x, ids: ids, weights: weights).asType(input.dtype).reshaped(input.shape)
+            } catch {
+                preconditionFailure("JANGT routed prefill rejected admitted bank: \(error)")
+            }
+        }
         do {
             let hidden: MLXArray
             switch gateUp {
@@ -125,7 +145,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 hidden = JANGTKernels.gateUp(
                     xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids, gate: gate, up: up,
                     limit: limit, outputDType: .float32)
-            case .codebook(let kernel, let gate, let up):
+            case .codebook(let kernel, _, let gate, let up):
                 hidden = try kernel.activatePreparedInput(
                     kernel.prepareInputForFusedDecode(x), gatePacked: gate.packed, gateScales: gate.scales,
                     upPacked: up.packed, upScales: up.scales, indices: ids, limit: limit > 0 ? limit : nil)
@@ -136,7 +156,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 let rotated = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: ids.flattened())
                 y = JANGTKernels.down(hr: rotated, h: hidden, indices: ids, weights: weights, projection: projection)
                     .asType(input.dtype)
-            case .codebook(let kernel, let bank):
+            case .codebook(let kernel, _, let bank):
                 let prepared = kernel.inputRotation == .hadamard32
                     ? try rowRotation(hidden, outputDType: .float32) : hidden
                 y = try kernel.projectPreparedHidden(
@@ -148,5 +168,64 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             // Module forwards are nonthrowing throughout MLXNN; admission validated every invariant up front.
             preconditionFailure("JANGT routed execution rejected admitted bank: \(error)")
         }
+    }
+
+    /// Expert-sorted prefill (vMLX Python `JTMixedSwitchGLU._prefill`): rows sorted by expert, NAX tiles per group,
+    /// outlier columns added in fp32, rows restored and combined with the routing weights in fp32.
+    private func prefill(_ x: MLXArray, ids: MLXArray, weights: MLXArray) throws -> MLXArray {
+        let tokens = x.dim(0), routes = ids.dim(1)
+        let flat = ids.flattened()
+        let order = argSort(flat)
+        let sortedIDs = take(flat, order).asType(.uint32)
+        let tok = order.floorDivide(routes)
+        let dtype = x.dtype
+        let downIsCodebook: Bool
+        if case .codebook = down { downIsCodebook = true } else { downIsCodebook = false }
+
+        var hidden: MLXArray
+        var hiddenRotated = false
+        switch gateUp {
+        case .trellis(let gate, let up, let signs):
+            let xr = take(JANGTKernels.rotateRows(x, signs: signs), tok, axis: 0).asType(dtype)
+            if gate.outlierColumns == 0 {
+                // One NAX pass over both weight tiles with the (clamped) SwiGLU epilogue; a JANGH down gets its
+                // input already Hadamard-32 rotated (the H32 store epilogue).
+                let rotate = downIsCodebook && intermediateSize % 32 == 0
+                hidden = JANGTPrefillKernel.project(xr, gate, up: up, indices: sortedIDs, limit: limit,
+                                                    rotateOutput: rotate)
+                hiddenRotated = rotate
+            } else {
+                let raw = take(x, tok, axis: 0)
+                var g = JANGTPrefillKernel.project(xr, gate, indices: sortedIDs).asType(.float32)
+                var u = JANGTPrefillKernel.project(xr, up, indices: sortedIDs).asType(.float32)
+                if let o = JANGTPrefillKernel.outliers(raw, gate, indices: sortedIDs) { g = g + o }
+                if let o = JANGTPrefillKernel.outliers(raw, up, indices: sortedIDs) { u = u + o }
+                if limit > 0 { g = minimum(g, limit); u = clip(u, min: -limit, max: limit) }
+                hidden = (g * sigmoid(g) * u).asType(dtype)
+            }
+        case .codebook(_, let prefillKernel, let gate, let up):
+            let xs = take(try rowRotation(x, outputDType: dtype), tok, axis: 0)
+            hidden = try prefillKernel.projectSorted(
+                xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs,
+                upPacked: up.packed, upScales: up.scales, limit: limit > 0 ? limit : nil)
+        }
+
+        let sortedOutput: MLXArray
+        switch down {
+        case .trellis(let projection, let signs):
+            let hr = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: sortedIDs).asType(dtype)
+            var y = JANGTPrefillKernel.project(hr, projection, indices: sortedIDs).asType(.float32)
+            if let o = JANGTPrefillKernel.outliers(hidden, projection, indices: sortedIDs) { y = y + o }
+            sortedOutput = y
+        case .codebook(let kernel, let prefillKernel, let bank):
+            let hr = hiddenRotated || kernel.inputRotation != .hadamard32
+                ? hidden : try rowRotation(hidden, outputDType: dtype)
+            sortedOutput = try prefillKernel.projectSorted(
+                hr, packed: bank.packed, scales: bank.scales, indices: sortedIDs)
+        }
+        // Unsort, then the routing-weighted sum as one fp32 (1 x k) @ (k x D) batched matmul.
+        let restored = take(sortedOutput, argSort(order), axis: 0).reshaped(tokens, routes, hiddenSize)
+            .asType(.float32)
+        return matmul(weights.reshaped(tokens, 1, routes), restored).reshaped(tokens, hiddenSize)
     }
 }

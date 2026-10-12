@@ -213,6 +213,50 @@ final class JANGTKernelTests: XCTestCase {
         print("JANGT K=\(k) limit=\(limit) large=\(largeHidden): gate/up rel-L2 \(hErr), down rel-L2 \(yErr)")
     }
 
+    /// Expert-sorted NAX prefill tiles (JANGTPrefillKernel) against the CPU decoder: single projection, fused
+    /// gate+up with a clamp that bites, and the outlier term, for 96 sorted rows over a ragged expert split.
+    private func runPrefill(k: Double) throws {
+        try XCTSkipUnless(JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
+        var rng = Rng(state: UInt64(k * 100) + 11)
+        let experts = 4, n = 256, kin = 1024, rows = 96
+        let cols = (0 ..< experts).map { _ in [Int32(3), Int32(900)] }
+        let gate = projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols, columnScales: false)
+        let up = projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols, columnScales: false)
+        // Sorted expert ids with a ragged split (segments of 7, 40, 0, 49 rows).
+        let ids: [UInt32] = Array(repeating: 0, count: 7) + Array(repeating: 1, count: 40) + Array(repeating: 3, count: 49)
+        let x = (0 ..< rows * kin).map { _ in Float(Float16(rng.normal())) }  // already "rotated" rows
+        let raw = (0 ..< rows * kin).map { _ in rng.normal() }
+        let limit: Float = 0.3
+        var single = [Float](), fused = [Float](), outl = [Float]()
+        for r in 0 ..< rows {
+            let e = Int(ids[r]), xr = Array(x[r * kin ..< (r + 1) * kin])
+            for c in 0 ..< n {
+                let g = dot(gate.row(e, c), xr) * gate.scale[e * n + c]
+                let u = dot(up.row(e, c), xr) * up.scale[e * n + c]
+                single.append(g)
+                let gc = min(g, limit), uc = min(max(u, -limit), limit)
+                fused.append(gc / (1 + exp(-gc)) * uc)
+                var o: Float = 0
+                for (j, col) in gate.columns(e).enumerated() { o += raw[r * kin + col] * gate.wout[(e * n + c) * gate.outliers + j] }
+                outl.append(o)
+            }
+        }
+        let g = try gate.mlx(), u = try up.mlx()
+        let xm = MLXArray(x, [rows, kin]).asType(.bfloat16), idx = MLXArray(ids)
+        let ySingle = JANGTPrefillKernel.project(xm, g, indices: idx).asType(.float32).asArray(Float.self)
+        let yFused = JANGTPrefillKernel.project(xm, g, up: u, indices: idx, limit: limit).asType(.float32).asArray(Float.self)
+        let yOut = try XCTUnwrap(JANGTPrefillKernel.outliers(MLXArray(raw, [rows, kin]), g, indices: idx)).asArray(Float.self)
+        let e1 = relL2(ySingle, single), e2 = relL2(yFused, fused), e3 = relL2(yOut, outl)
+        print("JANGT prefill K=\(k): single rel-L2 \(e1), fused \(e2), outliers \(e3)")
+        XCTAssertLessThan(e1, 1e-2)
+        XCTAssertLessThan(e2, 2e-2)
+        XCTAssertLessThan(e3, 1e-3)  // fp32 gather_mm runs in TF32 under MLX defaults (as in the reference)
+    }
+
+    func testPrefillTilesMatchCPUReferenceK2() throws { try runPrefill(k: 2) }
+    func testPrefillTilesMatchCPUReferenceK25() throws { try runPrefill(k: 2.5) }
+    func testPrefillTilesMatchCPUReferenceK3() throws { try runPrefill(k: 3) }
+
     func testKernelsMatchCPUReferenceK2() throws { try runGateUpAndDown(k: 2, limit: 0, largeHidden: false) }
     func testKernelsMatchCPUReferenceK25Clamped() throws { try runGateUpAndDown(k: 2.5, limit: 0.25, largeHidden: false) }
     func testKernelsMatchCPUReferenceK3LargeHidden() throws { try runGateUpAndDown(k: 3, limit: 0, largeHidden: true) }
