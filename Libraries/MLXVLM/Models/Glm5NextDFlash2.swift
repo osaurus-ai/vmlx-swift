@@ -57,3 +57,15 @@ extension Glm5Next: HiddenStateCaptureModel, TokenEmbedderModel, DFlash2VerifyRo
         return true
     }
 }
+
+/// No lane matmul on GLM-5.3. With it installed (DFlash 2 installs it on the target for batched verify), GLM-5.3-Flash
+/// JANGHT2.4 answers coherently below index_topk and degrades past it: 1.5k-token prompt fine, 3k misreads the
+/// request, 6k / 12k emit garbage from the first token (RunBench default arm and the osaurus app, 2026-10-11);
+/// `VMLX_LANE_QMM=0` restores coherent output at 6k. vMLX Python found and fixed the same defect (lane_qmm
+/// installed on the glm5_next target corrupted its served DFlash2 lane, `54156d41a`). The target keeps MLX's
+/// kernels; the drafter keeps its own lane install.
+extension Glm5Next: LaneQMMTargetPolicy {
+    public var laneQMMEnabled: Bool { false }
+    public var laneQMMTiled: Bool { false }
+    public var laneQMMUntiledMinRows: Int { Int.max }
+}

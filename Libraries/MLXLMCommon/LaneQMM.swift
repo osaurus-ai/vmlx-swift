@@ -297,7 +297,8 @@ extension LaneQMM {
     /// row costs; other targets keep the defaults below.
     public static func installForDFlash2Target(_ target: Any) {
         guard ProcessInfo.processInfo.environment["VMLX_LANE_QMM"] != "0",
-            let module = target as? Module
+            let module = target as? Module,
+            (target as? LaneQMMTargetPolicy)?.laneQMMEnabled ?? true
         else { return }
         let id = ObjectIdentifier(module)
         lock.lock()
@@ -522,8 +523,12 @@ public protocol LaneQMMTargetPolicy {
     /// target sets false where the in-place read measured the same end-to-end speed (see
     /// `LaneQMMSources.directScales`).
     var laneQMMPackedScales: Bool { get }
+    /// Whether the lane matmul may be installed on this target at all. Default true; a target whose verify
+    /// output the lane kernels change sets false (GLM-5.3: see `Glm5Next.laneQMMEnabled`).
+    var laneQMMEnabled: Bool { get }
 }
 
 extension LaneQMMTargetPolicy {
     public var laneQMMPackedScales: Bool { true }
+    public var laneQMMEnabled: Bool { true }
 }
