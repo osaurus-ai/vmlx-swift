@@ -74,3 +74,23 @@ final class NaiveN05FlashPrefillAttentionTests: XCTestCase {
         XCTAssertLessThan(e, 1e-2)
     }
 }
+
+/// Diagnostic sweep (JANGT_PERF=1): blocked sliding attention at large row counts must stay finite.
+final class NaiveN05FlashBlockedSlidingSweepTests: XCTestCase {
+    func testLargeBlockCountsStayFinite() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["JANGT_PERF"] == "1")
+        MLXRandom.seed(9)
+        let h = 64, kv = 8, d = 192, dv = 128, w = 128
+        for (l, hist, withSinks) in [(2048, 0, true), (4096, 0, true), (4096, 127, true), (4096, 0, false), (3000, 0, true)] {
+            let q = MLXRandom.normal([1, h, l, d]).asType(.bfloat16)
+            let k = MLXRandom.normal([1, kv, hist + l, d]).asType(.bfloat16)
+            let v = MLXRandom.normal([1, kv, hist + l, dv]).asType(.bfloat16)
+            let sinks: MLXArray? = withSinks ? (MLXRandom.normal([h]) * 0.5).asType(.bfloat16) : nil
+            let o = NaiveN05FlashPrefillAttention.blockedSliding(
+                q: q, k: k, v: v, scale: Float(1 / sqrt(Double(d))), sinks: sinks, window: w)
+            let bad = (1 - MLX.isFinite(o).asType(.int32)).sum().item(Int32.self)
+            let badRows = (1 - MLX.isFinite(o).all(axes: [1, 3]).asType(.int32)).sum().item(Int32.self)
+            print("blocked sliding l=\(l) hist=\(hist) sinks=\(withSinks): non-finite \(bad) rows \(badRows)")
+        }
+    }
+}

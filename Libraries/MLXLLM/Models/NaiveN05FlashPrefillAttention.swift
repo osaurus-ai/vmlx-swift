@@ -12,6 +12,9 @@ import MLXFast
 /// 15.3 s at 2,048). Both rewrites are exact up to summation order; padded batches keep the reference.
 enum NaiveN05FlashPrefillAttention {
     static let enabled = ProcessInfo.processInfo.environment["VMLX_NAIVE_PREFILL_ATTENTION"] != "0"
+    /// Per-path switches (A/B and diagnosis): `VMLX_NAIVE_BLOCKED_SWA=0`, `VMLX_NAIVE_SPARSE_DSA=0`.
+    static let blockedSlidingEnabled = ProcessInfo.processInfo.environment["VMLX_NAIVE_BLOCKED_SWA"] != "0"
+    static let sparseEnabled = ProcessInfo.processInfo.environment["VMLX_NAIVE_SPARSE_DSA"] != "0"
 
     /// Sliding window W: query block b (W rows) only sees keys [bW - W, bW + W) of the front-padded key array, a
     /// 2W-key slab = [previous block | own block]. All blocks run as ONE batched SDPA (batch = block) with the same

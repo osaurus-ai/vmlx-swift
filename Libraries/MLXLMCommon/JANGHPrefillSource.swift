@@ -78,8 +78,8 @@ struct TQBlockLoader {
           constexpr short SM = BM / WM, SN = BN / WN, SK = 32;
           constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
           const short tm = SM * (simd_group_id / WN); const short tn = SN * (simd_group_id % WN);
-          const short sgp_sm = min(SM, short(max(0, (M - (y_row + tm)))));
-          const short sgp_sn = min(SN, short(max(0, (N - (y_col + tn)))));
+          const short sgp_sm = short(min(int(SM), max(0, M - (y_row + tm))));  // clamp in int: M - row >= 32768 wraps a short
+          const short sgp_sn = short(min(int(SN), max(0, N - (y_col + tn))));
           uint32_t index; short offset; uint32_t index_next = indices[y_row]; short offset_next = 0; int n = 0;
           while (n < tgp_bm) {
             n++; offset = offset_next; index = index_next; offset_next = tgp_bm;
@@ -197,8 +197,8 @@ struct TQBlockLoader {
           constexpr short SM = BM / WM, SN = BN / WN, SK = 32;
           constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
           const short tm = SM * (simd_group_id / WN); const short tn = SN * (simd_group_id % WN);
-          const short sgp_sm = min(SM, short(max(0, (M - (y_row + tm)))));
-          const short sgp_sn = min(SN, short(max(0, (N - (y_col + tn)))));
+          const short sgp_sm = short(min(int(SM), max(0, M - (y_row + tm))));  // clamp in int: M - row >= 32768 wraps a short
+          const short sgp_sn = short(min(int(SN), max(0, N - (y_col + tn))));
           NAXTile<float, TM, TN> Gt; Gt.clear();
           const device T* xn = x + size_t(y_row + tm) * K + size_t(it0) * BK;
           thread loader_w_t lg(wgl, sg + y_col, K, Wg, simd_group_id, simd_lane_id, tgp_bn);

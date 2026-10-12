@@ -84,12 +84,14 @@ final class NaiveN05FlashAttention: Module {
         {
             let scale = Float(1 / sqrt(Double(g.keyDimensions)))
             let scaledValues = config.valueScale.map { v * MLXArray(Float($0), dtype: v.dtype) } ?? v
-            if sliding {
+            if sliding, NaiveN05FlashPrefillAttention.blockedSlidingEnabled {
                 let o = NaiveN05FlashPrefillAttention.blockedSliding(
                     q: q, k: k, v: scaledValues, scale: scale, sinks: sink?.asType(q.dtype), window: config.window)
                 return output(o.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
             }
-            if sink == nil, let indexer, let projectedIndex, let indexKeys {
+            if !sliding, NaiveN05FlashPrefillAttention.sparseEnabled, sink == nil, let indexer, let projectedIndex,
+                let indexKeys
+            {
                 let keyCount = k.dim(2), topK = config.indexerTopK
                 let selected: MLXArray
                 if keyCount <= topK {
