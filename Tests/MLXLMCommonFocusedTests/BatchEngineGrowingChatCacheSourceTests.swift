@@ -18,7 +18,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("case reusablePrefixWarmup"))
         #expect(source.contains("cachePromptIntent: CachePromptIntent = .generation"))
         #expect(source.components(
-            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 3)
+            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 4)
         #expect(source.contains(
             "guard cachePromptIntent != .reusablePrefixWarmup else { return false }"))
     }
@@ -287,12 +287,12 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         let info = try #require(task.range(of: "_ = continuation.yield(handler.infoEvent(info))"))
         let preStoreSync = try #require(task.range(
-            of: "Stream().synchronize()", range: info.upperBound..<task.endIndex))
+            of: "StreamOrDevice.default.stream.synchronize()", range: info.upperBound..<task.endIndex))
         let store = try #require(task.range(
             of: "iterator.storeCacheAfterGeneration(",
             range: preStoreSync.upperBound..<task.endIndex))
         let postStoreSync = try #require(task.range(
-            of: "Stream().synchronize()", range: store.upperBound..<task.endIndex))
+            of: "StreamOrDevice.default.stream.synchronize()", range: store.upperBound..<task.endIndex))
         let advisorDrain = try #require(task.range(
             of: "MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()",
             range: postStoreSync.upperBound..<task.endIndex))
@@ -316,7 +316,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         let serializedRestore = try #require(source.range(
             of: "let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO"))
         let restore = try #require(source.range(
-            of: "let count = restoreFromDiskArrays(diskArrays, into: &self.cache)",
+            of: "diskArrays, into: &self.cache, requirePromptBoundary: true)",
             range: serializedRestore.lowerBound..<source.endIndex))
         #expect(serializedRestore.lowerBound < restore.lowerBound)
         #expect(source.contains("MLX.eval(self.cache)"))
@@ -345,8 +345,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("seedSnapshot = capturedDiskSeed"))
         #expect(batch.contains("splitPrefillInputBeforeFinalToken("))
         #expect(batch.contains("cacheRequiresPrefillCapturedDiskSeed(slot.cache)"))
-        #expect(!batch.contains(
-            "slot.originalInput.cachePromptIntent != .reusablePrefixWarmup"))
+        // The DSV4 N-1 seed store must not exclude warmups (the rotating-chunk capture added in #509 legitimately
+        // does, so scope the check to the seed path).
+        let seedStart = try #require(batch.range(of: "func storePrefillCapturedDiskSeed("))
+        let seedBody = String(batch[seedStart.lowerBound...].prefix(4000))
+        #expect(!seedBody.contains(".reusablePrefixWarmup"))
         #expect(batch.contains(
             "excluding warmups here causes the"))
         #expect(batch.contains("remainingPromptUnits > 1"))
@@ -423,7 +426,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         let skip = try #require(finishBody.range(of:
             "skipped cache store because no new prompt-boundary snapshot was retained"))
-        let drain = try #require(finishBody.range(of: "Stream().synchronize()"))
+        let drain = try #require(finishBody.range(of: "StreamOrDevice.default.stream.synchronize()"))
         let finish = try #require(finishBody.range(of: "slot.continuation.finish()"))
         #expect(skip.lowerBound < drain.lowerBound)
         #expect(drain.lowerBound < finish.lowerBound)
@@ -457,7 +460,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
             of: "slot.diskSeedSnapshot = nil",
             range: immediateStore.lowerBound..<source.endIndex))
         let tailPrefill = try #require(source.range(
-            of: "return try context.model.prepare(\n                        split.tail",
+            of: "return try context.model.prepare(\n                            split.tail",
             range: release.lowerBound..<source.endIndex))
         #expect(immediateStore.lowerBound < release.lowerBound)
         #expect(release.lowerBound < tailPrefill.lowerBound)
