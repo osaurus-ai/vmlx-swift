@@ -449,7 +449,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_ADAPTIVE_BLOCK"] == "1"
         self.adaptiveBlockSize =
             self.adaptiveBlockSizeEnabled ? Self.recallLearnedBlockSize() : nil
-        // Per-cycle verify width (DFlash2WidthChooser): (8, 16) on lane-flat targets, else (5, 8, 16).
+        // Per-cycle verify width (DFlash2WidthChooser): the target's declared ladder (DFlash2WidthLadderPolicy),
+        // else (8, 16) on lane-flat targets, else (5, 8, 16); AR is always a candidate.
         // The configured `blockSize` stays the trained width so the staged verify keeps its shape;
         // other widths take the eager input-capture path. Off when the caller pinned a size, when the
         // legacy probe ladder is on, or with VMLX_DFLASH2_WIDTHS=0.
@@ -457,7 +458,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] != "0"
         {
             let widths = DFlash2WidthChooser.plan(
-                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target))
+                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target),
+                targetLadder: (target as? DFlash2WidthLadderPolicy)?.dflash2WidthLadder)
             if widths != [effectiveBlockSize] {
                 self.widthChooser = DFlash2WidthChooser(
                     widths: widths,

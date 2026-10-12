@@ -272,5 +272,18 @@ final class DFlash2WidthChooserTests: XCTestCase {
         XCTAssertLessThan(Double(lazy.specTokens) / Double(lazy.specTokens + lazy.arTokens), 0.02, "\(lazy)")
         XCTAssertLessThan(lazy.spec, eager.spec, "control: eager exploration times every width per bucket")
     }
-}
 
+    /// A target-declared ladder replaces the default candidates (AR stays; widths outside 2...2*trained drop).
+    func testPlanUsesTargetLadder() {
+        guard ProcessInfo.processInfo.environment["VMLX_DFLASH2_BLOCK"] == nil,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] == nil,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_OPTION"] == nil
+        else { return }
+        XCTAssertEqual(DFlash2WidthChooser.plan(trained: 8, laneFlat: false), [1, 5, 8, 16])
+        XCTAssertEqual(DFlash2WidthChooser.plan(trained: 8, laneFlat: true), [1, 8, 16])
+        XCTAssertEqual(
+            DFlash2WidthChooser.plan(trained: 8, laneFlat: false, targetLadder: [3, 4, 6, 8, 16, 32, 1]),
+            [1, 3, 4, 6, 8, 16])
+        XCTAssertEqual(DFlash2WidthChooser.plan(trained: 8, laneFlat: false, targetLadder: []), [1, 5, 8, 16])
+    }
+}

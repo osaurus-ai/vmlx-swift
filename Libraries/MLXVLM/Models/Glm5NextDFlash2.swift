@@ -64,6 +64,14 @@ extension Glm5Next: HiddenStateCaptureModel, TokenEmbedderModel, DFlash2VerifyRo
 /// `VMLX_LANE_QMM=0` restores coherent output at 6k. vMLX Python found and fixed the same defect (lane_qmm
 /// installed on the glm5_next target corrupted its served DFlash2 lane, `54156d41a`). The target keeps MLX's
 /// kernels; the drafter keeps its own lane install.
+/// GLM-5.3's verify costs ~0.25 AR steps per added row (33 / 47 / 61 / 90 ms at 1 / 2 / 4 / 8 rows), so on prose
+/// (per-position acceptance ~0.6) a 4-row verify pays and a 5-row one barely does. With (3, 4, 6) available the chooser
+/// settles on 4 for prose. Alternating A/B, 4 rounds, per MHz, against (5, 8, 16): prose +28 / +13 / +15 / +7 %;
+/// code, easy code and easy prose within noise (mean +2 / -1 / -0.5 %).
+extension Glm5Next: DFlash2WidthLadderPolicy {
+    public var dflash2WidthLadder: [Int] { [3, 4, 6, 8, 16] }
+}
+
 extension Glm5Next: LaneQMMTargetPolicy {
     public var laneQMMEnabled: Bool { false }
     public var laneQMMTiled: Bool { false }

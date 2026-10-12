@@ -185,6 +185,12 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     }
 }
 
+/// A DFlash 2 target that measured a better candidate ladder than the default (min(5, trained), trained,
+/// 2*trained) declares it here (speculative widths only; AR is added unless `VMLX_DFLASH2_AR_OPTION=0`).
+public protocol DFlash2WidthLadderPolicy {
+    var dflash2WidthLadder: [Int] { get }
+}
+
 struct DFlash2WidthChooser {
     static let decay = 0.85
     static let probeEvery = 32
@@ -234,16 +240,25 @@ struct DFlash2WidthChooser {
 
     /// Candidate widths: (trained, 2*trained) when the target's verify cost is lane-flat, else
     /// (min(5, trained), trained, 2*trained). `VMLX_DFLASH2_BLOCK=<n>` pins one width (A/B tool).
-    static func plan(trained: Int, laneFlat: Bool) -> [Int] {
+    static func plan(trained: Int, laneFlat: Bool, targetLadder: [Int]? = nil) -> [Int] {
         let t = max(2, trained)
         if let raw = ProcessInfo.processInfo.environment["VMLX_DFLASH2_BLOCK"], let n = Int(raw) {
             return [max(2, min(n, 2 * t))]
+        }
+        // `VMLX_DFLASH2_WIDTHS=1,4,8,16`: an explicit candidate ladder (A/B tool; 1 = AR; `0` disables the chooser).
+        if let raw = ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] {
+            let list = Array(Set(raw.split(separator: ",").compactMap { Int($0) }.filter { $0 >= 1 && $0 <= 2 * t }))
+                .sorted()
+            if !list.isEmpty { return list }
         }
         // Width 1 = a plain AR step, measured like any other width: when speculation emits fewer
         // tokens per second than AR (27B JANGH2 sampled prose: 24 vs 29 tok/s), the chooser
         // picks AR; decayed acceptance drifting back to the prior plus the periodic re-time
         // re-probes speculation. `VMLX_DFLASH2_AR_OPTION=0` removes it.
         let ar = ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_OPTION"] == "0" ? [] : [1]
+        if let ladder = targetLadder?.filter({ $0 >= 2 && $0 <= 2 * t }), !ladder.isEmpty {
+            return ar + Array(Set(ladder)).sorted()
+        }
         if laneFlat { return ar + [t, 2 * t] }
         return ar + Array(Set([min(5, t), t, 2 * t])).sorted()
     }
