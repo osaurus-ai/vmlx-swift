@@ -177,6 +177,28 @@ final class KDAFusedDecodeTests: XCTestCase {
         XCTAssertLessThan(convErr, 1e-2)
     }
 
+    /// Multi-row prefill conv kernel against the stock grouped Conv1d + SiLU, fresh and primed caches.
+    func testConvPrefillMatchesStock() throws {
+        let kda = layer()
+        for rows in [2, 7, 100, 513] {
+            let x = MLXRandom.normal([1, rows, hidden], key: MLXRandom.key(UInt64(90 + rows))).asType(.bfloat16)
+            for primedCache in [false, true] {
+                let a = primedCache ? primed(kda) : MambaCache()
+                let b = primedCache ? primed(kda) : MambaCache()
+                let fused = kda(x, cache: a)
+                KDAConvRuntime.prefillEnabled = false
+                let stock = kda(x, cache: b)
+                KDAConvRuntime.prefillEnabled = true
+                eval(fused, stock, a[0]!, a[1]!, b[0]!, b[1]!)
+                let outErr = rel(fused, stock), stateErr = rel(a[1]!, b[1]!), convErr = rel(a[0]!, b[0]!)
+                print("KDA conv prefill rows=\(rows) primed=\(primedCache): out rel \(outErr) state rel \(stateErr) conv rel \(convErr)")
+                XCTAssertEqual(convErr, 0)
+                XCTAssertEqual(outErr, 0)
+                XCTAssertEqual(stateErr, 0)
+            }
+        }
+    }
+
     func testFusedDecodeSpeed() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["JANGT_PERF"] == "1")
         let kda = layer()

@@ -416,10 +416,20 @@ public final class BailingV3KDAAttention: Module {
             if let cache {
                 cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
             }
-            q = silu(qConv(convInput[0..., 0..., 0 ..< proj]))
-            k = silu(kConv(convInput[0..., 0..., proj ..< (2 * proj)]))
-            v = silu(vConv(convInput[0..., 0..., (2 * proj) ..< (3 * proj)]))
-                .reshaped(B, T, numHeads, headDim)
+            if fusedConv, B == 1,
+                let act = glm5KDAConvPrefill(
+                    convInput: convInput, qWeight: qConv.weight, kWeight: kConv.weight, vWeight: vConv.weight,
+                    proj: proj, kernelSize: convKernelSize)
+            {
+                q = act[0..., 0..., 0 ..< proj]
+                k = act[0..., 0..., proj ..< (2 * proj)]
+                v = act[0..., 0..., (2 * proj) ..< (3 * proj)].reshaped(B, T, numHeads, headDim)
+            } else {
+                q = silu(qConv(convInput[0..., 0..., 0 ..< proj]))
+                k = silu(kConv(convInput[0..., 0..., proj ..< (2 * proj)]))
+                v = silu(vConv(convInput[0..., 0..., (2 * proj) ..< (3 * proj)]))
+                    .reshaped(B, T, numHeads, headDim)
+            }
         }
 
         q = q.reshaped(B, T, numHeads, headDim)

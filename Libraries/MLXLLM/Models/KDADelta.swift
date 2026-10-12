@@ -267,6 +267,12 @@ public enum KDAConvRuntime {
             .trimmingCharacters(in: .whitespaces).lowercased()
         return !(["0", "false", "off", "no", ""].contains(v ?? "1"))
     }()
+    /// Multi-row conv kernel (``glm5KDAConvPrefill``); `VMLX_KDA_CONV_PREFILL=0` keeps the stock convolutions.
+    nonisolated(unsafe) public static var prefillEnabled: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_KDA_CONV_PREFILL"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return !(["0", "false", "off", "no", ""].contains(v ?? "1"))
+    }()
 }
 
 /// Convolve + activate + shift one decode step, or return `nil` meaning "use the stock path".
@@ -311,6 +317,74 @@ public func glm5KDAConvDecode(
         outputShapes: [token.shape, state.shape],
         outputDTypes: [token.dtype, token.dtype])
     return (outputs[0], outputs[1])
+}
+
+/// Multi-row (prefill) twin of ``glm5KDAConvDecode``: the three depthwise convolutions and their SiLU over every
+/// row of `convInput` = [carried state (K - 1 rows) | this forward's rows], one dispatch instead of three grouped
+/// `Conv1d` calls and three activations per KDA layer (vMLX Python `glm5_kda_qkv_prefill`, e1d9e30c: GLM-5.3 4k
+/// cold prefill +8.9 %). fp32 taps in order, then the stock path's own roundings (conv output in the activation
+/// dtype, MLX's Sigmoid and the multiply in that dtype), so prefill state matches the stock convolutions.
+/// Returns `[1, T, 3 * proj]` (q | k | v), or nil for anything it does not handle exactly.
+/// `VMLX_KDA_CONV_PREFILL=0` keeps the stock convolutions.
+public func glm5KDAConvPrefill(
+    convInput: MLXArray,  // [1, T + kernelSize - 1, 3 * proj]
+    qWeight: MLXArray, kWeight: MLXArray, vWeight: MLXArray,
+    proj: Int, kernelSize: Int
+) -> MLXArray? {
+    guard KDAConvRuntime.prefillEnabled, kernelSize >= 2,
+        let kernel = KDAConvPrefillKernelManager.shared.kernel
+    else { return nil }
+    let channels = 3 * proj
+    guard convInput.ndim == 3, convInput.dim(0) == 1, convInput.dim(2) == channels,
+        convInput.dim(1) >= kernelSize,
+        convInput.dtype == .float16 || convInput.dtype == .bfloat16
+    else { return nil }
+    for w in [qWeight, kWeight, vWeight] {
+        guard w.dtype == convInput.dtype, w.size == proj * kernelSize else { return nil }
+    }
+    let rows = convInput.dim(1) - (kernelSize - 1)
+    return kernel(
+        [convInput, qWeight, kWeight, vWeight],
+        template: [("T", convInput.dtype), ("P", proj), ("C3", channels), ("K", kernelSize)],
+        grid: (channels, rows, 1),
+        threadGroup: (min(256, channels), 1, 1),
+        outputShapes: [[1, rows, channels]],
+        outputDTypes: [convInput.dtype])[0]
+}
+
+private final class KDAConvPrefillKernelManager: Sendable {
+    static let shared = KDAConvPrefillKernelManager()
+    let kernel: MLXFast.MLXFastKernel?
+
+    private init() {
+        let source = """
+                uint c = thread_position_in_grid.x;
+                uint t = thread_position_in_grid.y;
+                if (c >= (uint)C3) return;
+                uint lane = c / (uint)P;
+                uint ch = c - lane * (uint)P;
+                device const T* w = lane == 0u ? q_weight : (lane == 1u ? k_weight : v_weight);
+                // Row t's window is input rows t ... t + K - 1 (the first K - 1 rows are the carried state).
+                float acc = 0.0f;
+                for (uint tap = 0; tap < (uint)K; ++tap) {
+                    acc += (float)input[(size_t)(t + tap) * (size_t)C3 + c]
+                         * (float)w[(size_t)ch * (size_t)K + tap];
+                }
+                // The stock path's rounding, step for step: Conv1d writes T, then MLXNN's compiled
+                // `x * sigmoid(x)` with T intermediates and MLX's Sigmoid (`1 / (1 + exp(|x|))`, mirrored).
+                const T cv = (T)acc;
+                const T one = T(1);
+                const T y = one / (one + metal::precise::exp(metal::abs(cv)));
+                const T sg = (cv < T(0)) ? y : one - y;
+                out[(size_t)t * (size_t)C3 + c] = cv * sg;
+            """
+        // METAL-ONLY: same as the decode kernel.
+        kernel = MLXFast.metalKernel(
+            name: "vmlx_glm5_kda_qkv_conv_prefill",
+            inputNames: ["input", "q_weight", "k_weight", "v_weight"],
+            outputNames: ["out"],
+            source: source)
+    }
 }
 
 // MARK: - Public entry
