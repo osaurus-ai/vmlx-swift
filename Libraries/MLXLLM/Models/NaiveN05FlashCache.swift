@@ -142,3 +142,9 @@ final class NaiveN05FlashCache: DiskCacheStateProviding {
         return result
     }
 }
+
+/// Exact-prefix restore (``ExactPrefixRestoreCache``): a stored boundary holds exactly the K, V and fp32 indexer rows
+/// the forward produced for those tokens (sliding layers: exactly the last window - 1 rows; no recurrent, pooled or
+/// quantized state), so forced tool selection may restore it like a plain KV cache. Without this every tool-named
+/// osaurus turn (tool_choice=required) re-prefilled the whole history: 40 s at 21k tokens, 167 s at 48k.
+extension NaiveN05FlashCache: ExactPrefixRestoreCache {}

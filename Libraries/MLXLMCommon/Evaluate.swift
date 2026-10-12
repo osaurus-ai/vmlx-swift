@@ -2012,7 +2012,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
+            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore
+                && !cacheRestoreIsExactPrefix(self.cache)
+            {
                 let structuralBoundary = input.cachePrefixTokenCounts
                     .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()
                 if let model = self.model as? any CanonicalRequiredToolCacheModel,
@@ -2343,7 +2345,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokenIds: self.promptTokenIds,
             input: input,
             cache: self.cache,
-            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
+            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary && !cacheRestoreIsExactPrefix(self.cache))
         // Only the already-existing cold head prepare may report a canonical
         // seed. Warm/media requests retain their original fallback behavior.
         let canonicalModel = self.model as? any CanonicalRequiredToolCacheModel
@@ -3494,7 +3496,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
                 if !usesCanonicalHybridBoundary,
                    requiresDiskBackedRestore,
-                   !skipDiskBackedToolPromptSeedBoundary,
+                   !skipDiskBackedToolPromptSeedBoundary || cacheRestoreIsExactPrefix(storageTopologySnapshot),
                    promptTokenIds.count > 1
                 {
                     // Reusable-prefix warmups publish this N-1 seed too —

@@ -1177,7 +1177,9 @@ public actor BatchEngine {
     }
 
     private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
-        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection {
+        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
+            !cacheRestoreIsExactPrefix(slot.cache)
+        {
             return true
         }
         return shouldSkipDiskBackedToolPromptSeedBoundary(
@@ -2095,9 +2097,10 @@ public actor BatchEngine {
             // Scope the fetch result to this coordinator branch. Ordinary
             // requests keep longest-prefix reuse. A caller that is forcing a
             // fresh tool selection may bypass only an unproven disk-backed
-            // topology; paged/full-KV restores remain eligible.
+            // topology; paged/full-KV and exact-prefix restores remain eligible.
             if requiresDiskBackedRestore,
-               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection
+               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
+               !cacheRestoreIsExactPrefix(slot.cache)
             {
                 Self.logger.info(
                     "Slot \(slot.id.description, privacy: .public): skipped disk-backed required-tool cache restore; caller requested fresh tool selection"

@@ -704,7 +704,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             let result: CacheFetchResult
             if requiresDiskBackedRestore,
-               input.cacheRestorePolicy == .freshRequiredToolSelection
+               input.cacheRestorePolicy == .freshRequiredToolSelection,
+               !cacheRestoreIsExactPrefix(self.cache)
             {
                 result = .miss
             } else {
