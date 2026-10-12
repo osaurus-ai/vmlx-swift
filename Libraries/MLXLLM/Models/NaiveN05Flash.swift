@@ -118,6 +118,22 @@ final class NaiveN05FlashAttention: Module {
                 }
             }
         }
+        // One-token decode with trivial padding, on the sliding layers and on the sparse layers at or below
+        // `index_topk` keys: the mask is all true (the cache hands back at most `window` keys ending at this query;
+        // below `index_topk` every key is selected) and every query has a key, so the zero-output guard cannot fire.
+        // Skip the mask, the indexer scores and the guard (~8 dispatches per layer); bit-identical outputs.
+        // Above `index_topk` decode keeps the masked path: the per-query sparse kernel runs one threadgroup per KV
+        // head for a single query and measured 18 % slower at 30k context than masked SDPA over every key.
+        if trivialPadding, batch == 1, length == 1, NaiveN05FlashMath.decodeWithoutMaskEnabled,
+            sliding || k.dim(2) <= config.indexerTopK,
+            NaiveN05FlashMath.usesAsymmetricDecodeSDPA(query: q, key: k, value: v)
+        {
+            let scaled = config.valueScale.map { v * MLXArray(Float($0), dtype: v.dtype) } ?? v
+            let o = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: scaled, scale: Float(1 / sqrt(Double(q.dim(-1)))), mask: .none,
+                sinks: sink?.asType(q.dtype))
+            return output(o.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+        }
         var allowed = NaiveN05FlashMath.allowedMask(padding: padding, queryOffset: past, length: length,
             keyOffset: keyOffset, keyLength: k.dim(2), window: sliding ? config.window : nil,
             gpuArange: allowedMaskGPUArange)
