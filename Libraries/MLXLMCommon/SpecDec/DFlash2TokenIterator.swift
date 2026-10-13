@@ -116,6 +116,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let isGreedy: Bool
     private let blockSize: Int
     private let maskTokenID: Int
+    /// Fixed steps per AR stretch for this target (`arBurstSteps(for:)`), or nil for the adaptive stretch.
+    private let arBurstSteps: Int?
+    /// Consecutive chooser AR picks; the adaptive stretch doubles with it and resets on a speculative pick.
+    private var arStreak = 0
 
     let maxTokens: Int?
     var tokenCount = 0
@@ -467,6 +471,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths))
             }
         }
+        self.arBurstSteps = Self.arBurstSteps(for: target)
         self.maskTokenID = config.maskTokenId
         self.maxTokens = effectiveParameters.maxTokens
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -965,7 +970,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if bs <= 1, !drafterDisabled, widthChooser?.width == 1 {
             // The chooser measured AR as the faster option: a pipelined AR stretch, timed per step as width 1.
             let start = Date.timeIntervalSinceReferenceDate
-            let steps = runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget))
+            let steps = runAutoregressiveBurst(steps: Swift.min(nextARStretch(), budget))
+            arStreak += 1
             if steps > 0 {
                 widthChooser!.observe(
                     verifyWidth: 1, tokens: 1,
@@ -975,8 +981,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             return steps > 0
         }
         if bs <= 1 || drafterDisabled {
-            return runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget)) > 0
+            // No speculation possible (budget or disabled drafter): pipeline as far as the budget allows.
+            return runAutoregressiveBurst(
+                steps: Swift.min(arBurstSteps ?? Self.maxAdaptiveARStretch, budget)) > 0
         }
+        arStreak = 0
         let cycleStart = Date.timeIntervalSinceReferenceDate
         if treeMode == nil { treeMode = resolveTreeMode() }
         if treeMode == true, let ok = runTreeCycle(rows: bs, cycleStart: cycleStart) {
@@ -1702,9 +1711,26 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 .utf8))
     }
 
-    /// Steps per AR stretch (`VMLX_DFLASH2_AR_BURST`, default 4; 1 = the serial single step).
-    static let arBurstSteps: Int = Swift.max(
-        1, Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") ?? 4)
+    /// Steps per AR stretch: `VMLX_DFLASH2_AR_BURST` when set, else the target's `DFlash2ARBurstPolicy`, else 1
+    /// (the serial single step). Not a global default: see `DFlash2ARBurstPolicy` for the per-target measurements.
+    static func arBurstSteps(for target: Any) -> Int? {
+        if let forced = Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") {
+            return Swift.max(1, forced)
+        }
+        return (target as? DFlash2ARBurstPolicy).map { Swift.max(1, $0.dflash2ARBurstSteps) }
+    }
+
+    /// Longest adaptive AR stretch. Each stretch ends in one host sync; on a fast model that sync is the whole cost
+    /// of the lane's AR mode (MiniCPM-V 4.7 1B, lane AR-only vs plain AR 253-274 tok/s: stretch 1 = 176-181,
+    /// 4 = 237-241, 16 = 251-253, 64 = 254-256). 32 keeps the chooser re-checking speculation every few hundred tokens.
+    static let maxAdaptiveARStretch = 32
+
+    /// Steps for the next chooser-picked AR stretch: the target's fixed policy, else 1, 2, 4, ... doubling while the
+    /// chooser keeps picking AR (a fixed 4 locked Qwen3.8-27B into AR when speculation would have won, -20 %).
+    private func nextARStretch() -> Int {
+        if let arBurstSteps { return arBurstSteps }
+        return Swift.min(Self.maxAdaptiveARStretch, 1 << Swift.min(arStreak, 5))
+    }
 
     /// `steps` single-token target steps, pipelined: step k + 1 is built on step k's lazy token and dispatched
     /// before step k is read back, so the GPU does not idle while the host builds the next graph (vMLX Python

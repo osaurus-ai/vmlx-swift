@@ -286,4 +286,18 @@ final class DFlash2WidthChooserTests: XCTestCase {
             [1, 3, 4, 6, 8, 16])
         XCTAssertEqual(DFlash2WidthChooser.plan(trained: 8, laneFlat: false, targetLadder: []), [1, 5, 8, 16])
     }
+
+    /// AR stretch length is a per-target choice: only a target that declares `DFlash2ARBurstPolicy` gets a pipelined
+    /// stretch (GLM-5.3: 4). Everything else runs the serial step; a global default of 4 cost Qwen3.8-27B ~20 % decode.
+    func testARBurstIsPerTargetAndOtherwiseAdaptive() {
+        struct Declares: DFlash2ARBurstPolicy { var dflash2ARBurstSteps: Int { 4 } }
+        struct Silent {}
+        unsetenv("VMLX_DFLASH2_AR_BURST")
+        XCTAssertEqual(DFlash2TokenIterator.arBurstSteps(for: Declares()), 4)
+        XCTAssertNil(DFlash2TokenIterator.arBurstSteps(for: Silent()), "no policy: adaptive stretch")
+        setenv("VMLX_DFLASH2_AR_BURST", "3", 1)
+        defer { unsetenv("VMLX_DFLASH2_AR_BURST") }
+        XCTAssertEqual(DFlash2TokenIterator.arBurstSteps(for: Silent()), 3, "the env switch still overrides for A/B")
+        XCTAssertEqual(DFlash2TokenIterator.arBurstSteps(for: Declares()), 3)
+    }
 }

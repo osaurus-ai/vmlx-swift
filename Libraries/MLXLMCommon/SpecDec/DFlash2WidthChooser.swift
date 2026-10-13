@@ -191,6 +191,13 @@ public protocol DFlash2WidthLadderPolicy {
     var dflash2WidthLadder: [Int] { get }
 }
 
+/// A DFlash 2 target whose AR stretches measured faster pipelined declares the steps per stretch here. Targets that
+/// do not declare it run the serial single step: the pipelined stretch was measured on GLM-5.3 (+4 % prose) and cost
+/// Qwen3.8-27B ~20 % decode on low-acceptance text (JANGH2 and JANG_4D, alternating A/B at matched GPU clock).
+public protocol DFlash2ARBurstPolicy {
+    var dflash2ARBurstSteps: Int { get }
+}
+
 struct DFlash2WidthChooser {
     static let decay = 0.85
     static let probeEvery = 32

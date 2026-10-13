@@ -72,6 +72,12 @@ extension Glm5Next: DFlash2WidthLadderPolicy {
     public var dflash2WidthLadder: [Int] { [3, 4, 6, 8, 16] }
 }
 
+/// Pipelined AR stretches of 4 (9b03d3e06): prose +4 % over 3 rounds, and at 12k the width chooser no longer sticks
+/// on AR. Measured on GLM-5.3 only; other targets keep the serial step (`DFlash2ARBurstPolicy`).
+extension Glm5Next: DFlash2ARBurstPolicy {
+    public var dflash2ARBurstSteps: Int { 4 }
+}
+
 extension Glm5Next: LaneQMMTargetPolicy {
     public var laneQMMEnabled: Bool { false }
     public var laneQMMTiled: Bool { false }
