@@ -118,7 +118,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let maskTokenID: Int
     /// Fixed steps per AR stretch for this target (`arBurstSteps(for:)`), or nil for the adaptive stretch.
     private let arBurstSteps: Int?
-    /// Consecutive chooser AR picks; the adaptive stretch doubles with it and resets on a speculative pick.
+    /// Chooser AR-pick streak: +1 per AR stretch, -1 per speculative cycle; the adaptive stretch is 2^streak.
     private var arStreak = 0
 
     let maxTokens: Int?
@@ -985,7 +985,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             return runAutoregressiveBurst(
                 steps: Swift.min(arBurstSteps ?? Self.maxAdaptiveARStretch, budget)) > 0
         }
-        arStreak = 0
+        // A speculative pick (often just the chooser's periodic probe) shortens the next AR stretch by one doubling
+        // instead of resetting it: resetting to 1 put a mostly-AR model back on serial steps after every probe
+        // (MiniCPM-V 4.7 1B DSpark prose 221 -> 160 tok/s).
+        arStreak = Swift.max(0, arStreak - 1)
         let cycleStart = Date.timeIntervalSinceReferenceDate
         if treeMode == nil { treeMode = resolveTreeMode() }
         if treeMode == true, let ok = runTreeCycle(rows: bs, cycleStart: cycleStart) {
@@ -1726,7 +1729,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     static let maxAdaptiveARStretch = 32
 
     /// Steps for the next chooser-picked AR stretch: the target's fixed policy, else 1, 2, 4, ... doubling while the
-    /// chooser keeps picking AR (a fixed 4 locked Qwen3.8-27B into AR when speculation would have won, -20 %).
+    /// chooser keeps picking AR, one doubling back per speculative cycle (a fixed 4 locked Qwen3.8-27B into AR when speculation would have won, -20 %).
     private func nextARStretch() -> Int {
         if let arBurstSteps { return arBurstSteps }
         return Swift.min(Self.maxAdaptiveARStretch, 1 << Swift.min(arStreak, 5))
