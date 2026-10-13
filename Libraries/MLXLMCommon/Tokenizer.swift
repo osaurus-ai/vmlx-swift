@@ -383,7 +383,23 @@ public func canonicalChatCacheBoundaries(
         return rungs
     }
 
-    let historyTop = assistantContinuationStableBoundary()
+    /// The continuation probe proves a boundary only when it reaches past the previous message
+    /// boundary, i.e. it contains the newest message. A probe the template rejected or rewrote
+    /// diverges earlier and proves nothing: K2 Horizon's template requires a thinking field on every
+    /// assistant message, swift-jinja renders its `raise_exception` text instead of throwing, and the
+    /// probe shared exactly one token (BOS) with the prompt. That `1` outranked the exact
+    /// no-generation boundary, so every K2 follow-up at effort low/medium (generation rail
+    /// `<ifm|think_faster>…`, which history renders differently) missed its stored prompt and
+    /// re-prefilled the whole conversation: TTFT 1.2 → 5.6 s over five 2.5k-token turns.
+    func provenContinuationBoundary() -> Int? {
+        guard let boundary = assistantContinuationStableBoundary() else { return nil }
+        let previous = messages.count > 1
+            ? exactPrefixBoundary(messages: Array(messages.dropLast())) : nil
+        let floor = Swift.max(previous ?? 0, stable.last ?? 0, 1)
+        return boundary > floor ? boundary : nil
+    }
+
+    let historyTop = provenContinuationBoundary()
         ?? exactPrefixBoundary(messages: messages)
         ?? trailingContinuationBoundary()
     let history = historyTop.map { [$0] + historyLadder(below: $0) } ?? []

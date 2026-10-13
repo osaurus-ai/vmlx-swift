@@ -406,10 +406,14 @@ public final class ModelContainer: Sendable {
 
     /// Disable caching and release all cached state.
     public func disableCaching() {
-        _cacheCoordinator.withLock { coordinator in
+        let released = _cacheCoordinator.withLock { coordinator -> CacheCoordinator? in
+            let current = coordinator
             coordinator?.releaseVolatile()
             coordinator = nil
+            return current
         }
+        // Outside the lock: background disk writes of this coordinator finish (bounded wait).
+        released?.waitForPendingDiskWrites()
     }
 
     // MARK: - MLXPress runtime

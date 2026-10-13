@@ -364,8 +364,19 @@ public class SwitchGLU: Module, SwitchGLULayer {
         // construction and retain the two production gather QMMs.
         guard allowFusedGateUpCache else { return }
 
-        // Feature flag — opt out for A/B comparison.
-        if ProcessInfo.processInfo.environment["BENCH_NO_FUSED_GATE_UP"] == "1" {
+        // OFF by default (opt in with `VMLX_FUSED_GATE_UP=1` for A/B). The fused tensor is a
+        // permanent DUPLICATE of the gate and up expert banks: the originals stay resident for
+        // prefill (and for families whose decode path never reads the fused copy at all). Measured
+        // 2026-10-11, same build, idle live memory after two turns / decode tok/s, copy -> no copy:
+        //   Laguna-XS 4M    32.9 -> 21.7 GB, 102-104 -> 102 tok/s
+        //   Gemma-4 26B-A4B 26.7 -> 17.6 GB, 69.0-69.5 -> 68.2-68.5 tok/s
+        //   Ornith 35B-A3B  32.5 -> 20.5 GB, 99-101 -> 99-100 tok/s
+        // prefill was faster without it in all three, outputs identical. Resident memory must stay
+        // at the model's size (Eric); a 0-1 % decode micro-win does not pay 9-12 GB.
+        // `BENCH_NO_FUSED_GATE_UP=1` still forces it off.
+        if ProcessInfo.processInfo.environment["VMLX_FUSED_GATE_UP"] != "1"
+            || ProcessInfo.processInfo.environment["BENCH_NO_FUSED_GATE_UP"] == "1"
+        {
             return
         }
 

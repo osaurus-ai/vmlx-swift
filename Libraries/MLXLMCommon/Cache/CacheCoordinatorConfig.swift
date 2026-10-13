@@ -35,6 +35,13 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Whether the on-disk L2 cache (SQLite + safetensors) is enabled.
     public var enableDiskCache: Bool
 
+    /// Write-behind disk stores (see `DiskCache`): a store publishes at once and its file reaches
+    /// disk on a background writer, served from memory meanwhile. The serving configuration
+    /// (`VMLXServerRuntimeSettings.cacheCoordinatorConfig`) turns it on; a coordinator built
+    /// directly keeps synchronous stores (its callers may inspect files and rows right after a
+    /// store). `VMLX_DISK_WRITE_BEHIND=0` forces synchronous stores everywhere.
+    public var diskWriteBehind: Bool = false
+
     /// Number of tokens per paged cache block.
     public var pagedBlockSize: Int
 

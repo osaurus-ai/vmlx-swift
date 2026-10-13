@@ -246,6 +246,7 @@ final class Qwen35GatedDeltaNet: Module {
     private var attemptedInputFusion = false
     private static let fusionDiagnosticLock = NSLock()
     private nonisolated(unsafe) static var didReportInputFusion = false
+    private nonisolated(unsafe) static var didReportInputFusionSkipped = false
 
     private func ensureFusedInputSegments() -> [FusedInputSegment]? {
         if attemptedInputFusion { return fusedInputSegments }
@@ -266,6 +267,19 @@ final class Qwen35GatedDeltaNet: Module {
         guard quantized.allSatisfy({ $0 != nil && $0?.bias == nil && $0?.biases != nil })
         else { return nil }
         let q = quantized.map { $0! }
+        // The fused copy must REPLACE the members (rebindAsRows below). Windows into a mapped
+        // safetensors shard (the shipped mmap loader) cannot be released, so the copy would be a
+        // permanent duplicate of every GDN input projection. Skip fusion then (see `WeightBacking`).
+        guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: q)) else {
+            Self.fusionDiagnosticLock.lock()
+            if !Self.didReportInputFusionSkipped {
+                Self.didReportInputFusionSkipped = true
+                FileHandle.standardError.write(Data(
+                    "[Qwen35] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
+            }
+            Self.fusionDiagnosticLock.unlock()
+            return nil
+        }
 
         func scheme(_ m: QuantizedLinear) -> String {
             "\(m.groupSize)/\(m.bits)/\(m.mode)/\(m.scales.dtype)/\(m.biases!.dtype)"
@@ -284,6 +298,7 @@ final class Qwen35GatedDeltaNet: Module {
                 let scales = concatenated(mods.map(\.scales), axis: 0)
                 let biases = concatenated(mods.map { $0.biases! }, axis: 0)
                 MLX.eval(weight, scales, biases)
+                WeightBacking.rebindAsRows(mods, weight: weight, scales: scales, biases: biases)
                 var splits: [Int] = []
                 var offset = 0
                 for m in mods.dropLast() {

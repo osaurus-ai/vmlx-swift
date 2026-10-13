@@ -1685,6 +1685,21 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// values and downstream bookkeeping (strip boundaries, cache stores)
     /// reads stale positions. Compilable attention caches advance in-graph.
     private var compiledMambaOffsets: [(index: Int, base: Int)] = []
+    /// IFM Uno self-speculation (`DraftStrategy.uno`); nil when not requested or not servable.
+    private var uno: UnoDecoder?
+    /// Tokens an Uno cycle committed that `next()` has not returned yet (all already in the cache).
+    private var unoQueue: [Int] = []
+    /// Cache offset once prefill finished; the cache then holds this plus every returned token.
+    private var unoStartOffset = 0
+    /// Ordinary steps left in the current AR stretch, and when it started (`UnoWidthPlan.arStretch`).
+    private var unoARSteps = 0
+    private var unoARStretch: (start: Double, steps: Int)?
+    /// Length of the next AR stretch: doubles while the chooser keeps choosing AR (each stretch ends in
+    /// a host read of the pending token, which drains the pipelined AR loop), back to
+    /// `UnoWidthPlan.arStretch` after a speculative cycle.
+    private var unoARStretchLength = UnoWidthPlan.arStretch
+    /// Uno counters for the request (nil when the request did not run Uno).
+    public var unoGenerationStats: UnoGenerationStats? { uno?.stats }
     private var compiledStepCount = 0
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``). Created
@@ -1997,7 +2012,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
+            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore
+                && !cacheRestoreIsExactPrefix(self.cache)
+            {
                 let structuralBoundary = input.cachePrefixTokenCounts
                     .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()
                 if let model = self.model as? any CanonicalRequiredToolCacheModel,
@@ -2328,7 +2345,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokenIds: self.promptTokenIds,
             input: input,
             cache: self.cache,
-            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
+            skipBoundary: self.skipDiskBackedToolPromptSeedBoundary && !cacheRestoreIsExactPrefix(self.cache))
         // Only the already-existing cold head prepare may report a canonical
         // seed. Warm/media requests retain their original fallback behavior.
         let canonicalModel = self.model as? any CanonicalRequiredToolCacheModel
@@ -2404,6 +2421,150 @@ public struct TokenIterator: TokenIteratorProtocol {
             try setupCompiledDecode(
                 maxCacheLength: effectiveParameters.compiledMaxCacheLength
                     ?? Swift.max(4096, neededLength ?? 4096))
+        }
+        if case .uno(let adapterPath, let blockSize) = effectiveParameters.draftStrategy {
+            setupUno(
+                adapterPath: adapterPath, blockSize: blockSize, input: input,
+                parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
+        }
+    }
+
+    /// Enable Uno for this request when it can be served exactly; otherwise log why and decode AR.
+    /// `blockSize` pins the rows per cycle; nil chooses them per cycle (`UnoWidthPlan`).
+    private mutating func setupUno(
+        adapterPath: URL, blockSize pinned: Int?, input: LMInput, parameters: GenerateParameters,
+        stopTokenIDs: Set<Int>
+    ) {
+        let blockSize = pinned ?? UnoWidthPlan.candidates.max()!
+        let reason: String? = {
+            guard let target = model as? any UnoSelfSpeculativeModel else {
+                return "model \(type(of: model)) has no Uno pathway"
+            }
+            if processor != nil { return "logit processors (penalties / JSON schema) need per-token sampling" }
+            if parameters.minP > 0 { return "min-p sampling is not supported by the Uno acceptance test" }
+            if compiledForward != nil { return "compiled decode is active" }
+            if input.image != nil || input.video != nil { return "media inputs" }
+            if !cache.allSatisfy(\.isTrimmable) { return "the cache cannot drop rejected rows" }
+            if blockSize < 2 { return "block size \(blockSize) < 2" }
+            // A greedy response on such a target must equal ordinary decoding token for token
+            // (the bundle's own runtime contract; DFlash2 verifies it one row at a time). Uno's draft
+            // and verify are multi-row forwards, whose matmul and attention kernels round differently
+            // from 1-row decoding, so a near-tie can flip (Diplodocus preview 3, 2.2k-token prompt:
+            // first difference after ~200 greedy tokens). Sampled requests keep Uno, as DFlash2 keeps
+            // batched verification for them.
+            if parameters.temperature <= 0,
+                (target as? any DFlash2Target)?.requiresSequentialDFlash2Verification == true
+            {
+                return "greedy decoding on this model must match ordinary decoding exactly"
+            }
+            do {
+                let adapter = try UnoAdapterResolver.shared.adapter(at: adapterPath)
+                let mask = try target.installUnoAdapter(adapter)
+                // Draft and verify are multi-row forwards; the target's lane policy keeps 1-row AR
+                // on its ordinary kernels.
+                LaneQMM.installForDFlash2Target(target)
+                // `VMLX_UNO_PREWARM=1`: compile every speculative shape before the first request
+                // decodes. Off by default: measured, it only MOVES the one-time ~1.8 s compile from
+                // mid-stream into the first request's TTFT (0.75 → 4.2 s at a ~450 MHz clock). Its
+                // right home is the host: `UnoWarmup.prepare` right after the model loads.
+                if ProcessInfo.processInfo.environment["VMLX_UNO_PREWARM"] == "1",
+                    let ms = try UnoWarmup.prepare(
+                        model: target, adapterDirectory: adapterPath, temperature: parameters.temperature)
+                {
+                    Self.logger.info("Uno prewarm \(ms) ms")
+                }
+                uno = UnoDecoder(
+                    model: target, mask: mask, blockSize: blockSize,
+                    maskTokenBound: target.unoNoiseTokenBound,
+                    temperature: parameters.temperature, topP: parameters.topP,
+                    topK: parameters.topK, stopTokenIDs: stopTokenIDs)
+                if let seed = parameters.randomSeed {
+                    uno?.randomState = MLXRandom.RandomState(seed: seed &+ 0x5851_F42D_4C95_7F2D)
+                }
+                if pinned == nil {
+                    uno?.chooser = DFlash2WidthChooser(
+                        widths: UnoWidthPlan.candidates,
+                        costs: .shared(
+                            for: target, widths: UnoWidthPlan.candidates, namespace: "uno",
+                            // `VMLX_UNO_CLOCK_TRACK=0`: per-width EMA costs (A/B control).
+                            tracksClock: UnoWarmup.tracksClock),
+                        bonusTokens: 1,
+                        initial: UnoWidthPlan.declaredWidth(adapterDirectory: adapterPath) ?? 8,
+                        sharesAcceptance: true,
+                        // `VMLX_UNO_PROBE_REWARD=0`: plain probe backoff (A/B control).
+                        rewardsWinningProbes: ProcessInfo.processInfo.environment["VMLX_UNO_PROBE_REWARD"] != "0",
+                        // `VMLX_UNO_DECAY=<x>`: acceptance-evidence decay (A/B tool; 0.85 = DFlash2's).
+                        decay: ProcessInfo.processInfo.environment["VMLX_UNO_DECAY"].flatMap(Double.init) ?? 0.95,
+                        // `VMLX_UNO_LAZY=0`: time every width in every bucket (A/B control).
+                        lazyExploration: ProcessInfo.processInfo.environment["VMLX_UNO_LAZY"] != "0")
+                }
+                unoStartOffset = cache.map(\.offset).max() ?? 0
+                return nil
+            } catch {
+                return "adapter \(adapterPath.path): \(error.localizedDescription)"
+            }
+        }()
+        if let reason {
+            Self.logger.warning(
+                "Uno requested but not used for this request (decoding autoregressively): \(reason, privacy: .public)")
+        }
+    }
+
+    /// One Uno step: return a queued token, or run a cycle from the pending token `y`. Nil hands this
+    /// step to ordinary decoding (stop-token seed, or too little budget left for a cycle).
+    private mutating func unoNext() -> Int? {
+        if !unoQueue.isEmpty {
+            let token = unoQueue.removeFirst()
+            tokenCount += 1
+            lastForwardedTokenId = token
+            return token
+        }
+        if unoARSteps > 0 {
+            unoARSteps -= 1
+            return nil
+        }
+        guard var decoder = uno else { return nil }
+        // After an AR stretch this read waits for the stretch's last forward, closing its timing.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
+        if let stretch = unoARStretch {
+            decoder.observeAR(
+                steps: stretch.steps, seconds: Date.timeIntervalSinceReferenceDate - stretch.start)
+            unoARStretch = nil
+        }
+        defer { uno = decoder }
+        let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        guard remaining >= 4, !decoder.stopTokenIDs.contains(seed) else { return nil }
+        decoder.prepare(keys: cache.first?.offset ?? 0)
+        if decoder.wantsAR {
+            // This call's ordinary step is the stretch's first. Never past the budget's end: the
+            // stretch must close (and be timed) inside this request.
+            let steps = Swift.max(1, Swift.min(unoARStretchLength, remaining - 1))
+            unoARSteps = steps - 1
+            unoARStretch = (Date.timeIntervalSinceReferenceDate, steps)
+            unoARStretchLength = Swift.min(unoARStretchLength * 2, UnoWidthPlan.maxARStretch)
+            return nil
+        }
+        unoARStretchLength = UnoWidthPlan.arStretch
+        let committed = decoder.cycle(
+            seed: seed, cache: cache, maxCommit: Swift.min(remaining - 1, 1 << 20))
+        unoQueue = Array(committed.dropLast())
+        y = .init(tokens: MLXArray([Int32(committed.last!)]))
+        tokenCount += 1
+        lastForwardedTokenId = seed
+        // Same cadence as ordinary decoding: once per 256 tokens, when this cycle crosses a boundary.
+        if (tokenCount + unoQueue.count) / 256 > (tokenCount - 1) / 256 {
+            Memory.clearCache()
+        }
+        return seed
+    }
+
+    /// Uno cycles can commit past a stop token or the budget; the caller stops there. Bring the cache
+    /// back to exactly what ordinary decoding would hold: prompt + every returned token.
+    private func reconcileUnoCache() {
+        guard uno != nil else { return }
+        let expected = unoStartOffset + tokenCount
+        for layer in cache where layer.offset > expected {
+            _ = layer.trim(layer.offset - expected)
         }
     }
 
@@ -3106,6 +3267,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
+        if uno != nil, let token = unoNext() {
+            return token
+        }
 
         let previousY = y
         if (processor as? JSONSchemaLogitProcessor)?.isTerminated == true {
@@ -3143,6 +3307,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        reconcileUnoCache()
         defer {
             if !Task.isCancelled,
                let coordinator = cacheCoordinator,
@@ -3331,7 +3496,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
                 if !usesCanonicalHybridBoundary,
                    requiresDiskBackedRestore,
-                   !skipDiskBackedToolPromptSeedBoundary,
+                   !skipDiskBackedToolPromptSeedBoundary || cacheRestoreIsExactPrefix(storageTopologySnapshot),
                    promptTokenIds.count > 1
                 {
                     // Reusable-prefix warmups publish this N-1 seed too —
@@ -3509,6 +3674,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
         }
 
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/post-answer] gate include=\(includeGeneratedBoundary) "
+                    + "canonicalHybrid=\(usesCanonicalHybridBoundary) warmup=\(isReusablePrefixWarmup) "
+                    + "generated=\(generatedTokenIds.count) quantize=\(needsCacheQuantization)\n").utf8))
+        }
         guard !usesCanonicalHybridBoundary,
             !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
@@ -3531,6 +3702,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             generatedTokenIds: generatedTokenIds,
             cacheOffsets: cacheBoundaryLeafOffsets(cache),
             pendingDrainedTokenId: lastForwardedTokenId)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/post-answer] prompt=\(promptTokenIds.count) generated=\(generatedTokenIds.count) "
+                    + "offsets=\(Array(Set(cacheBoundaryLeafOffsets(cache))).sorted()) "
+                    + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
+        }
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.

@@ -62,7 +62,7 @@ final class NaiveN05FlashAttention: Module {
         _sink.wrappedValue = g.hasSink ? MLXArray.zeros([g.heads]) : nil
         indexer = sliding ? nil : NaiveN05FlashIndexer(c)
     }
-    func callAsFunction(_ states: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil) throws -> MLXArray {
+    func callAsFunction(_ states: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil, trivialPadding: Bool = false) throws -> MLXArray {
         let g = geometry, batch = states.dim(0), length = states.dim(1)
         let past = cache?.offset ?? 0
         let keyOffset = cache?.keyOffset ?? 0
@@ -76,6 +76,63 @@ final class NaiveN05FlashAttention: Module {
         if let cache {
             let full = try cache.append(keys: k, values: v, indexer: indexKeys)
             k = full.0; v = full.1; indexKeys = full.2
+        }
+        // Multi-row, unpadded: exact blocked sliding window / per-query sparse DSA instead of the O(rows x keys)
+        // reference (NaiveN05FlashPrefillAttention). Decode and padded batches keep the paths below.
+        if trivialPadding, batch == 1, length > 1, NaiveN05FlashPrefillAttention.enabled, q.dtype == .bfloat16,
+            keyOffset == 0 || sliding
+        {
+            let scale = Float(1 / sqrt(Double(g.keyDimensions)))
+            let scaledValues = config.valueScale.map { v * MLXArray(Float($0), dtype: v.dtype) } ?? v
+            if sliding, NaiveN05FlashPrefillAttention.blockedSlidingEnabled {
+                let o = NaiveN05FlashPrefillAttention.blockedSliding(
+                    q: q, k: k, v: scaledValues, scale: scale, sinks: sink?.asType(q.dtype), window: config.window)
+                return output(o.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+            }
+            if !sliding, NaiveN05FlashPrefillAttention.sparseEnabled, sink == nil, let indexer, let projectedIndex,
+                let indexKeys
+            {
+                let keyCount = k.dim(2), topK = config.indexerTopK
+                let selected: MLXArray
+                if keyCount <= topK {
+                    // Selection is skipped below index_topk (every causal key): pass all of them.
+                    let width = (keyCount + 31) / 32 * 32
+                    let ids = MLXArray(Int32(0) ..< Int32(width))
+                    let row = MLX.where(ids .< Int32(keyCount), ids, MLXArray(Int32(-1)))
+                    selected = broadcast(row.reshaped(1, width), to: [length, width])
+                } else if topK % 32 == 0 {
+                    let scores = indexer.scores(query: projectedIndex.0, keys: indexKeys, weights: projectedIndex.2)
+                    let queryPositions = MLXArray(Int32(past) ..< Int32(past + length)).reshaped(length, 1)
+                    let keyPositions = MLXArray(Int32(0) ..< Int32(keyCount)).reshaped(1, keyCount)
+                    let masked = MLX.where(
+                        (queryPositions .>= keyPositions).expandedDimensions(axis: 0), scores,
+                        MLXArray(-Float.infinity))
+                    selected = argPartition(-masked, kth: topK - 1, axis: -1)[.ellipsis, ..<topK].reshaped(length, topK)
+                } else {
+                    selected = MLXArray.zeros([0], dtype: .int32)
+                }
+                if selected.size > 0 {
+                    let o = NaiveN05FlashPrefillAttention.sparse(
+                        q: q, k: k, v: scaledValues, selected: selected, scale: scale, queryOffset: past)
+                    return output(o.transposed(0, 2, 1, 3).reshaped(batch, length, -1).asType(states.dtype))
+                }
+            }
+        }
+        // One-token decode with trivial padding, on the sliding layers and on the sparse layers at or below
+        // `index_topk` keys: the mask is all true (the cache hands back at most `window` keys ending at this query;
+        // below `index_topk` every key is selected) and every query has a key, so the zero-output guard cannot fire.
+        // Skip the mask, the indexer scores and the guard (~8 dispatches per layer); bit-identical outputs.
+        // Above `index_topk` decode keeps the masked path: the per-query sparse kernel runs one threadgroup per KV
+        // head for a single query and measured 18 % slower at 30k context than masked SDPA over every key.
+        if trivialPadding, batch == 1, length == 1, NaiveN05FlashMath.decodeWithoutMaskEnabled,
+            sliding || k.dim(2) <= config.indexerTopK,
+            NaiveN05FlashMath.usesAsymmetricDecodeSDPA(query: q, key: k, value: v)
+        {
+            let scaled = config.valueScale.map { v * MLXArray(Float($0), dtype: v.dtype) } ?? v
+            let o = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: scaled, scale: Float(1 / sqrt(Double(q.dim(-1)))), mask: .none,
+                sinks: sink?.asType(q.dtype))
+            return output(o.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
         }
         var allowed = NaiveN05FlashMath.allowedMask(padding: padding, queryOffset: past, length: length,
             keyOffset: keyOffset, keyLength: k.dim(2), window: sliding ? config.window : nil,
@@ -100,6 +157,12 @@ final class NaiveN05FlashRouter: Module {
         _correction.wrappedValue = MLXArray.zeros([c.expertCount], dtype: .float32)
     }
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let routed = SigmoidRouterKernels.route(
+            x, weight: weight, correctionBias: correction, topK: config.routes,
+            normalize: config.normalizeRoutes, scaling: Float(config.routingScale))
+        {
+            return (routed.indices, routed.weights)  // fp32 weights, as below
+        }
         let probabilities = sigmoid(matmul(x.asType(.float32), weight.asType(.float32).T))
         let indices = argPartition(-(probabilities + correction.asType(.float32)), kth: config.routes - 1, axis: -1)[.ellipsis, ..<config.routes]
         var scores = takeAlong(probabilities, indices, axis: -1)
@@ -166,8 +229,9 @@ final class NaiveN05FlashDecoderLayer: Module {
         _postNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
         mlp = c.routedLayers[layer] ? NaiveN05FlashMoE(c, experts: routed, layerIndex: layer) : NaiveN05FlashDenseMLP(c)
     }
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil) throws -> MLXArray {
-        let h = try x + attention(inputNorm(x), positions: positions, padding: padding, cache: cache, rotaryTables: rotaryTables)
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil, trivialPadding: Bool = false) throws -> MLXArray {
+        let h = try x + attention(inputNorm(x), positions: positions, padding: padding, cache: cache,
+                                  rotaryTables: rotaryTables, trivialPadding: trivialPadding)
         return h + mlp(postNorm(h))
     }
 }
@@ -203,15 +267,10 @@ final class NaiveN05FlashModel: Module {
     init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
         excludedSafetensorsKeys: Set<String> = [], allowedMaskGPUArange: Bool? = nil,
         fusedRotaryApply: Bool? = nil) throws {
-        let canonicalExclusions = Set(c.routedLayers.indices.filter { c.routedLayers[$0] }.flatMap { layer in
-            ["gate_proj", "up_proj", "down_proj"].flatMap { role in
-                ["tq2_packed", "tq2_scales"].map {
-                    "model.layers.\(layer).mlp.switch_mlp.\(role).\($0)"
-                }
-            }
-        })
         guard excludedSafetensorsKeys.isEmpty
-            || (routedFactory != nil && excludedSafetensorsKeys == canonicalExclusions)
+            || (routedFactory != nil && JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                excludedSafetensorsKeys,
+                routedLayers: Set(c.routedLayers.indices.filter { c.routedLayers[$0] })))
         else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         self.excludedSafetensorsKeys = excludedSafetensorsKeys
         config = c
@@ -239,7 +298,12 @@ final class NaiveN05FlashModel: Module {
         let rotaryTables = NaiveN05FlashMath.RotaryTables(
             positions: positions, fusedApply: fusedRotaryApply)
         var h = model.embedding(tokens)
-        for (i, layer) in model.layers.enumerated() { h = try layer(h, positions: positions, padding: padding, cache: cache?[i], rotaryTables: rotaryTables) }
+        // No caller padding: every key is real (the exact prefill attention paths require it).
+        let trivialPadding = suppliedPadding == nil && suppliedPositions == nil
+        for (i, layer) in model.layers.enumerated() {
+            h = try layer(h, positions: positions, padding: padding, cache: cache?[i], rotaryTables: rotaryTables,
+                          trivialPadding: trivialPadding)
+        }
         return head(model.norm(h))
     }
 }

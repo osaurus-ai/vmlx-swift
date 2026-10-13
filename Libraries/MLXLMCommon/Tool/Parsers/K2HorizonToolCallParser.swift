@@ -58,6 +58,15 @@ public struct K2HorizonToolCallParser: ToolCallParser, Sendable {
         if text.hasPrefix(startTag!) {
             guard let end = completeToolCallEnd(in: text), end == text.endIndex else { return [] }
             text = String(text.dropFirst(startTag!.count).dropLast(endTag!.count))
+            // Native low-effort K2 may repeat the group opener before its first
+            // member. One closing envelope terminates that prefix. Only consume
+            // consecutive leading openers: never rewrite argument values or
+            // accept a new nested envelope after a call has started.
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            while text.hasPrefix(startTag!) {
+                text = String(text.dropFirst(startTag!.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         var calls: [ToolCall] = []
         while !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

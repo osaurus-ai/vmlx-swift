@@ -247,6 +247,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         } else {
             self.diskCache = nil
         }
+        self.diskCache?.writeBehind = config.diskWriteBehind
         self.diskRootKey = self.diskCache?.cacheDir.standardizedFileURL.path
 
         self.ssmStateCache = SSMStateCache(
@@ -1562,6 +1563,10 @@ public final class CacheCoordinator: @unchecked Sendable {
         let usesCombinedQuota = config.enableDiskCache
             && diskCache != nil
             && ssmStateCache.diskStore != nil
+        // Back-pressure for write-behind happens HERE, before the combined quota lock: the writer
+        // takes that lock in `afterPublish`, so waiting for it to drain while holding the lock is a
+        // deadlock (see `DiskCache.store`).
+        diskCache?.waitForWriteBehindRoom()
         if usesCombinedQuota {
             CombinedDiskCacheQuotaLock.shared.lock()
         }
@@ -1601,8 +1606,19 @@ public final class CacheCoordinator: @unchecked Sendable {
                 return
             }
         }
+        // Write-behind (see DiskCache) unless THIS call also stores a separate recurrent companion:
+        // that companion links onto the KV row inside this critical section ("KV first" below), so
+        // the row must exist before return. Hybrids whose recurrent state is native in the KV file
+        // (Qwen3.8 / Flash-Next / 27B GatedDeltaNet: `storesCompanion == false`) write one file and
+        // link nothing, so they write behind too: their single boundary save was the whole
+        // end-of-turn wait (Flash-Next 0.52 s, 27B 1.08 s per boundary at 10.8k tokens, 800 MB/s).
+        // When the write is deferred, what follows the row (early-companion adoption, the quota pass
+        // and the capacity-pressure record) runs on the writer once the row has landed, under the
+        // same lock.
+        var deferred = false
         if let diskArrays, !diskArrays.isEmpty {
-            diskCache?.store(
+            let isHybrid = isHybrid
+            deferred = diskCache?.store(
                 tokens: tokens,
                 arrays: diskArrays,
                 mediaSalt: mediaSalt,
@@ -1610,11 +1626,24 @@ public final class CacheCoordinator: @unchecked Sendable {
                 chainId: chainId,
                 isStableRoot: isStableRoot,
                 isResumeBoundary: isResumeBoundary,
-                isPostAnswer: isPostAnswer)
-            if !storesCompanion {
+                isPostAnswer: isPostAnswer,
+                allowWriteBehind: !storesCompanion,
+                afterPublish: { [self] in
+                    if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.lock() }
+                    defer { if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.unlock() } }
+                    adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
+                    if usesCombinedQuota {
+                        enforceCombinedDiskQuotaLocked(activeChain: chainId)
+                    } else {
+                        enforceCombinedDiskQuota(activeChain: chainId)
+                    }
+                    diskCache?.reconcileCapacityPressure(chainId: chainId, requiresCompanion: isHybrid)
+                }) ?? false
+            if !deferred, !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
             }
         }
+        if deferred { return }
 
         // KV first: the companion store reports what it wrote to the index
         // before it returns (still inside this critical section), and links
@@ -2115,6 +2144,14 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func releaseVolatile() {
         pagedCache?.clear()
         ssmStateCache.clear()
+    }
+
+    /// Wait for disk stores still being written in the background (``DiskCache`` write-behind) to
+    /// reach disk and the index. Unload, shutdown and app quit call this so an entry published as
+    /// stored is durable before the process lets go of it. A timeout only logs.
+    @discardableResult
+    public func waitForPendingDiskWrites(timeout: TimeInterval = 30) -> Bool {
+        diskCache?.waitForPendingWrites(timeout: timeout) ?? true
     }
 
     /// Clear all cache tiers, releasing all cached data.

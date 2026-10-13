@@ -6,6 +6,30 @@ import VMLXJinja
 
 @Suite("K2-Horizon native parser and history contract")
 struct K2HorizonParserContractTests {
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["DIPLODOC_TEMPLATE"] != nil))
+    func preview3TemplateMatchesPythonHighLowAndHistory() throws {
+        let env = ProcessInfo.processInfo.environment
+        let path = try #require(env["DIPLODOC_TEMPLATE"])
+        let probes = try #require(env["DIPLODOC_PROBES"])
+        let template = try Template(
+            String(contentsOfFile: path, encoding: .utf8),
+            with: .init(lstripBlocks: true, trimBlocks: true))
+        let rows = try #require(JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: probes))) as? [[String: Any]])
+        #expect(rows.count == 9)
+        for row in rows {
+            var context: [String: Any] = [
+                "messages": row["messages"]!, "bos_token": "<|ifm|begin_of_text|>",
+                "eos_token": "<|ifm|endoftext|>", "add_generation_prompt": true,
+                "reasoning_effort": row["effort"]!, "tool_call_format": "xml",
+            ]
+            if let tools = row["tools"], !(tools is NSNull) { context["tools"] = tools }
+            let rendered = try template.render(
+                try context.mapValues { try VMLXJinja.Value(any: $0) })
+            #expect(rendered == row["rendered"] as? String, "\(row["name"]!)")
+        }
+    }
+
     private let tools: [[String: any Sendable]] = {
         let account: [String: any Sendable] = ["type": "string"]
         let count: [String: any Sendable] = ["type": "integer"]
@@ -60,6 +84,27 @@ struct K2HorizonParserContractTests {
                 == .string("007"))
         let wrong = call("lookup" + argument("count", "true"))
         #expect(parser.parse(content: wrong, tools: tools) == nil)
+    }
+
+    @Test func repeatedLeadingGroupOpenersPreserveValuesAtEveryBoundary() {
+        let value = "literal <ifm|tool_calls> remains data"
+        let member = "<ifm|tool_call>lookup" + argument("account", value) + "</ifm|tool_call>"
+        let text = "<ifm|tool_calls>\n<ifm|tool_calls>\n" + member + "</ifm|tool_calls>"
+        for split in 0 ... text.count {
+            let processor = ToolCallProcessor(format: .k2Horizon, tools: tools)
+            let index = text.index(text.startIndex, offsetBy: split)
+            var visible = processor.processChunk(String(text[..<index])) ?? ""
+            visible += processor.processChunk(String(text[index...])) ?? ""
+            visible += processor.processEOS() ?? ""
+            #expect(visible.isEmpty)
+            #expect(processor.toolCalls.count == 1)
+            #expect(processor.toolCalls.first?.function.arguments["account"] == .string(value))
+        }
+        let parser = K2HorizonToolCallParser()
+        // A repeated group AFTER a member is not the admitted prefix defect.
+        let nested = "<ifm|tool_calls>" + member + "<ifm|tool_calls>" + member + "</ifm|tool_calls>"
+        #expect(parser.parseEOS(nested, tools: tools).isEmpty)
+        #expect(parser.parseEOS("<ifm|tool_calls>\n<ifm|tool_calls>" + member, tools: tools).isEmpty)
     }
 
     @Test func JSONQuotedProtocolMarkersAreDataAtEveryBoundary() throws {

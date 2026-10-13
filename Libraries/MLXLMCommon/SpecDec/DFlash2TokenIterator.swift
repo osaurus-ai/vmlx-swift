@@ -72,6 +72,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     /// Cycles verified as a draft TREE (DFlash2Tree.swift) instead of a chain.
     public var treeCycles: Int = 0
     public var verifyCalls: Int = 0
+    /// One-token target forwards used by numerical-compatibility verification.
+    public var sequentialVerificationSteps: Int = 0
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
     public var emittedTokens: Int = 0
@@ -80,8 +82,10 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var draftSeconds: Double = 0
     public var verifySeconds: Double = 0
     public var commitSeconds: Double = 0
+    /// Wall seconds spent in autoregressive steps (fallback, chooser width 1, disabled drafter).
+    public var arSeconds: Double = 0
 
-    /// Mean number of tokens committed per target forward. 1.0 means the
+    /// Mean number of tokens committed per verification cycle. 1.0 means the
     /// drafter contributed nothing; the ceiling is `blockSize`.
     public var acceptanceLength: Double {
         verifyCalls > 0 ? Double(emittedTokens) / Double(verifyCalls) : 0
@@ -207,6 +211,20 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
+    /// Greedy requests on targets that require it verify with one-token
+    /// forwards (bit-identical to AR) and stop at the first rejection.
+    /// Sampled requests always verify in one batched forward: rejection
+    /// sampling preserves the target distribution under either rounding.
+    private let sequentialVerify: Bool
+    /// Target context rows from AR steps the drafter has not read yet, concatenated once when it
+    /// next drafts (a per-step concat chained one lazy copy per step).
+    private var arContextRows: [MLXArray] = []
+    /// Diagnostic only (`VMLX_DFLASH2_SYNC_PHASE_TIMING=1`): drain the GPU at
+    /// each phase edge so draft/verify seconds are GPU work, not the host
+    /// waiting on an earlier dispatch. Serializes the pipeline; never on in
+    /// normal runs.
+    private let syncPhaseTiming =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_SYNC_PHASE_TIMING"] == "1"
     /// Per-cycle verify width chooser (nil = fixed `blockSize`).
     private var widthChooser: DFlash2WidthChooser?
 
@@ -391,10 +409,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // DFlash2 decodes only through multi-row verify forwards. MLX's quantized matmul switches
         // kernels with the row count; the lane matmul (LaneQMM.swift, Metal 4 matrix units) costs about
         // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
-        LaneQMM.installForDFlash2Target(target)
+        // Sequential verification keeps the ordinary decode kernels, so the
+        // lane matmul is installed only when this request verifies batched.
+        // VMLX_DFLASH2_BATCHED_GREEDY=1 (diagnostic): measure greedy acceptance with batched/tree verify on a target
+        // that declares sequential verification. Output is then not bit-identical to AR.
+        let sequential = target.requiresSequentialDFlash2Verification
+            && effectiveParameters.temperature <= 0
+            && ProcessInfo.processInfo.environment["VMLX_DFLASH2_BATCHED_GREEDY"] != "1"
+        self.sequentialVerify = sequential
+        if !sequential {
+            LaneQMM.installForDFlash2Target(target)
+        }
 
         self.target = target
         self.drafter = drafter
+        LaneQMM.installForDFlash2Drafter(drafter)
         self.orderedLayerIDs = config.targetLayerIds
         self.captureLayerIDs = Set(config.targetLayerIds)
         self.cache = cache ?? target.newCache(parameters: effectiveParameters)
@@ -420,7 +449,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_ADAPTIVE_BLOCK"] == "1"
         self.adaptiveBlockSize =
             self.adaptiveBlockSizeEnabled ? Self.recallLearnedBlockSize() : nil
-        // Per-cycle verify width (DFlash2WidthChooser): (8, 16) on lane-flat targets, else (5, 8, 16).
+        // Per-cycle verify width (DFlash2WidthChooser): the target's declared ladder (DFlash2WidthLadderPolicy),
+        // else (8, 16) on lane-flat targets, else (5, 8, 16); AR is always a candidate.
         // The configured `blockSize` stays the trained width so the staged verify keeps its shape;
         // other widths take the eager input-capture path. Off when the caller pinned a size, when the
         // legacy probe ladder is on, or with VMLX_DFLASH2_WIDTHS=0.
@@ -428,7 +458,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] != "0"
         {
             let widths = DFlash2WidthChooser.plan(
-                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target))
+                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target),
+                targetLadder: (target as? DFlash2WidthLadderPolicy)?.dflash2WidthLadder)
             if widths != [effectiveBlockSize] {
                 self.widthChooser = DFlash2WidthChooser(
                     widths: widths,
@@ -756,7 +787,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // makes the commit lazy and an in-flight verify abandonable, so it
         // is what verify prefetch needs. Compiling the traced forward is a
         // separate opt-in below.
-        if target is DFlash2StagedVerifyRollbackModel,
+        if !sequential,
+            target is DFlash2StagedVerifyRollbackModel,
             ProcessInfo.processInfo.environment["VMLX_DFLASH2_STAGED_VERIFY"] != "0"
         {
             self.useStagedVerify = true
@@ -818,7 +850,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // Leave the final token to its own chunk so the last logits
             // row is the one the first sample comes from, matching the
             // reference's `min(step_size, remaining - 1)`.
-            var take = remaining == 1 ? 1 : Swift.min(step, remaining - 1)
+            var take = target.dflash2PrefillSeparatesFinalToken
+                ? (remaining == 1 ? 1 : Swift.min(step, remaining - 1))
+                : Swift.min(step, remaining)
             // Force a chunk edge at the capture boundary so the snapshot
             // is the state after EXACTLY that many tokens — a snapshot
             // taken mid-chunk would describe a prefix no key ever matches.
@@ -873,9 +907,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
                     format:
-                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
+                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs ar=%.2fs arFallback=%d widths=%@\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
-                    stats.verifySeconds, stats.commitSeconds,
+                    stats.verifySeconds, stats.commitSeconds, stats.arSeconds,
                     stats.autoregressiveFallbackTokens,
                     stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
                         .joined(separator: ","))
@@ -928,18 +962,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
         let bs = Swift.min(widthChooser?.width ?? adaptiveBlockSize ?? blockSize, budget + 1)
         if bs <= 1, !drafterDisabled, widthChooser?.width == 1 {
-            // The chooser measured AR as the faster option: time the step as width 1.
+            // The chooser measured AR as the faster option: a pipelined AR stretch, timed per step as width 1.
             let start = Date.timeIntervalSinceReferenceDate
-            let ok = runAutoregressiveStep()
-            if ok {
+            let steps = runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget))
+            if steps > 0 {
                 widthChooser!.observe(
-                    verifyWidth: 1, tokens: 1, seconds: Date.timeIntervalSinceReferenceDate - start)
-                stats.widthCycles[1, default: 0] += 1
+                    verifyWidth: 1, tokens: 1,
+                    seconds: (Date.timeIntervalSinceReferenceDate - start) / Double(steps), count: steps)
+                stats.widthCycles[1, default: 0] += steps
             }
-            return ok
+            return steps > 0
         }
         if bs <= 1 || drafterDisabled {
-            return runAutoregressiveStep()
+            return runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget)) > 0
         }
         let cycleStart = Date.timeIntervalSinceReferenceDate
         if treeMode == nil { treeMode = resolveTreeMode() }
@@ -1024,6 +1059,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // credits collapsing to one host sync per cycle for a large share
         // of its speedup — this loop previously paid three.
         asyncEval(proposal.tokens)
+        if syncPhaseTiming { eval(proposal.tokens) }
         stats.draftSeconds += Date.timeIntervalSinceReferenceDate - draftStart
 
         // The sliding clip inside drafter attention can advance the cache
@@ -1071,7 +1107,41 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var logits: MLXArray
         var greedyTargetIds: MLXArray? = nil
         let newHidden: MLXArray
-        if stagedCycle {
+        var verifyRows = verifyInput.dim(1)
+        if sequentialVerify {
+            // One-token forwards, in the AR decode shape. A row whose argmax
+            // disagrees with the next draft token is the last one that can be
+            // committed, so later rows are never computed (the old path ran
+            // every row and trimmed them again).
+            let draftIDs = draftTokens.reshaped(-1).asArray(Int32.self)
+            var rowLogits: [MLXArray] = []
+            var rowTargets: [MLXArray] = []
+            var rowHidden: [Int: [MLXArray]] = [:]
+            var input = Int32(lastToken)
+            for row in 0 ..< verifyInput.dim(1) {
+                let result = target.callAsFunction(
+                    MLXArray([input]).reshaped(1, 1), cache: cache,
+                    captureLayerIDs: captureLayerIDs)
+                let targetID = argMax(result.logits, axis: -1)
+                eval(targetID)
+                rowLogits.append(result.logits)
+                rowTargets.append(targetID)
+                for id in captureLayerIDs {
+                    rowHidden[id, default: []].append(result.capturedHiddenStates[id]!)
+                }
+                guard row < draftIDs.count, targetID.item(Int32.self) == draftIDs[row] else {
+                    break
+                }
+                input = draftIDs[row]
+            }
+            verifyRows = rowLogits.count
+            logits = concatenated(rowLogits, axis: 1)
+            greedyTargetIds = concatenated(rowTargets, axis: 1)
+            newHidden = extractContextFeature(
+                captured: rowHidden.mapValues { concatenated($0, axis: 1) },
+                targetLayerIDs: orderedLayerIDs)
+            stats.sequentialVerificationSteps += verifyRows
+        } else if stagedCycle {
             if !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.
@@ -1124,6 +1194,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         } else {
             asyncEval(logits, newHidden)
         }
+        if syncPhaseTiming {
+            if let greedyTargetIds { eval(greedyTargetIds, newHidden) } else { eval(logits, newHidden) }
+        }
         let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
         stats.verifySeconds += cycleVerifySeconds
         stats.verifyCalls += 1
@@ -1132,7 +1205,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             blockSize: bs,
             proposal: proposal,
             draftTokens: draftTokens,
-            verifyRows: verifyInput.dim(1),
+            verifyRows: verifyRows,
             logits: logits,
             greedyTargetIds: greedyTargetIds,
             newHidden: newHidden,
@@ -1315,6 +1388,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// in-attention clip advance the cache offset past its physical fill (the same offset/fill desync as the old
     /// init shift).
     private mutating func clipDrafterContext() {
+        foldARContextRows()
         guard let limit = drafterContextLimit, contextHidden.dim(1) > limit else { return }
         let skip = contextHidden.dim(1) - limit
         draftPositionBase += (draftCache.first?.offset ?? 0) + skip
@@ -1339,6 +1413,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private mutating func runTreeCycle(rows: Int, cycleStart: TimeInterval) -> Bool? {
         guard rows >= 2, let treeTarget = target as? DFlash2TreeVerifyModel else { return nil }
         abandonInFlightVerify(keepLattice: true)
+        foldARContextRows()
 
         // MARK: draft — one drafter forward, one small readback, host best-first search
         let draftStart = Date.timeIntervalSinceReferenceDate
@@ -1458,6 +1533,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// offset were never touched. Must run before ANY path that persists
     /// or reuses the cache, or unverified draft positions leak into a
     /// stored prefix.
+    private mutating func foldARContextRows() {
+        guard !arContextRows.isEmpty else { return }
+        let width = arContextRows[0].dim(-1)
+        let prior = contextHidden.dim(1) > 0 && contextHidden.dim(-1) == width ? [contextHidden] : []
+        contextHidden = concatenated(prior + arContextRows, axis: 1)
+        arContextRows.removeAll(keepingCapacity: true)
+    }
+
     private mutating func abandonInFlightVerify(keepLattice: Bool = false) {
         if pendingLattice != nil, !keepLattice {
             pendingLattice = nil
@@ -1616,9 +1699,54 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 .utf8))
     }
 
+    /// Steps per AR stretch (`VMLX_DFLASH2_AR_BURST`, default 4; 1 = the serial single step).
+    static let arBurstSteps: Int = Swift.max(
+        1, Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") ?? 4)
+
+    /// `steps` single-token target steps, pipelined: step k + 1 is built on step k's lazy token and dispatched
+    /// before step k is read back, so the GPU does not idle while the host builds the next graph (vMLX Python
+    /// c7e751d5, "a pipelined AR loop"). The serial step paid a full host sync per token: GLM-5.3 32.6 ms against
+    /// 28.7 ms for the pipelined AR arm. Every step consumes an already-committed token, so nothing here is
+    /// speculative: tokens after a stop token are dropped by the consumer exactly like accepted drafts after one.
+    /// Returns the tokens emitted (0 on failure).
+    private mutating func runAutoregressiveBurst(steps: Int) -> Int {
+        guard steps > 1 else { return runAutoregressiveStep() ? 1 : 0 }
+        let arStart = Date.timeIntervalSinceReferenceDate
+        defer { stats.arSeconds += Date.timeIntervalSinceReferenceDate - arStart }
+        abandonInFlightVerify()
+        var input = MLXArray([Int32(lastToken)]).reshaped(1, 1)
+        var sampledSteps: [MLXArray] = []
+        var hiddenSteps: [MLXArray] = []
+        for _ in 0 ..< steps {
+            let (logits, captured) = target.callAsFunction(
+                input, cache: cache, captureLayerIDs: captureLayerIDs,
+                recordPrefixCommitStates: false)
+            let hidden = extractContextFeature(captured: captured, targetLayerIDs: orderedLayerIDs)
+            let sampled = sampler.sample(logits: logits[0..., -1, 0...])
+            asyncEval(sampled, hidden)
+            sampledSteps.append(sampled)
+            hiddenSteps.append(hidden)
+            input = sampled.reshaped(1, 1).asType(.int32)
+        }
+        pendingTokens.removeAll(keepingCapacity: true)
+        for (sampled, hidden) in zip(sampledSteps, hiddenSteps) {
+            let token = sampled.reshaped(-1)[0].item(Int.self)
+            // Rows the drafter has not read yet accumulate across consecutive AR steps.
+            arContextRows.append(hidden)
+            pendingTokens.append(token)
+            lastToken = token
+        }
+        pendingIndex = 0
+        stats.emittedTokens += steps
+        stats.autoregressiveFallbackTokens += steps
+        return steps
+    }
+
     /// Single-token target step. Used when the remaining budget cannot
     /// fill a block and as the safety valve when acceptance cannot run.
     private mutating func runAutoregressiveStep() -> Bool {
+        let arStart = Date.timeIntervalSinceReferenceDate
+        defer { stats.arSeconds += Date.timeIntervalSinceReferenceDate - arStart }
         // A plain step reads and advances the same cache an in-flight
         // verify has already speculatively extended.
         abandonInFlightVerify()
@@ -1631,8 +1759,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         MLX.eval(sampled, hidden)
         let token = sampled.reshaped(-1)[0].item(Int.self)
         // Rows the drafter has not read yet accumulate across consecutive AR steps.
-        contextHidden = contextHidden.dim(1) > 0 && contextHidden.dim(-1) == hidden.dim(-1)
-            ? concatenated([contextHidden, hidden], axis: 1) : hidden
+        arContextRows.append(hidden)
         lastToken = token
         pendingTokens = [token]
         pendingIndex = 0

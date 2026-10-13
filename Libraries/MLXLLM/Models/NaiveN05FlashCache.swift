@@ -12,8 +12,23 @@ final class NaiveN05FlashCache: DiskCacheStateProviding {
     func innerState() -> [MLXArray] { rows }
     let window: Int?
     let requiresIndexer: Bool
-    private var rows: [MLXArray] = []
-    var keyOffset: Int { offset - (rows.first?.dim(2) ?? 0) }
+    /// Full-attention layers (no window) keep capacity buffers grown in ``step``-row steps and write new rows in
+    /// place, so a decode step does not copy the whole history (the concatenating append copied K, V and the fp32
+    /// indexer keys of every DSA layer every token: tens of MB per layer per token at 20k context). `rows` exposes
+    /// only the valid prefix. Sliding layers keep at most window - 1 rows and stay on the concatenating append.
+    private static let step = 256
+    private var storage: [MLXArray] = []
+    private var count = 0
+    private var rows: [MLXArray] {
+        // Always views, never the buffer objects: an in-place write swaps new contents into the buffer object, and
+        // a caller holding it (a snapshot, a lazy store) must keep the rows it was handed.
+        get { storage.map { $0[0..., 0..., ..<count, 0...] } }
+        set {
+            storage = newValue
+            count = newValue.first?.dim(2) ?? 0
+        }
+    }
+    var keyOffset: Int { offset - count }
     init(window: Int?, requiresIndexer: Bool) {
         precondition(window == nil || window! > 0)
         self.window = window
@@ -80,15 +95,30 @@ final class NaiveN05FlashCache: DiskCacheStateProviding {
                 && old.dim(3) == new.dim(3) && old.dtype == new.dtype
             }) else { throw Failure.invalidGeometry }
         }
+        let n = keys.dim(2)
+        if window == nil {
+            let needed = count + n
+            if storage.isEmpty || needed > storage[0].dim(2) {
+                let capacity = (needed + Self.step - 1) / Self.step * Self.step
+                storage = (0 ..< incoming.count).map { i in
+                    var shape = incoming[i].shape
+                    shape[2] = capacity - count
+                    let fresh = MLXArray.zeros(shape, dtype: incoming[i].dtype)
+                    return count == 0 ? fresh : concatenated([rows[i], fresh], axis: 2)
+                }
+            }
+            for i in incoming.indices {
+                storage[i][0..., 0..., count ..< needed, 0...] = incoming[i]
+            }
+            count = needed
+            offset += n
+            let full = rows
+            return (full[0], full[1], requiresIndexer ? full[2] : nil)
+        }
         let full = rows.isEmpty ? incoming : zip(rows, incoming).map { concatenated([$0, $1], axis: 2) }
-        let nextOffset = offset + keys.dim(2)
-        let retained: [MLXArray]
-        if let window {
-            let start = max(0, full[0].dim(2) - (window - 1))
-            retained = full.map { $0[0..., 0..., start..., 0...] }
-        } else { retained = full }
-        rows = retained
-        offset = nextOffset
+        let start = max(0, full[0].dim(2) - (window! - 1))
+        rows = full.map { $0[0..., 0..., start..., 0...] }
+        offset += n
         return (full[0], full[1], requiresIndexer ? full[2] : nil)
     }
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -99,16 +129,22 @@ final class NaiveN05FlashCache: DiskCacheStateProviding {
     var isTrimmable: Bool { window == nil }
     func trim(_ n: Int) -> Int {
         guard n > 0, window == nil, !rows.isEmpty else { return 0 }
-        let count = min(n, offset)
-        rows = rows.map { $0[0..., 0..., ..<(offset - count), 0...] }
-        offset -= count
-        return count
+        let removed = min(n, offset)
+        count -= removed
+        offset -= removed
+        return removed
     }
     func copy() -> any KVCache {
         let result = NaiveN05FlashCache(window: window, requiresIndexer: requiresIndexer)
-        // No in-place writes in this reference cache; immutable snapshots own their graph.
+        // The copy owns its rows: a lazy `+ 0` over the valid prefix, independent of later in-place appends here.
         result.rows = rows.map { $0 + MLXArray(0, dtype: $0.dtype) }
         result.offset = offset
         return result
     }
 }
+
+/// Exact-prefix restore (``ExactPrefixRestoreCache``): a stored boundary holds exactly the K, V and fp32 indexer rows
+/// the forward produced for those tokens (sliding layers: exactly the last window - 1 rows; no recurrent, pooled or
+/// quantized state), so forced tool selection may restore it like a plain KV cache. Without this every tool-named
+/// osaurus turn (tool_choice=required) re-prefilled the whole history: 40 s at 21k tokens, 167 s at 48k.
+extension NaiveN05FlashCache: ExactPrefixRestoreCache {}

@@ -679,4 +679,77 @@ struct CanonicalChatCacheBoundariesTests {
             boundaries, tokenizer: tokenizer, messages: messages,
             promptTokens: promptTokens)
     }
+
+    /// K2 Horizon shape: the template requires a thinking field on assistant messages and, under
+    /// swift-jinja, renders error text (here 900…) for one without it instead of throwing. Real history
+    /// carries `reasoning_content` (K2HorizonTemplateContract.prepare); the continuation probe's bare
+    /// assistant message does not. The history boundary must fall back to the exact no-generation
+    /// boundary, not the probe's 1-token LCP.
+    private struct ThinkingFieldTokenizer: GenerationPromptControllableTokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            try applyChatTemplate(
+                messages: messages, tools: tools, additionalContext: additionalContext,
+                addGenerationPrompt: true)
+        }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?, addGenerationPrompt: Bool
+        ) throws -> [Int] {
+            if messages.contains(where: {
+                ($0["role"] as? String) == "assistant" && $0["reasoning_content"] == nil
+            }) {
+                return [1, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911, 912]
+            }
+            var result = [1]
+            for message in messages {
+                switch message["role"] as? String {
+                case "system": result += [10, 11, 12]
+                case "user": result += [30, 31, 32, 33]
+                case "assistant": result += [40, 41, 42, 43]
+                default: result += [50]
+                }
+                result.append(60)  // end of message
+            }
+            // Generation rail that history renders differently (`<ifm|think_faster>` vs `<ifm|think>`).
+            if addGenerationPrompt { result += [70, 71, 72] }
+            return result
+        }
+    }
+
+    @Test("A rejected continuation probe does not collapse the history boundary to BOS")
+    func rejectedContinuationProbeFallsBackToExactBoundary() throws {
+        let tokenizer = ThinkingFieldTokenizer()
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "s"],
+            ["role": "user", "content": "u1"],
+            ["role": "assistant", "content": "a1", "reasoning_content": ""],
+            ["role": "user", "content": "u2"],
+        ]
+        let prompt = try tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: nil)
+        let noGeneration = try tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: nil, addGenerationPrompt: false)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: nil, additionalContext: nil,
+            promptTokens: prompt)
+        #expect(!boundaries.all.contains(1), "bogus 1-token boundary: \(boundaries.all)")
+        #expect(boundaries.all.contains(noGeneration.count), "all=\(boundaries.all)")
+        // The next turn's prompt (history rendered, generation rail gone) starts with it.
+        var next = messages
+        next.append(["role": "assistant", "content": "a2", "reasoning_content": ""])
+        next.append(["role": "user", "content": "u3"])
+        let nextPrompt = try tokenizer.applyChatTemplate(
+            messages: next, tools: nil, additionalContext: nil)
+        #expect(Array(nextPrompt.prefix(noGeneration.count)) == noGeneration)
+    }
 }

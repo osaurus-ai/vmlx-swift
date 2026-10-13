@@ -30,7 +30,28 @@ public enum MultiRowDecodeAttention {
     nonisolated(unsafe) public static var arrayMaskIsCausal: Bool =
         ProcessInfo.processInfo.environment["VMLX_MULTIROW_ATTENTION_ARRAY_MASK_CAUSAL"] == "1"
 
+    /// Set inside a speculative draft/verify forward that must use this kernel regardless of the
+    /// process-wide opt-in (`enabled`). Task-local: other tasks (other models, ordinary requests)
+    /// keep stock attention.
+    @TaskLocal public static var speculativeScope = false
     @TaskLocal private static var linearChainMaskScope = false
+
+    /// Whether a 2-16-row forward routes here: the process-wide opt-in, or inside a speculative
+    /// block (`withSpeculativeBlock`). Callers test the row count first, so a 1-row decode step never
+    /// reads this.
+    public static var active: Bool { enabled || speculativeScope }
+
+    /// Run a speculative block forward (Uno draft and verify): linear-chain array masks count as
+    /// causal and the forward uses this kernel even when the process-wide opt-in is off.
+    ///
+    /// Why Uno always needs it: without it a 12-16-row block over a long context walks every key
+    /// serially (MLX's tiled kernel above 8 rows) and its cost grows far faster with context than a
+    /// 1-row step's. In osaurus (opt-in off) K2 Uno cycles at 16-20k tokens cost 200-650 ms and lost
+    /// to AR; the chooser's cross-bucket cost estimates (which scale with AR's growth) were then
+    /// optimistic exactly there.
+    public static func withSpeculativeBlock<R>(_ body: () throws -> R) rethrows -> R {
+        try $speculativeScope.withValue(true) { try withLinearChainMask(body) }
+    }
 
     /// Run `body` with linear-chain array masks routed to the multi-row kernel.
     public static func withLinearChainMask<R>(_ body: () throws -> R) rethrows -> R {

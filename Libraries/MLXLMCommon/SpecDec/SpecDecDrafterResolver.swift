@@ -58,7 +58,7 @@ public actor SpecDecDrafterResolver {
         strategy: DraftStrategy
     ) throws -> ResolvedDrafter {
         switch strategy {
-        case .none, .autoregressive, .nativeMTP, .dflash2:
+        case .none, .autoregressive, .nativeMTP, .dflash2, .uno:
             throw SpecDecError.notImplemented(
                 "resolve: \(strategy.kindName) is not a DFlash 1 block-diffusion strategy")
         case .dflash(let path, _):

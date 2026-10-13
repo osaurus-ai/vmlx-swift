@@ -1045,6 +1045,52 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    /// Serving configuration (write-behind): a native-recurrent hybrid writes one file and links no
+    /// companion, so its store is deferred too. While in flight the entry is durable (it must not be
+    /// rederived) and a lookup is served from memory with its in-file recurrent state; after the
+    /// write a reopened coordinator restores it from disk.
+    @Test("native-recurrent hybrid writes behind and restores its in-file state")
+    func nativeHybridWritesBehind() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("mamba-write-behind")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        prepareMLXMetallibForCacheTopologyTests()
+        func coordinator() -> CacheCoordinator {
+            var config = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true, pagedBlockSize: 4, maxCacheBlocks: 40,
+                diskCacheMaxGB: 1.0, diskCacheDir: tmp, modelKey: "mamba-write-behind-focused")
+            config.diskWriteBehind = true
+            let c = CacheCoordinator(config: config)
+            c.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+            return c
+        }
+        let writer = coordinator()
+        writer.diskCache?.writeDelayForTesting = 0.3
+        let tokens = Array(601...612)
+        let cache = makeNemotronOmniCache(tokenCount: tokens.count, populated: true)
+        writer.storeAfterGeneration(
+            promptTokens: tokens, perLayerData: [], ssmStates: extractSSMStates(from: cache),
+            cache: cache)
+        #expect(writer.diskCache?.pendingWriteCount == 1, "native hybrid store must be deferred")
+        #expect(writer.hasDurableDiskEntry(tokens: tokens))
+        if case .hit(let matched, _, let detail, _, _, let arrays) = writer.fetch(tokens: tokens + [613]) {
+            #expect(matched == tokens.count && detail == .disk)
+            #expect(arrays?.keys.contains { $0.hasPrefix("mamba_") } == true)
+        } else {
+            Issue.record("in-flight native hybrid entry must be served")
+        }
+        #expect(writer.waitForPendingDiskWrites())
+        let reopened = coordinator()
+        #expect(reopened.hasDurableDiskEntry(tokens: tokens))
+        if case .hit(let matched, _, _, _, _, let arrays) = reopened.fetch(tokens: tokens + [613]) {
+            #expect(matched == tokens.count)
+            #expect(arrays?.keys.contains { $0.hasPrefix("mamba_") } == true)
+        } else {
+            Issue.record("persisted native hybrid entry must restore after reopen")
+        }
+        }
+    }
+
     @Test("separate-payload topology still persists and requires the companion")
     func separatePayloadTopologyKeepsCompanion() {
         FocusedMLXTestSupport.withLock {

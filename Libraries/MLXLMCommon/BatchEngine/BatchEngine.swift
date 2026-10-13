@@ -531,6 +531,12 @@ public actor BatchEngine {
             )
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
+        if parameters.draftStrategy?.usesUno == true {
+            Self.logger.error(
+                "Rejected BatchEngine.submit Uno request: Uno drafts and verifies through the target's own cache, which a shared batched slot cannot express; use BatchEngine.generate for the exclusive path."
+            )
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
 
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
@@ -728,6 +734,19 @@ public actor BatchEngine {
         // batched decode path — the request still succeeds, just without
         // any speculation, which is the worst kind of failure because it
         // looks exactly like success.
+        // Uno runs inside TokenIterator on the solo path for the same reason: its two-pass cycle owns
+        // the target cache. Requests it cannot serve exactly decode AR there (TokenIterator logs why).
+        if parameters.draftStrategy?.usesUno == true {
+            guard canStartExclusiveSoloPath else {
+                Self.logger.error(
+                    "Rejected BatchEngine.generate Uno request: Uno is an exclusive solo path.")
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            }
+            return startSoloFastPath(
+                input: input,
+                parameters: parameters,
+                promptTail: promptTail)
+        }
         if parameters.draftStrategy?.usesDFlash2 == true,
             DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
         {
@@ -1158,7 +1177,9 @@ public actor BatchEngine {
     }
 
     private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
-        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection {
+        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
+            !cacheRestoreIsExactPrefix(slot.cache)
+        {
             return true
         }
         return shouldSkipDiskBackedToolPromptSeedBoundary(
@@ -1671,6 +1692,8 @@ public actor BatchEngine {
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
         StreamOrDevice.default.stream.synchronize()
+        // Background disk-cache writes of the last turns must land before the model goes.
+        cacheCoordinator?.waitForPendingDiskWrites()
         if shouldPurgeSoloMediaWorkingSet {
             Memory.clearCache()
             stepsSinceMemoryPurge = 0
@@ -2074,9 +2097,10 @@ public actor BatchEngine {
             // Scope the fetch result to this coordinator branch. Ordinary
             // requests keep longest-prefix reuse. A caller that is forcing a
             // fresh tool selection may bypass only an unproven disk-backed
-            // topology; paged/full-KV restores remain eligible.
+            // topology; paged/full-KV and exact-prefix restores remain eligible.
             if requiresDiskBackedRestore,
-               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection
+               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
+               !cacheRestoreIsExactPrefix(slot.cache)
             {
                 Self.logger.info(
                     "Slot \(slot.id.description, privacy: .public): skipped disk-backed required-tool cache restore; caller requested fresh tool selection"

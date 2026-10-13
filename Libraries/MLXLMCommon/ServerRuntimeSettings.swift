@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+#if canImport(os)
+import os
+#endif
 
 /// Stable engine-side contract for an Osaurus server/session settings panel.
 ///
@@ -538,6 +541,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // drafter means "draft with this", not "draft with this as well".
         // Off (AR) disables every speculative strategy, including a previously
         // selected external drafter. Selection is retained for re-enabling.
+        // Order: a drafter the user selected (explicit intent), then a bundled Uno adapter (the
+        // target drafts with its own weights), then a bundled DFlash 2 drafter.
+        if let selected = selectedDFlash2Drafter(configData: configData) {
+            return .dflash2(
+                drafterPath: URL(fileURLWithPath: selected.path),
+                blockSize: mtp.dflash2BlockSize)
+        }
+        if let adapter = bundledUnoAdapter(configData: configData, bundleDirectory: bundleDirectory) {
+            return .uno(
+                adapterPath: adapter,
+                blockSize: Self.unoPinnedBlockSize)
+        }
         if let selection = resolvedDFlash2Selection(
             configData: configData, bundleDirectory: bundleDirectory)
         {
@@ -572,6 +587,45 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             return info
         }
         return bundledDFlash2Drafter(configData: configData, bundleDirectory: bundleDirectory)
+    }
+
+    /// The user-selected DFlash 2 drafter when it fits this bundle (bundled drafters excluded).
+    public func selectedDFlash2Drafter(configData: Data?) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off, let path = mtp.dflash2DrafterPath, !path.isEmpty,
+            let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
+            info.mismatchReason(configData: configData) == nil
+        else { return nil }
+        return info
+    }
+
+    static let speculationLogger = Logger(subsystem: "vmlx", category: "Speculation")
+
+    /// Model types whose runtime implements the Uno conditional-LoRA pathway
+    /// (``UnoSelfSpeculativeModel``).
+    public static let unoModelTypes: Set<String> = ["k2_horizon"]
+
+    /// Pinned Uno rows per cycle (`VMLX_UNO_BLOCK`, diagnostic). Nil: Uno chooses per cycle
+    /// (`UnoWidthPlan`), starting from the width the bundle declares.
+    public static var unoPinnedBlockSize: Int? {
+        Int(ProcessInfo.processInfo.environment["VMLX_UNO_BLOCK"] ?? "").flatMap { $0 >= 2 ? $0 : nil }
+    }
+
+    /// The bundle-local `uno/` adapter (IFM Uno self-speculation) when speculation is not switched off,
+    /// the folder holds a PEFT adapter, and the bundle's model type implements the Uno pathway.
+    public func bundledUnoAdapter(configData: Data?, bundleDirectory: URL?) -> URL? {
+        guard mtp.mode != .off, let bundleDirectory, let configData,
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            let modelType = config["model_type"] as? String,
+            Self.unoModelTypes.contains(modelType)
+        else { return nil }
+        let local = bundleDirectory.appendingPathComponent("uno", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: local.path) else { return nil }
+        if let reason = UnoAdapter.mismatchReason(directory: local, configData: configData) {
+            Self.speculationLogger.warning(
+                "Bundled Uno adapter not used (decoding autoregressively): \(reason, privacy: .public)")
+            return nil
+        }
+        return local
     }
 
     /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.
@@ -1010,7 +1064,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 legacyGB: diskMaxSizeGB,
                 directory: diskDir))
 
-        return CacheCoordinatorConfig(
+        var config = CacheCoordinatorConfig(
             usePagedCache: reuseEnabled && cache.pagedKV.enabled,
             enableDiskCache: diskEnabled,
             pagedBlockSize: cache.pagedKV.blockSize ?? 64,
@@ -1023,6 +1077,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             defaultKVMode: cache.defaultKVMode,
             defaultMaxKVSize: cache.defaultMaxKVSize,
             longPromptMultiplier: cache.longPromptMultiplier)
+        // Serving: the end of a turn or tool call never waits for SSD writes (see DiskCache).
+        config.diskWriteBehind = true
+        return config
     }
 
     /// Automatic uses a share of free space plus this cache's own payloads.

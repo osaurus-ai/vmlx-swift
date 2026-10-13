@@ -112,6 +112,10 @@ enum NaiveN05FlashMath {
         return allowed .&& picked
     }
 
+    /// `VMLX_NAIVE_DECODE_NO_MASK=0` keeps the masked decode attention (A/B and diagnosis).
+    nonisolated(unsafe) static var decodeWithoutMaskEnabled =
+        ProcessInfo.processInfo.environment["VMLX_NAIVE_DECODE_NO_MASK"] != "0"
+
     /// The pinned Metal vector kernel supports asymmetric 192/128 heads only
     /// for short queries. Larger prefill retains the independent reference.
     static func usesAsymmetricDecodeSDPA(query: MLXArray, key: MLXArray, value: MLXArray) -> Bool {

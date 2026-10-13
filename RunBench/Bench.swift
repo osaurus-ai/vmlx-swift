@@ -592,8 +592,32 @@ struct Bench {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_GLMCOST"] ?? "0") == "1" {
+            try await runGlm5VerifyCostBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_ROWCOST"] ?? "0") == "1" {
             try await runRowCostBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_ROWEXACT"] ?? "0") == "1" {
+            try await runK2RowExactness(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_FWD_SWEEP"] ?? "0") == "1" {
+            try await runK2ForwardSweep(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC_COMPONENTS"] ?? "0") == "1" {
+            try await runDiplodocusComponentCosts(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
+            try await runK2MultiturnBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DIPLODOC"] ?? "0") == "1" {
+            try await runDiplodocusQualification(modelPath: modelPath)
             return
         }
         if (env["BENCH_SPEED"] ?? "0") == "1" {

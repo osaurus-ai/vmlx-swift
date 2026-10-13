@@ -82,8 +82,12 @@ func runSpeedProbe(modelPath: String) async throws {
             loadConfiguration: LoadConfiguration(nativeMTP: true)
         ).0
     } else {
+        // Same load policy as the app (osaurus loads with a LoadConfiguration): wired-limit residency,
+        // memory caps. The configuration-less overload skips them, which made "ar" arms measure a
+        // different residency state than every "default" arm (91 GB GLM: 1.4-1.8 vs 25 tok/s at random).
         context = try await MLXLMCommon.loadModel(
-            from: modelDir, using: #huggingFaceTokenizerLoader())
+            from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default
+        ).0
     }
     print(
         "[BENCH_SPEED_RESOLUTION] requested=\(arm) bundleDefault=\(String(describing: defaultStrategy))"
@@ -112,6 +116,8 @@ func runSpeedProbe(modelPath: String) async throws {
         var p = GenerateParameters(
             maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
             repetitionPenalty: nil)
+        // BENCH_SPEED_PREFILL_STEP=<n>: prefill chunk size (the app's per-request prefillStepSize).
+        if let step = env["BENCH_SPEED_PREFILL_STEP"].flatMap(Int.init), step > 0 { p.prefillStepSize = step }
         // BENCH_SPEED_SAMPLED=1: the bundle sampler the app sends by default (Qwen3.8: T 1.0, top_p 0.95, top_k 20).
         if env["BENCH_SPEED_SAMPLED"] == "1" {
             p.temperature = 1.0
@@ -143,6 +149,7 @@ func runSpeedProbe(modelPath: String) async throws {
     struct Row {
         var cat: String
         var tokens: Int
+        var promptTokens = 0
         var decode: Double
         var ttft: Double
         var text: String
@@ -201,9 +208,11 @@ func runSpeedProbe(modelPath: String) async throws {
         let span = (first.map { last - $0 }) ?? 0
         let chunkRate = span > 0.2 && tokens > 1 ? Double(tokens - 1) / span : 0
         if !mtp.isEmpty { print("[BENCH_SPEED_MTP] \(cat) \(mtp)") }
-        return Row(
+        var row = Row(
             cat: cat, tokens: tokens, decode: decode, ttft: (first ?? t0) - t0, text: text,
             chunkRate: chunkRate)
+        row.promptTokens = send.text.tokens.size
+        return row
     }
 
     // BENCH_SPEED_IMAGES=a.png,b.png: media smoke — one turn per image ("color and digit"), the
@@ -334,8 +343,9 @@ func runSpeedProbe(modelPath: String) async throws {
             let preview = String(r.text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
             let line = String(
                 format:
-                    "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"preview\":%@}",
-                cat, r.tokens, r.decode, r.chunkRate, r.ttft, String(reflecting: preview))
+                    "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"prompt_tokens\":%d,\"prefill_tok_s\":%.1f,\"preview\":%@}",
+                cat, r.tokens, r.decode, r.chunkRate, r.ttft, r.promptTokens,
+                r.ttft > 0 ? Double(r.promptTokens) / r.ttft : 0, String(reflecting: preview))
             print("[BENCH_SPEED_ROW] " + line)
             lines.append(line)
             texts.append(r.text)

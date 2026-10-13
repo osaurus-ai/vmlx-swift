@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXHuggingFace
 import MLXLLM
 @preconcurrency import VMLXTokenizers
@@ -13,7 +14,7 @@ import MLXLLM
 /// drops reasoning (what the chat template replays). One JSON line per turn.
 ///
 /// Env: K2MT_ARM=app|ram|none · K2MT_TURNS (10) · K2MT_MAX_TOKENS (400) · K2MT_EFFORT (high) · K2MT_OUT (dir) ·
-/// K2MT_GREEDY=1
+/// K2MT_GREEDY=1 · K2MT_UNO=<adapter dir> (Uno, adaptive unless K2MT_BLOCK) · K2MT_LONG=1 (long-output asks)
 func runK2MultiturnBench(modelPath: String) async throws {
     let env = ProcessInfo.processInfo.environment
     let arm = env["K2MT_ARM"] ?? "app"
@@ -26,9 +27,31 @@ func runK2MultiturnBench(modelPath: String) async throws {
     try FileManager.default.createDirectory(at: diskDir, withIntermediateDirectories: true)
 
     let modelDir = URL(fileURLWithPath: modelPath)
+    // K2MT_RESOLVE=1: resolve load configuration and draft strategy from the bundle exactly as the
+    // osaurus load path does (native MTP heads, a bundled DFlash 2 drafter or Uno adapter).
+    var resolvedStrategy: DraftStrategy? = nil
+    var loadConfiguration = LoadConfiguration.osaurusProduction
+    if env["K2MT_RESOLVE"] == "1" {
+        let settings = VMLXServerRuntimeSettings()
+        let configData = try? Data(contentsOf: modelDir.appendingPathComponent("config.json"))
+        let jang = try? JangLoader.loadConfig(at: modelDir)
+        let status = try? MTPBundleInspector.inspect(modelDirectory: modelDir, jangConfig: jang)
+        loadConfiguration = settings.resolvedLoadConfiguration(
+            base: .osaurusProduction, configData: configData, jangConfig: jang, status: status)
+        resolvedStrategy = settings.resolvedMTPDraftStrategy(
+            configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
+        print("K2MT_RESOLVED strategy=\(String(describing: resolvedStrategy)) nativeMTP=\(loadConfiguration.nativeMTP)")
+    }
+    // K2MT_NO_MMAP=1: materialize weights instead of mapping the shards (memory A/B control).
+    if env["K2MT_NO_MMAP"] == "1" { loadConfiguration.useMmapSafetensors = false }
     let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .osaurusProduction
+        from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: loadConfiguration
     ).0
+    if case .uno(let adapter, _)? = resolvedStrategy {
+        let t0 = Date()
+        let ms = try UnoWarmup.prepare(model: context.model, adapterDirectory: adapter)
+        print("K2MT_UNO_WARMUP ms=\(ms.map(String.init) ?? "nil") wall_ms=\(Int(Date().timeIntervalSince(t0) * 1000))")
+    }
     if env["K2MT_SDPA"] == "1" {
         // Attention alone, 36 layers x (32q/8kv x 128, bf16), decode L=1. Contiguous KV vs a slice of a larger buffer (KVCacheSimple).
         do {
@@ -69,6 +92,101 @@ func runK2MultiturnBench(modelPath: String) async throws {
         return
     }
     if env["K2MT_MULTIROW"] == "1" { runMultiRowAttentionProbe(); return }
+    if env["K2MT_IOBENCH"] == "1" {
+        // SSD cache file I/O mechanisms, no model: gathered vs per-tensor writes, cold restore +/- read-ahead.
+        try DiskCacheIOProbe.run(
+            directory: URL(fileURLWithPath: env["K2MT_IO_DIR"] ?? NSTemporaryDirectory() + "k2mt-io"),
+            layers: Int(env["K2MT_IO_LAYERS"] ?? "36") ?? 36, heads: Int(env["K2MT_IO_HEADS"] ?? "8") ?? 8,
+            tokens: Int(env["K2MT_IO_TOKENS"] ?? "28000") ?? 28000, dim: Int(env["K2MT_IO_DIM"] ?? "128") ?? 128,
+            rounds: Int(env["K2MT_IO_ROUNDS"] ?? "3") ?? 3)
+        return
+    }
+    if env["K2MT_LANEBENCH"] == "1" {
+        // Lane matmul at Qwen3.8-27B shapes, 4-bit g64: packed SBt scales vs in-place scales. Median of 101.
+        for (nOut, kIn) in [(6144, 5120), (5120, 6144), (17408, 5120), (5120, 17408)] {
+            for rows in [8, 16] {
+                let w = (MLXRandom.normal([nOut, kIn]) * 0.04).asType(.bfloat16)
+                let (q, s0, b0) = MLX.quantized(w, groupSize: 64, bits: 4)
+                let s = s0.asType(.bfloat16), b = b0!.asType(.bfloat16)
+                let sbt = LaneQMM.packScales(s, b)
+                let x = MLXRandom.normal([rows, kIn]).asType(.bfloat16)
+                eval(q, s, b, sbt, x)
+                func time(_ f: () -> MLXArray) -> Double {
+                    for _ in 0 ..< 10 { eval(f()) }
+                    var t: [Double] = []
+                    for _ in 0 ..< 101 {
+                        let t0 = Date(); eval(f()); t.append(Date().timeIntervalSince(t0) * 1000)
+                    }
+                    return t.sorted()[50]
+                }
+                let packed = time { LaneQMM.laneMatmul(x, weight: q, sbt: sbt, bits: 4, group: 64, tiled: false) }
+                let inPlace = time {
+                    LaneQMM.laneMatmul(x, weight: q, scales: s, biases: b, scaleGroup: 64, bits: 4, group: 64, tiled: false)
+                }
+                let mlx = time {
+                    quantizedMM(x, q, scales: s, biases: b, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+                }
+                print(String(format: "K2MT_LANEBENCH n=%d k=%d rows=%d packed_ms=%.3f inplace_ms=%.3f mlx_ms=%.3f",
+                    nOut, kIn, rows, packed, inPlace, mlx))
+            }
+        }
+        return
+    }
+    if env["K2MT_MEMPROBE"] == "1" {
+        // Where does memory beyond the weights come from? Live MLX memory and the model's own
+        // parameter bytes, after each stage, with caches dropped and the buffer pool cleared.
+        let model = context.model
+        func paramBytes() -> Int {
+            model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        }
+        func line(_ stage: String) {
+            Memory.clearCache()
+            print(String(format: "K2MT_MEMPROBE %@ active_mb=%.0f cache_mb=%.0f params_mb=%.0f",
+                stage, Double(Memory.activeMemory) / 1_048_576, Double(Memory.cacheMemory) / 1_048_576,
+                Double(paramBytes()) / 1_048_576))
+        }
+        line("after_load")
+        do {
+            var mapped = 0, owned = 0, mappedMB = 0
+            for (_, m) in model.leafModules().flattened() {
+                guard let q = m as? QuantizedLinear else { continue }
+                if WeightBacking.sharesMappedShard(q.weight) { mapped += 1; mappedMB += q.weight.nbytes >> 20 } else { owned += 1 }
+            }
+            var ownedByKind: [String: Int] = [:]
+            for (path, p) in model.parameters().flattened() where !WeightBacking.sharesMappedShard(p) {
+                let kind = path.split(separator: ".").filter { Int($0) == nil }.suffix(3).joined(separator: ".")
+                ownedByKind[kind, default: 0] += p.nbytes
+            }
+            let top = ownedByKind.sorted { $0.value > $1.value }.prefix(8)
+                .map { "\($0.key)=\($0.value >> 20)" }.joined(separator: " ")
+            print("K2MT_MEMPROBE owned_params_mb=\(ownedByKind.values.reduce(0, +) >> 20) \(top)")
+            print("K2MT_MEMPROBE backing quantized_linear shard_shared=\(mapped) replaceable=\(owned) shard_shared_weight_mb=\(mappedMB)")
+        }
+        if env["K2MT_MEMPROBE_LANE"] == "1" {
+            LaneQMM.installForDFlash2Target(model)
+            line("after_lane_install")
+        }
+        for round in 1 ... 3 {
+            do {
+                let cache = model.newCache(parameters: nil)
+                let toks = MLXArray((0 ..< 512).map { Int32(1000 + ($0 * 7919) % 50_000) }).reshaped(1, 512)
+                eval(model(LMInput.Text(tokens: toks), cache: cache, state: nil).logits)
+                var tok = MLXArray([Int32(4242)]).reshaped(1, 1)
+                for _ in 0 ..< 16 {
+                    let lg = model(LMInput.Text(tokens: tok), cache: cache, state: nil).logits
+                    tok = argMax(lg[0..., -1, 0...], axis: -1).reshaped(1, 1).asType(.int32)
+                    eval(tok)
+                }
+            }
+            line("after_forward_\(round)")
+        }
+        return
+    }
+    if env["K2MT_ROWS"] != nil, let uno = env["K2MT_PREP_UNO"] {
+        // Diagnostic: forward cost after the Uno load warm-up (adapter + lane routing installed).
+        _ = try UnoWarmup.prepare(model: context.model, adapterDirectory: URL(fileURLWithPath: uno))
+        print("K2MT_ROWS prepared Uno adapter + lane")
+    }
     if env["K2MT_ROWS"] != nil {
         // Forward cost vs query rows (speculative verify/draft shape) at fixed context. Trim back after each timing.
         let model = context.model
@@ -134,6 +252,12 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         return
     }
+    if let uno = env["K2MT_UNO"], env["K2MT_UNO_WARMUP"] == "1" {
+        // What the host does after load (osaurus: MLXBatchAdapter.warmupUnoAtLoad).
+        let t0 = Date()
+        let ms = try UnoWarmup.prepare(model: context.model, adapterDirectory: URL(fileURLWithPath: uno))
+        print("K2MT_UNO_WARMUP ms=\(ms.map(String.init) ?? "nil") wall_ms=\(Int(Date().timeIntervalSince(t0) * 1000))")
+    }
     let container = ModelContainer(context: context)
     if arm != "none" {
         var config = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
@@ -147,7 +271,17 @@ func runK2MultiturnBench(modelPath: String) async throws {
     let coordinator = container.cacheCoordinator
     print("K2MT_START arm=\(arm) disk=\(coordinator?.config.enableDiskCache ?? false) turns=\(turns) max_tokens=\(maxTokens)")
 
-    let asks = [
+    let longAsks = [
+        "Write a complete, detailed tutorial on implementing a key-value store in Python: design, full code for every component (storage engine, write-ahead log, compaction, an HTTP API), and tests. Be thorough and long.",
+        "Now extend the store with replication: explain leader election and log shipping in depth, then give the full code changes.",
+        "Rewrite the whole storage engine as an LSM tree with memtables, SSTables and bloom filters. Show all the code and explain every part.",
+        "Write a long, careful performance analysis of the store: every operation's complexity, I/O behaviour, and benchmarks you would run, with code for the benchmarks.",
+        "Write extensive documentation for the project: README, architecture overview, API reference with examples for every endpoint, and an operations guide.",
+        "Review all the code we wrote so far for bugs and race conditions; list each issue and give the corrected code in full.",
+        "Explain how you would port the store to Rust, with the full Rust code for the storage engine and WAL.",
+        "Write a final comprehensive study guide covering everything in this conversation, with headings, code, and exercises.",
+    ]
+    let asks = env["K2MT_LONG"] == "1" ? longAsks : [
         "Write a detailed explanation of how a hash map handles collisions, with a short Python example.",
         "Now compare open addressing and separate chaining in a table, then explain when each is better.",
         "Write a Python class implementing a hash map with linear probing and resizing.",
@@ -193,22 +327,90 @@ func runK2MultiturnBench(modelPath: String) async throws {
             i += 1
         }
     }
+    func memoryLine(_ label: String) {
+        print(String(
+            format: "K2MT_MEM %@ footprint_mb=%.0f mlx_active_mb=%.0f mlx_cache_mb=%.0f mlx_peak_mb=%.0f",
+            label, footprintMB(), Double(Memory.activeMemory) / 1_048_576,
+            Double(Memory.cacheMemory) / 1_048_576, Double(Memory.peakMemory) / 1_048_576))
+    }
+    memoryLine("after_load")
+    var previousPrompt: [Int32] = []
+    let mediaAsks = [
+        "Describe this image in detail: what is shown, any text, and the colors.",
+        "Now listen to this audio clip. What do you hear? Transcribe any speech.",
+        "Compare the image from my first message with the audio clip: is there any connection? Answer in a short paragraph.",
+        "Summarize everything we discussed in two sentences.",
+    ]
+    var chatHistory: [Chat.Message] = [.system("You are a precise assistant. Answer completely.")]
     for turn in 0 ..< min(turns, asks.count) {
         let ask = turn == 0 && !pad.isEmpty ? "Reference module:\n```python\n\(pad)```\n\n" + asks[turn] : asks[turn]
         messages.append(["role": "user", "content": ask])
-        nonisolated(unsafe) let input = try await context.processor.prepare(input: UserInput(
-            messages: messages, additionalContext: ["reasoning_effort": effort]))
+        // K2MT_IMAGE / K2MT_AUDIO: a structured chat whose turn 0 carries the image and turn 1 the
+        // audio (both stay in history), then text follow-ups: media-salted cache entries.
+        let mediaMode = env["K2MT_IMAGE"] != nil || env["K2MT_AUDIO"] != nil
+        if mediaMode {
+            var userMsg = Chat.Message.user(mediaAsks[min(turn, mediaAsks.count - 1)])
+            if turn == 0, let image = env["K2MT_IMAGE"] {
+                userMsg = .user(mediaAsks[0], images: [.url(URL(fileURLWithPath: image))])
+            } else if turn == 1, let audio = env["K2MT_AUDIO"] {
+                userMsg = .user(mediaAsks[1], audios: [.url(URL(fileURLWithPath: audio))])
+            }
+            chatHistory.append(userMsg)
+        }
+        nonisolated(unsafe) let input = try await context.processor.prepare(input: mediaMode
+            ? UserInput(chat: chatHistory, additionalContext: effort == "none" ? nil : ["reasoning_effort": effort])
+            : UserInput(
+                messages: messages,
+                additionalContext: effort == "none" ? nil : ["reasoning_effort": effort]))
         let promptTokens = input.text.tokens.size
+        // Longest common prefix with the previous turn's prompt: what a prefix cache can reuse at most.
+        let tokenList = input.text.tokens.reshaped(-1).asArray(Int32.self)
+        var lcp = 0
+        while lcp < min(tokenList.count, previousPrompt.count), tokenList[lcp] == previousPrompt[lcp] { lcp += 1 }
+        if env["K2MT_LCP_DUMP"] == "1", lcp < previousPrompt.count {
+            let lo = max(0, lcp - 8)
+            let prevTail = Array(previousPrompt[lo ..< min(previousPrompt.count, lcp + 12)])
+            let curTail = Array(tokenList[lo ..< min(tokenList.count, lcp + 12)])
+            print("K2MT_LCP turn=\(turn) lcp=\(lcp) prev=\(previousPrompt.count)")
+            print("  prev: \(context.tokenizer.decode(tokenIds: prevTail.map(Int.init)).debugDescription)")
+            print("  cur:  \(context.tokenizer.decode(tokenIds: curTail.map(Int.init)).debugDescription)")
+        }
+        previousPrompt = tokenList
+        if env["K2MT_BOUNDARY_DEBUG"] == "1", let ctl = context.tokenizer as? any GenerationPromptControllableTokenizer {
+            let ctx: [String: any Sendable] = ["reasoning_effort": effort]
+            let prepared = K2HorizonTemplateContract.prepare(messages: messages, modelType: "k2_horizon")
+            func show(_ label: String, _ msgs: [[String: any Sendable]], gen: Bool) {
+                do {
+                    let t = try ctl.applyChatTemplate(messages: msgs, tools: nil, additionalContext: ctx, addGenerationPrompt: gen)
+                    var l = 0
+                    while l < min(t.count, tokenList.count), Int32(t[l]) == tokenList[l] { l += 1 }
+                    print("K2MT_BDBG turn=\(turn) \(label) count=\(t.count) lcp_with_prompt=\(l) head=\(t.prefix(6)) prompt_head=\(tokenList.prefix(6))")
+                } catch { print("K2MT_BDBG turn=\(turn) \(label) ERROR \(error)") }
+            }
+            show("gen", prepared, gen: true)
+            show("nogen", prepared, gen: false)
+            var probe = prepared; probe.append(["role": "assistant", "content": "0"])
+            show("probe_raw", probe, gen: false)
+            show("probe_prepared", K2HorizonTemplateContract.prepare(messages: probe, modelType: "k2_horizon"), gen: false)
+            let b = canonicalChatCacheBoundaries(tokenizer: context.tokenizer, messages: prepared, tools: nil, additionalContext: ctx, promptTokens: tokenList.map(Int.init))
+            print("K2MT_BDBG turn=\(turn) canonical all=\(b.all) stable=\(b.stable) input_all=\(input.cachePrefixTokenCounts)")
+        }
         var p = GenerateParameters(
             generationConfig: context.configuration.generationDefaults,
             fallback: GenerateParameters(maxTokens: maxTokens))
         p.maxTokens = maxTokens
         if env["K2MT_GREEDY"] == "1" { p.temperature = 0; p.topP = 1; p.topK = 0 }
+        if let resolvedStrategy { p.draftStrategy = resolvedStrategy }
+        if let uno = env["K2MT_UNO"] {
+            p.draftStrategy = .uno(
+                adapterPath: URL(fileURLWithPath: uno), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))
+        }
         if let drafter = env["K2MT_DFLASH2"] {
             p.draftStrategy = .dflash2(
                 drafterPath: URL(fileURLWithPath: drafter), blockSize: env["K2MT_BLOCK"].flatMap(Int.init))
         }
         let diskBefore = diskBytes()
+        let uno0 = (UnoProcessCounters.cycles, UnoProcessCounters.committedTokens, UnoProcessCounters.arSteps)
         let start = Date()
         var first: Date?
         var stamps: [Date] = []
@@ -226,8 +428,9 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         let streamEnd = Date()
         // Store settle: SSD bytes stable for 1 s (max 20 s) after the stream ends.
+        // K2MT_NO_SETTLE=1: send the next turn at once (an instant tool / auto-continue).
         var last = diskBytes(), stableSince = Date(), settleEnd = Date()
-        while Date().timeIntervalSince(streamEnd) < 20 {
+        while env["K2MT_NO_SETTLE"] != "1", Date().timeIntervalSince(streamEnd) < 20 {
             try await Task.sleep(nanoseconds: 250_000_000)
             let now = diskBytes()
             if now != last { last = now; stableSince = Date() }
@@ -235,7 +438,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
         }
         let stats = coordinator?.snapshotStats()
         let row: [String: Any] = [
-            "arm": arm, "turn": turn, "prompt_tokens": promptTokens, "gen_tokens": genTokens,
+            "arm": arm, "turn": turn, "prompt_tokens": promptTokens, "lcp_prev_prompt": lcp, "gen_tokens": genTokens,
             "ttft_s": first.map { $0.timeIntervalSince(start) } ?? -1,
             "prompt_time_s": promptTime, "decode_tps": tps, "gen_time_s": genTime,
             "turn_wall_s": streamEnd.timeIntervalSince(start),
@@ -248,7 +451,10 @@ func runK2MultiturnBench(modelPath: String) async throws {
             "mlx_cache_mb": Double(Memory.cacheMemory) / 1_048_576,
             "t_start": iso.string(from: start), "t_end": iso.string(from: streamEnd),
             "reasoning_chars": reasoning.count, "text_chars": text.count,
-            "multirow_calls": MultiRowDecodeAttention.servedCalls, "text_sha": String(text.hashValue),
+            "multirow_calls": MultiRowDecodeAttention.servedCalls,
+            "uno_cycles": UnoProcessCounters.cycles - uno0.0,
+            "uno_cycle_tokens": UnoProcessCounters.committedTokens - uno0.1,
+            "uno_ar_steps": UnoProcessCounters.arSteps - uno0.2, "text_sha": String(text.hashValue),
         ]
         if stamps.count > 600 {
             // Event rate per 512-event window (one event ~ one token at streamInterval 1).
@@ -257,9 +463,15 @@ func runK2MultiturnBench(modelPath: String) async throws {
             while i + 512 < stamps.count { w.append(String(format: "%.1f", 512 / stamps[i + 512].timeIntervalSince(stamps[i]))); i += 512 }
             print("K2MT_WINDOWS turn=\(turn) events=\(stamps.count) rates=\(w.joined(separator: ","))")
         }
+        if env["K2MT_MEM_EVERY_TURN"] == "1" { memoryLine("after_turn_\(turn)") }
         if let dump = env["K2MT_TEXT_DUMP"] { try? text.write(toFile: dump, atomically: true, encoding: .utf8) }
         let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
         print("K2MT_TURN " + String(decoding: data, as: UTF8.self))
         messages.append(["role": "assistant", "content": text])
+        chatHistory.append(.assistant(text))
     }
+    // Idle floor: every background write landed, then 3 s of nothing (what the app sits at between turns).
+    _ = coordinator?.waitForPendingDiskWrites()
+    try await Task.sleep(nanoseconds: 3_000_000_000)
+    memoryLine("idle_after_turns")
 }

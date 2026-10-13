@@ -8,6 +8,38 @@ import XCTest
 
 class ModuleTests: XCTestCase {
 
+    func testUpdateModuleSparseNestedArrayKeepsUntouchedLayers() throws {
+        try Device.withDefaultDevice(.cpu) {
+            class Block: Module { @ModuleInfo var projection = Linear(4, 4) }
+            class Container: Module { let layers = [Block(), Block(), Block()] }
+            let model = Container()
+            let first = model.layers[0].projection
+            let last = model.layers[2].projection
+            let replacement = Linear(4, 4)
+            try model.update(
+                modules: ModuleChildren.unflattened([("layers.1.projection", replacement)]),
+                verify: .all)
+            XCTAssertTrue(model.layers[0].projection === first)
+            XCTAssertTrue(model.layers[1].projection === replacement)
+            XCTAssertTrue(model.layers[2].projection === last)
+            XCTAssertTrue(Dictionary(uniqueKeysWithValues: model.namedModules())["layers.1.projection"] === replacement)
+        }
+    }
+
+    func testUpdateModuleSparseArrayReplacementKeepsLeadingModule() throws {
+        try Device.withDefaultDevice(.cpu) {
+            class Container: Module { @ModuleInfo var layers = [Linear(4, 4), Linear(4, 4)] }
+            let model = Container()
+            let first = model.layers[0]
+            let replacement = Linear(4, 4)
+            try model.update(
+                modules: ModuleChildren.unflattened([("layers.1", replacement)]), verify: .all)
+            XCTAssertEqual(model.layers.count, 2)
+            XCTAssertTrue(model.layers[0] === first)
+            XCTAssertTrue(model.layers[1] === replacement)
+        }
+    }
+
     override class func setUp() {
         setDefaultDevice()
     }

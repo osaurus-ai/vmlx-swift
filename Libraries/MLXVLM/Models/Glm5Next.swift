@@ -1858,6 +1858,14 @@ public final class Glm5NextMoEGate: Module {
     public func callAsFunction(
         _ x: MLXArray, correctionBias: MLXArray
     ) -> (indices: MLXArray, weights: MLXArray) {
+        if numGroups <= 1, topkGroup <= 1,
+            let routed = SigmoidRouterKernels.route(
+                x, weight: weight, correctionBias: correctionBias, topK: topK,
+                normalize: topK > 1 && normTopkProb, scaling: routedScalingFactor)
+        {
+            // Same output contract as the graph below (weights rounded to the activation dtype).
+            return (routed.indices, routed.weights.asType(x.dtype))
+        }
         let logits = x.matmul(weight.T)
         let originalScores = sigmoid(logits.asType(.float32))
         let scoresForChoice = originalScores + correctionBias
@@ -1877,6 +1885,7 @@ public final class Glm5NextMoEGate: Module {
 }
 
 /// The sparse MLP: 288 routed experts fused into a `SwitchGLU`, plus one always-on shared expert.
+
 public final class Glm5NextMoE: Module {
     /// Canonical checkpoint layer; standalone modules do not invent an owner.
     public let routedAdviceLayerIndex: Int?
@@ -2047,6 +2056,9 @@ public final class Glm5NextDecoderLayer: Module {
             _ffnHC.wrappedValue = DeepseekV4HyperConnection(
                 hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
                 eps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
+            // vMLX Python mHC v3 (glm5_mhc_decode): two dispatches for decode and verify slabs.
+            _attentionHC.wrappedValue?.fusedDecodeCollapse = true
+            _ffnHC.wrappedValue?.fusedDecodeCollapse = true
         }
 
         if isMultiTokenPrediction {
@@ -2139,7 +2151,9 @@ public final class Glm5NextSharedHead: Module {
 extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, CanonicalRequiredToolCacheModel {
 
     public var canonicalRequiredToolCacheIdentity: String {
-        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1"
+        // The fused mHC prefill computes the projection in true fp32 (the graph runs TF32), so its cold prefill is a
+        // different canonical state.
+        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1" + (MHCFusedPrefill.enabled ? "-mhcprefill1" : "")
     }
 
     public func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int? {
@@ -2987,7 +3001,22 @@ public final class Glm5NextLanguageModel: Module {
         _ inputs: MLXArray, mask: MLXArray? = nil, caches: [KVCache]? = nil,
         inputEmbedding: MLXArray? = nil
     ) throws -> MLXArray {
+        try forwardCapturing(
+            inputs, mask: mask, caches: caches, captureLayerIDs: [], inputEmbedding: inputEmbedding
+        ).hidden
+    }
+
+    /// The backbone forward, additionally returning the COMPLETED output of each decoder layer in
+    /// `captureLayerIDs` (0-based), contracted over the hyper-connection streams by the same
+    /// unweighted mean GLM applies before its final norm — the DFlash 2 drafter's context taps
+    /// (SGLang `_prepare_aux_hidden_state`; vMLX Python `glm_dflash2._MeanStreamTap`). An empty set
+    /// is exactly the ordinary forward.
+    public func forwardCapturing(
+        _ inputs: MLXArray, mask: MLXArray? = nil, caches: [KVCache]? = nil,
+        captureLayerIDs: Set<Int>, inputEmbedding: MLXArray? = nil
+    ) throws -> (hidden: MLXArray, captured: [Int: MLXArray]) {
         var h = inputEmbedding ?? embedTokens(inputs)
+        var captured: [Int: MLXArray] = [:]
 
         // WITH hyper-connections the residual stream is WIDER than the hidden size: (B, L, H)
         // becomes (B, L, hcMult, H), tiled, and every `collapse`/`expand` pair works on that shape.
@@ -2999,12 +3028,15 @@ public final class Glm5NextLanguageModel: Module {
 
         for index in 0 ..< numDecoderLayers {
             h = try layers[index](h, mask: mask, cache: caches?[safe: index])
+            if captureLayerIDs.contains(index) {
+                captured[index] = usesHyperConnections ? Self.reduceHyperConnectionStream(h) : h
+            }
         }
 
         if usesHyperConnections {
             h = Self.reduceHyperConnectionStream(h)
         }
-        return norm(h)
+        return (norm(h), captured)
     }
 
     /// Collapses the hcMult copies back to one hidden state: an UNWEIGHTED MEAN.
@@ -3297,14 +3329,9 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, Safetenso
         customRoutedTensorNames: Set<String> = []
     ) throws {
         if !customRoutedTensorNames.isEmpty {
-            let expected = Set(routedExperts.keys.flatMap { layer in
-                ["gate_proj", "up_proj", "down_proj"].flatMap { role in
-                    ["tq2_packed", "tq2_scales"].map { suffix in
-                        "model.layers.\(layer).mlp.switch_mlp.\(role).\(suffix)"
-                    }
-                }
-            })
-            guard customRoutedTensorNames == expected else {
+            guard JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                customRoutedTensorNames, routedLayers: Set(routedExperts.keys))
+            else {
                 throw Glm5NextRoutedBankError.invalidCustomTensorExclusions
             }
         }

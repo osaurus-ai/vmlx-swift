@@ -368,8 +368,11 @@ public func loadWeights(
         // `jangpress-prestacked`) are deliberate artifacts, not indexed
         // weights, so they keep their exact-path opt-in. Gated to JANG
         // bundles: stock community bundles keep the historical glob and are
-        // untouched by this contract.
-        if jangConfig != nil,
+        // untouched by this contract. Custom-bank (JANGH/JANGHT) loads pass no
+        // `jangConfig` (their typed contract bypasses legacy shape inference) but
+        // are still JANG bundles: key the manifest on the sidecar file, so a
+        // bundled `dflash2/` drafter never globs into the target's weights.
+        if jangConfig != nil || JangLoader.findConfigPath(at: modelDirectory) != nil,
             let indexedNames = indexedShardFileNames(at: modelDirectory)
         {
             let decision = indexManifestDecision(

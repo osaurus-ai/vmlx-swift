@@ -253,6 +253,21 @@ public func cacheContainsPathDependentState(_ cache: [any KVCache]) -> Bool {
 /// This includes path-dependent recurrent caches plus sliding-window /
 /// hybrid-pool layers whose ring or pool metadata is not represented by
 /// plain paged KV blocks.
+/// A disk-backed cache whose state at a stored boundary is exactly the rows its forward produced for those tokens:
+/// no recurrent, pooled, rotated-ring or quantized state, so a restore followed by the suffix prefill differs from a
+/// cold prefill only by chunk rounding, exactly like a plain KV cache. Forced tool selection
+/// (`CacheRestorePolicy.freshRequiredToolSelection`) skips disk restore only for disk-backed topologies WITHOUT this
+/// property; plain KV keeps its normal reuse under the same policy.
+public protocol ExactPrefixRestoreCache {}
+
+/// True when every layer is either an ordinary (not disk-backed) cache or an ``ExactPrefixRestoreCache``.
+public func cacheRestoreIsExactPrefix(_ cache: [any KVCache]) -> Bool {
+    !cache.isEmpty && cache.allSatisfy { layer in
+        if let list = layer as? CacheList { return cacheRestoreIsExactPrefix((0 ..< list.count).map { list[$0] }) }
+        return layer is ExactPrefixRestoreCache || !cacheRequiresDiskBackedCoordinatorRestore([layer])
+    }
+}
+
 public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) -> Bool {
     if cacheContainsPathDependentState(cache) {
         return true
