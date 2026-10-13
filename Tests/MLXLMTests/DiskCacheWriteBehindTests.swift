@@ -251,6 +251,59 @@ struct DiskCacheWriteBehindTests {
         }
     }
 
+    @Test func clearDoesNotRepublishAfterSlowPendingWrite() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("slow-clear")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+            cache.writeBehind = true
+            cache.writeDelayForTesting = 31
+            let tokens = Array(5 ..< 40)
+            cache.store(tokens: tokens, arrays: ["keys": MLXArray.ones([4_096])])
+            cache.clear()
+            #expect(cache.waitForPendingWrites(timeout: 10))
+            #expect(cache.snapshotStats().currentEntryCount == 0)
+            #expect(!cache.hasDurableEntry(tokens: tokens))
+        }
+    }
+
+    @Test func externalPurgeInvalidatesOnlyItsRootAndAllowsReplacement() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("external-clear")
+            let otherDir = root("external-clear-other")
+            defer {
+                try? FileManager.default.removeItem(at: dir)
+                try? FileManager.default.removeItem(at: otherDir)
+            }
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+            let other = DiskCache(cacheDir: otherDir, maxSizeBytes: 50_000_000, modelKey: "wb")
+            for item in [cache, other] {
+                item.writeBehind = true
+                item.writeDelayForTesting = 0.3
+            }
+            let tokens = Array(5 ..< 40)
+            let original = ["keys": MLXArray.ones([4_096])]
+            cache.store(tokens: tokens, arrays: original)
+            other.store(tokens: tokens, arrays: original)
+            MLXCacheIOLock.withSerializedMLXCacheIO {
+                DiskCache.invalidatePendingWrites(in: dir)
+            }
+            #expect(!cache.hasDurableEntry(tokens: tokens))
+            #expect(other.hasDurableEntry(tokens: tokens))
+            // Re-store the same hash before the invalidated writer finishes. Its completion must
+            // not remove the replacement's buffers, publish stale bytes or corrupt accounting.
+            cache.store(tokens: tokens, arrays: ["keys": MLXArray.ones([4_096]) * 2])
+            #expect(cache.pendingWriteCount == 2)
+            #expect(cache.waitForPendingWrites(timeout: 10))
+            #expect(other.waitForPendingWrites(timeout: 10))
+            #expect(cache.pendingWriteCount == 0)
+            #expect(cache.hasWriteBehindRoom)
+            let restored = try #require(cache.fetch(tokens: tokens)?["keys"])
+            #expect(restored[0].item(Float.self) == 2)
+            #expect(other.hasDurableEntry(tokens: tokens))
+        }
+    }
+
     /// The serving configuration opts the coordinator in: a persistent boundary store returns
     /// before its file exists, the entry already counts as durable (it must not be produced again),
     /// and quota enforcement still happens, on the writer, once each row has landed.

@@ -592,6 +592,8 @@ public final class DiskCache: @unchecked Sendable {
         let tokenCount: Int
         let bytes: Int
         let geometry: RecurrentGeometry
+        // Read and written under the owning DiskCache lock.
+        var invalidated = false
         init(arrays: [String: MLXArray], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry) {
             self.arrays = arrays
             self.tokenCount = tokenCount
@@ -608,9 +610,33 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
+    private final class WeakCache: @unchecked Sendable {
+        weak var value: DiskCache?
+        init(_ value: DiskCache) { self.value = value }
+    }
+    private static let activeCaches = OSAllocatedUnfairLock(initialState: [WeakCache]())
+
+    /// Invalidate queued publications before an external purge of this root. The caller must hold
+    /// MLXCacheIOLock so stores and writer publication cannot race the purge. Includes caches whose
+    /// model has unloaded but whose writer still owns pending buffers. No disk wait or buffer copy.
+    public static func invalidatePendingWrites(in directory: URL) {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        let caches = activeCaches.withLock { entries in
+            entries = entries.filter { $0.value != nil }
+            return entries.compactMap(\.value)
+        }
+        for cache in caches
+        where cache.cacheDir.standardizedFileURL.resolvingSymlinksInPath().path == root {
+            cache.lock.lock()
+            for entry in cache.inflight.values { entry.invalidated = true }
+            cache.lock.unlock()
+        }
+    }
+
     /// Entries whose file is still being written, by content hash (under `lock`).
     private var inflight: [String: InflightWrite] = [:]
     private var inflightBytes = 0
+    private var inflightStoreCount = 0
     private let writerQueue = DispatchQueue(label: "vmlx.disk-cache.writer", qos: .userInitiated)
     private let pendingWrites = DispatchGroup()
     private let inflightChanged = NSCondition()
@@ -629,7 +655,7 @@ public final class DiskCache: @unchecked Sendable {
     public var pendingWriteCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return inflight.count
+        return inflightStoreCount
     }
 
     /// Wait until every write-behind store has reached disk and its index row. Shutdown, unload,
@@ -716,7 +742,7 @@ public final class DiskCache: @unchecked Sendable {
     private func completeWriteBehind(
         hash: String, finalURL: URL, tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int,
         chainId: String?, rowKind: Int64, replayChunkSize: Int?, enforceQuota: Bool,
-        layout: [String], geometry: RecurrentGeometry, enqueued: Date
+        layout: [String], geometry: RecurrentGeometry, enqueued: Date, entry: InflightWrite
     ) {
         if let delay = writeDelayForTesting { Thread.sleep(forTimeInterval: delay) }
         let start = Date()
@@ -734,9 +760,14 @@ public final class DiskCache: @unchecked Sendable {
                 _ = Self.removeRegularFile(at: tmp)
                 throw DiskCacheIntegrityError.incompleteWrite(finalURL.lastPathComponent)
             }
+            MLXDiskCacheIOLock.shared.lock()
+            defer { MLXDiskCacheIOLock.shared.unlock() }
             lock.lock()
             defer { lock.unlock() }
-            if _refuseOccupiedStoreLocked(finalURL: finalURL, hash: hash, tokenCount: tokenCount) {
+            if entry.invalidated {
+                _ = Self.removeRegularFile(at: tmp)
+                outcome = "cleared"
+            } else if _refuseOccupiedStoreLocked(finalURL: finalURL, hash: hash, tokenCount: tokenCount) {
                 _ = Self.removeRegularFile(at: tmp)
                 outcome = "refused-occupied"
             } else {
@@ -783,14 +814,15 @@ public final class DiskCache: @unchecked Sendable {
         }
         let end = Date()
         lock.lock()
-        let finished = inflight.removeValue(forKey: hash)
-        if let finished { inflightBytes -= finished.bytes }
+        if inflight[hash] === entry { inflight.removeValue(forKey: hash) }
+        inflightBytes -= entry.bytes
+        inflightStoreCount -= 1
         lastWriteBehindMs = end.timeIntervalSince(start) * 1000
         lock.unlock()
         // Drop the payload here, as soon as its bytes are on disk: holding it until the next request
         // would keep up to a full context of KV above the model's idle footprint between turns.
         // (MLX's allocator free path is mutex-protected; the arrays are evaluated and unshared.)
-        _ = finished
+        // The writer owns entry until this call returns, including after clear/replacement.
         inflightChanged.lock()
         inflightChanged.broadcast()
         inflightChanged.unlock()
@@ -921,6 +953,12 @@ public final class DiskCache: @unchecked Sendable {
         self.modelKey = modelKey
         self.retireRetryInterval = retireRetryInterval
         self.now = now
+        defer {
+            Self.activeCaches.withLock { entries in
+                entries = entries.filter { $0.value != nil }
+                entries.append(WeakCache(self))
+            }
+        }
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
@@ -1203,7 +1241,7 @@ public final class DiskCache: @unchecked Sendable {
         // screen: the screen evaluates and reduces the whole payload (and materializes a lazy
         // snapshot copy), which a store that is then skipped never needed. Before 2026-10-11 the
         // screen ran first. A skipped store counts in `stores` as before; a refused one does not.
-        if inflight[hash] != nil {
+        if let entry = inflight[hash], !entry.invalidated {
             stores += 1
             // The same content-addressed payload is already on its way to disk.
             storeSkips += 1
@@ -1300,9 +1338,11 @@ public final class DiskCache: @unchecked Sendable {
                         + "strided=\(strided) stridedBytes=\(stridedBytes) bytes=\(bytes)\n").utf8))
             }
             let geometry = Self.recurrentGeometry(arrays)
-            inflight[hash] = InflightWrite(
+            let entry = InflightWrite(
                 arrays: arrays, tokenCount: tokenCount, bytes: bytes, geometry: geometry)
+            inflight[hash] = entry
             inflightBytes += bytes
+            inflightStoreCount += 1
             writeBehindStores += 1
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 traceLastStoredTokens = tokens
@@ -1316,7 +1356,7 @@ public final class DiskCache: @unchecked Sendable {
                     hash: hash, finalURL: url, tensors: tensors, tokenCount: tokenCount,
                     chainId: chainId, rowKind: rowKind, replayChunkSize: replayChunkSize,
                     enforceQuota: enforceQuota, layout: layout, geometry: geometry,
-                    enqueued: enqueued)
+                    enqueued: enqueued, entry: entry)
                 afterPublish?()
                 pendingWrites.leave()
             }
@@ -1586,7 +1626,7 @@ public final class DiskCache: @unchecked Sendable {
     ) -> [String: MLXArray]? {
         // Still being written: serve the payload the store validated and materialized. Same
         // content-addressed bytes the file will hold; no wait, no disk read.
-        if let entry = inflight[hash], entry.tokenCount == tokens.count {
+        if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count {
             inflightFetches += 1
             if countHit { hits += 1 }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -1818,7 +1858,7 @@ public final class DiskCache: @unchecked Sendable {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
-        if let entry = inflight[hash] {
+        if let entry = inflight[hash], !entry.invalidated {
             return entry.satisfies(
                 tokenCount: tokens.count, requireNativeRecurrent: requireNativeRecurrent)
         }
@@ -1858,7 +1898,7 @@ public final class DiskCache: @unchecked Sendable {
         guard let (hash, url) = entryKey(tokens: tokens, mediaSalt: mediaSalt) else { return false }
         lock.lock()
         defer { lock.unlock() }
-        if let entry = inflight[hash] {
+        if let entry = inflight[hash], !entry.invalidated {
             return entry.satisfies(
                 tokenCount: tokens.count, requireNativeRecurrent: requireNativeRecurrent)
         }
@@ -1923,7 +1963,8 @@ public final class DiskCache: @unchecked Sendable {
             counts.append(Int(sqlite3_column_int64(stmt, 0)))
         }
         // In-flight entries have no row yet; they are this model's (one DiskCache per model key).
-        let inflightCounts = inflight.values.map(\.tokenCount).filter { $0 > 0 && $0 <= maxTokens }
+        let inflightCounts = inflight.values.filter { !$0.invalidated }.map(\.tokenCount)
+            .filter { $0 > 0 && $0 <= maxTokens }
         func merged(_ indexed: [Int]) -> [Int] {
             guard !inflightCounts.isEmpty else { return indexed }
             return Array(Set(indexed + inflightCounts).sorted(by: >).prefix(limit))
@@ -3279,6 +3320,11 @@ public final class DiskCache: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+
+        // A slow writer may outlive the bounded drain above. Invalidate its publication and
+        // lookups while retaining its arrays until the writer finishes reading their bytes.
+        // A subsequent store of the same hash owns a separate entry and must survive this writer.
+        for entry in inflight.values { entry.invalidated = true }
 
         // Files first, rows after: dying in between leaves rows that name
         // missing files, which the next fetch or import clears — never
