@@ -30,12 +30,11 @@ public enum MultiRowDecodeAttention {
     nonisolated(unsafe) public static var arrayMaskIsCausal: Bool =
         ProcessInfo.processInfo.environment["VMLX_MULTIROW_ATTENTION_ARRAY_MASK_CAUSAL"] == "1"
 
+    @TaskLocal private static var linearChainMaskScope = false
+
     /// Run `body` with linear-chain array masks routed to the multi-row kernel.
     public static func withLinearChainMask<R>(_ body: () throws -> R) rethrows -> R {
-        let previous = arrayMaskIsCausal
-        arrayMaskIsCausal = true
-        defer { arrayMaskIsCausal = previous }
-        return try body()
+        try $linearChainMaskScope.withValue(true, operation: body)
     }
 
     public static func maskAllowed(_ mask: MLXFast.ScaledDotProductAttentionMaskMode, queryLength: Int, keyLength: Int) -> Bool {
@@ -43,7 +42,7 @@ public enum MultiRowDecodeAttention {
         case .causal: return true
         case .array(let m):
             // [L, N] or [1, 1, L, N]: one causal mask shared by every head (leading dims of 1 only).
-            guard arrayMaskIsCausal, m.ndim >= 2, m.ndim <= 4,
+            guard (arrayMaskIsCausal || linearChainMaskScope), m.ndim >= 2, m.ndim <= 4,
                 m.dim(-2) == queryLength, m.dim(-1) == keyLength
             else { return false }
             return m.shape.dropLast(2).allSatisfy { $0 == 1 }
