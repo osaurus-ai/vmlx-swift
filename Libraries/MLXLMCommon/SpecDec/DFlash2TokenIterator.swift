@@ -1078,9 +1078,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(
                     "input_capture_staged")
                 {
-                    target.callAsFunction(
-                        verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
-                        recordPrefixCommitStates: false)
+                    MultiRowDecodeAttention.withLinearChainMask {
+                        target.callAsFunction(
+                            verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
+                            recordPrefixCommitStates: false)
+                    }
                 }
                 logits = l
                 newHidden = extractContextFeature(
@@ -1099,10 +1101,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let verifierMode = usesInputCapture
                 ? "input_capture"
                 : (hasRecurrentState ? "capture_commit" : "input_capture")
+            // Linear chain verify: its causal array mask may take the opt-in multi-row attention kernel
+            // (MultiRowDecodeAttention; tree verify runs treeAttention and never reaches it).
             let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(verifierMode) {
-                target.callAsFunction(
-                    verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
-                    recordPrefixCommitStates: hasRecurrentState && !usesInputCapture)
+                MultiRowDecodeAttention.withLinearChainMask {
+                    target.callAsFunction(
+                        verifyInput, cache: cache, captureLayerIDs: captureLayerIDs,
+                        recordPrefixCommitStates: hasRecurrentState && !usesInputCapture)
+                }
             }
             logits = l
             newHidden = extractContextFeature(
@@ -1494,9 +1500,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         ) { (args: [MLXArray]) -> [MLXArray] in
             CompiledDecodeTrace.withActive {
                 NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
-                    let (logits, captured) = capturedTarget.callAsFunction(
-                        args[0], cache: cacheRef, captureLayerIDs: capIDs,
-                        recordPrefixCommitStates: false)
+                    // Linear chain verify (see MultiRowDecodeAttention); the scope is read while tracing.
+                    let (logits, captured) = MultiRowDecodeAttention.withLinearChainMask {
+                        capturedTarget.callAsFunction(
+                            args[0], cache: cacheRef, captureLayerIDs: capIDs,
+                            recordPrefixCommitStates: false)
+                    }
                     var outs: [MLXArray] = [greedy ? argMax(logits, axis: -1) : logits]
                     for id in ids { outs.append(captured[id]!) }
                     return outs

@@ -56,6 +56,15 @@ public struct DFlash2TreePlan {
 
     /// Additive attention mask `[1, 1, W, prefix + W]`: every row sees the whole committed prefix
     /// and, inside the window, exactly its own root path.
+    /// Row r sees window row a (its own root path) — the window part of `attentionMask`.
+    public var windowVisibility: [[Bool]] {
+        (0 ..< rows).map { row in
+            var seen = [Bool](repeating: false, count: rows)
+            for a in paths[row] { seen[a] = true }
+            return seen
+        }
+    }
+
     public func attentionMask(prefix: Int, dtype: DType) -> MLXArray {
         var allowed = [Bool](repeating: false, count: rows * rows)
         for row in 0 ..< rows {
@@ -106,6 +115,15 @@ public final class DFlash2TreeScope: @unchecked Sendable {
     private var convCache: [Int: MLXArray] = [:]
 
     public init(plan: DFlash2TreePlan) { self.plan = plan }
+
+    private var windowBitsCache: MLXArray?
+    /// The tree's window visibility as MultiRowDecodeAttention window bits (built once per plan).
+    public var multiRowWindowBits: MLXArray {
+        if let windowBitsCache { return windowBitsCache }
+        let bits = MultiRowDecodeAttention.windowBits(plan.windowVisibility)
+        windowBitsCache = bits
+        return bits
+    }
 
     public func attentionMask(prefix: Int, dtype: DType) -> MLXArray {
         if let maskCache, maskCache.prefix == prefix, maskCache.mask.dtype == dtype {

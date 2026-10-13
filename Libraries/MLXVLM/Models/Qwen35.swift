@@ -4319,11 +4319,28 @@ extension Qwen35Language.Attention {
             x: values, positionIds: scope.plan.positionIds(start: start))
         (queries, keys) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: queries, k: keys, cos: cosValues, sin: sinValues)
+        let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+        if MultiRowDecodeAttention.enabled, !hadamard, type(of: cache) == KVCacheSimple.self, L <= 16 {
+            // Draft-tree verify through the multi-row kernel: prefix fully visible, window by root path.
+            let prefix = cache.offset
+            let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+            let attended: MLXArray
+            if MultiRowDecodeAttention.eligible(queries: queries, keys: cachedKeys, values: cachedValues) {
+                attended = MultiRowDecodeAttention.attend(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    windowBits: scope.multiRowWindowBits)
+            } else {
+                attended = MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    mask: .array(scope.attentionMask(prefix: prefix, dtype: queries.dtype)))
+            }
+            return oProj(compiledSigmoidMultiply(attended.transposed(0, 2, 1, 3).reshaped(1, L, -1), gate))
+        }
         let mask = scope.attentionMask(prefix: cache.offset, dtype: queries.dtype)
         let output = JangHadamardAttention.attention(
             queries: queries, keys: keys, values: values, cache: cache, scale: scale,
             mask: .array(mask),
-            enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+            enabled: hadamard
         )
         .transposed(0, 2, 1, 3)
         .reshaped(1, L, -1)
