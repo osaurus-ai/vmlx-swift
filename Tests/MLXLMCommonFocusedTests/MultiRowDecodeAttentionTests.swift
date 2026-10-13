@@ -11,6 +11,28 @@ import Testing
 /// the 32-key tile or of the block split.
 @Suite("Multi-row decode attention", .serialized)
 struct MultiRowDecodeAttentionTests {
+    @Test("linear-chain mask scope cannot change another request's custom mask")
+    func concurrentMaskIsolation() async {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let previous = MultiRowDecodeAttention.arrayMaskIsCausal
+        MultiRowDecodeAttention.arrayMaskIsCausal = false
+        defer { MultiRowDecodeAttention.arrayMaskIsCausal = previous }
+        let worker = Task.detached {
+            MultiRowDecodeAttention.withLinearChainMask {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 10)
+            }
+        }
+        func waitUntilEntered() -> DispatchTimeoutResult { entered.wait(timeout: .now() + 5) }
+        #expect(waitUntilEntered() == .success)
+        let customMask = MLXArray.ones([2, 4], type: Bool.self)
+        #expect(!MultiRowDecodeAttention.maskAllowed(.array(customMask), queryLength: 2, keyLength: 4))
+        release.signal()
+        await worker.value
+        #expect(!MultiRowDecodeAttention.maskAllowed(.array(customMask), queryLength: 2, keyLength: 4))
+    }
+
     func relativeError(rows: Int, gqa: Int, keys: Int, blocks: Int?, dim: Int = 128) -> Float {
         let hkv = 2, hq = hkv * gqa
         MLXRandom.seed(UInt64(rows * 1000 + keys))
