@@ -46,7 +46,11 @@ public enum DiskCacheIOProbe {
     public static func makeCold(_ url: URL) -> Double {
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else { return -1 }
-        _ = fcntl(fd, F_FULLFSYNC)
+        #if canImport(Darwin)
+            _ = fcntl(fd, F_FULLFSYNC)
+        #else
+            _ = fsync(fd)
+        #endif
         var info = stat()
         if fstat(fd, &info) == 0, info.st_size > 0,
             let map = mmap(nil, Int(info.st_size), PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED

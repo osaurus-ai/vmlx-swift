@@ -263,11 +263,17 @@ enum SafetensorsByteWriter {
             // Darwin `writev` rejects (EINVAL) a call whose lengths sum past a 32-bit int, so each call
             // carries at most `maxCallBytes` (a larger segment is written in pieces).
             let maxCallBytes = maxGatheredCallBytes
+            #if canImport(Darwin)
+                let maxVectors = Int(IOV_MAX)
+            #else
+                let configuredMax = sysconf(Int32(_SC_IOV_MAX))
+                let maxVectors = configuredMax > 0 ? Int(configuredMax) : 16
+            #endif
             while index < segments.count {
                 var iov: [iovec] = []
                 var callBytes = 0
                 var k = 0
-                while index + k < segments.count, iov.count < Int(IOV_MAX), callBytes < maxCallBytes {
+                while index + k < segments.count, iov.count < maxVectors, callBytes < maxCallBytes {
                     let (base, length) = segments[index + k]
                     let skip = k == 0 ? consumed : 0
                     let take = min(length - skip, maxCallBytes - callBytes)

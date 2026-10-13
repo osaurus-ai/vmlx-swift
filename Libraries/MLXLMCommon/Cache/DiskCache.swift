@@ -589,13 +589,16 @@ public final class DiskCache: @unchecked Sendable {
 
     private final class InflightWrite: @unchecked Sendable {
         let arrays: [String: MLXArray]
+        // Immutable CPU views travel with their evaluated backing-array owners.
+        let tensors: [SafetensorsByteWriter.Tensor]
         let tokenCount: Int
         let bytes: Int
         let geometry: RecurrentGeometry
         // Read and written under the owning DiskCache lock.
         var invalidated = false
-        init(arrays: [String: MLXArray], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry) {
+        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry) {
             self.arrays = arrays
+            self.tensors = tensors
             self.tokenCount = tokenCount
             self.bytes = bytes
             self.geometry = geometry
@@ -701,8 +704,12 @@ public final class DiskCache: @unchecked Sendable {
         var offset = 0
         while offset < size {
             let count = min(size - offset, 1 << 30)
-            var advice = radvisory(ra_offset: off_t(offset), ra_count: Int32(count))
-            _ = fcntl(fd, F_RDADVISE, &advice)
+            #if canImport(Darwin)
+                var advice = radvisory(ra_offset: off_t(offset), ra_count: Int32(count))
+                _ = fcntl(fd, F_RDADVISE, &advice)
+            #else
+                _ = posix_fadvise(fd, off_t(offset), off_t(count), POSIX_FADV_WILLNEED)
+            #endif
             offset += count
         }
     }
@@ -1339,7 +1346,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             let geometry = Self.recurrentGeometry(arrays)
             let entry = InflightWrite(
-                arrays: arrays, tokenCount: tokenCount, bytes: bytes, geometry: geometry)
+                arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry)
             inflight[hash] = entry
             inflightBytes += bytes
             inflightStoreCount += 1
@@ -1353,7 +1360,7 @@ public final class DiskCache: @unchecked Sendable {
             pendingWrites.enter()
             writerQueue.async { [self] in
                 completeWriteBehind(
-                    hash: hash, finalURL: url, tensors: tensors, tokenCount: tokenCount,
+                    hash: hash, finalURL: url, tensors: entry.tensors, tokenCount: tokenCount,
                     chainId: chainId, rowKind: rowKind, replayChunkSize: replayChunkSize,
                     enforceQuota: enforceQuota, layout: layout, geometry: geometry,
                     enqueued: enqueued, entry: entry)
