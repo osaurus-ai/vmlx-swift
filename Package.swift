@@ -860,6 +860,7 @@ let package = Package(
                 .process("Resources/audio_only.mov"),
                 .copy("Resources/modernbert-tiny.safetensors"),
                 .copy("Resources/modernbert-tiny.json"),
+                .copy("Resources/minicpmv47"),
             ]
         ),
         .testTarget(

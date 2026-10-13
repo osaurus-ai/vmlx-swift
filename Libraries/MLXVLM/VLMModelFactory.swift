@@ -138,14 +138,12 @@ public enum VLMTypeRegistry {
         "qwen3_5": createSelecting(Qwen35Configuration.self, Qwen35.init(_:requesting:)),
         "qwen3_5_moe": createSelecting(Qwen35Configuration.self, Qwen35MoE.init(_:requesting:)),
         // MiniCPM-V 4.7: a Qwen3.5 text model (dense `qwen3_5_text` 1B, MoE `qwen3_5_moe_text` 35B-A3B) under the
-        // same `language_model.` keys, plus MiniCPM's own SigLIP-style tower + resampler (`vision_tower.`, `merger.`).
-        // That tower is not ported yet, so the model is built TEXT-ONLY: `vision_config` is withheld, the instance
-        // reports `.text` only, and a vision/video request fails at construction instead of silently dropping media.
+        // same `language_model.` keys, plus MiniCPM's own SigLIP-style tower, window merger and resampler
+        // (`vision_tower.`, `merger.`). `Qwen35Configuration` decodes the MiniCPM `vision_config` and canvas fields
+        // for this model type and `Qwen35` carries `MiniCPMV47Vision.Tower` in its `vision_tower` slot; images
+        // are served, video is refused by the processor (frame stacking not ported).
         "minicpmv4_7": { data, requesting in
-            var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            object["vision_config"] = nil
-            let textData = try JSONSerialization.data(withJSONObject: object)
-            let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: textData)
+            let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: data)
             if configuration.textConfiguration.numExperts > 0 {
                 return try Qwen35MoE(configuration, requesting: requesting)
             }
