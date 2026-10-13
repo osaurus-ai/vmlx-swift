@@ -116,6 +116,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let isGreedy: Bool
     private let blockSize: Int
     private let maskTokenID: Int
+    /// Steps per AR stretch for this target (`arBurstSteps(for:)`).
+    private let arBurstSteps: Int
 
     let maxTokens: Int?
     var tokenCount = 0
@@ -466,6 +468,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths))
             }
         }
+        self.arBurstSteps = Self.arBurstSteps(for: target)
         self.maskTokenID = config.maskTokenId
         self.maxTokens = effectiveParameters.maxTokens
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -964,7 +967,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if bs <= 1, !drafterDisabled, widthChooser?.width == 1 {
             // The chooser measured AR as the faster option: a pipelined AR stretch, timed per step as width 1.
             let start = Date.timeIntervalSinceReferenceDate
-            let steps = runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget))
+            let steps = runAutoregressiveBurst(steps: Swift.min(arBurstSteps, budget))
             if steps > 0 {
                 widthChooser!.observe(
                     verifyWidth: 1, tokens: 1,
@@ -974,7 +977,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             return steps > 0
         }
         if bs <= 1 || drafterDisabled {
-            return runAutoregressiveBurst(steps: Swift.min(Self.arBurstSteps, budget)) > 0
+            return runAutoregressiveBurst(steps: Swift.min(arBurstSteps, budget)) > 0
         }
         let cycleStart = Date.timeIntervalSinceReferenceDate
         if treeMode == nil { treeMode = resolveTreeMode() }
@@ -1699,9 +1702,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 .utf8))
     }
 
-    /// Steps per AR stretch (`VMLX_DFLASH2_AR_BURST`, default 4; 1 = the serial single step).
-    static let arBurstSteps: Int = Swift.max(
-        1, Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") ?? 4)
+    /// Steps per AR stretch: `VMLX_DFLASH2_AR_BURST` when set, else the target's `DFlash2ARBurstPolicy`, else 1
+    /// (the serial single step). Not a global default: see `DFlash2ARBurstPolicy` for the per-target measurements.
+    static func arBurstSteps(for target: Any) -> Int {
+        if let forced = Int(ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_BURST"] ?? "") {
+            return Swift.max(1, forced)
+        }
+        return Swift.max(1, (target as? DFlash2ARBurstPolicy)?.dflash2ARBurstSteps ?? 1)
+    }
 
     /// `steps` single-token target steps, pipelined: step k + 1 is built on step k's lazy token and dispatched
     /// before step k is read back, so the GPU does not idle while the host builds the next graph (vMLX Python
