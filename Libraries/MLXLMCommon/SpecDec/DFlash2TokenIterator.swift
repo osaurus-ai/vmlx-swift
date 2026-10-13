@@ -77,6 +77,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
     public var emittedTokens: Int = 0
+    /// Tokens emitted by verification cycles, excluding the initial sample and AR fallback.
+    public var verifiedEmittedTokens: Int = 0
     public var seededContextRows: Int = 0
     public var autoregressiveFallbackTokens: Int = 0
     public var draftSeconds: Double = 0
@@ -88,7 +90,7 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     /// Mean number of tokens committed per verification cycle. 1.0 means the
     /// drafter contributed nothing; the ceiling is `blockSize`.
     public var acceptanceLength: Double {
-        verifyCalls > 0 ? Double(emittedTokens) / Double(verifyCalls) : 0
+        verifyCalls > 0 ? Double(verifiedEmittedTokens) / Double(verifyCalls) : 0
     }
 }
 
@@ -375,7 +377,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         blockSize requestedBlockSize: Int?,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
         guard input.text.tokens.size > 0 else {
             throw DFlash2RuntimeError.emptyPrompt
@@ -680,6 +683,22 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             stripAt > restoredCount ? stripAt - restoredCount : nil
         }
 
+        let totalPromptCount = self.promptTokenIds.count
+        if restoredCount > 0 {
+            prefillProgressHandler?(PrefillProgress(
+                stage: .cacheRestore, completedUnitCount: restoredCount,
+                totalUnitCount: totalPromptCount, detail: "dflash2"))
+        }
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: restoredCount,
+            totalUnitCount: totalPromptCount, detail: "dflash2"))
+        let reportPrefill: (Int) -> Void = { completed in
+            prefillProgressHandler?(PrefillProgress(
+                stage: .prefill,
+                completedUnitCount: Swift.min(totalPromptCount, restoredCount + completed),
+                totalUnitCount: totalPromptCount, detail: "dflash2"))
+        }
+
         if Self.traceEnabled {
             let promptCount = promptTokenIds.count
             let prefillCount = tokensToPrefill.count
@@ -692,6 +711,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let prefill: PrefillResult
         if mediaPrefill, let mediaTarget {
             var retained: MLXArray?
+            var completedMediaRows = 0
             var boundarySnapshot: [KVCache]?
             let ordered = self.orderedLayerIDs
             let restored = self.promptTokenIds.count - tokensToPrefill.count
@@ -711,6 +731,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     retained = combined
                 }
                 if let retained { MLX.eval(retained) }
+                completedMediaRows += chunkHidden.dim(1)
+                reportPrefill(completedMediaRows)
             }
             guard let retained else { throw DFlash2RuntimeError.emptyPrompt }
             MLX.eval(lastLogits, retained)
@@ -725,8 +747,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 orderedLayerIDs: self.orderedLayerIDs,
                 hiddenLimit: hiddenLimit,
                 stepSize: effectiveParameters.prefillStepSize,
-                captureBoundaryAt: captureAt)
+                captureBoundaryAt: captureAt,
+                progressHandler: reportPrefill)
         }
+        prefillProgressHandler?(PrefillProgress(
+            stage: .complete, completedUnitCount: totalPromptCount,
+            totalUnitCount: totalPromptCount, detail: "dflash2"))
         if Self.traceEnabled {
             let logitsShape = prefill.lastLogits.shape
             let hiddenShape = prefill.hidden.shape
@@ -840,7 +866,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         orderedLayerIDs: [Int],
         hiddenLimit: Int?,
         stepSize: Int,
-        captureBoundaryAt: Int? = nil
+        captureBoundaryAt: Int? = nil,
+        progressHandler: ((Int) -> Void)? = nil
     ) throws -> PrefillResult {
         guard !tokens.isEmpty else {
             throw DFlash2RuntimeError.emptyPrompt
@@ -893,6 +920,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 MLX.eval(cache)
                 if let retained { MLX.eval(retained) }
                 Memory.clearCache()
+                progressHandler?(end)
             }
             start = end
         }
@@ -902,6 +930,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let lastLogits = logits[0..., (logits.dim(1) - 1)..., 0...]
         try Task.checkCancellation()
         MLX.eval(lastLogits, retained)
+        progressHandler?(tokens.count)
         return PrefillResult(
             lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
     }
@@ -1343,6 +1372,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         lastToken = last
         pendingTokens = emitted
         stats.emittedTokens += emitted.count
+        stats.verifiedEmittedTokens += emitted.count
         if adaptiveBlockSizeEnabled, stagedCycle {
             updateAdaptiveBlockSize(
                 emitted: emitted.count, verifySeconds: cycleVerifySeconds)
@@ -1507,6 +1537,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         lastToken = last
         pendingTokens = emitted
         stats.emittedTokens += emitted.count
+        stats.verifiedEmittedTokens += emitted.count
         stats.treeCycles += 1
         if widthChooser != nil {
             widthChooser!.observe(

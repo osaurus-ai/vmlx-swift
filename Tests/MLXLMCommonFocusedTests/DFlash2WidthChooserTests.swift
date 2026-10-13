@@ -10,6 +10,25 @@ import XCTest
 
 final class DFlash2WidthChooserTests: XCTestCase {
 
+    func testAcceptanceLengthExcludesAutoregressiveFallback() {
+        var stats = DFlash2GenerationStats()
+        stats.verifyCalls = 2
+        stats.emittedTokens = 36
+        stats.verifiedEmittedTokens = 5
+        stats.autoregressiveFallbackTokens = 30
+        XCTAssertEqual(stats.acceptanceLength, 2.5)
+        stats.emittedTokens += 100
+        stats.autoregressiveFallbackTokens += 100
+        XCTAssertEqual(stats.acceptanceLength, 2.5)
+    }
+
+    func testAROnlyHasNoVerificationAcceptance() {
+        var stats = DFlash2GenerationStats()
+        stats.emittedTokens = 100
+        stats.autoregressiveFallbackTokens = 100
+        XCTAssertEqual(stats.acceptanceLength, 0)
+    }
+
     /// Run `cycles` of the chooser against a fixed world: `seconds[w]` per cycle at width w, and
     /// `acceptedAt[w]` accepted drafts per verify cycle. Returns how often each width ran.
     private func simulate(
