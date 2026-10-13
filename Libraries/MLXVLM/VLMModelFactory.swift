@@ -137,6 +137,20 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": createSelecting(Qwen35Configuration.self, Qwen35.init(_:requesting:)),
         "qwen3_5_moe": createSelecting(Qwen35Configuration.self, Qwen35MoE.init(_:requesting:)),
+        // MiniCPM-V 4.7: a Qwen3.5 text model (dense `qwen3_5_text` 1B, MoE `qwen3_5_moe_text` 35B-A3B) under the
+        // same `language_model.` keys, plus MiniCPM's own SigLIP-style tower + resampler (`vision_tower.`, `merger.`).
+        // That tower is not ported yet, so the model is built TEXT-ONLY: `vision_config` is withheld, the instance
+        // reports `.text` only, and a vision/video request fails at construction instead of silently dropping media.
+        "minicpmv4_7": { data, requesting in
+            var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            object["vision_config"] = nil
+            let textData = try JSONSerialization.data(withJSONObject: object)
+            let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: textData)
+            if configuration.textConfiguration.numExperts > 0 {
+                return try Qwen35MoE(configuration, requesting: requesting)
+            }
+            return try Qwen35(configuration, requesting: requesting)
+        },
         "qwen4_exp": createSelecting(Qwen4ExpConfiguration.self, Qwen4Exp.init(_:requesting:)),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "muse_glimmer": createSelecting(MuseGlimmerConfiguration.self, MuseGlimmer.init(_:requesting:)),
@@ -247,6 +261,7 @@ public enum VLMProcessorTypeRegistry {
             "ministral3": "Mistral3Processor",
             "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
             "nemotron_h_omni": "NemotronHOmniProcessor",
+            "minicpmv4_7": "MiniCPMV47Processor",
         ]
         return processorTypeOverrides[modelType] ?? declaredProcessorType
     }
@@ -268,6 +283,8 @@ public enum VLMProcessorTypeRegistry {
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "MiniCPMV47Processor": create(
+            MiniCPMV47ProcessorConfiguration.self, MiniCPMV47Processor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
         "Gemma3Processor": create(

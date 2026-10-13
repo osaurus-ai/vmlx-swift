@@ -4134,7 +4134,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // With no tower built, the bundle's vision weights have no destination — drop them
         // rather than hand them to a module that does not exist.
         guard let visionModel else {
-            return sanitized.filter { !$0.key.contains("visual") && !$0.key.contains("vision_tower") }
+            // `merger.` is MiniCPM-V's top-level resampler (Qwen keeps its merger under the tower).
+            return sanitized.filter {
+                !$0.key.contains("visual") && !$0.key.contains("vision_tower") && !$0.key.hasPrefix("merger.")
+            }
         }
         return visionModel.sanitize(weights: sanitized)
     }
