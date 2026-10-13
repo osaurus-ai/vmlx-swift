@@ -512,6 +512,14 @@ public final class VLMModelFactory: ModelFactory {
         if let qwen35JANGHPreparation {
             configData = qwen35JANGHPreparation.dense.ordinaryConfiguration
         }
+        let miniCPMJANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil)
+            ? try MiniCPMV47JANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let miniCPMJANGHPreparation {
+            configData = miniCPMJANGHPreparation.banks.ordinaryConfiguration
+        }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -684,6 +692,10 @@ public final class VLMModelFactory: ModelFactory {
                     configurationData: mergedConfigData, requesting: configuration.requestedModalities)
             } else if let qwen35JANGHPreparation {
                 model = try qwen35JANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let miniCPMJANGHPreparation {
+                model = try miniCPMJANGHPreparation.construct(
                     configurationData: mergedConfigData,
                     requesting: configuration.requestedModalities)
             } else {
