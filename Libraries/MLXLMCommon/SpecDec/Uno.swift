@@ -18,7 +18,11 @@
 // cache holds every committed token except `final`, which becomes the next cycle's seed: exactly the
 // invariant ordinary decoding keeps (cache = prompt + returned tokens; the next token sampled, pending).
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
 
