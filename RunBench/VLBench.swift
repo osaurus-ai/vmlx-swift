@@ -530,6 +530,135 @@ enum VLBench {
         print("=== VLBench VIDEO BATCH done ===")
     }
 
+    // MARK: - Image smoke (real file, three connected turns)
+
+    /// Three connected turns through the production processor + BatchEngine:
+    ///   T1 image + prompt (thinking as given), T2 text-only follow-up with T1 in history,
+    ///   T3 the same image again with thinking flipped. Prints TTFT, prompt tok/s, decode tok/s and
+    /// the full visible/reasoning text of every turn; fails on an incomplete generation, a leaked
+    /// `<think>` marker or an empty answer.
+    static func runImageSmoke(
+        modelPath: String, imagePath: String, prompt: String, followUp: String, thinking: Bool,
+        temperature: Float, maxNewTokens: Int
+    ) async throws {
+        let modelDir = URL(fileURLWithPath: modelPath)
+        print("=== VLBench IMAGE SMOKE — \(modelDir.lastPathComponent) ===")
+        guard let image = CIImage(contentsOf: URL(fileURLWithPath: imagePath)) else {
+            throw NSError(domain: "VLBench", code: 30,
+                          userInfo: [NSLocalizedDescriptionKey: "cannot load image \(imagePath)"])
+        }
+        print("image: \(imagePath) extent=\(Int(image.extent.width))x\(Int(image.extent.height))")
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let context = try await loadProductionContext(from: modelDir)
+        print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+        print("Model: \(type(of: context.model))")
+        print("Processor: \(type(of: context.processor))")
+        if let bearing = context.model as? ModalityBearing {
+            print("Modalities: \(bearing.modalities.modalityDescription)")
+        }
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1)
+        var params = GenerateParameters(maxTokens: maxNewTokens, temperature: temperature, prefillStepSize: 512)
+        params.maxTokens = maxNewTokens
+        print("Sampling: temperature=\(params.temperature) maxTokens=\(maxNewTokens) thinking(T1)=\(thinking)")
+
+        var history: [Chat.Message] = []
+        let turns: [(label: String, chat: [Chat.Message], thinking: Bool)] = [
+            ("T1 image thinking=\(thinking)", [.user(prompt, images: [.ciImage(image)])], thinking),
+        ]
+        var answers: [String] = []
+        for (label, chat, think) in turns {
+            history = chat
+            answers.append(try await runSmokeTurn(label: label, engine: engine, ctx: ctx, chat: history, thinking: think, params: params))
+        }
+        history.append(.assistant(answers[0]))
+        history.append(.user(followUp))
+        answers.append(try await runSmokeTurn(
+            label: "T2 text follow-up thinking=\(thinking)", engine: engine, ctx: ctx, chat: history,
+            thinking: thinking, params: params))
+        history.append(.assistant(answers[1]))
+        history.append(.user("Look at the image once more. " + prompt, images: [.ciImage(image)]))
+        answers.append(try await runSmokeTurn(
+            label: "T3 image again thinking=\(!thinking)", engine: engine, ctx: ctx, chat: history,
+            thinking: !thinking, params: params))
+        print("\n=== VLBench IMAGE SMOKE done ===")
+    }
+
+    private static func runSmokeTurn(
+        label: String, engine: BatchEngine, ctx: ModelContext, chat: [Chat.Message], thinking: Bool,
+        params: GenerateParameters
+    ) async throws -> String {
+        print("\n[\(label)]")
+        var input = UserInput(chat: chat)
+        input.additionalContext = ["enable_thinking": thinking]
+        let prepStart = CFAbsoluteTimeGetCurrent()
+        let lmInput = try await ctx.processor.prepare(input: input)
+        let prepMs = (CFAbsoluteTimeGetCurrent() - prepStart) * 1000
+        let ids = lmInput.text.tokenIds ?? []
+        let imageId = ctx.tokenizer.convertTokenToId("<|image_pad|>") ?? -1
+        print(String(format: "  prepare(): %.0fms tokens=%d image_pads=%d pixels=%@ frames=%@",
+            prepMs, ids.count, ids.filter { $0 == imageId }.count,
+            lmInput.image?.pixels.shape.description ?? "nil",
+            lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil"))
+        let t0 = CFAbsoluteTimeGetCurrent()
+        nonisolated(unsafe) let sendable = lmInput
+        let stream = await engine.generate(input: sendable, parameters: params)
+        var text = ""
+        var reasoning = ""
+        var ttft: Double?
+        var generationTokens = 0
+        var promptTokensPerSecond = 0.0
+        var decodeTokensPerSecond = 0.0
+        var promptTime = 0.0
+        var stopReason = "unknown"
+        var unclosedReasoning = false
+        for await event in stream {
+            switch event {
+            case .chunk(let chunk):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                text += chunk
+            case .reasoning(let chunk):
+                if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
+                reasoning += chunk
+            case .info(let info):
+                generationTokens = info.generationTokenCount
+                promptTokensPerSecond = info.promptTokensPerSecond
+                decodeTokensPerSecond = info.tokensPerSecond
+                promptTime = info.promptTime
+                stopReason = String(describing: info.stopReason)
+                unclosedReasoning = info.unclosedReasoning
+            case .prefillProgress, .toolCall, .toolCallProgress:
+                break
+            }
+        }
+        let total = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format:
+            "  TTFT %dms total %.2fs promptTime %.2fs promptTok/s=%.1f genTokens=%d decodeTok/s=%.1f stop=%@ unclosedReasoning=%@",
+            Int((ttft ?? 0) * 1000), total, promptTime, promptTokensPerSecond, generationTokens,
+            decodeTokensPerSecond, stopReason, unclosedReasoning ? "true" : "false"))
+        print("  FULL_REASONING \(reasoning.debugDescription)")
+        print("  FULL_TEXT \(text.debugDescription)")
+        guard stopReason == "stop", !unclosedReasoning else {
+            throw NSError(domain: "VLBench", code: 31,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): incomplete generation stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+        }
+        let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !visible.isEmpty else {
+            throw NSError(domain: "VLBench", code: 32,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): empty visible answer"])
+        }
+        if let marker = ["<think>", "</think>", "<|image_pad|>", "<image>", "</image>", "<slice>"].first(where: { visible.contains($0) }) {
+            throw NSError(domain: "VLBench", code: 33,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): leaked marker \(marker)"])
+        }
+        if !thinking, !reasoning.isEmpty {
+            throw NSError(domain: "VLBench", code: 34,
+                          userInfo: [NSLocalizedDescriptionKey: "\(label): reasoning deltas with thinking off"])
+        }
+        return text
+    }
+
     // MARK: - Mixed-variable multi-turn matrix (2026-04-22)
 
     /// Single model + single BatchEngine, four turns with different

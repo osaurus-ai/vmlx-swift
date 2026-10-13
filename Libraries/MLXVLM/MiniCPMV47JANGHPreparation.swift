@@ -44,13 +44,11 @@ struct MiniCPMV47JANGHPreparation {
                     modulePrefix: "language_model.")))
     }
 
-    /// Build the text-only Qwen3.5-MoE (the vision tower is not ported; see `minicpmv4_7` in VLMModelFactory) from the
-    /// ordinary configuration, then replace every routed `switch_mlp` with its JANGH bank BEFORE weights load.
+    /// Build the Qwen3.5-MoE with MiniCPM's vision tower (see `minicpmv4_7` in VLMModelFactory) from the ordinary
+    /// configuration, then replace every routed `switch_mlp` with its JANGH bank BEFORE weights load. The vision
+    /// weights are ordinary bf16 and load through the generic path.
     func construct(configurationData: Data, requesting: Set<ModelRuntimeRequestModality>?) throws -> Qwen35MoE {
-        var object = try JSONSerialization.jsonObject(with: configurationData) as? [String: Any] ?? [:]
-        object["vision_config"] = nil
-        let config = try JSONDecoder.json5().decode(
-            Qwen35Configuration.self, from: try JSONSerialization.data(withJSONObject: object))
+        let config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData)
         let model = try Qwen35MoE(config, requesting: requesting)
         let routed = try banks.makeRoutedExperts(activationLimit: nil)
         let modules = Set(model.leafModules().flattened().map(\.0))

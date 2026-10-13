@@ -1200,6 +1200,12 @@ public struct Qwen35Configuration: Codable, Sendable {
     /// Optional, like `Gemma4Configuration.visionConfig`. A text-only Qwen 3.5 bundle carries no
     /// `vision_config`, and while this was non-optional such a bundle could not DECODE at all.
     public let visionConfiguration: VisionConfiguration?
+    /// MiniCPM-V 4.7 (`model_type == "minicpmv4_7"`) carries a SigLIP tower instead of Qwen3-VL's; its
+    /// `vision_config` decodes here and `visionConfiguration` stays nil. Exactly one of the two is set for a
+    /// bundle with vision weights.
+    public var miniCPMVisionConfiguration: MiniCPMV47VisionConfiguration? = nil
+    /// MiniCPM-V 4.7 top-level merger/canvas fields (`insert_layer_id`, `downsample_mode`, marker ids).
+    public var miniCPMCanvas: MiniCPMV47CanvasConfiguration? = nil
     public let modelType: String
     private let _ignoreIndex: Int?
     public var ignoreIndex: Int { _ignoreIndex ?? -100 }
@@ -1234,6 +1240,60 @@ public struct Qwen35Configuration: Codable, Sendable {
         case _vocabSize = "vocab_size"
         case _eosTokenId = "eos_token_id"
     }
+
+    public static let miniCPMV47ModelType = "minicpmv4_7"
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        textConfiguration = try c.decode(TextConfiguration.self, forKey: .textConfiguration)
+        modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? ""
+        if modelType == Self.miniCPMV47ModelType {
+            visionConfiguration = nil
+            miniCPMVisionConfiguration = try c.decodeIfPresent(
+                MiniCPMV47VisionConfiguration.self, forKey: .visionConfiguration)
+            miniCPMCanvas = try MiniCPMV47CanvasConfiguration(from: decoder)
+        } else {
+            visionConfiguration = try c.decodeIfPresent(VisionConfiguration.self, forKey: .visionConfiguration)
+        }
+        _ignoreIndex = try c.decodeIfPresent(Int.self, forKey: ._ignoreIndex)
+        _imageTokenId = try c.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+        _videoTokenId = try c.decodeIfPresent(Int.self, forKey: ._videoTokenId)
+        _imageTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._imageTokenIndex)
+        _videoTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._videoTokenIndex)
+        _visionStartTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionStartTokenId)
+        _visionEndTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionEndTokenId)
+        _vocabSize = try c.decodeIfPresent(Int.self, forKey: ._vocabSize)
+        _eosTokenId = try c.decodeIfPresent(IntOrIntArray.self, forKey: ._eosTokenId)
+    }
+
+    /// Whether any vision tower can be built from this configuration.
+    public var hasVisionConfiguration: Bool {
+        visionConfiguration != nil || miniCPMVisionConfiguration != nil
+    }
+}
+
+/// The vision module `Qwen35` carries in its `vision_tower` slot. Qwen3-VL's tower and MiniCPM-V 4.7's
+/// SigLIP tower + resampler both turn packed pixel patches into one LLM-embedding row per merged patch group,
+/// scattered onto the placeholder positions by the model.
+protocol Qwen35VisionPath: AnyObject {
+    /// Dtype pixels are cast to before entering the tower.
+    var visionDType: DType { get }
+    /// `[rows, llm hidden]`, crops/frames in input order.
+    func features(pixels: MLXArray, frames: [THW]) -> MLXArray
+    /// Rows `features` yields for these frames.
+    func mergedRowCount(for frames: [THW]) -> Int
+    /// Vision-side weight key/layout fixes, applied after the language-model remap.
+    func sanitizeVision(weights: [String: MLXArray]) -> [String: MLXArray]
+}
+
+extension Qwen3VLVision.VisionModel: Qwen35VisionPath {
+    var visionDType: DType { patchEmbed.proj.weight.dtype }
+    func features(pixels: MLXArray, frames: [THW]) -> MLXArray { self(pixels, gridTHW: frames).0 }
+    func mergedRowCount(for frames: [THW]) -> Int {
+        let divisor = max(1, spatialMergeSize * spatialMergeSize)
+        return frames.reduce(0) { $0 + $1.product / divisor }
+    }
+    func sanitizeVision(weights: [String: MLXArray]) -> [String: MLXArray] { sanitize(weights: weights) }
 }
 
 // MARK: - Language
@@ -3279,6 +3339,21 @@ enum Qwen35Language {
                         positionIds =
                             precomputedPositionIds[
                                 0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
+                    } else if let canvas = config.miniCPMCanvas,
+                        imageGridTHW != nil || videoGridTHW != nil
+                    {
+                        // MiniCPM-V 4.7 canvas M-RoPE: thumbnail stretched over the slice canvas, markers
+                        // pinned to its corners (`MiniCPMV4_7Model.get_rope_index`).
+                        let (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                            inputIds: inputs,
+                            imageGrids: imageGridTHW,
+                            videoGrids: videoGridTHW,
+                            imageTokenId: config.imageTokenId,
+                            videoTokenId: config.videoTokenId,
+                            canvas: canvas)
+                        positionIds = computed
+                        precomputedPositionIds = computed
+                        ropeDeltas = deltas
                     } else {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputs,
@@ -3508,7 +3583,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         !customDenseTensorNames.isEmpty && customDenseTensorNames.contains(key)
     }
 
-    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
+    /// Qwen3-VL's `Qwen3VLVision.VisionModel` or MiniCPM-V 4.7's `MiniCPMV47Vision.Tower`, both conforming to
+    /// `Qwen35VisionPath`; one module slot because both bundles store their tower under `vision_tower.`.
+    @ModuleInfo(key: "vision_tower") private var visionModel: Module?
+    fileprivate var visionPath: (any Qwen35VisionPath)? { visionModel as? any Qwen35VisionPath }
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
@@ -3525,7 +3603,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     public static func constructibleModalities(
         of config: Qwen35Configuration
     ) -> Set<ModelRuntimeRequestModality> {
-        config.visionConfiguration != nil ? [.text, .vision, .video] : [.text]
+        if config.visionConfiguration != nil { return [.text, .vision, .video] }
+        // MiniCPM-V 4.7: images only. Its video path (frames stacked onto one canvas image) is not ported.
+        if config.miniCPMVisionConfiguration != nil { return [.text, .vision] }
+        return [.text]
     }
 
 
@@ -3536,7 +3617,9 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) -> Set<ModelRuntimeRequestModality> {
         var m: Set<ModelRuntimeRequestModality> = []
         if components.contains(.languageCore) { m.insert(.text) }
-        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
+        if components.contains(.visionTower) {
+            m.formUnion(config.miniCPMVisionConfiguration != nil ? [.vision] : [.vision, .video])
+        }
         return m
     }
 
@@ -3578,18 +3661,28 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // than copied from the plan. A tower that did not get built — because the caller narrowed
         // the request, or because the configuration had no vision stanza — cannot contribute, so
         // the report cannot claim a lane the instance lacks.
-        var tower: Qwen3VLVision.VisionModel?
+        var tower: (any ModelCapabilityProviding)?
         if let vision = config.visionConfiguration, plan.builds(.visionTower) {
-            tower = Qwen3VLVision.VisionModel(vision)
-            _visionModel.wrappedValue = tower
+            let built = Qwen3VLVision.VisionModel(vision)
+            tower = built
+            _visionModel.wrappedValue = built
+        } else if let vision = config.miniCPMVisionConfiguration, plan.builds(.visionTower) {
+            let built = MiniCPMV47Vision.Tower(
+                vision, canvas: config.miniCPMCanvas ?? MiniCPMV47CanvasConfiguration(),
+                llmHidden: config.textConfiguration.hiddenSize)
+            tower = built
+            _visionModel.wrappedValue = built
         }
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
 
         // The components declare their own contribution; `.video` is added here because it needs
-        // this model's video token id, which the encoder knows nothing about.
+        // this model's video token id, which the encoder knows nothing about. MiniCPM-V 4.7's tower
+        // serves images only (its video path is not ported), so it never gains `.video`.
         var provided = Set<ModelRuntimeRequestModality>.provided(by: [tower])
         provided.insert(.text)  // this family's core is a text LM
-        if provided.contains(.vision), config.videoTokenId != nil { provided.insert(.video) }
+        if provided.contains(.vision), config.videoTokenId != nil, config.miniCPMVisionConfiguration == nil {
+            provided.insert(.video)
+        }
         self.modalities = provided
         super.init()
     }
@@ -3699,10 +3792,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// vision tower's output rows: each `THW` frame yields
     /// `t*h*w / spatialMergeSize^2` rows.
     private func mergedRowCount(for frames: [THW]?) -> Int {
-        guard let frames, let vision = config.visionConfiguration else { return 0 }
-        let merge = vision.spatialMergeSize
-        let divisor = max(1, merge * merge)
-        return frames.reduce(0) { $0 + $1.product / divisor }
+        guard let frames, let visionPath else { return 0 }
+        return visionPath.mergedRowCount(for: frames)
     }
 
     private func nonZero(_ mask: MLXArray) -> [Int] {
@@ -3742,8 +3833,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 + "(modalities: \(modalities.modalityDescription)). "
                 + "Load with .vision requested, or send text only.")
         }
-        let visionDType =
-            visionModel?.patchEmbed.proj.weight.dtype ?? languageModel.model.embedTokens.weight.dtype
+        let visionDType = visionPath?.visionDType ?? languageModel.model.embedTokens.weight.dtype
         var pixelParts: [MLXArray] = []
 
         if let image = input.image {
@@ -3760,12 +3850,12 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues, let visionModel,
+        if let pixelValues, let visionPath,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
             let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let visionHidden = visionPath.features(pixels: pixelValues, frames: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
@@ -4133,13 +4223,13 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
         // With no tower built, the bundle's vision weights have no destination — drop them
         // rather than hand them to a module that does not exist.
-        guard let visionModel else {
+        guard let visionPath else {
             // `merger.` is MiniCPM-V's top-level resampler (Qwen keeps its merger under the tower).
             return sanitized.filter {
                 !$0.key.contains("visual") && !$0.key.contains("vision_tower") && !$0.key.hasPrefix("merger.")
             }
         }
-        return visionModel.sanitize(weights: sanitized)
+        return visionPath.sanitizeVision(weights: sanitized)
     }
 
     private static func mtpNormWeightsNeedShift(_ weights: [String: MLXArray]) -> Bool {
@@ -4577,10 +4667,10 @@ extension Qwen35: DFlash2MediaPrefillModel {
         onChunk: ([Int: MLXArray]) -> Void
     ) throws -> MLXArray {
         let inputIds = input.text.tokens
-        guard let visionModel else {
+        guard let visionPath else {
             throw VLMError.processing("media prefill needs the vision tower")
         }
-        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        let visionDType = visionPath.visionDType
         var pixelParts: [MLXArray] = []
         var imageFrames: [THW]?
         var videoFrames: [THW]?
@@ -4605,7 +4695,7 @@ extension Qwen35: DFlash2MediaPrefillModel {
             embeddings = textEmbeds
         } else {
             // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
-            let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
+            let visionHidden = visionPath.features(pixels: concatenated(pixelParts), frames: frames)
             embeddings = try mergeInputIdsWithImageFeatures(
                 imageFeatures: visionHidden.asType(textEmbeds.dtype),
                 imageRowCount: mergedRowCount(for: imageFrames),
