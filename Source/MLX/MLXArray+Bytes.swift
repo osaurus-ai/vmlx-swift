@@ -121,6 +121,10 @@ extension MLXArray {
     /// - ``asData(noCopy:disambiguate:)``
     /// - ``asMTLBuffer(device:noCopy:)``
     public func asArray<T: HasDType>(_ type: T.Type) -> [T] {
+        guard isValid else {
+            reportInvalidArrayUse("MLXArray.asArray")
+            return []
+        }
         if type.dtype != self.dtype {
             return self.asType(type).asArray(type)
         }

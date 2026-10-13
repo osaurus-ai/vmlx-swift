@@ -375,6 +375,10 @@ public final class MLXArray {
     /// let value = array[1].item(Float.self)
     /// ```
     public func item<T: HasDType>(_ type: T.Type) -> T {
+        guard isValid else {
+            reportInvalidArrayUse("MLXArray.item")
+            return Self.zeroFilled(count: 1)[0]
+        }
         precondition(self.size == 1)
         // A failed eval leaves no `array::Data`; the mlx-c item accessors would
         // re-run the failing eval and the complex path dereferences null.

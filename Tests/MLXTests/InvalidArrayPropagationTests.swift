@@ -30,6 +30,20 @@ class InvalidArrayPropagationTests: XCTestCase {
             line: line)
     }
 
+    func testInvalidArrayHostConversionPropagatesWithoutRecursing() {
+        XCTAssertThrowsError(try withError {
+            let bad = invalidArray()
+            _ = bad.asArray(Float.self)
+        }) { assertOriginatingError($0) }
+    }
+
+    func testInvalidScalarHostReadPropagatesWithoutSizeTrap() {
+        XCTAssertThrowsError(try withError {
+            let bad = invalidArray()
+            _ = bad.item(Int.self)
+        }) { assertOriginatingError($0) }
+    }
+
     func testInvalidArrayReadsAsRankZero() {
         XCTAssertThrowsError(
             try withError { error in
