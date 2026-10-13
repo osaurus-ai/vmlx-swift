@@ -50,6 +50,23 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
             "BatchEngine's solo path must read the drafter path off the strategy")
     }
 
+    /// A DFlash 2 request that arrives while the engine serves another request (continuous batching
+    /// > 1: a spawned subagent, a parallel delegation) decodes as a batched AR slot, with a log line,
+    /// instead of being cancelled. The second of two concurrent requests used to fail outright.
+    func testBatchEngineGenerateServesABusyEngineDFlash2RequestAutoregressively() throws {
+        let text = try source("Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift")
+        XCTAssertFalse(
+            text.contains("Rejected BatchEngine.generate DFlash 2 request"),
+            "a busy engine must not cancel a DFlash 2 request")
+        guard let notice = text.range(of: "BatchEngine.generate DFlash 2 request decodes autoregressively") else {
+            return XCTFail("the autoregressive fallback must be logged")
+        }
+        let after = text[notice.upperBound...].prefix(400)
+        XCTAssertTrue(
+            after.contains("parameters.draftStrategy = nil"),
+            "the fallback must drop the strategy so the batched path does not carry it")
+    }
+
     /// The raw batched submit path has no way to express a draft/verify
     /// cycle, so it must refuse rather than quietly decode without it.
     func testBatchEngineSubmitRefusesDFlash2RatherThanIgnoringIt() throws {

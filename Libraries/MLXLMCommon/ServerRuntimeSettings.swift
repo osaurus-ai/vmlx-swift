@@ -633,12 +633,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         configData: Data?, bundleDirectory: URL?
     ) -> VMLXDFlash2DrafterInfo? {
         guard mtp.mode != .off, let bundleDirectory else { return nil }
-        // `dflash2/` (DFlash 2) or `dspark/` (DSpark, e.g. MiniCPM-V 4.7): both run on the DFlash 2 lane.
+        // `dflash2/` (DFlash 2) or `dspark/` (DSpark, e.g. MiniCPM-V 4.7): both run on the DFlash 2 lane. A fitting
+        // drafter is used by default (Eric, 2026-10-12); `jang_config.json` `speculative.default` does not suppress it.
+        // The width chooser keeps AR as width 1, and Speculative Decoding Off (`mtp.mode == .off`) turns it off.
         for name in ["dflash2", "dspark"] {
-            // A bundle that stamps its DSpark drafter off by default (`jang_config.json` `speculative.default: false`)
-            // keeps plain decoding unless the user selects the drafter. MiniCPM-V 4.7 ships it that way: the 1B
-            // measured slower with DSpark than without.
-            if name == "dspark", Self.bundleStampsSpeculativeOff(bundleDirectory) { continue }
             let local = bundleDirectory.appendingPathComponent(name, isDirectory: true)
             if let info = VMLXDFlash2DrafterInfo.read(at: local),
                 info.mismatchReason(configData: configData) == nil
@@ -647,17 +645,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             }
         }
         return nil
-    }
-
-    /// `jang_config.json` `speculative.default == false` (explicitly). Absent stamps decide nothing.
-    static func bundleStampsSpeculativeOff(_ bundleDirectory: URL) -> Bool {
-        guard
-            let data = try? Data(contentsOf: bundleDirectory.appendingPathComponent("jang_config.json")),
-            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let speculative = root["speculative"] as? [String: Any],
-            let enabledByDefault = speculative["default"] as? Bool
-        else { return false }
-        return !enabledByDefault
     }
 
     /// Why the selected drafter is not being used for this bundle, for

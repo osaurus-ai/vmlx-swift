@@ -750,16 +750,20 @@ public actor BatchEngine {
         if parameters.draftStrategy?.usesDFlash2 == true,
             DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
         {
-            guard canStartExclusiveSoloPath else {
-                Self.logger.error(
-                    "Rejected BatchEngine.generate DFlash 2 request: block-diffusion drafting is an exclusive solo path until batched scheduling lands."
-                )
-                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+            if canStartExclusiveSoloPath {
+                return startSoloFastPath(
+                    input: input,
+                    parameters: parameters,
+                    promptTail: promptTail)
             }
-            return startSoloFastPath(
-                input: input,
-                parameters: parameters,
-                promptTail: promptTail)
+            // Another request owns the engine (continuous batching > 1: a spawned subagent, a parallel
+            // delegation). The drafter is a separate model and the target is untouched, so this request
+            // decodes as an ordinary batched AR slot instead of being cancelled (it was: the second of two
+            // concurrent requests on a DFlash 2 / DSpark model failed outright).
+            Self.logger.notice(
+                "BatchEngine.generate DFlash 2 request decodes autoregressively: the engine is serving another request and drafting is an exclusive solo path."
+            )
+            parameters.draftStrategy = nil
         }
         // Block-diffusion models (e.g. diffusion_gemma) generate whole
         // canvases via denoising and cannot share batched decode slots.
