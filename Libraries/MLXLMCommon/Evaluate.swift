@@ -5182,16 +5182,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
-            // Hosts install a non-fatal MLX error handler, so a C++ error in
-            // the prefill forward (Metal allocation or command-buffer failure
-            // under memory pressure, a kernel failure) is logged and swallowed
-            // while the arrays downstream of it are never realized. Snapshot
-            // the process-wide error sequence so such a failure finishes this
-            // request with its diagnostic (Sentry APPLE-MACOS-1ZE / 2PW / 1X5:
-            // the PLE token read of exactly those arrays used to be the crash).
-            let preparationEpoch = MLXErrorMonitor.sequence()
+            // Collect only errors escaping this operation's scoped handlers.
+            // A process-wide counter also sees unrelated requests and probes
+            // whose owners caught their errors and selected a valid fallback.
             do {
-                iterator = try makeIterator.consume()()
+                iterator = try MLX.withError { try makeIterator.consume()() }
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -5243,27 +5238,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 return
             }
 
-            if let mlxError = MLXErrorMonitor.message(since: preparationEpoch) {
-                Logger(subsystem: "vmlx", category: "generateLoopTask").error(
-                    "MLX error during prompt processing: \(mlxError, privacy: .public)")
-                StreamOrDevice.default.stream.synchronize()
-                handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(
-                    handler.infoEvent(
-                        GenerateCompletionInfo(
-                            promptTokenCount: promptTokenCount,
-                            generationTokenCount: 0,
-                            promptTime: iterator.promptPrefillTime,
-                            generationTime: 0,
-                            stopReason: .cancelled,
-                            toolCallProtocolFailure: handler.toolCallProtocolFailure,
-                            generationFailure: GenerationFailure(
-                                stage: .preparation,
-                                cause: "MLX error during prompt processing: \(mlxError)"))))
-                continuation.finish()
-                return
-            }
-
             var start = Date.timeIntervalSinceReferenceDate
             var promptTime: TimeInterval = 0
             var tokenCount = 0
@@ -5276,19 +5250,18 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            var stepEpoch = MLXErrorMonitor.sequence()
-            while let token = iterator.next() {
-                // See `preparationEpoch`: a swallowed MLX error inside this
-                // step leaves the sampled token unrealized (it reads back as
-                // zero). Stop with the diagnostic instead of emitting it and
-                // decoding from a model state that was never computed.
-                if let mlxError = MLXErrorMonitor.message(since: stepEpoch) {
+            while true {
+                let nextToken: Int?
+                do {
+                    nextToken = try MLX.withError { iterator.next() }
+                } catch {
                     decodeFailure = GenerationFailure(
-                        stage: .decoding, cause: "MLX error during decode: \(mlxError)")
+                        stage: .decoding, cause: "MLX error during decode: \(error.localizedDescription)")
                     stopReason = .cancelled
                     streamTiming?.recordTermination("mlx_error")
                     break
                 }
+                guard let token = nextToken else { break }
 
                 // Check for cancellation on every loop iteration. A consumer
                 // that stops after the handler surfaced a parsed tool call is
@@ -5344,17 +5317,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     break
                 }
                 generatedTokenIds.append(token)
-                stepEpoch = MLXErrorMonitor.sequence()
             }
 
-            // The error may have fired inside the step that ended the loop
-            // (an unrealized token reads back as 0, which can be a stop id).
-            if decodeFailure == nil, let mlxError = MLXErrorMonitor.message(since: stepEpoch) {
-                decodeFailure = GenerationFailure(
-                    stage: .decoding, cause: "MLX error during decode: \(mlxError)")
-                stopReason = .cancelled
-                streamTiming?.recordTermination("mlx_error")
-            }
+
 
             if stopReason == nil {
                 if Task.isCancelled {

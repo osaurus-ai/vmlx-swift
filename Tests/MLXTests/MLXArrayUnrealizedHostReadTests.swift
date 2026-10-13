@@ -94,6 +94,16 @@ struct MLXArrayUnrealizedHostReadTests {
         #expect(!box.messages.contains { $0.contains("returning zero bytes") })
     }
 
+    @Test("checked conversion rejects an invalid array without recursive conversion")
+    func checkedInvalidConversionThrows() {
+        let invalid = withErrorHandler({ _ in }) {
+            matmul(MLXArray.zeros([2, 3]), MLXArray.zeros([4, 2]))
+        }
+        #expect(throws: MLXError.self) {
+            try invalid.asArrayChecked(Float.self)
+        }
+    }
+
     @Test("asArrayChecked returns the values of a healthy array")
     func asArrayCheckedHealthy() throws {
         let healthy = MLXArray([Float(1), 2, 3]) * MLXArray(Float(2))

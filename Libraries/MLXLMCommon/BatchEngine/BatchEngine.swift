@@ -1805,18 +1805,9 @@ public actor BatchEngine {
             // 1. Admit new requests from wait queue
             admitPendingRequests()
 
-            // 2. Run one scheduling step. Hosts install a non-fatal MLX error
-            //    handler, so a C++ error inside the step (Metal allocation or
-            //    command-buffer failure under memory pressure, a kernel
-            //    failure) is logged and swallowed while every array scheduled
-            //    in that step stays unrealized. Finish the slots that stepped
-            //    with the diagnostic instead of decoding token 0 from
-            //    zero-filled host reads (mirrors `Evaluate.generateLoopTask`).
-            let stepEpoch = MLXErrorMonitor.sequence()
+            // Each operation owns a scoped MLX error collector and checks it
+            // before publishing a token or completing a slot.
             step()
-            if let mlxError = MLXErrorMonitor.message(since: stepEpoch) {
-                failActiveSlotsAfterMLXError(mlxError)
-            }
 
             // 3. Remove finished slots. Media requests retain their prepared
             //    image/video arrays in `originalInput` for the lifetime of the
@@ -2021,11 +2012,9 @@ public actor BatchEngine {
 
     // MARK: - Step Logic
 
-    /// Finish every unfinished slot after an MLX error fired during `step()`.
-    /// The handler is process-global, so the error cannot be attributed to
-    /// one slot; all slots that shared the step hold unrealized arrays.
-    private func failActiveSlotsAfterMLXError(_ message: String) {
-        for i in activeSlots.indices where !activeSlots[i].isFinished {
+    /// Cancel only the slots sharing a failed operation. Never publish their caches.
+    private func failSlotsAfterMLXError(_ indices: [Int], message: String) {
+        for i in indices where !activeSlots[i].isFinished {
             var slot = activeSlots[i]
             let prefill = slot.phase == .prefill
             let phase = prefill ? "prompt processing" : "decode"
@@ -2045,7 +2034,13 @@ public actor BatchEngine {
         // Prefill is done sequentially per slot (each chunk is large, batching
         // prefill chunks of different lengths wastes compute on padding).
         for i in activeSlots.indices where activeSlots[i].phase == .prefill {
-            stepPrefill(slotIndex: i)
+            do {
+                try withError { error in
+                    try stepPrefill(slotIndex: i, error: error)
+                }
+            } catch {
+                failSlotsAfterMLXError([i], message: error.localizedDescription)
+            }
         }
 
         // Phase 2: Batch-decode all slots that are in decode phase.
@@ -2078,7 +2073,7 @@ public actor BatchEngine {
     ///   and full prompt processing including multimodal fusion
     ///
     /// After prefill, samples the first decode token and transitions the slot to `.decode`.
-    private func stepPrefill(slotIndex: Int) {
+    private func stepPrefill(slotIndex: Int, error: ErrorBox) throws {
         var slot = activeSlots[slotIndex]
         let totalPromptUnits = max(0, slot.promptTokenCount)
         slot.continuation.yield(.prefillProgress(PrefillProgress(
@@ -2123,7 +2118,7 @@ public actor BatchEngine {
             }
             guard !slot.originalInput.requiresPostPrepareCacheKey || usesPostPrepareAlias else {
                 activeSlots[slotIndex] = slot
-                return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
+                return try stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare, error: error)
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
             // Scope the fetch result to this coordinator branch. Ordinary
@@ -2459,7 +2454,7 @@ public actor BatchEngine {
             }
         }
 
-        stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare, slot: slot)
+        try stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare, slot: slot, error: error)
     }
 
     /// Split the still-unprocessed prompt immediately before its final token.
@@ -2569,8 +2564,9 @@ public actor BatchEngine {
     private func stepPrefillAfterCacheLookup(
         slotIndex: Int,
         inputForPrepare: LMInput,
-        slot initialSlot: BatchSlot? = nil
-    ) {
+        slot initialSlot: BatchSlot? = nil,
+        error: ErrorBox
+    ) throws {
         var slot = initialSlot ?? activeSlots[slotIndex]
 
         // Alignment after preparation does not prove that a warm restore used
@@ -2865,6 +2861,7 @@ public actor BatchEngine {
             from: slot.cache)
 
         let tokenID = firstToken.item(Int.self)
+        try error.check()
 
         slot.phase = .decode
         slot.decodeStartTime = Date()
@@ -2954,8 +2951,9 @@ public actor BatchEngine {
     /// both.
     private func stepCompiledDecode(
         slotIndex: Int,
-        forward: @Sendable ([MLXArray]) -> [MLXArray]
-    ) {
+        forward: @Sendable ([MLXArray]) -> [MLXArray],
+        error: ErrorBox
+    ) throws {
         var slot = activeSlots[slotIndex]
         guard let nextToken = slot.nextToken else {
             Self.logger.error(
@@ -2968,6 +2966,7 @@ public actor BatchEngine {
         // CompilableKVCache layers as its state; mutating them via
         // `_updateInternal` is how the trace advances.
         let result = forward([nextToken])
+        try error.check()
         guard result.count == 1 else {
             Self.logger.error(
                 "Slot \(slot.id.description, privacy: .public): compiled forward returned \(result.count) outputs, expected 1"
@@ -2978,6 +2977,7 @@ public actor BatchEngine {
         // result[0] shape: [1, 1, V]. Force materialisation so we can
         // read the sampled token ID below.
         MLX.eval(result[0])
+        try error.check()
 
         // Extract as [1, V] for the processor/sampler contract.
         let logits = result[0][0 ..< 1, 0, 0...]
@@ -2986,6 +2986,7 @@ public actor BatchEngine {
             return
         }
         let tokenID = token.item(Int.self)
+        try error.check()
 
         // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
         // because compile requires `.simple` family (TQ compression would
@@ -2993,6 +2994,7 @@ public actor BatchEngine {
         // for symmetry with `stepBatchDecode` so any future compile+quant
         // mode finds the hook wired in.
         maybeCompressSlotCache(&slot)
+        try error.check()
 
         // Stop conditions (same rules as uncompiled path).
         if stopTokenIDs.contains(tokenID) {
@@ -3225,6 +3227,16 @@ public actor BatchEngine {
     /// ``BatchKVCache`` wrappers, runs one model forward pass, then samples
     /// independently per sequence.
     private func stepBatchDecode(slotIndices: [Int]) {
+        do {
+            try withError { error in
+                try stepBatchDecode(slotIndices: slotIndices, error: error)
+            }
+        } catch {
+            failSlotsAfterMLXError(slotIndices, message: error.localizedDescription)
+        }
+    }
+
+    private func stepBatchDecode(slotIndices: [Int], error: ErrorBox) throws {
         if slotIndices.count > 1 {
             let grouped = decodeCompatibilityGroups(slotIndices: slotIndices)
             if grouped.count > 1 {
@@ -3247,7 +3259,7 @@ public actor BatchEngine {
         if slotIndices.count == 1,
             let forward = activeSlots[slotIndices[0]].compiledForward
         {
-            stepCompiledDecode(slotIndex: slotIndices[0], forward: forward)
+            try stepCompiledDecode(slotIndex: slotIndices[0], forward: forward, error: error)
             return
         }
 
@@ -3324,6 +3336,7 @@ public actor BatchEngine {
             cache: layerCaches,
             state: nil
         )
+        try error.check()
         // result.logits shape: [B, 1, vocabSize]
 
         // Async-eval the logits so GPU work kicks off while we do the
@@ -3334,6 +3347,7 @@ public actor BatchEngine {
         // path that cost ~15% decode tok/s on hybrid-SSM 35B-A3B. This
         // mirrors `TokenIterator.next()`'s `asyncEval(token)` pattern.
         asyncEval(result.logits)
+        try error.check()
 
         // Split SSM states back to per-sequence caches
         for batchAC in batchArraysCaches {
@@ -3360,6 +3374,7 @@ public actor BatchEngine {
         }
         let validSampledTokens = sampledTokens.compactMap { $0 }
         if !validSampledTokens.isEmpty { asyncEval(validSampledTokens) }
+        try error.check()
 
         // Sample per sequence and route results
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
@@ -3370,6 +3385,7 @@ public actor BatchEngine {
             // of both the logits and the sampled tokens) — this wait
             // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
+            try error.check()
 
             // Stage 0: per-step KV-quant compression hook. For slots with
             // short prompts that were below the TQ minimum threshold at
@@ -3378,6 +3394,7 @@ public actor BatchEngine {
             // `cache.contains(where: { $0 is TurboQuantKVCache })` guard, so
             // this is a cheap no-op once compressed.
             maybeCompressSlotCache(&slot)
+            try error.check()
 
             // Check stop conditions BEFORE yielding — don't emit EOS tokens to callers.
             // This matches TokenIterator behavior where the stop token is never surfaced.

@@ -150,17 +150,18 @@ extension MLXArray {
     ///
     /// - Throws: ``MLXError/caught(_:)`` carrying the MLX error message.
     public func asArrayChecked<T: HasDType>(_ type: T.Type) throws -> [T] {
-        if type.dtype != self.dtype {
-            return try self.asType(type).asArrayChecked(type)
-        }
-        return try withEvaluatedHostAccess { realized in
-            guard realized else {
-                throw MLXError.caught(
-                    MLXErrorMonitor.lastMessage
-                        ?? "array could not be evaluated"
-                        + " (shape=\(self.shape), dtype=\(self.dtype))")
+        try withError { error in
+            let source = type.dtype == self.dtype ? self : self.asType(type)
+            try error.check()
+            return try source.withEvaluatedHostAccess { realized in
+                // Keep the diagnostic scoped to this read, including conversion.
+                // Another request's process-wide last error is not this failure.
+                try error.check()
+                guard realized else {
+                    throw MLXError.caught("array could not be evaluated (shape=\(source.shape), dtype=\(source.dtype))")
+                }
+                return source.copyRealizedHostBytes()
             }
-            return copyRealizedHostBytes()
         }
     }
 

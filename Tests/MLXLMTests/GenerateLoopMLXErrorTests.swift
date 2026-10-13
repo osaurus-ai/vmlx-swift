@@ -110,7 +110,7 @@ struct GenerateLoopMLXErrorTests {
         // token and everything after it were not.
         #expect(text == "one two ")
         #expect(info?.generationTokenCount == 2)
-        #expect(!box.messages.isEmpty)
+        #expect(failure?.cause.contains("Unable to build metal library from source") == true)
     }
 
     @Test("a stream with no MLX error completes normally (control)")
@@ -138,4 +138,46 @@ struct GenerateLoopMLXErrorTests {
         #expect(text == "one two three four ")
         #expect(info?.generationTokenCount == 4)
     }
+    struct RecoveredProbeIterator: TokenIteratorProtocol {
+        var index = 0
+        var maxTokens: Int? { nil }
+        var tokenCount: Int { index }
+        var promptPrefillTime: TimeInterval { 0 }
+        mutating func next() -> Int? {
+            guard index < 2 else { return nil }
+            defer { index += 1 }
+            if index == 0 {
+                // A scoped optional operation failed and its owner recovered.
+                // It must not poison a healthy generation's outer boundary.
+                do {
+                    try MLX.withError {
+                        _ = matmul(MLXArray.zeros([2, 3]), MLXArray.zeros([4, 2]))
+                    }
+                } catch {}
+            }
+            return index
+        }
+    }
+
+    @Test("a recovered scoped MLX failure does not cancel healthy generation")
+    func recoveredScopedErrorDoesNotPoisonGeneration() async {
+        let (stream, task) = generateTask(
+            promptTokenCount: 1,
+            modelConfiguration: ModelConfiguration(id: "vmlx/recovered-probe"),
+            tokenizer: PieceTokenizer(pieces: ["one ", "two "]),
+            iterator: RecoveredProbeIterator())
+        var text = ""
+        var info: GenerateCompletionInfo?
+        for await event in stream {
+            switch event {
+            case .chunk(let chunk): text += chunk
+            case .info(let completion): info = completion
+            default: break
+            }
+        }
+        await task.value
+        #expect(info?.generationFailure == nil)
+        #expect(text == "one two ")
+    }
+
 }
