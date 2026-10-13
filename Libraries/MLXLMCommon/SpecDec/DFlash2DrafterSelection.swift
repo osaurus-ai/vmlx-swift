@@ -58,9 +58,10 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             // the selector and the two-tap conv are what this runtime
             // needs, and a DFlash 1 checkpoint has neither despite
             // carrying `dflash_config`.
-            let topK = dflash["selector_top_k"] as? Int, topK > 0,
-            let rank = dflash["selector_rank"] as? Int, rank > 0,
-            let convKernel = dflash["conv_kernel_size"] as? Int, convKernel > 0,
+            // ... or a DSpark drafter: the DFlash 1 backbone plus the Markov head (`markov_rank`, at the root or nested).
+            ((dflash["selector_top_k"] as? Int ?? 0) > 0 && (dflash["selector_rank"] as? Int ?? 0) > 0
+                && (dflash["conv_kernel_size"] as? Int ?? 0) > 0)
+                || ((dflash["markov_rank"] as? Int ?? root["markov_rank"] as? Int ?? 0) > 0),
             let vocabularySize = root["vocab_size"] as? Int,
             let targetLayerIDs = dflash["target_layer_ids"] as? [Int],
             !targetLayerIDs.isEmpty, targetLayerIDs.allSatisfy({ $0 >= 0 }),
@@ -98,7 +99,9 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
         guard DFlash2ArtifactMetadata.rejectionReason(at: directory) == nil else { return nil }
         return VMLXDFlash2DrafterInfo(
             path: directory.path,
-            blockSize: (dflash["block_size"] as? Int) ?? (root["block_size"] as? Int) ?? 8,
+            // Verify width: a DSpark `block_size` counts drafts (the anchor row drafts too), so +1.
+            blockSize: ((dflash["block_size"] as? Int) ?? (root["block_size"] as? Int) ?? 8)
+                + (((dflash["markov_rank"] as? Int ?? root["markov_rank"] as? Int ?? 0) > 0) ? 1 : 0),
             vocabularySize: vocabularySize,
             targetLayerCount: (root["num_target_layers"] as? Int)
                 ?? ((targetLayerIDs.max() ?? 0) + 1),

@@ -459,7 +459,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         {
             let widths = DFlash2WidthChooser.plan(
                 trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target),
-                targetLadder: (target as? DFlash2WidthLadderPolicy)?.dflash2WidthLadder)
+                targetLadder: (target as? DFlash2WidthLadderPolicy)?.dflash2WidthLadder
+                    ?? (config.isDSpark ? DFlash2WidthChooser.dsparkLadder(trained: config.blockSize) : nil))
             if widths != [effectiveBlockSize] {
                 self.widthChooser = DFlash2WidthChooser(
                     widths: widths,
@@ -1352,6 +1353,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// acceptance we can do losslessly on the host (greedy, or sampled with a top-k filter).
     private func resolveTreeMode() -> Bool {
         if ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE"] == "0" { return false }
+        // A tree needs the DFlash 2 candidate selector's lattice; a DSpark drafter drafts one chain.
+        guard drafter.supportsLattice else { return false }
         guard let treeTarget = target as? DFlash2TreeVerifyModel,
             treeTarget.dflash2SupportsTree(cache: cache),
             isGreedy || treeFilter != nil
@@ -1799,6 +1802,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     // MARK: - Stats + cache store
 
     var dflash2Stats: DFlash2GenerationStats { stats }
+    var dflash2GenerationStats: DFlash2GenerationStats? { stats }
 
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],

@@ -29,7 +29,7 @@ public enum DFlash2Loader {
             throw DFlash2LoadError.malformedConfig(configURL)
         }
         let config = try DFlash2Configuration(json: root)
-        guard config.isDFlash2 else {
+        guard config.isRunnable else {
             throw DFlash2LoadError.notDFlash2(dir)
         }
 
@@ -170,6 +170,7 @@ public enum DFlash2LoadError: Error, LocalizedError {
     case noWeights(URL)
     case weightUpdateFailed(Error)
     case targetMismatch(String)
+    case unsupportedMarkovHead(String)
 
     public var errorDescription: String? {
         switch self {
@@ -193,6 +194,8 @@ public enum DFlash2LoadError: Error, LocalizedError {
             return "DFlash 2 drafter weight update failed: \(err)"
         case .targetMismatch(let detail):
             return "DFlash 2 drafter does not match the loaded model: \(detail)"
+        case .unsupportedMarkovHead(let kind):
+            return "DSpark drafter declares markov_head_type \"\(kind)\"; only the vanilla head is supported"
         }
     }
 }

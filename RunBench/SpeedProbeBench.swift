@@ -140,6 +140,10 @@ func runSpeedProbe(modelPath: String) async throws {
             let block = env["BENCH_SPEED_DFLASH2_BLOCK"].flatMap(Int.init)
             p.draftStrategy = .dflash2(
                 drafterPath: modelDir.appendingPathComponent("dflash2"), blockSize: block)
+        case "dspark":
+            let block = env["BENCH_SPEED_DFLASH2_BLOCK"].flatMap(Int.init)
+            p.draftStrategy = .dflash2(
+                drafterPath: modelDir.appendingPathComponent("dspark"), blockSize: block)
         default:
             break
         }
@@ -190,6 +194,14 @@ func runSpeedProbe(modelPath: String) async throws {
             case .info(let info):
                 tokens = info.generationTokenCount
                 genTime = info.generateTime
+                if let d = info.dflash2Stats {
+                    mtp = String(
+                        format: "dflash2 verify=%d acceptLen=%.2f drafted=%d accepted=%d arFallback=%d widths=%@",
+                        d.verifyCalls, d.acceptanceLength, d.draftedTokens, d.acceptedTokens,
+                        d.autoregressiveFallbackTokens,
+                        d.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
+                            .joined(separator: ","))
+                }
                 if let m = info.nativeMTPStats {
                     mtp = String(
                         format:

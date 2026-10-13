@@ -109,6 +109,19 @@ public struct DFlash2Configuration: Sendable {
     /// bidirectionally, which is the whole point of block diffusion.
     public let isCausal: Bool?
     public let dflash: DFlash2InnerConfig
+    /// DSpark (arXiv 2607.05147): rank of the vanilla Markov head's low-rank bigram bias, 0 on DFlash 1/2. With it the
+    /// block is drafted semi-autoregressively off ONE drafter forward: each position's logits get
+    /// `markov_w2(markov_w1[previous draft])` added before its draft is picked.
+    public let markovRank: Int
+    /// DSpark checkpoints draft from EVERY block row, the anchor row emitting draft 0 (DFlash drops the anchor row).
+    /// Their declared `block_size` counts drafts; `blockSize` here is normalized to the verify width (+1). Reading the
+    /// wrong mapping is a silent 0 %-acceptance drafter, not an error (mlx-serve `anchor_row_drafts`).
+    public let anchorRowDrafts: Bool
+    /// GPT-J interleaved rope (`rope_is_neox_style: false`). DFlash sidecars and MiniCPM-V 4.7's DSpark are neox.
+    public let ropeTraditional: Bool
+    /// The trained confidence head (per-position draft confidence). Loaded so the checkpoint binds; the verify width
+    /// is chosen by the width chooser, so it is not consulted.
+    public let hasConfidenceHead: Bool
 
     public var blockSize: Int { dflash.blockSize }
     public var maskTokenId: Int { dflash.maskTokenId }
@@ -120,6 +133,12 @@ public struct DFlash2Configuration: Sendable {
     public var isDFlash2: Bool {
         dflash.selectorRank > 0 && dflash.selectorTopK > 0 && dflash.convKernelSize > 0
     }
+
+    /// A DSpark drafter: the DFlash 1 backbone (no conv, no selector) plus the Markov head.
+    public var isDSpark: Bool { markovRank > 0 }
+
+    /// Runnable on the DFlash 2 lane.
+    public var isRunnable: Bool { isDFlash2 || isDSpark }
 
     /// Decode from raw `config.json` contents.
     public init(json root: [String: Any]) throws {
@@ -179,6 +198,26 @@ public struct DFlash2Configuration: Sendable {
         {
             inner = inner.replacingBlockSize(top)
         }
+        // DSpark splits its contract between the root and `dflash_config` (mlx-serve reads both, nested first).
+        let dflashObject = dflashRaw as? [String: Any] ?? [:]
+        func any(_ key: String) -> Any? { dflashObject[key] ?? root[key] }
+        let markovRank = (any("markov_rank") as? Int) ?? 0
+        if markovRank > 0 {
+            let kind = (any("markov_head_type") as? String) ?? "vanilla"
+            // `gated` / `rnn` heads carry extra trained modules this forward has no arm for: refuse by name rather
+            // than draft from the base logits and look like a bad drafter.
+            guard kind == "vanilla" else { throw DFlash2LoadError.unsupportedMarkovHead(kind) }
+        }
+        self.markovRank = markovRank
+        let architectures = (root["architectures"] as? [String]) ?? []
+        self.anchorRowDrafts =
+            markovRank > 0 || (any("projector_type") as? String) == "dspark"
+            || architectures.contains { $0.contains("DSpark") }
+        if anchorRowDrafts {
+            inner = inner.replacingBlockSize(inner.blockSize + 1)
+        }
+        self.ropeTraditional = (any("rope_is_neox_style") as? Bool).map { !$0 } ?? false
+        self.hasConfidenceHead = (any("enable_confidence_head") as? Bool) ?? false
         self.dflash = inner
     }
 }
@@ -513,8 +552,9 @@ final class DFlash2DecoderLayer: Module {
     let mlp: DFlash2MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-    @ModuleInfo(key: "attention_conv") var attentionConv: GroupedDynamicCausalConv
-    @ModuleInfo(key: "mlp_conv") var mlpConv: GroupedDynamicCausalConv
+    /// DFlash 2 only; nil on a DSpark (DFlash 1 backbone) drafter.
+    @ModuleInfo(key: "attention_conv") var attentionConv: GroupedDynamicCausalConv?
+    @ModuleInfo(key: "mlp_conv") var mlpConv: GroupedDynamicCausalConv?
 
     init(_ config: DFlash2Configuration, layerIndex: Int) {
         self._attention.wrappedValue = DFlash2Attention(config, layerIndex: layerIndex)
@@ -524,14 +564,16 @@ final class DFlash2DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._attentionConv.wrappedValue = GroupedDynamicCausalConv(
-            hiddenSize: config.hiddenSize,
-            kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
-        self._mlpConv.wrappedValue = GroupedDynamicCausalConv(
-            hiddenSize: config.hiddenSize,
-            kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
+        if config.dflash.convKernelSize > 0 {
+            self._attentionConv.wrappedValue = GroupedDynamicCausalConv(
+                hiddenSize: config.hiddenSize,
+                kernelSize: config.dflash.convKernelSize,
+                groupSize: config.dflash.convGroupSize)
+            self._mlpConv.wrappedValue = GroupedDynamicCausalConv(
+                hiddenSize: config.hiddenSize,
+                kernelSize: config.dflash.convKernelSize,
+                groupSize: config.dflash.convGroupSize)
+        }
         super.init()
     }
 
@@ -542,6 +584,11 @@ final class DFlash2DecoderLayer: Module {
         // of dying on a host-side dim() read; the iterator detects the
         // degenerate proposal and falls back to AR.
         guard x.ndim == 3 else { return x }
+        guard let attentionConv, let mlpConv else {
+            // DFlash 1 / DSpark layer: plain pre-norm attention + MLP.
+            let h = x + attention(inputLayerNorm(x), context: context, rope: rope, cache: cache)
+            return h + mlp(postAttentionLayerNorm(h))
+        }
         var residual = x
         var (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
         h = residual
@@ -742,9 +789,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
     /// applied once to the concatenated target context per round.
     @ModuleInfo(key: "fc") var fc: Linear
     @ModuleInfo(key: "hidden_norm") var hiddenNorm: RMSNorm
-    @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
+    /// DFlash 2 only; nil on a DSpark drafter.
+    @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector?
+    /// DSpark only.
+    @ModuleInfo(key: "markov_head") var markovHead: DSparkMarkovHead?
+    @ModuleInfo(key: "confidence_head") var confidenceHead: DSparkConfidenceHead?
 
     private let rope: RoPE
+
+    /// Whether this drafter can produce a draft-tree lattice (needs the DFlash 2 candidate selector).
+    public var supportsLattice: Bool { candidateSelector != nil }
 
     public init(_ config: DFlash2Configuration) {
         self.config = config
@@ -756,9 +810,20 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             config.targetLayerIds.count * config.hiddenSize, config.hiddenSize, bias: false)
         self._hiddenNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._candidateSelector.wrappedValue = DFlash2CandidateSelector(config)
+        if config.isDFlash2 {
+            self._candidateSelector.wrappedValue = DFlash2CandidateSelector(config)
+        }
+        if config.isDSpark {
+            self._markovHead.wrappedValue = DSparkMarkovHead(
+                vocabularySize: config.vocabSize, rank: config.markovRank)
+            if config.hasConfidenceHead {
+                self._confidenceHead.wrappedValue = DSparkConfidenceHead(
+                    inputDimensions: config.hiddenSize + config.markovRank)
+            }
+        }
         self.rope = RoPE(
-            dimensions: config.headDim, traditional: false, base: config.ropeTheta, scale: 1)
+            dimensions: config.headDim, traditional: config.ropeTraditional, base: config.ropeTheta,
+            scale: 1)
         super.init()
     }
 
@@ -858,19 +923,19 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         var l0MLPInput = h
 
         for (index, layer) in layers.enumerated() {
-            if index == 0 {
+            if index == 0, let attentionConv = layer.attentionConv, let mlpConv = layer.mlpConv {
                 l0InputNorm = layer.inputLayerNorm(h)
-                let (convIn, kernel) = layer.attentionConv.prepare(l0InputNorm)
+                let (convIn, kernel) = attentionConv.prepare(l0InputNorm)
                 l0ConvInput = convIn
                 l0Kernel = kernel
                 l0Attention = layer.attention(
                     convIn, context: context, rope: rope, cache: cache[index])
-                l0AttentionConv = layer.attentionConv.finish(l0Attention, dynamic: kernel)
+                l0AttentionConv = attentionConv.finish(l0Attention, dynamic: kernel)
                 l0PostAttention = h + l0AttentionConv
-                let (mlpIn, mlpKernel) = layer.mlpConv.prepare(
+                let (mlpIn, mlpKernel) = mlpConv.prepare(
                     layer.postAttentionLayerNorm(l0PostAttention))
                 l0MLPInput = mlpIn
-                h = l0PostAttention + layer.mlpConv.finish(layer.mlp(mlpIn), dynamic: mlpKernel)
+                h = l0PostAttention + mlpConv.finish(layer.mlp(mlpIn), dynamic: mlpKernel)
             } else {
                 h = layer(h, context: context, rope: rope, cache: cache[index])
             }
@@ -897,6 +962,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         embedder: any TokenEmbedderModel
     ) -> DFlash2LatticeArrays? {
+        guard let candidateSelector else { return nil }
         let hidden = hiddenStates(
             inputs: inputs, targetHidden: targetHidden, cache: cache,
             embedder: embedder, logitsStart: 1)
@@ -915,6 +981,11 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         temperature: Float,
         logitsStart: Int = 1
     ) -> DFlash2Proposal {
+        if let markovHead {
+            return proposeDSpark(
+                inputs: inputs, targetHidden: targetHidden, cache: cache, embedder: embedder,
+                temperature: temperature, markovHead: markovHead)
+        }
         let hidden = hiddenStates(
             inputs: inputs, targetHidden: targetHidden, cache: cache,
             embedder: embedder, logitsStart: logitsStart)
@@ -926,8 +997,96 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 tokens: hidden, candidates: hidden, probabilities: nil)
         }
         let logits = computeLogits(hidden, embedder: embedder)
+        guard let candidateSelector else {
+            return DFlash2Proposal(tokens: hidden, candidates: hidden, probabilities: nil)
+        }
         return candidateSelector.select(
             hidden: hidden, logits: logits, anchorIds: inputs[0..., 0],
             temperature: temperature)
+    }
+
+    /// DSpark round. `inputs` is the lane's `[anchor, mask × (bs − 1)]` block for verify width `bs`; DSpark drafts
+    /// `bs − 1` tokens from `bs − 1` rows (anchor + bs − 2 masks), every row INCLUDING the anchor's emitting one draft,
+    /// so the trailing mask row is dropped before the forward (the drafter attends bidirectionally within the block, so
+    /// an extra row would change every other row). The Markov chain stays on the device: each step's previous token is
+    /// the previous step's lazy argmax / sample, one evaluation for the whole block instead of a host sync per draft.
+    private func proposeDSpark(
+        inputs: MLXArray, targetHidden: MLXArray, cache: [KVCache],
+        embedder: any TokenEmbedderModel, temperature: Float, markovHead: DSparkMarkovHead
+    ) -> DFlash2Proposal {
+        let draftCount = inputs.dim(1) - 1
+        guard draftCount > 0 else {
+            return DFlash2Proposal(tokens: inputs, candidates: inputs, probabilities: nil)
+        }
+        let hidden = hiddenStates(
+            inputs: inputs[0..., ..<draftCount], targetHidden: targetHidden, cache: cache,
+            embedder: embedder, logitsStart: 0)
+        guard hidden.ndim == 3 else {
+            return DFlash2Proposal(tokens: hidden, candidates: hidden, probabilities: nil)
+        }
+        let logits = computeLogits(hidden, embedder: embedder)  // [1, draftCount, vocab]
+        var previous = inputs[0..., 0]  // [1] the anchor
+        var tokens: [MLXArray] = []
+        var candidateRows: [MLXArray] = []
+        var probabilityRows: [MLXArray] = []
+        tokens.reserveCapacity(draftCount)
+        let topK = Swift.min(DSparkMarkovHead.sampledCandidates, logits.dim(-1))
+        for step in 0 ..< draftCount {
+            let scores = logits[0..., step, 0...] + markovHead.bias(previous: previous)  // [1, vocab]
+            if temperature > 0 {
+                // Sample from the top-K restriction so q is exactly zero outside `candidates`, which is what the
+                // sampled accept test (and its residual) assumes, as with the DFlash 2 selector.
+                let vocab = scores.dim(-1)
+                let candidates = argPartition(scores, kth: vocab - topK, axis: -1)[0..., (vocab - topK)...]
+                let q = DFlash2Sampling.probabilities(
+                    takeAlong(scores, candidates, axis: -1).expandedDimensions(axis: 1),
+                    temperature: temperature)[0..., 0, 0...]
+                let chosen = DFlash2Sampling.sample(probabilities: q)
+                previous = takeAlong(candidates, chosen.expandedDimensions(axis: -1), axis: -1)[0..., 0]
+                candidateRows.append(candidates)
+                probabilityRows.append(q)
+            } else {
+                previous = argMax(scores, axis: -1)
+                candidateRows.append(previous.expandedDimensions(axis: -1))
+            }
+            tokens.append(previous)
+        }
+        return DFlash2Proposal(
+            tokens: stacked(tokens, axis: 1),
+            candidates: stacked(candidateRows, axis: 1),
+            probabilities: probabilityRows.isEmpty ? nil : stacked(probabilityRows, axis: 1))
+    }
+}
+
+/// DSpark's vanilla Markov head: `bias = markov_w2(markov_w1[previous])`, a rank-`r` bigram correction added to one
+/// block position's logits. `markov_w1` is a dense gather table (the checkpoint keeps it unquantized); `markov_w2` is an
+/// ordinary `rank → vocab` linear.
+final class DSparkMarkovHead: Module {
+    /// Candidates per position for sampled drafting (matches the DFlash 2 selector's typical top-k).
+    static let sampledCandidates = 16
+
+    @ModuleInfo(key: "markov_w1") var w1: Embedding
+    @ModuleInfo(key: "markov_w2") var w2: Linear
+
+    init(vocabularySize: Int, rank: Int) {
+        self._w1.wrappedValue = Embedding(embeddingCount: vocabularySize, dimensions: rank)
+        self._w2.wrappedValue = Linear(rank, vocabularySize, bias: false)
+        super.init()
+    }
+
+    /// `previous`: `[B]` token ids → `[B, vocab]` bias.
+    func bias(previous: MLXArray) -> MLXArray {
+        w2(w1(previous))
+    }
+}
+
+/// DSpark's trained per-position confidence head (`proj: hidden + rank → 1`). Loaded so the checkpoint binds strictly;
+/// the lane's width chooser decides the verify width, so it is not consulted.
+final class DSparkConfidenceHead: Module {
+    @ModuleInfo(key: "proj") var proj: Linear
+
+    init(inputDimensions: Int) {
+        self._proj.wrappedValue = Linear(inputDimensions, 1, bias: true)
+        super.init()
     }
 }
