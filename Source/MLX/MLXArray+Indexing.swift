@@ -137,11 +137,20 @@ extension MLXArray {
     {
         get {
             // see mlx_get_item_int
+            guard isValid else {
+                reportInvalidArrayUse("MLXArray subscript get")
+                return MLXArray(mlx_array_new())
+            }
             let axis = MLX.resolve(axis: axis, ndim: ndim)
             return take(resolve(index: index, axis: axis), axis: axis, stream: stream)
         }
         set {
             // see mlx_set_item_int()
+            guard isValid, newValue.isValid else {
+                reportInvalidArrayUse("MLXArray subscript set")
+                _invalidateInternal()
+                return
+            }
 
             precondition(dtype == newValue.dtype, "\(dtype) != \(newValue.dtype)")
 
@@ -189,6 +198,10 @@ extension MLXArray {
         stream stream: StreamOrDevice = .default
     ) -> MLXArray {
         get {
+            guard isValid else {
+                reportInvalidArrayUse("MLXArray subscript get")
+                return MLXArray(mlx_array_new())
+            }
             var starts = [Int32]()
             var stops = [Int32]()
             var strides = [Int32]()
@@ -214,6 +227,11 @@ extension MLXArray {
         }
         set {
             // this is [0 ..., 0 ..., range] where the number of full range leading expressions
+            guard isValid, newValue.isValid else {
+                reportInvalidArrayUse("MLXArray subscript set")
+                _invalidateInternal()
+                return
+            }
             let axis = MLX.resolve(axis: axis, ndim: ndim)
             let prefix = (0 ..< axis).map { 0 ..< dim($0) }.map { $0.mlxArrayIndexOperation }
             let range = (range as! MLXArrayIndex).mlxArrayIndexOperation
@@ -255,6 +273,10 @@ extension MLXArray {
     ) -> MLXArray {
         get {
             // see mlx_get_item_nd & the RangeExpression code above
+            guard isValid else {
+                reportInvalidArrayUse("MLXArray subscript get")
+                return MLXArray(mlx_array_new())
+            }
 
             var starts = [Int32]()
             var stops = [Int32]()
@@ -289,6 +311,11 @@ extension MLXArray {
         }
         set {
             // see mlx_set_item_nd
+            guard isValid, newValue.isValid else {
+                reportInvalidArrayUse("MLXArray subscript set")
+                _invalidateInternal()
+                return
+            }
 
             precondition(dtype == newValue.dtype, "\(dtype) != \(newValue.dtype)")
 
@@ -364,6 +391,14 @@ extension MLXArray {
         stream stream: StreamOrDevice = .default
     ) -> MLXArray {
         get {
+            // An invalid array (a failed MLX operation's result under a recovering
+            // error handler) reads as ndim 0 / shape []. Every path below would
+            // then treat the subscript as over-rank and trap the process; the
+            // failure must instead keep propagating to the caller's error check.
+            guard isValid else {
+                reportInvalidArrayUse("MLXArray subscript get")
+                return MLXArray(mlx_array_new())
+            }
             switch operations.count {
             case 0:
                 return self
@@ -374,6 +409,13 @@ extension MLXArray {
             }
         }
         set {
+            // Same propagation for in-place updates: an invalid destination or
+            // update leaves the destination invalid rather than silently stale.
+            guard isValid, newValue.isValid else {
+                reportInvalidArrayUse("MLXArray subscript set")
+                _invalidateInternal()
+                return
+            }
             if let result = updateSlice(src: self, operations: operations, update: newValue) {
                 self._updateInternal(result)
                 return

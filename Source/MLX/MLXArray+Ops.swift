@@ -2635,7 +2635,7 @@ extension MLXArray {
         var vec = mlx_vector_array_new()
         mlx_split(&vec, ctx, parts.int32, axis.int32, stream.ctx)
         defer { mlx_vector_array_free(vec) }
-        return mlx_vector_array_values(vec)
+        return splitPieces(mlx_vector_array_values(vec), expected: parts)
     }
 
     /// Split an array into 2 pieces along an axis and returns a tuple -- convenient for destructuring.
@@ -2661,7 +2661,7 @@ extension MLXArray {
         var vec = mlx_vector_array_new()
         mlx_split(&vec, ctx, 2, axis.int32, stream.ctx)
         defer { mlx_vector_array_free(vec) }
-        let pieces = mlx_vector_array_values(vec)
+        let pieces = splitPieces(mlx_vector_array_values(vec), expected: 2)
         return (pieces[0], pieces[1])
     }
 
@@ -2684,7 +2684,7 @@ extension MLXArray {
         var vec = mlx_vector_array_new()
         mlx_split_sections(&vec, ctx, indices.asInt32, indices.count, axis.int32, stream.ctx)
         defer { mlx_vector_array_free(vec) }
-        return mlx_vector_array_values(vec)
+        return splitPieces(mlx_vector_array_values(vec), expected: indices.count + 1)
     }
 
     /// Element-wise square root
