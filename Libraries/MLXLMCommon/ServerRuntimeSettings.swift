@@ -651,7 +651,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     }
 
     /// `jang_config.json` `speculative.default == false` (explicitly). Absent stamps decide nothing.
-    static func bundleStampsSpeculativeOff(_ bundleDirectory: URL) -> Bool {
+    public static func bundleStampsSpeculativeOff(_ bundleDirectory: URL) -> Bool {
         guard
             let data = try? Data(contentsOf: bundleDirectory.appendingPathComponent("jang_config.json")),
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

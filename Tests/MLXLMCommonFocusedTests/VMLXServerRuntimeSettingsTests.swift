@@ -151,6 +151,33 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(
             defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil
         )
+        // The speculative.default stamp only gates a bundled dspark/ drafter: a dflash2/ drafter (Qwen3.8-27B
+        // ships one, its stamp has no default key) stays on even when a bundle stamps default false.
+        try Data(#"{"speculative": {"method": "dflash2", "default": false}}"#.utf8)
+            .write(to: root.appendingPathComponent("jang_config.json"))
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
+                != nil)
+    }
+
+    @Test("only an explicit speculative.default false stamps a bundle off")
+    func speculativeStampIsExplicitOnly() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stamp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("jang_config.json")
+        #expect(!VMLXServerRuntimeSettings.bundleStampsSpeculativeOff(root))  // no jang_config.json
+        for (json, off) in [
+            (#"{}"#, false),
+            (#"{"speculative": {"method": "dspark"}}"#, false),
+            (#"{"speculative": {"method": "dspark", "default": true}}"#, false),
+            (#"{"speculative": {"method": "dspark", "default": "false"}}"#, false),
+            (#"{"speculative": {"method": "dspark", "default": false}}"#, true),
+        ] {
+            try Data(json.utf8).write(to: file)
+            #expect(VMLXServerRuntimeSettings.bundleStampsSpeculativeOff(root) == off, "\(json)")
+        }
     }
 
     @Test("selection capability shares the launch policy across architecture aliases")
