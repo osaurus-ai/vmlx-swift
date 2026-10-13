@@ -273,6 +273,53 @@ public final class ErrorBox: @unchecked Sendable {
     }
 }
 
+/// Process-wide record of MLX runtime errors, kept regardless of which
+/// handler (task-local, global, or the `fatalError` default) consumed them.
+///
+/// Hosts such as osaurus install a non-fatal global handler so a C++ error
+/// inside a forward pass (`[metal::malloc] ...`, `[METAL] Command buffer
+/// execution failed ...`, a JIT compile failure) is logged instead of taking
+/// the process down. After such an error the arrays downstream of the failed
+/// primitive are never realized. The generation loops snapshot
+/// ``sequence()`` before a step and consult ``message(since:)`` afterwards so
+/// the request that owned the failed step is finished with a
+/// `GenerationFailure` instead of decoding zero-filled host reads.
+public enum MLXErrorMonitor {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var _sequence: UInt64 = 0
+    nonisolated(unsafe) private static var _lastMessage: String?
+
+    /// Monotonic count of MLX errors dispatched in this process.
+    public static func sequence() -> UInt64 {
+        lock.withLock { _sequence }
+    }
+
+    /// The most recent MLX error message, if any.
+    public static var lastMessage: String? {
+        lock.withLock { _lastMessage }
+    }
+
+    /// The most recent MLX error message if at least one error was dispatched
+    /// after `sequence` was captured, else `nil`.
+    public static func message(since sequence: UInt64) -> String? {
+        lock.withLock { _sequence > sequence ? _lastMessage : nil }
+    }
+
+    static func record(_ message: String) {
+        lock.withLock {
+            _sequence &+= 1
+            _lastMessage = message
+        }
+    }
+}
+
+/// Route a Swift-detected MLX failure through the same handler chain as a
+/// C++ `mlx_error`, so hosts see it exactly where they see every other MLX
+/// error (task-local handler, global handler, or `fatalError`).
+func reportMLXError(_ message: String) {
+    errorHandler.dispatch(message)
+}
+
 /// Internal hook for the MLX error handling -- this sets the `mlx_set_error_handler` once to the
 /// `errorHandlerTrampoline` which forwards it to the singleton `ErrorHandler`.
 ///
@@ -333,6 +380,7 @@ private final class ErrorHandler: @unchecked Sendable {
 
     /// entry point when an error is encountered in the C++ MLX layer
     func dispatch(_ message: String) {
+        MLXErrorMonitor.record(message)
         if let handler = Self.errorHandler.last {
             handler(message)
         } else {

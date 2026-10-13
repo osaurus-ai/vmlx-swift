@@ -1805,8 +1805,18 @@ public actor BatchEngine {
             // 1. Admit new requests from wait queue
             admitPendingRequests()
 
-            // 2. Run one scheduling step
+            // 2. Run one scheduling step. Hosts install a non-fatal MLX error
+            //    handler, so a C++ error inside the step (Metal allocation or
+            //    command-buffer failure under memory pressure, a kernel
+            //    failure) is logged and swallowed while every array scheduled
+            //    in that step stays unrealized. Finish the slots that stepped
+            //    with the diagnostic instead of decoding token 0 from
+            //    zero-filled host reads (mirrors `Evaluate.generateLoopTask`).
+            let stepEpoch = MLXErrorMonitor.sequence()
             step()
+            if let mlxError = MLXErrorMonitor.message(since: stepEpoch) {
+                failActiveSlotsAfterMLXError(mlxError)
+            }
 
             // 3. Remove finished slots. Media requests retain their prepared
             //    image/video arrays in `originalInput` for the lifetime of the
@@ -2010,6 +2020,24 @@ public actor BatchEngine {
     }
 
     // MARK: - Step Logic
+
+    /// Finish every unfinished slot after an MLX error fired during `step()`.
+    /// The handler is process-global, so the error cannot be attributed to
+    /// one slot; all slots that shared the step hold unrealized arrays.
+    private func failActiveSlotsAfterMLXError(_ message: String) {
+        for i in activeSlots.indices where !activeSlots[i].isFinished {
+            var slot = activeSlots[i]
+            let prefill = slot.phase == .prefill
+            let phase = prefill ? "prompt processing" : "decode"
+            finishSlot(
+                &slot, reason: .cancelled,
+                generationFailure: GenerationFailure(
+                    stage: prefill ? .preparation : .decoding,
+                    cause: "MLX error during \(phase): \(message)"))
+            slot.isFinished = true
+            activeSlots[i] = slot
+        }
+    }
 
     /// Run one scheduling step: prefill pending slots, then batch-decode active slots.
     private func step() {
