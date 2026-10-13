@@ -9,10 +9,11 @@ public enum DFlash2ArtifactMetadata {
             let layers = root["num_hidden_layers"] as? Int, layers > 0, layers <= 1024
         else { throw DFlash2LoadError.targetMismatch("invalid attention dimensions") }
         let c = try DFlash2Configuration(json: root)
-        guard c.isDFlash2, c.hiddenSize > 0, c.numHiddenLayers > 0,
+        guard c.isRunnable, c.hiddenSize > 0, c.numHiddenLayers > 0,
             c.headDim > 0, c.numKeyValueHeads > 0, c.intermediateSize > 0,
-            c.vocabSize > 0, c.dflash.convGroupSize > 0,
-            c.hiddenSize % c.dflash.convGroupSize == 0,
+            c.vocabSize > 0,
+            !c.isDFlash2
+                || (c.dflash.convGroupSize > 0 && c.hiddenSize % c.dflash.convGroupSize == 0),
             !c.targetLayerIds.isEmpty, c.targetLayerIds.allSatisfy({ $0 >= 0 })
         else { throw DFlash2LoadError.targetMismatch("invalid drafter dimensions") }
         func product(_ dimensions: Int...) throws -> Int {
@@ -32,10 +33,24 @@ public enum DFlash2ArtifactMetadata {
         var shapes: [String: [Int]] = [
             "norm.weight": [h], "hidden_norm.weight": [h],
             "fc.weight": [h, try product(c.targetLayerIds.count, h)],
-            "candidate_selector.predecessor_codebook.weight": [c.vocabSize, rank],
-            "candidate_selector.successor_codebook.weight": [c.vocabSize, rank],
-            "candidate_selector.hidden_projection.weight": [rank, h],
         ]
+        if c.isDFlash2 {
+            shapes["candidate_selector.predecessor_codebook.weight"] = [c.vocabSize, rank]
+            shapes["candidate_selector.successor_codebook.weight"] = [c.vocabSize, rank]
+            shapes["candidate_selector.hidden_projection.weight"] = [rank, h]
+        }
+        if c.isDSpark {
+            shapes["markov_head.markov_w1.weight"] = [c.vocabSize, c.markovRank]
+            shapes["markov_head.markov_w2.weight"] = [c.vocabSize, c.markovRank]
+            if c.hasConfidenceHead {
+                let width = h.addingReportingOverflow(c.markovRank)
+                guard !width.overflow else {
+                    throw DFlash2LoadError.targetMismatch("drafter confidence dimension overflow")
+                }
+                shapes["confidence_head.proj.weight"] = [1, width.partialValue]
+                shapes["confidence_head.proj.bias"] = [1]
+            }
+        }
         for i in 0 ..< c.numHiddenLayers {
             let p = "layers.\(i)."
             for (name, shape) in [
@@ -49,7 +64,7 @@ public enum DFlash2ArtifactMetadata {
                 "mlp.up_proj.weight": [c.intermediateSize, h],
                 "mlp.down_proj.weight": [h, c.intermediateSize],
             ] { shapes[p + name] = shape }
-            for name in ["attention_conv", "mlp_conv"] {
+            for name in ["attention_conv", "mlp_conv"] where c.isDFlash2 {
                 shapes[p + name + ".base_kernel"] = [2, c.dflash.convKernelSize, h]
                 shapes[p + name + ".kernel_projection.weight"] = [
                     try product(2, c.dflash.convKernelSize, h / c.dflash.convGroupSize), h,

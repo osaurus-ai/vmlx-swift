@@ -1412,6 +1412,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var turboQuantCompressionCount: Int { get }
     var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { get }
     var nativeMTPStats: NativeMTPGenerationStats? { get }
+    var dflash2GenerationStats: DFlash2GenerationStats? { get }
     var generationFailure: GenerationFailure? { get }
     var structuredOutputComplete: Bool? { get }
     /// CPU-only end-of-generation bookkeeping needed to BUILD the completion
@@ -1433,6 +1434,7 @@ extension TokenIteratorProtocol {
     public var turboQuantCompressionCount: Int { 0 }
     public var lastTurboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? { nil }
     public var nativeMTPStats: NativeMTPGenerationStats? { nil }
+    public var dflash2GenerationStats: DFlash2GenerationStats? { nil }
     public var generationFailure: GenerationFailure? { nil }
     public var structuredOutputComplete: Bool? { nil }
 
@@ -5353,6 +5355,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
                 unclosedReasoning: unclosedReasoning,
                 nativeMTPStats: iterator.nativeMTPStats,
+                dflash2Stats: iterator.dflash2GenerationStats,
                 toolCallProtocolFailure: handler.toolCallProtocolFailure,
                 generationFailure: iterator.generationFailure
                     ?? (iterator.structuredOutputComplete != nil
@@ -5510,6 +5513,10 @@ public struct GenerateCompletionInfo: Sendable {
     /// native-MTP iterator.
     public let nativeMTPStats: NativeMTPGenerationStats?
 
+    /// DFlash 2 / DSpark lane counters (acceptance length, cycles per verify width). `nil` for any generation that did
+    /// not run that lane.
+    public let dflash2Stats: DFlash2GenerationStats?
+
     /// An originating runtime failure, distinct from explicit cancellation.
     /// Consumers must surface this error rather than treating the terminal
     /// metadata as a successful or user-cancelled completion. The legacy stop
@@ -5547,6 +5554,7 @@ public struct GenerateCompletionInfo: Sendable {
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false,
         nativeMTPStats: NativeMTPGenerationStats? = nil,
+        dflash2Stats: DFlash2GenerationStats? = nil,
         toolCallProtocolFailure: ToolCallProtocolFailure? = nil,
         generationFailure: GenerationFailure? = nil
     ) {
@@ -5560,6 +5568,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.unclosedReasoning = unclosedReasoning
         self.toolCallProtocolFailure = toolCallProtocolFailure
         self.nativeMTPStats = nativeMTPStats
+        self.dflash2Stats = dflash2Stats
         self.generationFailure = generationFailure
     }
 

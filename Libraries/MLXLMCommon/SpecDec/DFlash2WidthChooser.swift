@@ -247,6 +247,14 @@ struct DFlash2WidthChooser {
 
     /// Candidate widths: (trained, 2*trained) when the target's verify cost is lane-flat, else
     /// (min(5, trained), trained, 2*trained). `VMLX_DFLASH2_BLOCK=<n>` pins one width (A/B tool).
+    /// DSpark candidate widths: narrow-to-trained only. The drafter is trained for exactly `trained − 1` drafts, so
+    /// wider blocks are out of distribution; and on MoE targets the verify cost grows fast with rows, so narrow widths
+    /// must stay available. MiniCPM-V 4.7 35B-A3B (fixed-width sweep, 1.6 GHz): prose AR 91 / w3 101 / w5 83 / w8 57 /
+    /// w16 52; code 91 / 135 / 133 / 99 / 102; easy prose 90 / 148 / 177 / 169 / 258 tok/s. Width 12 never won.
+    static func dsparkLadder(trained: Int) -> [Int] {
+        Array(Set([3, 5, 8, trained].filter { $0 >= 2 && $0 <= trained })).sorted()
+    }
+
     static func plan(trained: Int, laneFlat: Bool, targetLadder: [Int]? = nil) -> [Int] {
         let t = max(2, trained)
         if let raw = ProcessInfo.processInfo.environment["VMLX_DFLASH2_BLOCK"], let n = Int(raw) {

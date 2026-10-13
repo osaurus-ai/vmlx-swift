@@ -137,6 +137,18 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": createSelecting(Qwen35Configuration.self, Qwen35.init(_:requesting:)),
         "qwen3_5_moe": createSelecting(Qwen35Configuration.self, Qwen35MoE.init(_:requesting:)),
+        // MiniCPM-V 4.7: a Qwen3.5 text model (dense `qwen3_5_text` 1B, MoE `qwen3_5_moe_text` 35B-A3B) under the
+        // same `language_model.` keys, plus MiniCPM's own SigLIP-style tower, window merger and resampler
+        // (`vision_tower.`, `merger.`). `Qwen35Configuration` decodes the MiniCPM `vision_config` and canvas fields
+        // for this model type and `Qwen35` carries `MiniCPMV47Vision.Tower` in its `vision_tower` slot; images
+        // are served, video is refused by the processor (frame stacking not ported).
+        "minicpmv4_7": { data, requesting in
+            let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: data)
+            if configuration.textConfiguration.numExperts > 0 {
+                return try Qwen35MoE(configuration, requesting: requesting)
+            }
+            return try Qwen35(configuration, requesting: requesting)
+        },
         "qwen4_exp": createSelecting(Qwen4ExpConfiguration.self, Qwen4Exp.init(_:requesting:)),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "muse_glimmer": createSelecting(MuseGlimmerConfiguration.self, MuseGlimmer.init(_:requesting:)),
@@ -247,6 +259,7 @@ public enum VLMProcessorTypeRegistry {
             "ministral3": "Mistral3Processor",
             "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
             "nemotron_h_omni": "NemotronHOmniProcessor",
+            "minicpmv4_7": "MiniCPMV47Processor",
         ]
         return processorTypeOverrides[modelType] ?? declaredProcessorType
     }
@@ -268,6 +281,8 @@ public enum VLMProcessorTypeRegistry {
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "MiniCPMV47Processor": create(
+            MiniCPMV47ProcessorConfiguration.self, MiniCPMV47Processor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
         "Gemma3Processor": create(
@@ -495,6 +510,14 @@ public final class VLMModelFactory: ModelFactory {
         if let qwen35JANGHPreparation {
             configData = qwen35JANGHPreparation.dense.ordinaryConfiguration
         }
+        let miniCPMJANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil)
+            ? try MiniCPMV47JANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let miniCPMJANGHPreparation {
+            configData = miniCPMJANGHPreparation.banks.ordinaryConfiguration
+        }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -667,6 +690,10 @@ public final class VLMModelFactory: ModelFactory {
                     configurationData: mergedConfigData, requesting: configuration.requestedModalities)
             } else if let qwen35JANGHPreparation {
                 model = try qwen35JANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let miniCPMJANGHPreparation {
+                model = try miniCPMJANGHPreparation.construct(
                     configurationData: mergedConfigData,
                     requesting: configuration.requestedModalities)
             } else {

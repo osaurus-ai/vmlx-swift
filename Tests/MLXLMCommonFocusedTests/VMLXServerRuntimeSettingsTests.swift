@@ -151,6 +151,12 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(
             defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil
         )
+        // Weights decide: a fitting drafter folder is used whatever jang_config.json stamps.
+        try Data(#"{"speculative": {"method": "dflash2", "default": false}}"#.utf8)
+            .write(to: root.appendingPathComponent("jang_config.json"))
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
+                != nil)
     }
 
     @Test("selection capability shares the launch policy across architecture aliases")

@@ -183,6 +183,26 @@ struct Bench {
         // Validates SSM seed + stepBatchDecode force-unwrap fix +
         // ReasoningParser.forPrompt tail detection, all in one run.
         //   BENCH_VIDEO=/path/to/file.mov overrides the default video.
+        // BENCH_VL_IMAGE_SMOKE=1: one real image file through the production VLM processor and
+        // BatchEngine, then a text-only follow-up with the image in history, then the image again
+        // with the opposite thinking mode. BENCH_VL_IMAGE=/path.png BENCH_VL_PROMPT="..."
+        // BENCH_VL_THINKING=0|1 BENCH_VL_FOLLOWUP="..." BENCH_VL_TEMPERATURE=0.
+        if (env["BENCH_VL_IMAGE_SMOKE"] ?? "0") == "1" {
+            guard let imagePath = env["BENCH_VL_IMAGE"] else {
+                fputs("BENCH_VL_IMAGE_SMOKE needs BENCH_VL_IMAGE=/path/to/image\n", stderr)
+                exit(2)
+            }
+            try await VLBench.runImageSmoke(
+                modelPath: modelPath, imagePath: imagePath,
+                prompt: env["BENCH_VL_PROMPT"]
+                    ?? "What text is written in this image, and what shapes and colors do you see? Answer briefly.",
+                followUp: env["BENCH_VL_FOLLOWUP"] ?? "Now answer in one short sentence: which shape was on the left?",
+                thinking: (env["BENCH_VL_THINKING"] ?? "0") == "1",
+                temperature: Float(env["BENCH_VL_TEMPERATURE"] ?? "0") ?? 0,
+                maxNewTokens: maxNew)
+            return
+        }
+
         if (env["BENCH_VL_MIXED"] ?? "0") == "1" {
             let videoPath = env["BENCH_VIDEO"]
                 ?? "Tests/MLXLMTests/Resources/1080p_30.mov"

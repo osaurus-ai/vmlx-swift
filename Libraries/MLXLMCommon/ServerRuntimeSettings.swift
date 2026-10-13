@@ -633,11 +633,19 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         configData: Data?, bundleDirectory: URL?
     ) -> VMLXDFlash2DrafterInfo? {
         guard mtp.mode != .off, let bundleDirectory else { return nil }
-        let local = bundleDirectory.appendingPathComponent("dflash2", isDirectory: true)
-        guard let info = VMLXDFlash2DrafterInfo.read(at: local),
-            info.mismatchReason(configData: configData) == nil
-        else { return nil }
-        return info
+        // `dflash2/` (DFlash 2) or `dspark/` (DSpark, e.g. MiniCPM-V 4.7): both run on the DFlash 2 lane. The default
+        // is decided by the weights: a drafter folder that fits the bundle is used; no stamp gates it. A bundle whose
+        // drafter should not run ships without the folder (MiniCPM-V 4.7 1B), and Speculative Decoding Off still
+        // turns any of them off.
+        for name in ["dflash2", "dspark"] {
+            let local = bundleDirectory.appendingPathComponent(name, isDirectory: true)
+            if let info = VMLXDFlash2DrafterInfo.read(at: local),
+                info.mismatchReason(configData: configData) == nil
+            {
+                return info
+            }
+        }
+        return nil
     }
 
     /// Why the selected drafter is not being used for this bundle, for

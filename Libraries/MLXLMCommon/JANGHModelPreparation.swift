@@ -10,10 +10,14 @@ public struct JANGHRoutedModelLayout: Sendable {
     public let sparseLayers: Set<Int>
     /// Routed experts per token (top-k). Only the selected-expert (SSD/LRU) path uses it.
     public let routesPerToken: Int
+    /// Wrapper in front of `model.layers.L.mlp.switch_mlp` in the checkpoint (`language_model.` for MiniCPM-V 4.7).
+    public let modulePrefix: String
 
     public init(modelType: String, hiddenSize: Int, intermediateSize: Int,
-                expertCount: Int, sparseLayers: Set<Int>, routesPerToken: Int = 8) {
+                expertCount: Int, sparseLayers: Set<Int>, routesPerToken: Int = 8,
+                modulePrefix: String = "") {
         self.routesPerToken = routesPerToken
+        self.modulePrefix = modulePrefix
         self.modelType = modelType
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -75,7 +79,7 @@ public final class JANGHModelPreparation {
         var dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var modules: [Int: String] = [:]
         for layer in layout.sparseLayers.sorted() {
-            let parent = "model.layers.\(layer).mlp.switch_mlp"
+            let parent = layout.modulePrefix + "model.layers.\(layer).mlp.switch_mlp"
             modules[layer] = parent
             for role in ["gate_proj", "up_proj", "down_proj"] {
                 dimensions[parent + "." + role] = .init(

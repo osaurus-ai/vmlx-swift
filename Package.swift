@@ -860,6 +860,7 @@ let package = Package(
                 .process("Resources/audio_only.mov"),
                 .copy("Resources/modernbert-tiny.safetensors"),
                 .copy("Resources/modernbert-tiny.json"),
+                .copy("Resources/minicpmv47"),
             ]
         ),
         .testTarget(
@@ -882,6 +883,7 @@ let package = Package(
                 "DFlash2TreeAndTopKAcceptanceTests.swift",
                 "LaneQMMGroup128Tests.swift",
                 "DFlash2WidthChooserTests.swift",
+                "DSparkDrafterTests.swift",
                 "ChunkedVectorAttentionTests.swift",
                 "SpeculativeAcceptanceBoundaryTests.swift",
                 "NativeMTPARSafetyTests.swift",
