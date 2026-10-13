@@ -302,6 +302,15 @@ func gatedDeltaOps(
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
+    // An invalid operand (the result of an MLX operation that already failed
+    // under a recovering error handler) reads every dim as 0, and `Hv / Hk`
+    // below would then divide by zero and kill the process. Hand the failure
+    // on as invalid outputs so the request-level error check reports the
+    // originating MLX error instead.
+    guard q.isValid, k.isValid, v.isValid, g.isValid, beta.isValid else {
+        return (MLXArray.mlxNone, MLXArray.mlxNone)
+    }
+
     let B = q.dim(0)
     let T = q.dim(1)
     let Hk = q.dim(2)

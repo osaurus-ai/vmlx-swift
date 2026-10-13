@@ -685,8 +685,11 @@ enum Qwen3VLVision {
             var mask = ones([1, sequenceLength, sequenceLength], dtype: queries.dtype)
             mask = mask * MLXArray(-1e9, dtype: queries.dtype)
 
+            // `1 ..< 0` traps: an empty cu_seqlens (no grid, or an invalid array
+            // after a failed upstream op) must leave the mask fully masked, not
+            // kill the process.
             let seqlens = cuSeqlens.asArray(Int.self)
-            for idx in 1 ..< seqlens.count {
+            for idx in stride(from: 1, to: seqlens.count, by: 1) {
                 let start = seqlens[idx - 1]
                 let end = seqlens[idx]
                 mask[0..., start ..< end, start ..< end] = MLXArray(0, dtype: queries.dtype)

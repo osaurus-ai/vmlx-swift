@@ -287,6 +287,20 @@ func initError() {
     _ = errorHandler
 }
 
+/// Route "an invalid array reached Swift-side shape logic" through the same
+/// path as a C++ MLX error.
+///
+/// An invalid array (``MLXArray/isValid`` == `false`) is the value a failed
+/// `mlx-c` call returns when a recovering error handler is installed, so the
+/// originating error has already been dispatched. This reports the Swift-side
+/// use with a message naming the site, lets any scoped ``ErrorBox`` keep its
+/// first (originating) error, and under the default handler stays fatal like
+/// every other MLX error.
+func reportInvalidArrayUse(_ site: String) {
+    errorHandler.dispatch(
+        "\(site) applied to an invalid MLXArray: the MLX operation that produced it failed")
+}
+
 /// Forward the error to the `ErrorHandler` singleton.  See `errorHandler` (above) for how this is
 /// installed.
 private func errorHandlerTrampoline(message: UnsafePointer<CChar>?, data: UnsafeMutableRawPointer?)

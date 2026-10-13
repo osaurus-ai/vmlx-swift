@@ -1549,7 +1549,18 @@ public func split(_ array: MLXArray, parts: Int, axis: Int = 0, stream: StreamOr
     var vec = mlx_vector_array_new()
     mlx_split(&vec, array.ctx, parts.int32, axis.int32, stream.ctx)
     defer { mlx_vector_array_free(vec) }
-    return mlx_vector_array_values(vec)
+    return splitPieces(mlx_vector_array_values(vec), expected: parts)
+}
+
+/// A failed `mlx_split`/`mlx_split_sections` (invalid input, or a C++ error
+/// already dispatched to the error handler) leaves the result vector empty.
+/// Callers index the pieces positionally (`parts[0]`, `parts[1]`, ...), so an
+/// empty result would trap the process in `Array.subscript`. Hand back the
+/// expected number of invalid arrays instead so the failure propagates to the
+/// caller's error check exactly like every other failed operation.
+func splitPieces(_ pieces: [MLXArray], expected: Int) -> [MLXArray] {
+    if pieces.count == expected { return pieces }
+    return (0 ..< max(expected, 0)).map { _ in MLXArray(mlx_array_new()) }
 }
 
 /// Split an array into 2 equal size pieces along a given axis.
@@ -1578,7 +1589,7 @@ public func split(_ array: MLXArray, axis: Int = 0, stream: StreamOrDevice = .de
     var vec = mlx_vector_array_new()
     mlx_split(&vec, array.ctx, 2, axis.int32, stream.ctx)
     defer { mlx_vector_array_free(vec) }
-    let pieces = mlx_vector_array_values(vec)
+    let pieces = splitPieces(mlx_vector_array_values(vec), expected: 2)
     return (pieces[0], pieces[1])
 }
 
@@ -1601,7 +1612,7 @@ public func split(
     var vec = mlx_vector_array_new()
     mlx_split_sections(&vec, array.ctx, indices.asInt32, indices.count, axis.int32, stream.ctx)
     defer { mlx_vector_array_free(vec) }
-    return mlx_vector_array_values(vec)
+    return splitPieces(mlx_vector_array_values(vec), expected: indices.count + 1)
 }
 
 /// Element-wise square root
