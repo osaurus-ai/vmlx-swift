@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+#if canImport(os)
 import os
+#endif
 
 /// Stable engine-side contract for an Osaurus server/session settings panel.
 ///
