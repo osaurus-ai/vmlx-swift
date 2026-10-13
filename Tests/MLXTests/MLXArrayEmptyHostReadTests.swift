@@ -29,7 +29,7 @@ struct MLXArrayEmptyHostReadTests {
         let competingLockAcquired = DispatchSemaphore(value: 0)
 
         DispatchQueue.global().async {
-            array.withEvaluatedHostAccess {
+            array.withEvaluatedHostAccess { _ in
                 enteredRead.signal()
                 releaseRead.wait()
             }
