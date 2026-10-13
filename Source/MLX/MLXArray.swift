@@ -174,7 +174,12 @@ public final class MLXArray {
     /// specialized conversion between integer types -- see ``item(_:)``
     private func itemInt() -> Int {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         case .bool:
@@ -222,7 +227,12 @@ public final class MLXArray {
     /// specialized conversion between integer types -- see ``item(_:)``
     private func itemUInt() -> UInt {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         case .bool:
@@ -269,7 +279,12 @@ public final class MLXArray {
     /// specialized conversion between float types -- see ``item(_:)``
     private func itemFloat() -> Float {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         #if !arch(x86_64)
@@ -294,7 +309,12 @@ public final class MLXArray {
 
     private func itemDouble() -> Double {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return 0
+        }
 
         switch self.dtype {
         #if !arch(x86_64)
@@ -330,7 +350,12 @@ public final class MLXArray {
     /// ```
     public func item<T: HasDType>(_ type: T.Type) -> T {
         precondition(self.size == 1)
-        eval()
+        // A failed eval leaves no `array::Data`; the mlx-c item accessors would
+        // re-run the failing eval and the complex path dereferences null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("item")
+            return Self.zeroFilled(count: 1)[0]
+        }
 
         // special cases for reading integers and floats from (roughly)
         // same typed arrays -- this avoids doing a conversion which

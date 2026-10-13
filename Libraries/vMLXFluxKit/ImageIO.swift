@@ -163,7 +163,11 @@ public enum ImageIO {
 
         // (C, H, W) → (H, W, C) for pixel buffer interpretation.
         let interleaved = asUInt8.transposed(1, 2, 0)
-        let bytes = interleaved.asArray(UInt8.self)
+        // Throwing read: if the diffusion/VAE graph behind this tensor failed
+        // to evaluate (Metal allocation or command-buffer failure under memory
+        // pressure, Sentry APPLE-MACOS-319), fail the job instead of writing a
+        // black PNG and reporting success.
+        let bytes = try interleaved.asArrayChecked(UInt8.self)
 
         // Build an NSBitmapImageRep and serialize.
         let bitsPerPixel = channels == 3 ? 24 : 8

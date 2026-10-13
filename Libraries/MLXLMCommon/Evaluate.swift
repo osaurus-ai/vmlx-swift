@@ -5182,8 +5182,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
+            // Collect only errors escaping this operation's scoped handlers.
+            // A process-wide counter also sees unrelated requests and probes
+            // whose owners caught their errors and selected a valid fallback.
             do {
-                iterator = try makeIterator.consume()()
+                iterator = try MLX.withError { try makeIterator.consume()() }
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -5240,13 +5243,26 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             var tokenCount = 0
             var generatedTokenIds: [Int] = []
             var stopReason: GenerateStopReason?
+            var decodeFailure: GenerationFailure?
 
             let stopTokenIds = buildStopTokenIds(
                 modelConfiguration: modelConfiguration,
                 tokenizer: tokenizer
             )
 
-            while let token = iterator.next() {
+            while true {
+                let nextToken: Int?
+                do {
+                    nextToken = try MLX.withError { iterator.next() }
+                } catch {
+                    decodeFailure = GenerationFailure(
+                        stage: .decoding, cause: "MLX error during decode: \(error.localizedDescription)")
+                    stopReason = .cancelled
+                    streamTiming?.recordTermination("mlx_error")
+                    break
+                }
+                guard let token = nextToken else { break }
+
                 // Check for cancellation on every loop iteration. A consumer
                 // that stops after the handler surfaced a parsed tool call is
                 // not abandoning the turn — the dispatched tool defines its
@@ -5303,6 +5319,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 generatedTokenIds.append(token)
             }
 
+
+
             if stopReason == nil {
                 if Task.isCancelled {
                     stopReason = handler.emittedToolCall ? .stop : .cancelled
@@ -5358,6 +5376,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 dflash2Stats: iterator.dflash2GenerationStats,
                 toolCallProtocolFailure: handler.toolCallProtocolFailure,
                 generationFailure: iterator.generationFailure
+                    ?? decodeFailure
                     ?? (iterator.structuredOutputComplete != nil
                         && (stopReason != .stop || iterator.structuredOutputComplete != true)
                         ? GenerationFailure(

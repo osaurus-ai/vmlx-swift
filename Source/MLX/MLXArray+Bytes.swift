@@ -131,26 +131,103 @@ extension MLXArray {
         // reads the backing descriptor. Qwen4Exp PLE performs this host read
         // once per decode step, so server cancellation/load churn made that
         // tiny gap a production EXC_BAD_ACCESS in Buffer::raw_ptr().
-        return withEvaluatedHostAccess {
-            return [T](unsafeUninitializedCapacity: self.size) { destination, initializedCount in
-                let source = UnsafeRawBufferPointer(
-                    start: mlx_array_data_uint8(self.ctx), count: physicalSize * itemSize)
-                copy(from: source, toContiguous: UnsafeMutableRawBufferPointer(destination))
-                initializedCount = self.size
+        return withEvaluatedHostAccess { realized in
+            guard realized else {
+                reportUnrealizedHostRead("asArray")
+                return Self.zeroFilled(count: self.size)
+            }
+            return copyRealizedHostBytes()
+        }
+    }
+
+    /// ``asArray(_:)`` that throws instead of returning zero-filled values
+    /// when the array could not be evaluated (a Metal allocation,
+    /// command-buffer, or kernel failure anywhere in its graph).
+    ///
+    /// Prefer this on throwing paths that hand the bytes to the user, such
+    /// as writing an image to disk: a failed evaluation then fails the
+    /// request instead of producing a plausible-looking zero result.
+    ///
+    /// - Throws: ``MLXError/caught(_:)`` carrying the MLX error message.
+    public func asArrayChecked<T: HasDType>(_ type: T.Type) throws -> [T] {
+        try withError { error in
+            let source = type.dtype == self.dtype ? self : self.asType(type)
+            try error.check()
+            return try source.withEvaluatedHostAccess { realized in
+                // Keep the diagnostic scoped to this read, including conversion.
+                // Another request's process-wide last error is not this failure.
+                try error.check()
+                guard realized else {
+                    throw MLXError.caught("array could not be evaluated (shape=\(source.shape), dtype=\(source.dtype))")
+                }
+                return source.copyRealizedHostBytes()
             }
         }
+    }
+
+    /// Copy the realized backing into a contiguous Swift array. Only valid
+    /// inside ``withEvaluatedHostAccess(_:)`` when `realized` is true.
+    private func copyRealizedHostBytes<T: HasDType>() -> [T] {
+        [T](unsafeUninitializedCapacity: self.size) { destination, initializedCount in
+            let source = UnsafeRawBufferPointer(
+                start: mlx_array_data_uint8(self.ctx), count: physicalSize * itemSize)
+            copy(from: source, toContiguous: UnsafeMutableRawBufferPointer(destination))
+            initializedCount = self.size
+        }
+    }
+
+    /// `count` zero elements. All ``HasDType`` conformers are trivial types
+    /// whose zero value is all-zero bytes.
+    static func zeroFilled<T: HasDType>(count: Int) -> [T] {
+        [T](unsafeUninitializedCapacity: count) { destination, initializedCount in
+            UnsafeMutableRawBufferPointer(destination).initializeMemory(
+                as: UInt8.self, repeating: 0)
+            initializedCount = count
+        }
+    }
+
+    /// Report a host read that found no realized backing. The eval failure
+    /// itself was already dispatched by `mlx_array_eval`; this names the
+    /// read that would otherwise have dereferenced a null `array::Data`
+    /// (Sentry APPLE-MACOS-1ZE / 2PW / 319 / 2EX / 1X5).
+    func reportUnrealizedHostRead(_ surface: String) {
+        reportMLXError(
+            "[MLXArray.\(surface)] host read of an array that failed to evaluate"
+                + " (shape=\(self.shape), dtype=\(self.dtype)); returning zero bytes."
+                + " MLX error: \(MLXErrorMonitor.lastMessage ?? "unknown")")
+    }
+
+    /// Evaluate under the stream driver lock and report whether the array is
+    /// realized. `mlx_array_eval` returns non-zero when the C++ eval threw
+    /// (the exception is forwarded to the MLX error handler); the array and
+    /// everything downstream of the failed primitive then have no
+    /// `array::Data`, and `mlx_array_data_*` would dereference null.
+    ///
+    /// Must be called with `evalLock` held.
+    private func realizeForHostRead() -> Bool {
+        mlx_array_eval(ctx) == 0
     }
 
     /// Evaluate and keep the global MLX stream driver lock held while a
     /// caller reads the realized host backing. Internal so every host-copy
     /// surface can share the same lifetime boundary without exposing the lock.
+    ///
+    /// `realized` is false when evaluation failed; the body must not touch
+    /// `mlx_array_data_*` in that case.
     func withEvaluatedHostAccess<Result>(
-        _ body: () throws -> Result
+        _ body: (_ realized: Bool) throws -> Result
     ) rethrows -> Result {
         try evalLock.withLock {
-            self.eval()
-            return try body()
+            let realized = realizeForHostRead()
+            return try body(realized)
         }
+    }
+
+    /// Evaluate under the stream driver lock and report whether the array has
+    /// a realized backing. Callers that read through the mlx-c item/data
+    /// accessors outside the lock use this to skip the read on failure.
+    func realizedForHostRead() -> Bool {
+        evalLock.withLock { realizeForHostRead() }
     }
 
 #if DEBUG
@@ -243,7 +320,15 @@ extension MLXArray {
     /// - ``asArray(_:)``
     /// - ``asMTLBuffer(device:noCopy:)``
     public func asData(access: AccessMethod = .copy) -> MLXArrayData {
-        self.eval()
+        // Same realization gate as `asArray`: a failed eval leaves no
+        // `array::Data`, and every branch below reads `mlx_array_data_uint8`.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("asData")
+            return MLXArrayData(
+                data: Data(count: self.nbytes),
+                shape: self.shape, strides: contiguousStrides(shape: self.shape),
+                dType: self.dtype)
+        }
 
         switch access {
         case .copy:
@@ -319,8 +404,6 @@ extension MLXArray {
     /// - ``asMTLBuffer(device:noCopy:)``
     @available(*, deprecated, message: "use asData(acccess: .copy)")
     public func asData(noCopy: Bool = false, disambiguate: Bool = false) -> Data {
-        self.eval()
-
         return asData(access: noCopy ? .noCopyIfContiguous : .copy)
             .data
     }

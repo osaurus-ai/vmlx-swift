@@ -19,7 +19,12 @@ extension MLXArray {
     /// - ``asArray(_:)``
     /// - ``asData(access:)``
     public func asMTLBuffer(device: some MTLDevice, noCopy: Bool = false) -> (any MTLBuffer)? {
-        self.eval()
+        // A failed eval leaves no `array::Data`; the force-unwrapped
+        // `mlx_array_data_uint8` below would dereference null.
+        guard realizedForHostRead() else {
+            reportUnrealizedHostRead("asMTLBuffer")
+            return nil
+        }
 
         if noCopy && self.contiguousToDimension() == 0 {
             // the backing is contiguous, we can provide a wrapper
