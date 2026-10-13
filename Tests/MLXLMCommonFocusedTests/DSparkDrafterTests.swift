@@ -70,6 +70,20 @@ final class DSparkDrafterTests: XCTestCase {
         XCTAssertFalse(model.supportsLattice, "a DSpark drafter drafts one chain, no tree lattice")
     }
 
+    func testDSparkExtremeBlockRejectsWithoutOverflow() throws {
+        let config = dsparkConfig(extra: ["block_size": Int.max])
+        XCTAssertThrowsError(try DFlash2Configuration(json: config))
+    }
+
+    func testDSparkExtremeConfidenceRankRejectsWithoutOverflow() throws {
+        var config = dsparkConfig()
+        var inner = config["dflash_config"] as! [String: Any]
+        inner["markov_rank"] = Int.max
+        config["dflash_config"] = inner
+        XCTAssertThrowsError(try DFlash2ArtifactMetadata.requiredShapes(
+            configData: JSONSerialization.data(withJSONObject: config)))
+    }
+
     func testDSparkLadderStaysWithinTheTrainedBlock() {
         XCTAssertEqual(DFlash2WidthChooser.dsparkLadder(trained: 16), [3, 5, 8, 16])
         XCTAssertEqual(DFlash2WidthChooser.dsparkLadder(trained: 6), [3, 5, 6])

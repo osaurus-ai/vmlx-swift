@@ -43,7 +43,11 @@ public enum DFlash2ArtifactMetadata {
             shapes["markov_head.markov_w1.weight"] = [c.vocabSize, c.markovRank]
             shapes["markov_head.markov_w2.weight"] = [c.vocabSize, c.markovRank]
             if c.hasConfidenceHead {
-                shapes["confidence_head.proj.weight"] = [1, h + c.markovRank]
+                let width = h.addingReportingOverflow(c.markovRank)
+                guard !width.overflow else {
+                    throw DFlash2LoadError.targetMismatch("drafter confidence dimension overflow")
+                }
+                shapes["confidence_head.proj.weight"] = [1, width.partialValue]
                 shapes["confidence_head.proj.bias"] = [1]
             }
         }

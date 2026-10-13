@@ -214,7 +214,11 @@ public struct DFlash2Configuration: Sendable {
             markovRank > 0 || (any("projector_type") as? String) == "dspark"
             || architectures.contains { $0.contains("DSpark") }
         if anchorRowDrafts {
-            inner = inner.replacingBlockSize(inner.blockSize + 1)
+            let width = inner.blockSize.addingReportingOverflow(1)
+            guard inner.blockSize > 0, !width.overflow else {
+                throw DFlash2LoadError.targetMismatch("invalid DSpark draft block size")
+            }
+            inner = inner.replacingBlockSize(width.partialValue)
         }
         self.ropeTraditional = (any("rope_is_neox_style") as? Bool).map { !$0 } ?? false
         self.hasConfidenceHead = (any("enable_confidence_head") as? Bool) ?? false

@@ -883,6 +883,7 @@ let package = Package(
                 "DFlash2TreeAndTopKAcceptanceTests.swift",
                 "LaneQMMGroup128Tests.swift",
                 "DFlash2WidthChooserTests.swift",
+                "DSparkDrafterTests.swift",
                 "ChunkedVectorAttentionTests.swift",
                 "SpeculativeAcceptanceBoundaryTests.swift",
                 "NativeMTPARSafetyTests.swift",
