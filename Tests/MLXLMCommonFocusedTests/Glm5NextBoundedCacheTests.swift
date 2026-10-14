@@ -287,6 +287,119 @@ struct Glm5NextBoundedCacheTests {
         #expect(error == 0)
     }
 
+    @Test("diagnostic per-row GLM projection and attention arithmetic")
+    func numericalStageProbe() throws {
+        let module = try attention()
+        let x = hidden(37)
+        func rows(_ value: MLXArray, _ apply: (MLXArray) -> MLXArray) -> MLXArray {
+            concatenated((0..<value.dim(1)).map { apply(value[0..., $0..<($0 + 1)]) }, axis: 1)
+        }
+        func report(_ label: String, _ batch: MLXArray, _ single: MLXArray) {
+            let errors = abs(batch - single).max(axis: -1).reshaped(-1).asArray(Float.self)
+            print("GLM_NUMERIC_STAGE label=\(label) maxabs=\(errors.max() ?? 0) first=\(errors[0]) rows=\(errors)")
+        }
+        let qa = module.qAProj(x)
+        let qaRows = rows(x) { module.qAProj($0) }
+        report("q_a_projection", qa, qaRows)
+        report("q_a_norm_same_input", module.qALayerNorm(qa), rows(qa) { module.qALayerNorm($0) })
+        let qResid = module.qALayerNorm(qa)
+        report("q_b_projection_same_input", module.qBProj(qResid), rows(qResid) { module.qBProj($0) })
+        let kv = module.kvAProjWithMqa(x)
+        report("kv_a_projection", kv, rows(x) { module.kvAProjWithMqa($0) })
+        report("kv_a_norm_same_input", module.kvALayerNorm(kv), rows(kv) { module.kvALayerNorm($0) })
+        let latent = module.kvALayerNorm(kv)
+        report("kv_b_projection_same_input", module.kvBProj(latent), rows(latent) { module.kvBProj($0) })
+        report("index_key_projection", module.indexer.wk(x), rows(x) { module.indexer.wk($0) })
+        report("index_weight_projection", module.indexer.weightsProj(x), rows(x) { module.indexer.weightsProj($0) })
+        report("output_projection_same_input", module.oProj(x), rows(x) { module.oProj($0) })
+
+        // Host double-precision dot products identify which first projection
+        // differs from the common input/weight contract. No runtime setting is changed.
+        let input = x.asArray(Float.self), weights = module.qAProj.weight.asArray(Float.self)
+        let width = module.qAProj.weight.dim(0)
+        var exact: [Float] = []
+        for row in 0..<37 {
+            for output in 0..<width {
+                var sum: Double = 0
+                for column in 0..<64 { sum += Double(input[row * 64 + column]) * Double(weights[output * 64 + column]) }
+                exact.append(Float(sum))
+            }
+        }
+        let oracle = MLXArray(exact, [1, 37, width])
+        report("q_a_batch_vs_double_dot", qa, oracle)
+        report("q_a_single_vs_double_dot", qaRows, oracle)
+
+        for absorbed in [true, false] {
+            for cap in [nil, 7] as [Int?] {
+                let single = Glm5NextIndexedKVCache(absorbed: absorbed, maxSize: cap, poolSize: 4)
+                let chunks = Glm5NextIndexedKVCache(absorbed: absorbed, maxSize: cap, poolSize: 4)
+                var a: [MLXArray] = [], b: [MLXArray] = []
+                for row in 0..<37 { a.append(try module(x[0..., row..<(row + 1)], cache: single)) }
+                var start = 0
+                for count in [4, 3, 9, 1, 12, 8] {
+                    b.append(try module(x[0..., start..<(start + count)], cache: chunks)); start += count
+                }
+                report("attention_absorbed=\(absorbed)_cap=\(String(describing: cap))", concatenated(b, axis: 1), concatenated(a, axis: 1))
+            }
+        }
+    }
+
+    @Test("diagnostic BF16 affine8 and MXFP8 projection path")
+    func nativeQuantizedStageProbe() throws {
+        // Match the inspected bundle's projection formats, using bounded tiny
+        // geometry and generated weights. This is not a real-weight model run.
+        let json = Self.tinyJSON.replacingOccurrences(of: "\"index_topk\":2048", with: "\"index_topk\":4")
+            .replacingOccurrences(of: "\"q_lora_rank\":32", with: "\"q_lora_rank\":64")
+            .replacingOccurrences(of: "\"kv_lora_rank\":16", with: "\"kv_lora_rank\":64")
+        let configuration = try JSONDecoder().decode(Glm5NextConfiguration.self, from: Data(json.utf8))
+        let module = Glm5NextSparseAttention(configuration.textConfig)
+        module.update(parameters: module.parameters().mapValues { $0.asType(.bfloat16) })
+        quantize(model: module, filter: { path, layer in
+            guard layer is Linear else { return nil }
+            return path == "indexer.wq_b" ? (32, 8, .mxfp8) : (64, 8, .affine)
+        })
+        #expect(module.qAProj is QuantizedLinear)
+        #expect(module.indexer.wqB is QuantizedLinear)
+        let x = hidden(37).asType(.bfloat16)
+        func rows(_ value: MLXArray, _ apply: (MLXArray) -> MLXArray) -> MLXArray {
+            concatenated((0..<value.dim(1)).map { apply(value[0..., $0..<($0 + 1)]) }, axis: 1)
+        }
+        func report(_ label: String, _ batch: MLXArray, _ single: MLXArray) {
+            let difference = batch.asType(.float32) - single.asType(.float32)
+            print("GLM_NATIVE_NUMERIC_STAGE label=\(label) dtype=\(batch.dtype) maxabs=\(abs(difference).max().item(Float.self))")
+        }
+        report("q_a_affine8", module.qAProj(x), rows(x) { module.qAProj($0) })
+        report("kv_a_affine8", module.kvAProjWithMqa(x), rows(x) { module.kvAProjWithMqa($0) })
+        let qResid = module.qALayerNorm(module.qAProj(x))
+        report("index_wq_b_mxfp8_same_input", module.indexer.wqB(qResid), rows(qResid) { module.indexer.wqB($0) })
+        for cap in [nil, 7] as [Int?] {
+            let single = Glm5NextIndexedKVCache(maxSize: cap, poolSize: 4)
+            let chunks = Glm5NextIndexedKVCache(maxSize: cap, poolSize: 4)
+            var a: [MLXArray] = [], b: [MLXArray] = []
+            for row in 0..<37 { a.append(try module(x[0..., row..<(row + 1)], cache: single)) }
+            var start = 0
+            for count in [4, 3, 9, 1, 12, 8] {
+                b.append(try module(x[0..., start..<(start + count)], cache: chunks)); start += count
+            }
+            report("attention_cap=\(String(describing: cap))", concatenated(b, axis: 1), concatenated(a, axis: 1))
+        }
+    }
+
+    @Test("early rows in a threshold-crossing chunk retain exactly the causal selection")
+    func thresholdCrossingSelectionControl() throws {
+        let indexer = Glm5NextIndexer(numHeads: 1, headDim: 2, topK: 8, poolSize: 8,
+            poolCompressed: true, alwaysSelectTail: true, hiddenSize: 2, qLoraRank: 2)
+        let packed = concatenated([MLXArray.zeros([1, 16, 4]), MLXArray.ones([1, 16, 1])], axis: 2)
+        let selected = try indexer.selectTopK(packed: packed, queries: MLXArray.ones([1, 8, 1, 2]),
+            hidden: MLXArray.ones([1, 8, 2]), queryOffset: 0)
+        let mask = indexer.maskFromIndices(selected, kvLength: 16).asArray(Bool.self)
+        for query in 0..<8 {
+            let expected = (0..<16).map { $0 <= query }
+            #expect(Array(mask[(query * 16)..<((query + 1) * 16)]) == expected)
+        }
+        print("GLM_THRESHOLD_CONTROL topK=8 pool=8 total=16 early_rows=8 exact_causal=true")
+    }
+
     static let tinyJSON = #"""
         {"model_type":"glm5_next","image_token_id":9,"video_token_id":10,
          "text_config":{"model_type":"glm5_next_text","hidden_size":64,

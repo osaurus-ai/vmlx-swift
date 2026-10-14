@@ -46,3 +46,25 @@ VMLX_GLM_CACHE_APPEND_PROBE=1 swift test --build-system swiftbuild --filter Glm5
 ```
 
 Keep the PR in draft for independent review. Do not merge or release until the numeric limitation is understood and real model/app 128k, footprint, sustained speed, multiturn and relevant cache/media proofs are complete.
+
+## Numerical diagnosis follow-up
+
+The first observed difference is before cache storage or sparse selection. A shared FP32 attention module with identical input and weights produced:
+
+| Stage/control | Maximum absolute difference |
+| --- | ---: |
+| q_a batched projection vs single-row projection | 0.0015132427 |
+| q_a batched projection vs host double-precision dot products | 0.0015133619 |
+| q_a single-row projection vs the same double-precision dots | 0.00000023841858 |
+| RMSNorm applied batchwise vs rowwise to identical projected inputs | 0.0 |
+| Other same-input Linear stages | approximately 0.000800–0.001513 |
+
+Source tracing supports a row-geometry arithmetic distinction: Linear calls matmul; Metal matmul selects GEMV for a singleton matrix dimension, whereas matrix GEMM can select NAX when the default-enabled TF32 policy permits FP32 inputs. This is source-path evidence plus the double-dot comparison, not a captured Metal kernel trace. No TF32 or other production precision policy was changed.
+
+The selection threshold cannot explain all original failures: topK=4 aligns with the first four-row chunk, and topK=64 never selects across the 37-row fixture. A focused topK=8, pool-eight control evaluates early rows inside a 16-row selection call and proves their selected mask is exactly causal. The real dense/absorbed arithmetic still differs by row shape.
+
+An additional same-module FP32 probe observed an uncapped row-25 output difference of **0.23808202** (absorbed) and **0.2380518** (expanded), alongside roughly 0.001 differences on other rows. Selection amplification near a ranking boundary is a hypothesis, not established for that outlier; it remains visible and unresolved.
+
+The inspected GLM bundle uses BF16-backed affine-eight projections with group size 64, except indexer wq_b using MXFP8 with group size 32. The original unquantized FP32 fixture therefore does not establish actual quantized bundle behavior. An additional tiny generated-weight fixture using those formats observed projection row-shape differences of **0.0078125**, and attention differences of **0.00390625** for both uncapped and cap-seven cases. This reproduces a row-shape precision distinction in the format-matched synthetic path; it is not real-weight inference, a JANGHT routed-kernel check, or a coherence verdict.
+
+The new stage probes report measurements without asserting parity. The original strict failing tests remain unchanged. No production arithmetic fix, changed seed, tolerance relaxation, or disabled failure was introduced. Reproduce the added bounded diagnostics with filters Glm5NextBoundedCacheTests/numericalStageProbe, /nativeQuantizedStageProbe, and /thresholdCrossingSelectionControl.
