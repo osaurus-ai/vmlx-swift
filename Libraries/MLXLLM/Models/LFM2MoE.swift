@@ -426,11 +426,10 @@ public class LFM2MoEModelInner: Module {
         var hidden = inputEmbeddings ?? embedTokens(inputs)
 
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
-            guard let index = firstAttentionIndex,
-                let cache,
-                index < cache.count
-            else { return .none }
-            return createAttentionMask(h: hidden, cache: cache[index])
+            guard let index = firstAttentionIndex else { return .none }
+            let layerCache = cache.flatMap { index < $0.count ? $0[index] : nil }
+            // Causality is required even when the caller does not retain KV.
+            return createAttentionMask(h: hidden, cache: layerCache)
         }()
 
         let ssmMask: MLXArray? = {
