@@ -29,6 +29,7 @@ enum NLLBench {
             print("NLL INVALID: fewer than 2 tokens")
             return
         }
+        print("NLL first_ids=\(Array(tokens.prefix(5))) count=\(tokens.count)")
         let cache = context.model.newCache(parameters: nil)
         var total: Double = 0
         var counted = 0
@@ -45,7 +46,9 @@ enum NLLBench {
             let picked = takeAlong(logits, targets, axis: -1).squeezed(axis: -1)
             let nll = (logSumExp(logits, axis: -1) - picked).sum()
             eval(nll)
-            total += Double(nll.item(Float.self))
+            let chunkNLL = Double(nll.item(Float.self))
+            print(String(format: "NLL chunk %d-%d mean=%.6f", start, end, chunkNLL / Double(end - start)))
+            total += chunkNLL
             counted += end - start
             start = end
         }
