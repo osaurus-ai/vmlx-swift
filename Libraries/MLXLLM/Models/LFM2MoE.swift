@@ -319,9 +319,13 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         if useExpertBias, let expertBias {
             selection = probabilities.asType(.float32) + expertBias
         } else {
-            selection = probabilities.asType(.float32)
+            selection = probabilities
         }
-        let indices = argPartition(-selection, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        // Preserve the reference's selected-slot order as well as its set.
+        // Negating then taking the first k chooses the same experts, but a
+        // different permutation changes low-precision score normalization
+        // and weighted reduction.
+        let indices = argPartition(selection, kth: -k, axis: -1)[.ellipsis, (-k)...]
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var scores = takeAlong(probabilities, indices, axis: -1)
         if normTopKProb {
@@ -330,6 +334,8 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         if args.routedScalingFactor != 1 {
             scores = scores * args.routedScalingFactor
         }
+
+        scores = scores.asType(x.dtype)
 
         let expertOutputs = switchMLP(x, indices)
         let weighted = expertOutputs * scores[.ellipsis, .newAxis]
