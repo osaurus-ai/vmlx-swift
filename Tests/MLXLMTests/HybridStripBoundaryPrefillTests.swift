@@ -3,7 +3,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -13,6 +13,8 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     private(set) var forwarded: [Int] = []
     private(set) var prepareCalls = 0
     private(set) var prepareMediaFlags: [Bool] = []
+    private(set) var prepareTokenSegments: [[Int]] = []
+    private(set) var prepareMaskSegments: [[Int]] = []
 
     var vocabularySize: Int { 64 }
 
@@ -23,6 +25,8 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         prepareCalls += 1
         prepareMediaFlags.append(input.hasMediaContent)
+        prepareTokenSegments.append(input.text.tokens.reshaped(-1).asArray(Int32.self).map(Int.init))
+        prepareMaskSegments.append(input.text.mask?.reshaped(-1).asArray(Int32.self).map(Int.init) ?? [])
         let step = max(1, windowSize ?? 512)
         var flatTokens = input.text.tokens.reshaped([-1])
         while flatTokens.size > step {
@@ -44,6 +48,27 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
         }
         return MLXArray.zeros([1, max(ids.count, 1), vocabularySize])
     }
+}
+
+private final class CancelledHybridModel: RecordingHybridModel, @unchecked Sendable {
+    override func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        if prepareCalls == 1 { throw CancellationError() }
+        return try super.prepare(input, cache: cache, windowSize: windowSize)
+    }
+}
+
+private final class CanonicalHybridModel: RecordingHybridModel, CanonicalRequiredToolCacheModel,
+    @unchecked Sendable {
+    var canonicalRequiredToolCacheIdentity: String { "test-owned-cold-schedule" }
+    func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int? { 3 }
+    func validateCanonicalRequiredToolCache(_ cache: [KVCache], boundary: Int) -> Bool { true }
+}
+
+private final class RecordingPromptProcessor: LogitProcessor {
+    var prompts: [[Int]] = []
+    func prompt(_ prompt: MLXArray) { prompts.append(prompt.reshaped(-1).asArray(Int32.self).map(Int.init)) }
+    func process(logits: MLXArray) -> MLXArray { logits }
+    func didSample(token: MLXArray) {}
 }
 
 /// Same recorder, dense cache topology.
@@ -121,6 +146,147 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
             model.forwarded, forwardedDuringPrefill,
             "storing the stripped boundary must not re-derive it through the model")
         XCTAssertEqual(model.prepareCalls, prepareCallsAfterPrefill)
+    }
+
+    func testStableBoundariesBeforeStripAreCapturedWithoutTerminalReplay() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let prompt = [1, 2, 3, 4, 5] + userTurn + genPromptSuffix
+        let input = LMInput(
+            tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0),
+            tokenIds: prompt,
+            cachePrefixTokenCounts: [5, 9],
+            cacheStablePrefixTokenCounts: [5, 9])
+        var iterator = try TokenIterator(
+            input: input, model: model,
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(model.forwarded, prompt)
+        let callsBeforeStore = model.prepareCalls
+        iterator.storeCacheAfterGeneration(
+            generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(model.forwarded, prompt,
+            "stable seeds before the later strip must be captured, not replayed after output")
+        XCTAssertEqual(model.prepareCalls, callsBeforeStore,
+            "terminal cache publication must not prepare the earlier stable prefixes again")
+        XCTAssertTrue(coordinator.diskCache!.waitForPendingWrites(timeout: 5))
+    }
+
+    func testWarmStableHeadUsesAbsoluteRestoredOffsetWithoutReplay() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3)
+        let cold = [1, 2, 3, 4, 5] + userTurn + genPromptSuffix
+        var first = try TokenIterator(
+            input: LMInput(tokens: MLXArray(cold.map(Int32.init)).expandedDimensions(axis: 0),
+                tokenIds: cold, cachePrefixTokenCounts: [5, 12], cacheStablePrefixTokenCounts: [5]),
+            model: RecordingHybridModel(), parameters: parameters, cacheCoordinator: coordinator)
+        first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertTrue(coordinator.diskCache!.waitForPendingWrites(timeout: 5))
+        let prompt = [1, 2, 3, 4, 5, 21, 22, 23, 24, 25, 26, 27] + genPromptSuffix
+        let model = RecordingHybridModel()
+        var warm = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0),
+                tokenIds: prompt, cachePrefixTokenCounts: [5, 9, 12], cacheStablePrefixTokenCounts: [5, 9]),
+            model: model, parameters: parameters, cacheCoordinator: coordinator)
+        XCTAssertEqual(model.forwarded, Array(prompt.dropFirst(4)), "warm restore must resume at4")
+        XCTAssertNil(warm.stableBoundarySnapshots[4], "already-restored seed must not be duplicated")
+        XCTAssertNotNil(warm.stableBoundarySnapshots[8])
+        let calls = model.prepareCalls
+        warm.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(model.forwarded, Array(prompt.dropFirst(4)))
+        XCTAssertEqual(model.prepareCalls, calls)
+        XCTAssertTrue(coordinator.diskCache!.waitForPendingWrites(timeout: 5))
+    }
+
+    func testStableHeadPreservesTokenMaskSegmentsAndOneProcessorPriming() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let prompt = [1, 2, 3, 4, 5] + userTurn + genPromptSuffix
+        let input = LMInput(text: .init(
+                tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0),
+                mask: MLXArray((0..<prompt.count).map(Int32.init)).expandedDimensions(axis: 0),
+                tokenIds: prompt),
+            cachePrefixTokenCounts: [5, 9, 12], cacheStablePrefixTokenCounts: [5, 9])
+        let model = RecordingHybridModel()
+        var iterator = try TokenIterator(input: input, model: model,
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(model.prepareTokenSegments.flatMap { $0 }, prompt)
+        XCTAssertEqual(model.prepareMaskSegments.flatMap { $0 }, Array(0..<prompt.count))
+        let spy = RecordingPromptProcessor()
+        // Exercise the same internal preparation path with a caller processor,
+        // resetting live cache/snapshots so the second pass is cold.
+        iterator.cache = model.newCache(parameters: nil)
+        iterator.hybridStripSnapshot = nil
+        iterator.stableBoundarySnapshots = [:]
+        iterator.processor = spy
+        try iterator.prepare(input: input, windowSize: 3)
+        XCTAssertEqual(spy.prompts, [prompt], "head snapshots must never prime/reset the processor")
+    }
+
+    func testStableHeadKeepsOpaqueMediaSpanOnOneSegment() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let prompt = [1, 99, 3, 4, 5, 99, 12, 13, 14, 15, 16, 17] + genPromptSuffix
+        let input = LMInput(text: .init(
+                tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0), tokenIds: prompt),
+            image: .init(pixels: MLXArray.zeros([1, 3, 2, 2])), mediaTokenIds: [99],
+            cachePrefixTokenCounts: [5, 9, 12], cacheStablePrefixTokenCounts: [5, 9])
+        let model = RecordingHybridModel()
+        let iterator = try TokenIterator(input: input, model: model,
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(model.forwarded, prompt)
+        XCTAssertEqual(model.prepareMediaFlags.filter { $0 }.count, 1)
+        XCTAssertNil(iterator.stableBoundarySnapshots[4], "cannot split within a media span")
+        XCTAssertNotNil(iterator.stableBoundarySnapshots[8], "later complete-media boundary remains eligible")
+    }
+
+    func testStableHeadPropagatesCancellationWithoutPublishingPartialSeeds() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let prompt = [1, 2, 3, 4, 5] + userTurn + genPromptSuffix
+        let model = CancelledHybridModel()
+        XCTAssertThrowsError(try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0),
+                tokenIds: prompt, cachePrefixTokenCounts: [5, 9, 12], cacheStablePrefixTokenCounts: [5, 9]),
+            model: model, parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3),
+            cacheCoordinator: coordinator)) { error in
+                XCTAssertTrue(error is CancellationError)
+            }
+        XCTAssertEqual(coordinator.snapshotStats().diskStats?.stores, 0)
+    }
+
+    func testCanonicalRequiredToolModelKeepsItsOriginalHeadSchedule() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = makeCoordinator()
+        let prompt = [1, 2, 3, 4, 5] + userTurn + genPromptSuffix
+        let tools: [ToolSpec] = [["type": "function", "function": ["name": "calculate"] as [String: any Sendable]]]
+        let scope = try XCTUnwrap(CanonicalRequiredToolContext(
+            additionalContext: ["tool_choice": "required"], tools: tools))
+        let model = CanonicalHybridModel()
+        _ = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init)).expandedDimensions(axis: 0),
+                tokenIds: prompt, cachePrefixTokenCounts: [5, 9, 12], cacheStablePrefixTokenCounts: [5, 9],
+                cacheRestorePolicy: .freshRequiredToolSelection,
+                toolSchemas: tools, canonicalRequiredToolContext: scope),
+            model: model, parameters: GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 3),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(model.prepareTokenSegments, [Array(prompt[..<12]), Array(prompt[12...])],
+            "typed canonical contract must keep the cold head layout unchanged")
     }
 
     func testHybridStorePublishesOnlyCanonicalStrippedBoundary() throws {

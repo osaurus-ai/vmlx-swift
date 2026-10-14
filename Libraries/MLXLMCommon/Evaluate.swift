@@ -2713,6 +2713,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private func boundarySplit(
         of input: LMInput,
         at boundary: Int,
+        inputStart: Int? = nil,
         allowHybridPool: Bool = false
     ) -> (head: LMInput?, tail: LMInput)? {
         guard !input.requiresPostPrepareCacheKey,
@@ -2724,7 +2725,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         else { return nil }
 
         let size = input.text.tokens.size
-        let split = boundary - (promptTokenIds.count - size)
+        // A structural head ends before the full prompt. Its caller must
+        // supply the absolute start; the suffix-only inference is otherwise
+        // wrong when splitting stable seeds inside that head.
+        let split = boundary - (inputStart ?? (promptTokenIds.count - size))
         guard split >= 0, split < size else { return nil }
 
         // Keep a media payload with the complete placeholder span it belongs
@@ -2822,7 +2826,17 @@ public struct TokenIterator: TokenIteratorProtocol {
         // generation and does not alter sampler or template behavior.
         if let capture = prefillBoundaryCapture(of: input) {
             if let head = capture.head {
-                try prepareBoundaryHead(head, windowSize: windowSize)
+                // The stable seeds can precede this later structural boundary.
+                // Capture them while forwarding the head, rather than replaying
+                // each prefix after output. Qualified canonical required-tool
+                // requests own their cold chunk schedule; preserve that route.
+                let ownsCanonicalSchedule = model is any CanonicalRequiredToolCacheModel
+                    && originalInput.cacheRestorePolicy == .freshRequiredToolSelection
+                    && originalInput.canonicalRequiredToolContext != nil
+                let remainingHead = ownsCanonicalSchedule ? nil : try prepareStableBoundarySegments(
+                    input: head, windowSize: windowSize, alreadyConsumed: inputStart,
+                    captureStoreSeedsOnly: true)
+                try prepareBoundaryHead(remainingHead ?? head, windowSize: windowSize)
             } else {
                 try withError { MLX.eval(cache) }
             }
@@ -2913,38 +2927,71 @@ public struct TokenIterator: TokenIteratorProtocol {
         input: LMInput, windowSize: Int?, alreadyConsumed: Int,
         promptTokensForProcessor: MLXArray
     ) throws -> Bool {
-        // Boundaries are absolute positions in the whole prompt, while `input`
-        // may already start partway through it when an earlier capture split
-        // it. Everything below works in absolute terms and subtracts
-        // `alreadyConsumed` only when slicing.
-        let promptCount =
-            alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
-        // Store shifts stable boundaries one token short for disk-backed
-        // restores, so capture N-1 as well and let the loop find either.
-        let wanted = Set(
-            originalInput.cacheStablePrefixTokenCounts
-                .filter { $0 > alreadyConsumed && $0 < promptCount }
-                .flatMap { [$0, $0 - 1] }
-        ).filter { $0 > alreadyConsumed }.sorted()
-        guard !wanted.isEmpty else { return false }
-
-        var consumed = alreadyConsumed
-        var remaining = input
-        for boundary in wanted {
-            guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary),
-                let head = split.head
-            else { continue }
-            try prepareBoundaryHead(head, windowSize: windowSize)
-            stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
-            remaining = split.tail
-            consumed = boundary
-        }
-        guard consumed > alreadyConsumed else { return false }
+        guard let remaining = try prepareStableBoundarySegments(
+            input: input, windowSize: windowSize, alreadyConsumed: alreadyConsumed)
+        else { return false }
         try prepareRemainder(
             input: remaining, windowSize: windowSize,
             promptTokensForProcessor: promptTokensForProcessor)
         return true
+    }
+
+    /// Forward interior stable segments without priming the processor or
+    /// sampling. A structural head uses the returned remainder before its own
+    /// snapshot; the final suffix uses it before the one sampling/priming step.
+    private mutating func prepareStableBoundarySegments(
+        input: LMInput, windowSize: Int?, alreadyConsumed: Int,
+        captureStoreSeedsOnly: Bool = false
+    ) throws -> LMInput? {
+        let segmentEnd = alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
+        let wanted: [Int]
+        if captureStoreSeedsOnly {
+            // The terminal store consumes only N-1 for disk-backed hybrid
+            // topologies. Retaining N as well would duplicate a KV payload
+            // through decode even though no store uses it.
+            let requiresDiskRestore = cacheRequiresDiskBackedCoordinatorRestore(cache)
+            wanted = Set(originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > 0 && $0 <= segmentEnd && $0 < promptTokenIds.count }
+                .map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 })
+                .filter { boundary in
+                    boundary > alreadyConsumed && boundary < segmentEnd
+                        && !(cacheCoordinator?.hasDurableDiskEntry(
+                            tokens: Array(promptTokenIds.prefix(boundary)), mediaSalt: mediaSalt) ?? false)
+                }.sorted()
+        } else {
+            // Preserve the pre-existing final-suffix partition exactly.
+            wanted = Set(originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > alreadyConsumed && $0 < segmentEnd }
+                .flatMap { [$0, $0 - 1] })
+                .filter { $0 > alreadyConsumed }.sorted()
+        }
+        guard !wanted.isEmpty else { return nil }
+        var consumed = alreadyConsumed
+        var remaining = input
+        for boundary in wanted {
+            guard boundary > consumed,
+                let split = boundarySplit(of: remaining, at: boundary, inputStart: consumed),
+                let head = split.head
+            else { continue }
+            try prepareBoundaryHead(head, windowSize: windowSize)
+            let snapshot = makePromptBoundaryCacheSnapshot(from: cache)
+            stableBoundarySnapshots[boundary] = snapshot
+            if captureStoreSeedsOnly,
+               ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // Logical payload only, not allocator/physical footprint. These
+                // evaluated owned copies live until terminal publication; the
+                // optimization exchanges replay work for retained seed bytes.
+                let bytes = snapshot.reduce(0) { total, layer in
+                    total + layer.state.reduce(0) { $0 + $1.nbytes }
+                }
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/stable-head-capture] boundary=\(boundary)"
+                        + " inputStart=\(consumed) snapshot_state_bytes=\(bytes)\n").utf8))
+            }
+            remaining = split.tail
+            consumed = boundary
+        }
+        return consumed > alreadyConsumed ? remaining : nil
     }
 
     /// Prefill `input` and prime `y` with the first sampled token.
