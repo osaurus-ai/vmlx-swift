@@ -884,6 +884,7 @@ let package = Package(
                 "LaneQMMGroup128Tests.swift",
                 "DFlash2WidthChooserTests.swift",
                 "DSparkDrafterTests.swift",
+                "DFlash2PrefillHiddenCaptureTests.swift",
                 "ChunkedVectorAttentionTests.swift",
                 "SpeculativeAcceptanceBoundaryTests.swift",
                 "NativeMTPARSafetyTests.swift",
