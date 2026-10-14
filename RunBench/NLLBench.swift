@@ -10,8 +10,9 @@ import VMLXTokenizers
 /// first BENCH_NLL_TOKENS tokens (default 2048), prefilled through the model's
 /// own cache in BENCH_PREFILL_STEP chunks (default 512). Teacher-forced, so it
 /// scores the model's numerics directly: two builds (or two kernel paths) that
-/// should compute the same function must give the same NLL, and a routing or
-/// kernel error shows up as a higher NLL on ordinary text.
+/// should compute the same reference graph must agree within its numerical
+/// noise floor. A routing or kernel error can move NLL in either direction;
+/// lower loss alone is not a correctness result.
 enum NLLBench {
     static func run(modelDir: URL, file: String, maxTokens: Int, chunk: Int) async throws {
         let loadStart = CFAbsoluteTimeGetCurrent()

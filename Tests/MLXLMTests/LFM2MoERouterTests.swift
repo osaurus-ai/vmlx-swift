@@ -7,7 +7,7 @@ import Testing
 
 @Suite("LFM2 MoE router matches the HF Lfm2Moe reference")
 struct LFM2MoERouterTests {
-    private func block(scaling: Float) throws -> Lfm2MoeSparseMoeBlock {
+    private func block(scaling: Float, experts: Int = 4, topK: Int = 2) throws -> Lfm2MoeSparseMoeBlock {
         let config = """
             {
               "model_type": "lfm2_moe",
@@ -16,8 +16,8 @@ struct LFM2MoERouterTests {
               "intermediate_size": 4,
               "moe_intermediate_size": 3,
               "num_hidden_layers": 1,
-              "num_experts": 4,
-              "num_experts_per_tok": 2,
+              "num_experts": \(experts),
+              "num_experts_per_tok": \(topK),
               "norm_topk_prob": true,
               "num_attention_heads": 1,
               "num_key_value_heads": 1,
@@ -63,6 +63,35 @@ struct LFM2MoERouterTests {
                 .sum(axis: -2)
 
             #expect(allClose(output, expected, atol: 1e-5).item(Bool.self))
+        }
+    }
+
+    @Test("BF16 mixing preserves reference top-k slot ordering")
+    func bfloat16ReferenceSlotOrder() throws {
+        try MLXMetalTestLock.withLock {
+            let moe = try block(scaling: 1, experts: 8, topK: 4)
+            let logits: [Float] = [2, 1, -1, -3, 0.5, 0.75, -0.5, 0.25]
+            moe.update(parameters: ModuleParameters.unflattened([
+                "gate.weight": MLXArray(logits.flatMap { [$0, 0] }, [8, 2]).asType(.bfloat16),
+                "expert_bias": MLXArray([0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07] as [Float]),
+                "switch_mlp.gate_proj.weight": sin(MLXArray(0..<48).asType(.float32) * 0.13)
+                    .reshaped(8, 3, 2).asType(.bfloat16),
+                "switch_mlp.up_proj.weight": cos(MLXArray(0..<48).asType(.float32) * 0.17)
+                    .reshaped(8, 3, 2).asType(.bfloat16),
+                "switch_mlp.down_proj.weight": sin(MLXArray(0..<48).asType(.float32) * 0.19)
+                    .reshaped(8, 2, 3).asType(.bfloat16),
+            ]))
+            let x = sin(MLXArray(0..<128).asType(.float32) * 0.29)
+                .reshaped(1, 64, 2).asType(.bfloat16)
+            let probabilities = sigmoid(moe.gate(x))
+            let selection = probabilities.asType(.float32) + moe.expertBias!
+            let indices = argPartition(selection, kth: -4, axis: -1)[.ellipsis, (-4)...]
+            let selected = takeAlong(probabilities, indices, axis: -1)
+            let scores = (selected / (selected.sum(axis: -1, keepDims: true) + 1e-6))
+                .asType(x.dtype)
+            let expected = (moe.switchMLP(x, indices) * scores[.ellipsis, .newAxis])
+                .sum(axis: -2)
+            #expect(arrayEqual(moe(x), expected).item(Bool.self))
         }
     }
 
