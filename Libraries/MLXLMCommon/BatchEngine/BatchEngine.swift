@@ -3469,18 +3469,18 @@ public actor BatchEngine {
     }
 
     private func maybeCompressSlotCache(_ slot: inout BatchSlot) {
-        let hadTQ = ModelCacheTopologySnapshot(cache: slot.cache).turboQuantKVLayerCount > 0
-        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: slot.cache)
+        let hadTQ = ModelCacheTopologySnapshot(cache: slot.cache, cacheComputationIdentity: context.model.cacheComputationIdentity).turboQuantKVLayerCount > 0
+        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: slot.cache, cacheComputationIdentity: context.model.cacheComputationIdentity)
         BatchQuantize.maybeCompress(
             cache: &slot.cache,
             parameters: slot.parameters
         )
-        let hasTQ = ModelCacheTopologySnapshot(cache: slot.cache).turboQuantKVLayerCount > 0
+        let hasTQ = ModelCacheTopologySnapshot(cache: slot.cache, cacheComputationIdentity: context.model.cacheComputationIdentity).turboQuantKVLayerCount > 0
         if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
             lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
                 before: before,
-                after: ModelCacheTopologySnapshot(cache: slot.cache)
+                after: ModelCacheTopologySnapshot(cache: slot.cache, cacheComputationIdentity: context.model.cacheComputationIdentity)
             )
         }
     }

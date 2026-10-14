@@ -31,6 +31,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
     public var cacheListLayerCount: Int
     /// Optional for decoding telemetry written before custom disk contracts.
     public private(set) var diskCacheStateIdentifiers: [String]?
+    /// Optional so older topology/transition telemetry still decodes.
+    /// This identifies model arithmetic, not an additional disk payload layout.
+    public private(set) var cacheComputationIdentity: String?
 
     public init(
         layerCount: Int = 0,
@@ -68,8 +71,9 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         self.cacheListLayerCount = cacheListLayerCount
     }
 
-    public init(cache: [any KVCache]) {
+    public init(cache: [any KVCache], cacheComputationIdentity: String? = nil) {
         self.init()
+        self.cacheComputationIdentity = cacheComputationIdentity
         layerCount = cache.count
         for layer in cache {
             record(layer)
@@ -122,6 +126,7 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
 
     public var topologyTags: [String] {
         var tags: [String] = ["layers=\(layerCount)"]
+        if let cacheComputationIdentity { tags.append("compute=\(cacheComputationIdentity)") }
         for identifier in diskCacheStateIdentifiers ?? [] {
             tags.append("diskState=\(identifier)")
         }
@@ -274,6 +279,7 @@ public struct TurboQuantCacheTransitionSnapshot: Codable, Sendable, Equatable {
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
     private let attentionCacheKeyComponent: String?
+    private let cacheComputationIdentity: String?
 
     // MARK: - Multi-tier KV Cache
 
@@ -301,11 +307,24 @@ public final class ModelContainer: Sendable {
             config.modelKey = "\(ObjectIdentifier(self))"
         }
         if let modelKey = config.modelKey {
-            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
-            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+            config.modelKey = scopedCacheModelKey(modelKey)
         }
         let coordinator = CacheCoordinator(config: config)
         _cacheCoordinator.withLock { $0 = coordinator }
+    }
+
+    private func scopedCacheModelKey(_ modelKey: String) -> String {
+        let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+        var key = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+        if let cacheComputationIdentity {
+            let component = "compute=\(cacheComputationIdentity)"
+            // Osaurus already includes topologyTags. Accept only an exact key
+            // component as present, preserving every different/legacy tag.
+            if !key.split(separator: "|").contains(Substring(component)) {
+                key += "|" + component
+            }
+        }
+        return key
     }
 
     /// Enable caching with auto-detection of hybrid models.
@@ -320,8 +339,7 @@ public final class ModelContainer: Sendable {
             config.modelKey = modelConfig.name
         }
         if let modelKey = config.modelKey {
-            let scoped = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
-            config.modelKey = attentionCacheKeyComponent.map { "\(scoped)|\($0)" } ?? scoped
+            config.modelKey = scopedCacheModelKey(modelKey)
         }
 
         let topology = await cacheTopologySnapshot()
@@ -400,7 +418,9 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters? = nil
     ) async -> ModelCacheTopologySnapshot {
         await context.read { ctx in
-            ModelCacheTopologySnapshot(cache: ctx.model.newCache(parameters: parameters))
+            ModelCacheTopologySnapshot(
+                cache: ctx.model.newCache(parameters: parameters),
+                cacheComputationIdentity: ctx.model.cacheComputationIdentity)
         }
     }
 
@@ -521,6 +541,7 @@ public final class ModelContainer: Sendable {
         ].compactMap { $0 }
         self.attentionCacheKeyComponent =
             cachePolicies.isEmpty ? nil : cachePolicies.joined(separator: "|")
+        self.cacheComputationIdentity = context.model.cacheComputationIdentity
         self.context = .init(context)
     }
 
