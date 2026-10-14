@@ -301,6 +301,82 @@ extension NativeMTPDepthExecutionTests {
         }
     }
 
+    /// SPEED REGRESSION GUARD (2026-10-14, Allosaurus/Flash-Next in-app 27-35 tok/s instead of ~100):
+    /// the 256-token AR calibration is a measurement, not a loss. It must resume the depth it
+    /// interrupted with NO probe judgement. Routing it through a depth-1 probe made winning code
+    /// regimes "lose" and long replies ran ~94 % AR. Do not weaken this test.
+    func testCalibrationResumesInterruptedDepthWithoutProbe() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires actual governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(sequence: true)
+            var parameters = GenerateParameters(maxTokens: 512, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            var now = 100.0
+            iterator.testingSeedMeasuredGovernor(depth: 3, now: now)
+            let original = iterator.testingGovernorSnapshot
+            iterator.tokenCount = 300  // past the 256-token AR re-measure point
+            now += 0.010
+            iterator.testingFeedGovernorCycle(now: now)
+            XCTAssertTrue(iterator.testingGovernorSnapshot.paused, "calibration pauses to measure AR")
+            for _ in 0..<2 {
+                now += 0.025
+                try iterator.testingMeasuredARStep(now: now)
+            }
+            let resumed = iterator.testingGovernorSnapshot
+            XCTAssertFalse(resumed.paused)
+            XCTAssertEqual(resumed.depth, 3, "calibration must resume the interrupted depth")
+            XCTAssertEqual(resumed.probeCycles, 0, "calibration must not be judged as a probe")
+            XCTAssertEqual(resumed.resumes, original.resumes)
+        }
+    }
+
+    /// SPEED REGRESSION GUARD (2026-10-14): a resume probe runs at the START depth (a depth-1 probe
+    /// commits <= 2 tokens/verify and cannot show a high-acceptance regime winning), and a LOST probe
+    /// pauses directly instead of walking the 3->2->1 demotion ladder at a loss.
+    func testResumeProbeRunsAtStartDepthAndLostProbePausesDirectly() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
+            throw XCTSkip("Requires actual governor")
+        }
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget(sequence: true)
+            var parameters = GenerateParameters(maxTokens: 512, temperature: 0)
+            parameters.draftStrategy = .nativeMTP(depth: 3)
+            var iterator = try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                parameters: parameters, depth: 3)
+            var now = 100.0
+            iterator.testingSeedMeasuredGovernor(depth: 3, now: now)
+            var cycles = 0
+            while !iterator.testingGovernorSnapshot.paused, cycles < 400 {
+                now += 0.080
+                iterator.testingFeedGovernorCycle(now: now)
+                cycles += 1
+            }
+            XCTAssertTrue(iterator.testingGovernorSnapshot.paused, "losing MTP must reach AR")
+            for _ in 0..<16 {
+                now += 0.025
+                try iterator.testingMeasuredARStep(now: now)
+            }
+            let probing = iterator.testingGovernorSnapshot
+            XCTAssertFalse(probing.paused)
+            XCTAssertEqual(probing.depth, 3, "probe runs at the configured start depth, not depth 1")
+            XCTAssertEqual(probing.probeCycles, 6)
+            for _ in 0..<6 {
+                now += 0.080
+                iterator.testingFeedGovernorCycle(now: now)
+            }
+            let lost = iterator.testingGovernorSnapshot
+            XCTAssertTrue(lost.paused, "a lost probe pauses immediately")
+            XCTAssertEqual(lost.trips, probing.trips + 1)
+            XCTAssertEqual(lost.depth, 3, "a lost probe is not demoted through the ladder")
+        }
+    }
+
     func testActualARReentryClearsMeanLossAndRetainsProbeContract() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires actual governor")

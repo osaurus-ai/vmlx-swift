@@ -496,6 +496,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyProbeStartedEmitted = 0
     private var arSafetyLastMeasuredToken = 0
     private var arSafetyCalibrationRemaining = 0
+    /// SPEED-CRITICAL (2026-10-14 Allosaurus/Flash-Next regression): the depth that was speculating
+    /// when a CALIBRATION pause (not a loss) stopped it. Calibration resumes HERE, with no probe
+    /// judgement. Before this, every 256-token calibration re-entered through a depth-1 resume
+    /// probe; a depth-1 probe can commit at most 2 tokens per verify, so a code regime running
+    /// 4-6 committed/verify (~7 ms/token vs AR ~20 ms on Allosaurus) "lost" the probe, the resume
+    /// interval doubled, and every long in-app reply ran ~94 % AR (27-35 tok/s instead of ~100).
+    /// Do NOT route calibration back through `probe: true`.
+    private var arSafetyCalibrationResumeDepth: Int?
+    /// Time the CONSUMER held the iterator between `next()` calls (detokenize, parsers, UI, SSE).
+    /// AR steps are timed inside the iterator (forward + sample), so the MTP side of every
+    /// MTP-vs-AR comparison must exclude this too or MTP is charged for the app's per-token work
+    /// and AR is not. See `arSafetyClockNow()`. SPEED-CRITICAL — keep both sides on one clock.
+    private var consumerWaitTotal: TimeInterval = 0
+    private var lastTokenReturnedAt: TimeInterval?
     /// True while a kept re-entry is speculating: a trip in that state backs
     /// the resume interval off further instead of resetting it.
     private var arSafetyReentered = false
@@ -974,6 +988,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     mutating func next() -> Int? {
+        if let returnedAt = lastTokenReturnedAt {
+            // Everything between the previous return and this call belonged to the consumer.
+            consumerWaitTotal += Swift.max(0, NativeMTPClock.now() - returnedAt)
+            lastTokenReturnedAt = nil
+        }
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1000,7 +1019,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let token = pendingTokens[pendingIndex]
         pendingIndex += 1
         tokenCount += 1
+        lastTokenReturnedAt = NativeMTPClock.now()
         return token
+    }
+
+    /// The AR-safety governor's clock: wall time minus the time the consumer held the iterator.
+    /// `generateAutoregressiveToken` times AR as forward + sample INSIDE the iterator; the MTP
+    /// ring and resume probes must use the same basis. SPEED-CRITICAL: do not swap this back to
+    /// `NativeMTPClock.now()` in the governor — in the app (reasoning parser, tool parser,
+    /// detokenizer, UI stream) that charged MTP alone for per-token host work and paused it.
+    private func arSafetyClockNow() -> TimeInterval {
+        NativeMTPClock.now() - consumerWaitTotal
     }
 
     mutating func storeCacheAfterGeneration(
@@ -2410,7 +2439,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private mutating func arSafetyAfterVerifyCycle(accepted: Int) {
         guard !Self.arSafetyDisabled, !forceAutoregressiveFallback else { return }
         arSafetyEmittedTotal += accepted + 1
-        let now = NativeMTPClock.now()
+        let now = arSafetyClockNow()
         arSafetyRing.append(ARSafetySample(
             emitted: arSafetyEmittedTotal, wall: now, verifyTotal: targetVerifyTime))
         let window = arSafetyWindowForRequest
@@ -2434,7 +2463,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let arMs = (arSafetyLiveStepSec ?? arSafetySeedStepSec ?? 0) * 1000
             arSafetyProbeStartedAt = nil
             if arMs <= 0 || mtpMs * Self.arSafetyReentryHysteresis >= arMs {
-                arSafetyDemoteOrPause(reason: String(
+                // SPEED-CRITICAL: a lost probe PAUSES directly. The probe runs at the start depth
+                // (see `arSafetyStartSpeculating`); demoting it 3→2→1 instead would keep a losing
+                // regime (prose at T=1) speculating through the whole ladder — measured 2026-10-14:
+                // 191 verify cycles at ~AR cost in a 448-token prose reply, 38 vs 43 tok/s.
+                arSafetyPause(reason: String(
                     format: "ar_safety_probe_lost(mtp=%.1fms/tok live_ar=%.1fms)",
                     mtpMs, arMs))
                 if arSafetyPaused {
@@ -2458,6 +2491,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         // Refresh real AR periodically; calibration does not reset failed-probe
         // spacing. This is bounded measurement overhead, not a free speed floor.
+        // SPEED-CRITICAL: `loss: false` makes this a measurement that resumes the current depth
+        // unjudged (`arSafetyCalibrationResumeDepth`). Never make calibration re-enter through a
+        // resume probe or count as a loss — that is what kept long Flash-Next/Allosaurus replies on AR.
         if arSafetySeedStepSec != nil, tokenCount - arSafetyLastMeasuredToken >= 256 {
             arSafetyPause(reason: "ar_safety_calibration", loss: false)
             return
@@ -2548,6 +2584,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         arSafetyTokensSincePause = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
+        // A calibration is a measurement, not a verdict: remember the winning depth and resume it.
+        arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
         arSafetyProbeCyclesRemaining = 0
         arSafetyProbeStartedAt = nil
         arSafetyRing.removeAll(keepingCapacity: true)
@@ -2594,11 +2632,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             guard arSafetyTokensSincePause >= arSafetyResumeInterval else { return }
         }
         arSafetyPaused = false
+        if let resumeDepth = arSafetyCalibrationResumeDepth {
+            // SPEED-CRITICAL: calibration resumes at the depth it interrupted, unjudged. The
+            // windowed trip test (now against the freshly measured AR) still protects AR speed.
+            arSafetyCalibrationResumeDepth = nil
+            adaptiveFallbackReason = nil
+            arSafetyStartSpeculating(
+                hidden: hidden, nextToken: nextToken, probe: false, resumeDepth: resumeDepth)
+            return
+        }
         arSafetyStartSpeculating(hidden: hidden, nextToken: nextToken, probe: true)
     }
 
     private mutating func arSafetyStartSpeculating(
-        hidden: MLXArray, nextToken: MLXArray, probe: Bool
+        hidden: MLXArray, nextToken: MLXArray, probe: Bool, resumeDepth: Int? = nil
     ) {
         // Same re-prime the depth controller uses on every depth change: a
         // fresh head cache, drafts from the current hidden. Drafts are only
@@ -2606,11 +2653,16 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // cache can only cost acceptance, never correctness.
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
-        currentDepth = probe ? 1 : depth
+        // SPEED-CRITICAL: a resume probe runs at the configured START depth, never depth 1. A
+        // depth-1 probe commits at most 2 tokens per verify, so it cannot show a high-acceptance
+        // regime (code, tool JSON, repetitive text) beating AR and the regime stayed on AR for the
+        // rest of the reply (2026-10-14, Allosaurus in-app 27-35 tok/s). A losing probe at the start
+        // depth costs ~6 cycles once per back-off interval; a wrongly lost probe costs the reply.
+        currentDepth = resumeDepth.map { Swift.max(1, Swift.min($0, Swift.max(depth, adaptiveDepthCeiling))) } ?? depth
         arSafetyRing.removeAll(keepingCapacity: true)
         arSafetyMeanLoss.reset(afterCycle: verifyCalls)
         arSafetyProbeCyclesRemaining = probe ? Self.arSafetyProbeWindow : 0
-        arSafetyProbeStartedAt = probe ? NativeMTPClock.now() : nil
+        arSafetyProbeStartedAt = probe ? arSafetyClockNow() : nil
         arSafetyProbeStartedEmitted = arSafetyEmittedTotal
         arSafetyFirstVerifySec = nil
         headChainPairs = 0
