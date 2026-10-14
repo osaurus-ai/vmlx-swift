@@ -4,6 +4,7 @@
 import Foundation
 import MLX
 import MLXLLM
+import MLXNN
 import MLXLMCommon
 import Testing
 
@@ -107,4 +108,37 @@ struct LFM2CacheOffsetInvariantTests {
                 "layer \(i) (\(type(of: layer))) offset \(layer.offset) != 3 after 3-token prefill")
         }
     }
+    @Test("no-cache LFM2 MoE prefill remains causal")
+    func moeNoCacheIsCausal() throws {
+        try MLXMetalTestLock.withLock {
+            let json = """
+                {"model_type":"lfm2_moe","vocab_size":16,"hidden_size":4,
+                 "intermediate_size":8,"moe_intermediate_size":2,"num_hidden_layers":2,
+                 "num_experts":2,"num_experts_per_tok":1,"norm_topk_prob":true,
+                 "num_attention_heads":1,"num_key_value_heads":1,"max_position_embeddings":128,
+                 "use_expert_bias":false,"num_dense_layers":2,"norm_eps":0.00001,
+                 "conv_bias":false,"conv_L_cache":3,"layer_types":["conv","full_attention"]}
+                """
+            let cfg = try JSONDecoder().decode(LFM2MoEConfiguration.self, from: Data(json.utf8))
+            let model = LFM2MoEModel(cfg)
+            let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened().map { name, array in
+                let phase = Float(name.utf8.reduce(0) { $0 + Int($1) } % 31) * 0.11
+                let values = name.contains("norm.weight")
+                    ? MLXArray.ones(array.shape, dtype: array.dtype)
+                    : (sin(MLXArray(0..<array.size).asType(.float32) * 0.37 + phase)
+                        + cos(MLXArray(0..<array.size).asType(.float32) * 0.119))
+                        .reshaped(array.shape).asType(array.dtype)
+                return (name, values)
+            })
+            model.update(parameters: ModuleParameters.unflattened(parameters))
+            let tokens = MLXArray([1, 2, 3, 4]).reshaped(1, 4)
+            let changedSuffix = MLXArray([1, 7, 8, 9]).reshaped(1, 4)
+            let output = model(tokens, cache: nil)
+            let changed = model(changedSuffix, cache: nil)
+            let cached = model(tokens, cache: model.newCache(parameters: nil))
+            #expect(arrayEqual(output, cached).item(Bool.self))
+            #expect(arrayEqual(output[0, 0], changed[0, 0]).item(Bool.self))
+        }
+    }
+
 }
