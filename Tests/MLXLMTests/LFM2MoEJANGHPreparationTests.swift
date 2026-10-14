@@ -250,7 +250,7 @@ final class LFM2MoEJANGHPreparationTests: XCTestCase {
                 let x = MLXArray(values, [1, rows, 32]).asType(.bfloat16)
                 let probabilities = sigmoid(moe.gate(x))
                 let selection = probabilities.asType(.float32) + moe.expertBias!
-                let indices = argPartition(-selection, kth: 1, axis: -1)[.ellipsis, ..<2]
+                let indices = argPartition(selection, kth: -2, axis: -1)[.ellipsis, (-2)...]
                 let picked = takeAlong(probabilities, indices, axis: -1)
                 let scores = picked / (picked.sum(axis: -1, keepDims: true) + 1e-6)
                 let expected = (affine(x, indices) * scores[.ellipsis, .newAxis]).sum(axis: -2)
