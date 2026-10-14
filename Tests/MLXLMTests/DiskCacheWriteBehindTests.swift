@@ -1,4 +1,5 @@
 import Foundation
+import Cmlx
 import MLX
 import Testing
 
@@ -231,6 +232,139 @@ struct DiskCacheWriteBehindTests {
             #expect(cache.snapshotStats().storeSkips == 1)
             #expect(cache.waitForPendingWrites(timeout: 10))
             #expect(cache.hasDurableEntry(tokens: tokens))
+        }
+    }
+
+    @Test func secondInFlightStorePreservesLatestOwnerAndResumeKind() throws {
+        try MLXMetalTestLock.withLock {
+            if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+                _ = path.withCString { mlx_metal_set_metallib_path($0) }
+            }
+            try Device.withDefaultDevice(.cpu) {
+                let dir = root("duplicate-owner-kind")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+                cache.writeBehind = true
+                cache.writeDelayForTesting = 0.4
+                let tokens = Array(1 ..< 20)
+                let payload = ["keys": MLXArray(Array(repeating: Int32(1), count: 2_048))]
+                cache.store(tokens: tokens, arrays: payload, enforceQuota: false, chainId: "A")
+                #expect(cache.pendingWriteCount == 1)
+                cache.store(tokens: tokens, arrays: payload, enforceQuota: false,
+                            chainId: "B", isResumeBoundary: true)
+                #expect(cache.writeBehindStores == 1)
+                #expect(cache.snapshotStats().storeSkips == 1)
+                #expect(cache.waitForPendingWrites(timeout: 10))
+                let rows = try DiskCacheAccountingTestSupport.RawDB(root: dir)
+                    .rows("SELECT chain_id, kind FROM cache_entries")
+                #expect(rows.count == 1)
+                #expect(rows.first?[0] == "B", "latest storing chat owns the published row")
+                #expect(rows.first?[1] == "2", "resume boundary must survive deduplication")
+                print("INFLIGHT_METADATA cpu_default=\(Device.defaultDevice()) rows=\(rows) writes=\(cache.writeBehindStores)")
+            }
+        }
+    }
+
+    @Test func duplicateMetadataKeepsRootKindAndNilKeepsOwner() throws {
+        try MLXMetalTestLock.withLock {
+            if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+                _ = path.withCString { mlx_metal_set_metallib_path($0) }
+            }
+            try Device.withDefaultDevice(.cpu) {
+                let dir = root("duplicate-root-kind")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+                cache.writeBehind = true
+                cache.writeDelayForTesting = 0.4
+                let tokens = Array(1 ..< 20)
+                let payload = ["keys": MLXArray(Array(repeating: Int32(1), count: 2_048))]
+                cache.store(tokens: tokens, arrays: payload, enforceQuota: false,
+                            chainId: "A", isResumeBoundary: true)
+                cache.store(tokens: tokens, arrays: payload, enforceQuota: false,
+                            chainId: "B", isStableRoot: true)
+                cache.store(tokens: tokens, arrays: payload, enforceQuota: false,
+                            chainId: nil, isPostAnswer: true)
+                #expect(cache.waitForPendingWrites(timeout: 10))
+                let rows = try DiskCacheAccountingTestSupport.RawDB(root: dir)
+                    .rows("SELECT chain_id, kind FROM cache_entries")
+                #expect(rows == [["B", "1"]])
+                #expect(cache.writeBehindStores == 1)
+                #expect(cache.snapshotStats().storeSkips == 2)
+            }
+        }
+    }
+
+    @Test func duplicatePublicationProtectsFinalizedOwnerUnderQuota() throws {
+        try MLXMetalTestLock.withLock {
+            if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+                _ = path.withCString { mlx_metal_set_metallib_path($0) }
+            }
+            try Device.withDefaultDevice(.cpu) {
+                let dir = root("duplicate-owner-quota")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                var config = CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true,
+                    diskCacheMaxGB: Float(12_000) / 1_073_741_824,
+                    diskCacheDir: dir, modelKey: "wb")
+                config.diskWriteBehind = true
+                let coordinator = CacheCoordinator(config: config)
+                let disk = try #require(coordinator.diskCache)
+                let payload = ["keys": MLXArray(Array(repeating: Int32(1), count: 2_048))]
+                let olderA = Array(200 ..< 300)
+                coordinator.storePersistentBoundary(
+                    tokens: olderA, diskArrays: payload, ssmStates: nil,
+                    chainId: "A", isResumeBoundary: true)
+                #expect(coordinator.waitForPendingDiskWrites())
+                disk.writeDelayForTesting = 0.4
+                let shared = Array(1 ..< 20)
+                coordinator.storePersistentBoundary(
+                    tokens: shared, diskArrays: payload, ssmStates: nil, chainId: "A")
+                #expect(disk.pendingWriteCount == 1)
+                coordinator.storePersistentBoundary(
+                    tokens: shared, diskArrays: payload, ssmStates: nil,
+                    chainId: "B", isResumeBoundary: true)
+                #expect(coordinator.waitForPendingDiskWrites())
+                let rows = try DiskCacheAccountingTestSupport.RawDB(root: dir)
+                    .rows("SELECT chain_id, kind, token_count FROM cache_entries")
+                #expect(rows == [["B", "2", "19"]],
+                        "publish callback must protect B, not the first writer A")
+                #expect(disk.writeBehindStores == 2, "older A plus one shared payload")
+                #expect(disk.snapshotStats().evictions == 1)
+                #expect(disk.usageBytes() <= 12_000)
+                print("INFLIGHT_QUOTA cpu_default=\(Device.defaultDevice()) rows=\(rows) bytes=\(disk.usageBytes())")
+            }
+        }
+    }
+
+    @Test func duplicateMetadataDoesNotRepublishClearedOrFailedPayload() throws {
+        try MLXMetalTestLock.withLock {
+            if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+                _ = path.withCString { mlx_metal_set_metallib_path($0) }
+            }
+            try Device.withDefaultDevice(.cpu) {
+                for failPublication in [false, true] {
+                    let dir = root("duplicate-lifecycle-\(failPublication)")
+                    defer { try? FileManager.default.removeItem(at: dir) }
+                    let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+                    cache.writeBehind = true
+                    cache.writeDelayForTesting = 0.05
+                    if failPublication {
+                        cache.publishFaultForTesting = { throw CocoaError(.fileWriteUnknown) }
+                    }
+                    let tokens = Array(1 ..< 20)
+                    let payload = ["keys": MLXArray(Array(repeating: Int32(1), count: 2_048))]
+                    cache.store(tokens: tokens, arrays: payload, enforceQuota: false, chainId: "A")
+                    cache.store(tokens: tokens, arrays: payload, enforceQuota: false,
+                                chainId: "B", isResumeBoundary: true)
+                    if !failPublication { cache.clear() }
+                    #expect(cache.waitForPendingWrites(timeout: 10))
+                    #expect(cache.pendingWriteCount == 0)
+                    #expect(!cache.hasDurableEntry(tokens: tokens))
+                    let rows = try DiskCacheAccountingTestSupport.RawDB(root: dir)
+                        .rows("SELECT chain_id, kind FROM cache_entries")
+                    #expect(rows.isEmpty, "metadata merge must not revive a cleared or failed payload")
+                }
+            }
         }
     }
 
