@@ -6,14 +6,14 @@
 // `Qwen35` / `Qwen35MoE` carrying `MiniCPMV47Vision.Tower` in its `vision_tower` slot (see the `minicpmv4_7` entry
 // in VLMModelFactory); canvas M-RoPE positions come from `MiniCPMV47Canvas`.
 //
-// This processor is the port of transformers' `MiniCPMV4_7Processor` + `MiniCPMV4_6ImageProcessorPil`: the chat
-// template renders one `<|image_pad|>` per image, which is expanded to
-// `<image_id>N</image_id><image>pad*thumb</image>` plus rows of `<slice>pad*k</slice>` separated by `\n`, while the
-// pixels are the thumbnail and slices as NaViT patches (`MiniCPMV47ImageProcessing`).
-//
-// Video is refused explicitly: the reference video processor samples frames and stacks several of them onto one
-// canvas image with separator lines (`concat_frames_as_image`) before the same slicing — a different input path
-// that is not implemented here.
+// This processor is the port of transformers' `MiniCPMV4_7Processor` + `MiniCPMV4_6ImageProcessorPil` +
+// `MiniCPMV4_6VideoProcessor`: the chat template renders one `<|image_pad|>` per image and one `<|video_pad|>` per
+// video. An image placeholder expands to `<image_id>N</image_id><image>pad*thumb</image>` plus rows of
+// `<slice>pad*k</slice>` separated by `\n`, its pixels being the thumbnail and slices as NaViT patches
+// (`MiniCPMV47ImageProcessing`). A video placeholder expands to the same frame layout once per sampled frame
+// (one per started second, up to `max_num_frames`), with `<|video_pad|>` tokens, no `<image_id>`, and the frames'
+// patches in order (`MiniCPMV47VideoProcessing`). Image pixels precede video pixels in the model's tower call and
+// are scattered onto their own placeholder kind, so the two modalities can be mixed in one turn.
 
 import CoreImage
 import Foundation
@@ -30,6 +30,10 @@ public struct MiniCPMV47ProcessorConfiguration: Codable, Sendable {
     public var imageMean: [Float] = [0.5, 0.5, 0.5]
     public var imageStd: [Float] = [0.5, 0.5, 0.5]
     public var mropeMode: String?
+    /// `MiniCPMV4_6VideoProcessor.max_num_frames`: frames sampled per video (reference default 128; the
+    /// bundles ship no `video_preprocessor_config.json`, so the key is read from `preprocessor_config.json` if
+    /// present and defaults otherwise).
+    public var maxNumFrames: Int = 128
 
     /// Patch-to-LLM-token merge factor per axis (4 in `16x`, 2 in `4x`); placeholder counts use its square.
     public var tokensPerPatchDivisor: Int { downsampleMode == "4x" ? 4 : 16 }
@@ -44,6 +48,7 @@ public struct MiniCPMV47ProcessorConfiguration: Codable, Sendable {
         case imageMean = "image_mean"
         case imageStd = "image_std"
         case mropeMode = "mrope_mode"
+        case maxNumFrames = "max_num_frames"
     }
 
     public init() {}
@@ -59,6 +64,7 @@ public struct MiniCPMV47ProcessorConfiguration: Codable, Sendable {
         imageMean = try c.decodeIfPresent([Float].self, forKey: .imageMean) ?? [0.5, 0.5, 0.5]
         imageStd = try c.decodeIfPresent([Float].self, forKey: .imageStd) ?? [0.5, 0.5, 0.5]
         mropeMode = try c.decodeIfPresent(String.self, forKey: .mropeMode)
+        maxNumFrames = try c.decodeIfPresent(Int.self, forKey: .maxNumFrames) ?? 128
     }
 }
 
@@ -78,6 +84,7 @@ public struct MiniCPMV47Processor: UserInputProcessor {
     /// `image_start_id` etc. from.
     struct Markers {
         let pad: Int
+        let videoPad: Int
         let imageStart: Int
         let imageEnd: Int
         let sliceStart: Int
@@ -104,7 +111,8 @@ public struct MiniCPMV47Processor: UserInputProcessor {
             throw VLMError.processing("MiniCPM-V 4.7 tokenizer does not encode a newline as one token")
         }
         return Markers(
-            pad: try id(Self.imagePadToken), imageStart: try id("<image>"), imageEnd: try id("</image>"),
+            pad: try id(Self.imagePadToken), videoPad: try id(Self.videoPadToken),
+            imageStart: try id("<image>"), imageEnd: try id("</image>"),
             sliceStart: try id("<slice>"), sliceEnd: try id("</slice>"), newline: newline[0],
             imageIdStart: tokenizer.convertTokenToId("<image_id>"),
             imageIdEnd: tokenizer.convertTokenToId("</image_id>"))
@@ -119,13 +127,17 @@ public struct MiniCPMV47Processor: UserInputProcessor {
             patchSize: config.patchSize, sliceMode: config.sliceMode, mean: config.imageMean, std: config.imageStd)
     }
 
-    public func prepare(input: UserInput) async throws -> LMInput {
-        guard input.videos.isEmpty else {
-            throw VLMError.processing(
-                "MiniCPM-V 4.7 video input is not implemented in this runtime: the reference stacks sampled frames "
-                + "onto one canvas image with separator lines before slicing, which this processor does not do. "
-                + "Send images or text.")
+    /// Sampled frames of one video, each as thumbnail + slices (`MiniCPMV4_6VideoProcessor`).
+    func preprocess(video: UserInput.Video) async throws -> [MiniCPMV47ImageProcessing.ProcessedCrops] {
+        let sampled = try await MiniCPMV47VideoProcessing.sample(video, maxNumFrames: config.maxNumFrames)
+        return sampled.frames.map {
+            MiniCPMV47VideoProcessing.process(
+                frame: $0, maxSliceNums: config.maxSliceNums, scaleResolution: config.scaleResolution,
+                patchSize: config.patchSize, sliceMode: config.sliceMode, mean: config.imageMean, std: config.imageStd)
         }
+    }
+
+    public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
@@ -138,6 +150,7 @@ public struct MiniCPMV47Processor: UserInputProcessor {
             staticSystemPrefix: input.cacheStableSystemPrefix)
 
         var processedImage: LMInput.ProcessedImage?
+        var processedVideo: LMInput.ProcessedVideo?
         if !input.images.isEmpty {
             let markers = try markers()
             let crops = try input.images.map { try preprocess(image: try $0.asCIImage(), processing: input.processing) }
@@ -150,21 +163,45 @@ public struct MiniCPMV47Processor: UserInputProcessor {
             }
             let expanded = try MiniCPMV47ImageProcessing.expand(
                 promptTokens: promptTokens, placeholder: markers.pad, replacements: replacements,
-                boundaries: cacheBoundaries)
+                boundaries: cacheBoundaries, modality: "image")
             promptTokens = expanded.tokens
             cacheBoundaries = expanded.boundaries
             processedImage = .init(
                 pixels: concatenated(crops.map { $0.patches }),
                 frames: crops.flatMap { $0.grids })
         }
+        if !input.videos.isEmpty {
+            let markers = try markers()
+            var videos: [[MiniCPMV47ImageProcessing.ProcessedCrops]] = []
+            for video in input.videos {
+                videos.append(try await preprocess(video: video))
+            }
+            let replacements = videos.map { frames in
+                MiniCPMV47VideoProcessing.placeholderTokens(
+                    frames: frames, padTokenId: markers.videoPad,
+                    tokensPerPatchDivisor: config.tokensPerPatchDivisor, markers: markers.canvas)
+            }
+            let expanded = try MiniCPMV47ImageProcessing.expand(
+                promptTokens: promptTokens, placeholder: markers.videoPad, replacements: replacements,
+                boundaries: cacheBoundaries, modality: "video")
+            promptTokens = expanded.tokens
+            cacheBoundaries = expanded.boundaries
+            let crops = videos.flatMap { $0 }
+            processedVideo = .init(
+                pixels: concatenated(crops.map { $0.patches }),
+                frames: crops.flatMap { $0.grids })
+        }
 
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
+        var mediaTokens: [String] = []
+        if processedImage != nil { mediaTokens.append(Self.imagePadToken) }
+        if processedVideo != nil { mediaTokens.append(Self.videoPadToken) }
         return LMInput(
             text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
             image: processedImage,
-            mediaTokenIds: processedImage == nil
-                ? nil : QwenVL.mediaTokenIds(tokenizer: tokenizer, tokens: [Self.imagePadToken]),
+            video: processedVideo,
+            mediaTokenIds: mediaTokens.isEmpty ? nil : QwenVL.mediaTokenIds(tokenizer: tokenizer, tokens: mediaTokens),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
             cachePrefixTokenCounts: cacheBoundaries.all,
             cacheStablePrefixTokenCounts: cacheBoundaries.stable,

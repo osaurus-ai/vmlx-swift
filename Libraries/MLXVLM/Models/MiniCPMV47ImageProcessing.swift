@@ -238,13 +238,24 @@ enum MiniCPMV47ImageProcessing {
 
     // MARK: Normalisation + patch packing
 
-    /// `[patchesH * patchesW, patch, patch, 3]` float32: `(float32(float64(x) / 255) - mean) / std`, patches
-    /// row-major, each tile `[row, col, channel]`.
-    static func normalizedPatches(_ image: RGB8, patchSize: Int, mean: [Float], std: [Float]) -> MLXArray {
+    /// How 8-bit values become normalised floats.
+    enum Normalization {
+        /// PIL image processor: `x.astype(float64) * (1/255)` narrowed to float32, then `(v - mean) / std`.
+        case pil
+        /// torchvision video processor (`rescale_and_normalize`, fused): `(float32(x) - mean*255) / (std*255)`.
+        case fusedTorch
+    }
+
+    /// `[patchesH * patchesW, patch, patch, 3]` float32, patches row-major, each tile `[row, col, channel]`.
+    static func normalizedPatches(
+        _ image: RGB8, patchSize: Int, mean: [Float], std: [Float], normalization: Normalization = .pil
+    ) -> MLXArray {
         precondition(image.height % patchSize == 0 && image.width % patchSize == 0)
         let gridH = image.height / patchSize
         let gridW = image.width / patchSize
         let rescale = 1.0 / 255.0
+        let fusedMean = mean.map { $0 * Float(255.0) }
+        let fusedStd = std.map { $0 * Float(255.0) }
         var out = [Float](repeating: 0, count: image.width * image.height * 3)
         var o = 0
         for py in 0 ..< gridH {
@@ -255,8 +266,13 @@ enum MiniCPMV47ImageProcessing {
                         let x = px * patchSize + j
                         let p = (y * image.width + x) * 3
                         for c in 0 ..< 3 {
-                            let v = Float(Double(image.data[p + c]) * rescale)
-                            out[o] = (v - mean[c]) / std[c]
+                            switch normalization {
+                            case .pil:
+                                let v = Float(Double(image.data[p + c]) * rescale)
+                                out[o] = (v - mean[c]) / std[c]
+                            case .fusedTorch:
+                                out[o] = (Float(image.data[p + c]) - fusedMean[c]) / fusedStd[c]
+                            }
                             o += 1
                         }
                     }
@@ -277,9 +293,12 @@ enum MiniCPMV47ImageProcessing {
         let sliceGrid: (rows: Int, cols: Int)?
     }
 
+    /// Image path by default (PIL bicubic, PIL normalisation); the video path passes torchvision's resize and
+    /// the fused normalisation, the slicing math being shared verbatim between the two reference processors.
     static func process(
         _ source: RGB8, maxSliceNums: Int, scaleResolution: Int, patchSize: Int, sliceMode: Bool,
-        mean: [Float], std: [Float]
+        mean: [Float], std: [Float],
+        resize: (RGB8, Int, Int) -> RGB8 = resizeBicubicPIL, normalization: Normalization = .pil
     ) -> ProcessedCrops {
         let (h, w) = (source.height, source.width)
         let grid = sliceMode
@@ -288,20 +307,20 @@ enum MiniCPMV47ImageProcessing {
         let (sourceH, sourceW) = findBestResize(
             height: Double(h), width: Double(w), scaleResolution: scaleResolution, patchSize: patchSize,
             allowUpscale: grid == nil)
-        let thumbnail = resizeBicubicPIL(source, toWidth: sourceW, height: sourceH)
-        var parts = [normalizedPatches(thumbnail, patchSize: patchSize, mean: mean, std: std)]
+        let thumbnail = resize(source, sourceW, sourceH)
+        var parts = [normalizedPatches(thumbnail, patchSize: patchSize, mean: mean, std: std, normalization: normalization)]
         var grids = [THW(1, sourceH / patchSize, sourceW / patchSize)]
         if let grid {
             let (refineH, refineW) = refineSize(
                 height: h, width: w, grid: grid, scaleResolution: scaleResolution, patchSize: patchSize,
                 allowUpscale: true)
-            let refined = resizeBicubicPIL(source, toWidth: refineW, height: refineH)
+            let refined = resize(source, refineW, refineH)
             let tileH = refineH / grid.rows
             let tileW = refineW / grid.cols
             for row in stride(from: 0, to: refineH, by: tileH) {
                 for col in stride(from: 0, to: refineW, by: tileW) {
                     let tile = refined.cropped(x: col, y: row, width: tileW, height: tileH)
-                    parts.append(normalizedPatches(tile, patchSize: patchSize, mean: mean, std: std))
+                    parts.append(normalizedPatches(tile, patchSize: patchSize, mean: mean, std: std, normalization: normalization))
                     grids.append(THW(1, tileH / patchSize, tileW / patchSize))
                 }
             }
@@ -345,12 +364,13 @@ enum MiniCPMV47ImageProcessing {
     /// Replace the k-th single placeholder token with `replacements[k]`, carrying template cache boundaries
     /// through (a boundary inside an expanded span is discarded, like `QwenVL.expandPaddingTokens`).
     static func expand(
-        promptTokens: [Int], placeholder: Int, replacements: [[Int]], boundaries: CanonicalChatCacheBoundaries
+        promptTokens: [Int], placeholder: Int, replacements: [[Int]], boundaries: CanonicalChatCacheBoundaries,
+        modality: String = "image"
     ) throws -> (tokens: [Int], boundaries: CanonicalChatCacheBoundaries) {
         let positions = promptTokens.indices.filter { promptTokens[$0] == placeholder }
         guard positions.count == replacements.count else {
             throw VLMError.processing(
-                "MiniCPM-V 4.7: \(positions.count) image placeholder(s) in the prompt but \(replacements.count) image(s)")
+                "MiniCPM-V 4.7: \(positions.count) \(modality) placeholder(s) in the prompt but \(replacements.count) \(modality)(s)")
         }
         var result: [Int] = []
         result.reserveCapacity(promptTokens.count + replacements.reduce(0) { $0 + $1.count })

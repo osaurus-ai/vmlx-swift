@@ -538,16 +538,29 @@ enum VLBench {
     /// the full visible/reasoning text of every turn; fails on an incomplete generation, a leaked
     /// `<think>` marker or an empty answer.
     static func runImageSmoke(
-        modelPath: String, imagePath: String, prompt: String, followUp: String, thinking: Bool,
+        modelPath: String, imagePath: String?, videoPath: String?, prompt: String, followUp: String, thinking: Bool,
         temperature: Float, maxNewTokens: Int
     ) async throws {
         let modelDir = URL(fileURLWithPath: modelPath)
-        print("=== VLBench IMAGE SMOKE — \(modelDir.lastPathComponent) ===")
-        guard let image = CIImage(contentsOf: URL(fileURLWithPath: imagePath)) else {
-            throw NSError(domain: "VLBench", code: 30,
-                          userInfo: [NSLocalizedDescriptionKey: "cannot load image \(imagePath)"])
+        // The media turn carries either one image (BENCH_VL_IMAGE) or one video (BENCH_VL_VIDEO), through the
+        // production processor; the follow-up is text-only with the medium in history.
+        let media: [UserInput.Image]
+        let videos: [UserInput.Video]
+        if let videoPath {
+            print("=== VLBench VIDEO SMOKE — \(modelDir.lastPathComponent) ===")
+            print("video: \(videoPath)")
+            media = []
+            videos = [.url(URL(fileURLWithPath: videoPath))]
+        } else {
+            guard let imagePath, let image = CIImage(contentsOf: URL(fileURLWithPath: imagePath)) else {
+                throw NSError(domain: "VLBench", code: 30,
+                              userInfo: [NSLocalizedDescriptionKey: "cannot load image \(imagePath ?? "nil")"])
+            }
+            print("=== VLBench IMAGE SMOKE — \(modelDir.lastPathComponent) ===")
+            print("image: \(imagePath) extent=\(Int(image.extent.width))x\(Int(image.extent.height))")
+            media = [.ciImage(image)]
+            videos = []
         }
-        print("image: \(imagePath) extent=\(Int(image.extent.width))x\(Int(image.extent.height))")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context = try await loadProductionContext(from: modelDir)
@@ -564,8 +577,9 @@ enum VLBench {
         print("Sampling: temperature=\(params.temperature) maxTokens=\(maxNewTokens) thinking(T1)=\(thinking)")
 
         var history: [Chat.Message] = []
+        let kind = videos.isEmpty ? "image" : "video"
         let turns: [(label: String, chat: [Chat.Message], thinking: Bool)] = [
-            ("T1 image thinking=\(thinking)", [.user(prompt, images: [.ciImage(image)])], thinking),
+            ("T1 \(kind) thinking=\(thinking)", [.user(prompt, images: media, videos: videos)], thinking),
         ]
         var answers: [String] = []
         for (label, chat, think) in turns {
@@ -578,11 +592,11 @@ enum VLBench {
             label: "T2 text follow-up thinking=\(thinking)", engine: engine, ctx: ctx, chat: history,
             thinking: thinking, params: params))
         history.append(.assistant(answers[1]))
-        history.append(.user("Look at the image once more. " + prompt, images: [.ciImage(image)]))
+        history.append(.user("Look at the \(kind) once more. " + prompt, images: media, videos: videos))
         answers.append(try await runSmokeTurn(
-            label: "T3 image again thinking=\(!thinking)", engine: engine, ctx: ctx, chat: history,
+            label: "T3 \(kind) again thinking=\(!thinking)", engine: engine, ctx: ctx, chat: history,
             thinking: !thinking, params: params))
-        print("\n=== VLBench IMAGE SMOKE done ===")
+        print("\n=== VLBench \(kind.uppercased()) SMOKE done ===")
     }
 
     private static func runSmokeTurn(
@@ -597,10 +611,13 @@ enum VLBench {
         let prepMs = (CFAbsoluteTimeGetCurrent() - prepStart) * 1000
         let ids = lmInput.text.tokenIds ?? []
         let imageId = ctx.tokenizer.convertTokenToId("<|image_pad|>") ?? -1
-        print(String(format: "  prepare(): %.0fms tokens=%d image_pads=%d pixels=%@ frames=%@",
-            prepMs, ids.count, ids.filter { $0 == imageId }.count,
+        let videoId = ctx.tokenizer.convertTokenToId("<|video_pad|>") ?? -1
+        print(String(format: "  prepare(): %.0fms tokens=%d image_pads=%d video_pads=%d pixels=%@ frames=%@ video_pixels=%@ video_frames=%@",
+            prepMs, ids.count, ids.filter { $0 == imageId }.count, ids.filter { $0 == videoId }.count,
             lmInput.image?.pixels.shape.description ?? "nil",
-            lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil"))
+            lmInput.image?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil",
+            lmInput.video?.pixels.shape.description ?? "nil",
+            lmInput.video?.frames?.map { "\($0.h)x\($0.w)" }.joined(separator: ",") ?? "nil"))
         let t0 = CFAbsoluteTimeGetCurrent()
         nonisolated(unsafe) let sendable = lmInput
         let stream = await engine.generate(input: sendable, parameters: params)
@@ -648,7 +665,7 @@ enum VLBench {
             throw NSError(domain: "VLBench", code: 32,
                           userInfo: [NSLocalizedDescriptionKey: "\(label): empty visible answer"])
         }
-        if let marker = ["<think>", "</think>", "<|image_pad|>", "<image>", "</image>", "<slice>"].first(where: { visible.contains($0) }) {
+        if let marker = ["<think>", "</think>", "<|image_pad|>", "<|video_pad|>", "<image>", "</image>", "<slice>"].first(where: { visible.contains($0) }) {
             throw NSError(domain: "VLBench", code: 33,
                           userInfo: [NSLocalizedDescriptionKey: "\(label): leaked marker \(marker)"])
         }

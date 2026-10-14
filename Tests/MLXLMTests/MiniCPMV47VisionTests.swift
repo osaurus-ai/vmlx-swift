@@ -252,23 +252,209 @@ struct MiniCPMV47ProcessorTests {
         #expect(prepared.mediaTokenIds == [MiniCPMV47Fixtures.imageTokenId])
     }
 
-    @Test func videoIsRefusedExplicitly() async throws {
+    /// Video (and video + image) prompts against the reference run on the SAME AVFoundation-decoded frames:
+    /// token ids, modality labels, per-crop grids, canvas positions and rope delta must be identical.
+    @Test(arguments: MiniCPMV47VideoFixtures.cases)
+    func prepareMatchesReferenceVideoTokens(name: String) async throws {
         let bundle = try #require(MiniCPMV47Fixtures.bundleDirectory)
+        let m = try MiniCPMV47VideoFixtures.manifest(name)
         let tokenizer = try await #huggingFaceTokenizerLoader().load(from: bundle)
         let processor = MiniCPMV47Processor(try processorConfiguration(bundle), tokenizer: tokenizer)
-        let input = UserInput(chat: [.user("What happens?", videos: [.url(URL(fileURLWithPath: "/dev/null"))])])
-        do {
-            _ = try await processor.prepare(input: input)
-            Issue.record("video input was accepted")
-        } catch let error as VLMError {
-            #expect(String(describing: error).contains("video"))
+        let video = UserInput.Video.url(try MiniCPMV47VideoFixtures.videoURL(name))
+        let images = try m.images.map { UserInput.Image.url(try MiniCPMV47Fixtures.imageURL($0)) }
+        var input = UserInput(chat: [.user(m.prompt, images: images, videos: [video])])
+        if let thinking = m.enable_thinking { input.additionalContext = ["enable_thinking": thinking] }
+        let prepared = try await processor.prepare(input: input)
+        let ids = try #require(prepared.text.tokenIds)
+        if ids != m.input_ids {
+            let firstDiff = zip(ids, m.input_ids).enumerated().first { $0.element.0 != $0.element.1 }?.offset ?? min(ids.count, m.input_ids.count)
+            Issue.record("\(name): tokens differ at \(firstDiff) (swift \(ids.count) vs ref \(m.input_ids.count)); swift[\(firstDiff)...] = \(ids.dropFirst(firstDiff).prefix(8)), ref = \(m.input_ids.dropFirst(firstDiff).prefix(8))")
         }
+        let types = ids.map { $0 == MiniCPMV47Fixtures.imageTokenId ? 1 : ($0 == MiniCPMV47Fixtures.videoTokenId ? 2 : 0) }
+        #expect(types == m.mm_token_type_ids)
+        #expect(prepared.video?.frames?.map { [$0.h, $0.w] } == m.target_sizes_videos)
+        #expect(prepared.video?.pixels.shape == [m.pixel_values_videos_shape[3] / 14, 14, 14, 3])
+        if let targetSizes = m.target_sizes {
+            #expect(prepared.image?.frames?.map { [$0.h, $0.w] } == targetSizes)
+            #expect(prepared.mediaTokenIds == [MiniCPMV47Fixtures.imageTokenId, MiniCPMV47Fixtures.videoTokenId])
+        } else {
+            #expect(prepared.image == nil)
+            #expect(prepared.mediaTokenIds == [MiniCPMV47Fixtures.videoTokenId])
+        }
+        let (positions, delta) = MiniCPMV47Canvas.ropeIndex(
+            inputIds: ids, imageGrids: prepared.image?.frames ?? [], videoGrids: prepared.video?.frames ?? [],
+            imageTokenId: MiniCPMV47Fixtures.imageTokenId, videoTokenId: MiniCPMV47Fixtures.videoTokenId,
+            markers: MiniCPMV47Fixtures.markers, mergeFactor: 4)
+        for d in 0 ..< 3 {
+            let mismatches = zip(positions[d].map(Int.init), m.position_ids[d]).enumerated().filter { $0.element.0 != $0.element.1 }
+            #expect(mismatches.isEmpty, "\(name) axis \(d): \(mismatches.count) mismatches, first \(mismatches.prefix(5).map { ($0.offset, $0.element.0, $0.element.1) })")
+        }
+        #expect(Int(delta) == m.rope_delta, "\(name) rope delta")
     }
 
     private func processorConfiguration(_ bundle: URL) throws -> MiniCPMV47ProcessorConfiguration {
         try JSONDecoder().decode(
             MiniCPMV47ProcessorConfiguration.self,
             from: Data(contentsOf: bundle.appendingPathComponent("preprocessor_config.json")))
+    }
+}
+
+struct MiniCPMV47VideoManifest: Decodable {
+    let prompt: String
+    let enable_thinking: Bool?
+    let images: [String]
+    let image_first: Bool
+    let video_fps: Double
+    let video_total_frames: Int
+    let frame_indices: [Int]
+    let sampled_frames_shape: [Int]
+    let input_ids: [Int]
+    let mm_token_type_ids: [Int]
+    let target_sizes_videos: [[Int]]
+    let grids_videos: [[Int]]
+    let target_sizes: [[Int]]?
+    let pixel_values_videos_shape: [Int]
+    let position_ids: [[Int]]
+    let rope_delta: Int
+    let video_token_count: Int
+}
+
+enum MiniCPMV47VideoFixtures {
+    /// Reference manifests `video_<case>.json` (transformers 5.18 `MiniCPMV4_6VideoProcessor`, torchvision
+    /// backend, fed the frames AVFoundation decodes from the H.264 clips next to them). A mixed message is
+    /// covered image-first only: `Qwen3VLMessageGenerator` renders a message's images before its videos (the
+    /// same convention Qwen3-VL uses here), so a video-then-image content order is not expressible.
+    static let cases = ["clipA", "clipB", "image_then_clipB"]
+    static let clips = ["clipA": "clipA_640x360_30fps_h264", "clipB": "clipB_518x346_24fps_h264"]
+
+    static func manifest(_ name: String) throws -> MiniCPMV47VideoManifest {
+        let url = try #require(Bundle.module.url(forResource: "video_\(name)", withExtension: "json", subdirectory: "minicpmv47"))
+        return try JSONDecoder().decode(MiniCPMV47VideoManifest.self, from: Data(contentsOf: url))
+    }
+
+    static func clipName(_ name: String) -> String { name.contains("clipA") ? "clipA" : "clipB" }
+
+    static func videoURL(_ name: String) throws -> URL {
+        try #require(Bundle.module.url(forResource: clips[clipName(name)]!, withExtension: "mp4", subdirectory: "minicpmv47"))
+    }
+
+    /// Reference `pixel_values_videos[0]` `[3, 14, N*14]` as `[N, 14, 14, 3]` patches.
+    static func referencePatches(_ root: URL, _ name: String, _ m: MiniCPMV47VideoManifest) throws -> MLXArray {
+        let values = try MiniCPMV47Fixtures.floats(root.appendingPathComponent("\(name)/pixel_values_videos_f32.bin"))
+        let n = m.pixel_values_videos_shape[3] / 14
+        return MLXArray(values, [3, 14, n, 14]).transposed(2, 1, 3, 0)
+    }
+}
+
+@Suite("MiniCPM-V 4.7 video sampling and torchvision resize", .serialized)
+struct MiniCPMV47VideoMathTests {
+
+    /// `MiniCPMV4_6VideoProcessor.sample_frames` on the same (total, fps) pairs: one per started second, and the
+    /// 0.1 s + linspace thinning past `max_num_frames` seconds (expected lists printed by the reference).
+    @Test func sampleFrameIndicesMatchReference() {
+        func check(_ total: Int, _ fps: Double, count: Int, first: [Int], last: [Int], sum: Int) {
+            let idx = MiniCPMV47VideoProcessing.sampleFrameIndices(totalFrames: total, fps: fps, maxNumFrames: 128)
+            #expect(idx.count == count, "\(total)@\(fps) count")
+            #expect(Array(idx.prefix(first.count)) == first, "\(total)@\(fps) first")
+            #expect(Array(idx.suffix(last.count)) == last, "\(total)@\(fps) last")
+            #expect(idx.reduce(0, +) == sum, "\(total)@\(fps) sum")
+        }
+        check(90, 30.0, count: 3, first: [0, 30, 60], last: [0, 30, 60], sum: 90)
+        check(72, 24.0, count: 3, first: [0, 24, 48], last: [0, 24, 48], sum: 72)
+        check(100, 29.97, count: 4, first: [0, 29, 59, 89], last: [0, 29, 59, 89], sum: 177)
+        check(45, 15.0, count: 3, first: [0, 15, 30], last: [0, 15, 30], sum: 45)
+        check(1, 30.0, count: 1, first: [0], last: [0], sum: 0)
+        check(6000, 30.0, count: 128, first: [0, 45, 93, 141, 186, 234, 282, 330], last: [5853, 5901, 5949, 5997], sum: 383615)
+        check(4000, 25.0, count: 128, first: [0, 30, 62, 92, 125, 155, 187, 220], last: [3902, 3932, 3965, 3997], sum: 255648)
+        check(3853, 29.97002997, count: 128, first: [0, 29, 59, 89, 119, 149, 179, 209], last: [3755, 3785, 3815, 3848], sum: 246029)
+        check(3907, 30.0, count: 128, first: [0, 30, 60, 90, 120, 153, 183, 213], last: [3810, 3840, 3870, 3903], sum: 249601)
+    }
+
+    /// `tvF.resize(uint8, BICUBIC, antialias=True)` on a 346x518 synthetic pattern (`(x*7 + y*13 + c*101) % 256`):
+    /// pixel sums and sampled values printed by torchvision 0.29.
+    @Test func torchAntialiasedBicubicMatchesTorchvision() {
+        let (h, w) = (346, 518)
+        var data = [UInt8](repeating: 0, count: h * w * 3)
+        for y in 0 ..< h {
+            for x in 0 ..< w {
+                for c in 0 ..< 3 { data[(y * w + x) * 3 + c] = UInt8((x * 7 + y * 13 + c * 101) % 256) }
+            }
+        }
+        let image = MiniCPMV47ImageProcessing.RGB8(width: w, height: h, data: data)
+        let expectations: [(Int, Int, Int, [Int])] = [
+            (392, 560, 83961912, [0, 114, 225, 89, 128, 232]),
+            (336, 616, 79171441, [0, 114, 228, 106, 116, 253]),
+            (448, 448, 76769839, [0, 114, 227, 71, 150, 237]),
+            (280, 504, 53976644, [2, 112, 241, 120, 124, 246]),
+        ]
+        for (oh, ow, sum, samples) in expectations {
+            let r = MiniCPMV47VideoProcessing.resizeBicubicTorchAA(image, toWidth: ow, height: oh)
+            #expect(r.width == ow && r.height == oh)
+            #expect(r.data.reduce(0) { $0 + Int($1) } == sum, "\(oh)x\(ow) sum")
+            let points = [(0, 0, 0), (oh - 1, ow - 1, 2), (oh / 2, ow / 3, 1), (7, ow - 5, 0), (oh - 3, 11, 2), (oh / 3, ow / 2, 0)]
+            #expect(points.map { Int(r[$0.0, $0.1, $0.2]) } == samples, "\(oh)x\(ow) samples")
+        }
+    }
+
+    /// Frame placeholders: `<image>pad*thumb</image>` + slice rows per frame, back to back, no `<image_id>`.
+    @Test func videoPlaceholderLayout() {
+        let markers = MiniCPMV47Fixtures.markers
+        let sliced = MiniCPMV47ImageProcessing.ProcessedCrops(
+            patches: MLXArray.zeros([1]), grids: [THW(1, 24, 44), THW(1, 32, 32), THW(1, 32, 32)], sliceGrid: (1, 2))
+        let plain = MiniCPMV47ImageProcessing.ProcessedCrops(patches: MLXArray.zeros([1]), grids: [THW(1, 28, 40)], sliceGrid: nil)
+        let tokens = MiniCPMV47VideoProcessing.placeholderTokens(
+            frames: [sliced, plain], padTokenId: 7, tokensPerPatchDivisor: 16, markers: markers)
+        var expected: [Int] = [markers.imageStart] + Array(repeating: 7, count: 66) + [markers.imageEnd]
+        for _ in 0 ..< 2 { expected += [markers.sliceStart] + Array(repeating: 7, count: 64) + [markers.sliceEnd] }
+        expected += [markers.imageStart] + Array(repeating: 7, count: 70) + [markers.imageEnd]
+        #expect(tokens == expected)
+    }
+}
+
+@Suite("MiniCPM-V 4.7 video decode and pixel parity", .serialized,
+       .enabled(if: MiniCPMV47Fixtures.binaryRoot != nil))
+struct MiniCPMV47VideoPixelTests {
+
+    /// The library's AVFoundation decode of the sampled frames must equal the dump the reference consumed
+    /// (`videos/<clip>.mp4.avf_frames_u8_thwc.bin`, all frames), and the sampled patches the reference's
+    /// `pixel_values_videos`.
+    @Test(arguments: ["clipA", "clipB"])
+    func decodedFramesAndPatchesMatchReference(name: String) async throws {
+        let root = try #require(MiniCPMV47Fixtures.binaryRoot)
+        let m = try MiniCPMV47VideoFixtures.manifest(name)
+        let url = try MiniCPMV47VideoFixtures.videoURL(name)
+        let sampled = try await MiniCPMV47VideoProcessing.sample(.url(url), maxNumFrames: 128)
+        #expect(sampled.totalFrames == m.video_total_frames)
+        #expect(sampled.fps == m.video_fps)
+        #expect(sampled.indices == m.frame_indices)
+        let (t, h, w) = (m.sampled_frames_shape[0], m.sampled_frames_shape[1], m.sampled_frames_shape[2])
+        #expect(sampled.frames.count == t)
+        let dump = try MiniCPMV47Fixtures.bytes(
+            root.appendingPathComponent("videos/\(MiniCPMV47VideoFixtures.clips[MiniCPMV47VideoFixtures.clipName(name)]!).mp4.avf_frames_u8_thwc.bin"))
+        #expect(dump.count == m.video_total_frames * h * w * 3)
+        var byteMismatches = 0
+        for (k, index) in sampled.indices.enumerated() {
+            let frame = sampled.frames[k]
+            #expect(frame.height == h && frame.width == w)
+            let base = index * h * w * 3
+            for i in 0 ..< h * w * 3 where frame.data[i] != dump[base + i] { byteMismatches += 1 }
+        }
+        #expect(byteMismatches == 0, "\(name): \(byteMismatches) decoded bytes differ from the AVFoundation dump")
+
+        let crops = sampled.frames.map {
+            MiniCPMV47VideoProcessing.process(
+                frame: $0, maxSliceNums: 9, scaleResolution: 448, patchSize: 14, sliceMode: true,
+                mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5])
+        }
+        #expect(crops.flatMap { $0.grids.map { [$0.h, $0.w] } } == m.target_sizes_videos)
+        let patches = concatenated(crops.map { $0.patches })
+        let expected = try MiniCPMV47VideoFixtures.referencePatches(root, name, m)
+        #expect(patches.shape == expected.shape)
+        let diff = abs(patches - expected)
+        let maxAbs = diff.max().item(Float.self)
+        let differing = (diff .> 0).sum().item(Int.self)
+        #expect(maxAbs == 0, "\(name): video pixel max-abs \(maxAbs), \(differing) of \(diff.size) values differ")
+        print("[minicpmv47 video pixels] \(name): max-abs \(maxAbs) differing \(differing)/\(diff.size)")
     }
 }
 

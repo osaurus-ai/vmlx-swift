@@ -3604,8 +3604,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         of config: Qwen35Configuration
     ) -> Set<ModelRuntimeRequestModality> {
         if config.visionConfiguration != nil { return [.text, .vision, .video] }
-        // MiniCPM-V 4.7: images only. Its video path (frames stacked onto one canvas image) is not ported.
-        if config.miniCPMVisionConfiguration != nil { return [.text, .vision] }
+        // MiniCPM-V 4.7: images and video (sampled frames, each sliced like an image, `<|video_pad|>` tokens).
+        if config.miniCPMVisionConfiguration != nil { return [.text, .vision, .video] }
         return [.text]
     }
 
@@ -3617,9 +3617,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) -> Set<ModelRuntimeRequestModality> {
         var m: Set<ModelRuntimeRequestModality> = []
         if components.contains(.languageCore) { m.insert(.text) }
-        if components.contains(.visionTower) {
-            m.formUnion(config.miniCPMVisionConfiguration != nil ? [.vision] : [.vision, .video])
-        }
+        if components.contains(.visionTower) { m.formUnion([.vision, .video]) }
         return m
     }
 
@@ -3676,11 +3674,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
 
         // The components declare their own contribution; `.video` is added here because it needs
-        // this model's video token id, which the encoder knows nothing about. MiniCPM-V 4.7's tower
-        // serves images only (its video path is not ported), so it never gains `.video`.
+        // this model's video token id, which the encoder knows nothing about. Both towers serve it:
+        // Qwen3-VL's through its temporal patches, MiniCPM-V 4.7's through per-frame slicing.
         var provided = Set<ModelRuntimeRequestModality>.provided(by: [tower])
         provided.insert(.text)  // this family's core is a text LM
-        if provided.contains(.vision), config.videoTokenId != nil, config.miniCPMVisionConfiguration == nil {
+        if provided.contains(.vision), config.videoTokenId != nil {
             provided.insert(.video)
         }
         self.modalities = provided
