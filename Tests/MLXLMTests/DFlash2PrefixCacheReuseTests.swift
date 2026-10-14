@@ -22,6 +22,7 @@
 // never match, and cross-turn reuse silently drops to zero.
 
 import Foundation
+import Cmlx
 import MLX
 @testable import MLXLMCommon
 import MLXNN
@@ -196,6 +197,31 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         var p = GenerateParameters(maxTokens: 2, temperature: 0)
         p.prefillStepSize = 4
         return p
+    }
+
+    func testSSDStoresOwnTheChatBeforeAnyCacheHit() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+            _ = path.withCString { mlx_metal_set_metallib_path($0) }
+        }
+        for canonical in [false, true] {
+            let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+            let coordinator = makeCoordinator()
+            coordinator.setHybrid(canonical)
+            var settings = parameters()
+            settings.cacheChainId = "active-chat-owner"
+            var iterator = try DFlash2TokenIterator(
+                input: input(turn1User + genPromptSuffix), target: target,
+                drafter: makeDrafter(), blockSize: nil, parameters: settings,
+                cacheCoordinator: coordinator)
+            iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+            let rows = try XCTUnwrap(coordinator.diskCache).quotaEntries()
+            XCTAssertFalse(rows.isEmpty)
+            XCTAssertTrue(rows.allSatisfy { $0.chainId == "active-chat-owner" },
+                          "ownership must be recorded at store, not adopted at the next cache hit")
+        }
     }
 
     /// Turn 1 must forward the prompt exactly once — no replay to

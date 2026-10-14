@@ -8,6 +8,19 @@ import Testing
 
 @Suite("BatchEngine growing-chat cache source coverage")
 struct BatchEngineGrowingChatCacheSourceTests {
+    @Test("DFlash and DSpark stores retain the requesting chat owner at both boundaries")
+    func draftCacheStoresRetainChatOwner() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift",
+            encoding: .utf8)
+        let store = try #require(source.components(separatedBy: "mutating func storeCacheAfterGeneration(").last)
+        let calls = store.components(separatedBy: "coordinator.storeAfterGeneration(").dropFirst()
+        #expect(calls.count == 2, "canonical stripped and full-prompt boundaries both need ownership")
+        for call in calls {
+            #expect(call.contains("chainId: cacheInitParameters.cacheChainId"))
+        }
+    }
+
     @Test("reusable-prefix warmup intent survives input copies and forbids hybrid stripping")
     func reusablePrefixWarmupIntentIsPreserved() throws {
         let source = try String(
