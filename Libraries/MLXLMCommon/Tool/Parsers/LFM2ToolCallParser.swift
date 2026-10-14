@@ -33,6 +33,20 @@ public struct LFM2ToolCallParser: ToolCallParser, Sendable {
 
     public init() {}
 
+    /// A configured Liquid reasoning/tool template owns its generation tail,
+    /// historical thinking and Python-call replay. Older non-reasoning tool
+    /// templates still use the existing explicit-tool-choice fallback.
+    public static func preservesNativeReasoningTemplate(_ template: String?) -> Bool {
+        guard let template else { return false }
+        return template.contains("<|tool_call_start|>")
+            && template.contains("<|tool_call_end|>")
+            && template.contains("<think>")
+            && template.contains("</think>")
+            && template.contains("preserve_thinking")
+            && template.contains("add_generation_prompt")
+    }
+
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         if let call = native.parse(content: content, tools: tools) {
             return call
