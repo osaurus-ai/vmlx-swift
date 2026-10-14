@@ -7,6 +7,11 @@
 import Foundation
 import MLX
 import MLXNN
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 
 public enum DFlash2Loader {
 
@@ -25,6 +30,8 @@ public enum DFlash2Loader {
             throw DFlash2LoadError.missingConfig(configURL)
         }
         let configData = try Data(contentsOf: configURL)
+        let initialCompanionIdentity = DSparkNativeCompanionSnapshot.enabled
+            ? companionIdentity(at: dir) : nil
         guard let root = try JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
             throw DFlash2LoadError.malformedConfig(configURL)
         }
@@ -106,7 +113,33 @@ public enum DFlash2Loader {
         }
 
         MLX.eval(model)
+        if let identity = initialCompanionIdentity, identity == companionIdentity(at: dir) {
+            model.nativeCompanionIdentity = identity
+        }
         return model
+    }
+
+    /// Match the donor's bundle-file fingerprint contract without hashing
+    /// large tensor contents on each restore. Include effective loader policy.
+    static func companionIdentity(at directory: URL) -> String? {
+        let root = directory.resolvingSymlinksInPath()
+        guard let config = try? Data(contentsOf: root.appendingPathComponent("config.json")),
+              let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+        else { return nil }
+        let weights = enumerator.compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "safetensors" }.sorted { $0.path < $1.path }
+        guard !weights.isEmpty else { return nil }
+        var hash = SHA256()
+        hash.update(data: Data("dspark-native-companion-v1|\(root.path)|noDraftQuant=\(ProcessInfo.processInfo.environment["VMLX_DFLASH2_NO_DRAFT_QUANT"] == "1")".utf8))
+        hash.update(data: config)
+        for file in weights {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+                  let size = attrs[.size] as? NSNumber,
+                  let modified = attrs[.modificationDate] as? Date
+            else { return nil }
+            hash.update(data: Data("\(file.path)|\(size)|\(modified.timeIntervalSince1970)|\(attrs[.systemFileNumber] ?? "")\n".utf8))
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Cheap probe: does this directory hold a DFlash 2 drafter?

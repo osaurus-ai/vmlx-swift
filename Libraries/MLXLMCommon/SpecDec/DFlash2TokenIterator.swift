@@ -132,6 +132,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let cacheInitParameters: GenerateParameters
     private let mediaSalt: String?
     private var promptCacheSnapshot: [KVCache]?
+    private var promptDraftCompanionReference: DSparkNativeCompanionSnapshot?
+    private var boundaryDraftCompanionReference: DSparkNativeCompanionSnapshot?
 
     /// Index of the generation-suffix-stripped boundary in
     /// ``promptTokenIds`` — the last turn-start token, i.e. the end of the
@@ -508,6 +510,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // MARK: prefix reuse
 
         var tokensToPrefill = self.promptTokenIds
+        var diskCompanionCandidate: (arrays: [String: MLXArray], boundary: Int)?
         // Media: prefilled through the target's vision path. A restored (media-salted) entry is
         // continued at positions recomputed from the full prompt's token ids + media grids, so
         // the entry itself never needs to carry the M-RoPE delta. A suffix that carries a media
@@ -619,6 +622,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             .utf8))
                 }
                 if restored {
+                    if let diskArrays {
+                        diskCompanionCandidate = (diskArrays, matchedTokens)
+                    }
                     // A full hit needs one token replayed for drafter hidden state.
                     // Recurrent/ring companions cannot be rewound by trimming KV.
                     // Keep this defense even if a future lookup returns a full hit.
@@ -683,6 +689,56 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             stripAt > restoredCount ? stripAt - restoredCount : nil
         }
 
+        // Diagnostic reference only. A missing companion never invalidates a
+        // usable target prefix and never forces a cold prefill.
+        let referenceEnabled = DSparkNativeCompanionSnapshot.enabled
+            && drafter.supportsChunkedContextPrefill
+            && drafter.nativeCompanionIdentity != nil
+            && cacheCoordinator?.diskCache != nil && cacheCoordinator?.config.modelKey != nil
+        let referenceDType: DType? = referenceEnabled
+            ? target.embed(MLXArray([Int32(promptTokenIds[0])]).reshaped(1, 1)).dtype : nil
+        var restoredReference = false
+        if referenceEnabled, let dtype = referenceDType, restoredCount > 0,
+           let candidate = diskCompanionCandidate, candidate.boundary >= restoredCount,
+           let restored = DSparkNativeCompanionSnapshot.restore(
+               arrays: candidate.arrays, config: config,
+               draftIdentity: drafter.nativeCompanionIdentity!, targetIdentity: cacheCoordinator!.config.modelKey!,
+               embeddingDType: dtype, tokens: Array(promptTokenIds.prefix(candidate.boundary)), mediaSalt: mediaSalt) {
+            for layer in restored where layer.offset > restoredCount {
+                _ = layer.trim(layer.offset - restoredCount)
+            }
+            if restored.allSatisfy({ $0.offset == restoredCount }) {
+                self.draftCache = restored
+                restoredReference = true
+            }
+        }
+        diskCompanionCandidate = nil
+        let referenceFullHistory = referenceEnabled && (restoredCount == 0 || restoredReference)
+        let draftPrefillCache = self.draftCache
+        let referencePromptIDs = self.promptTokenIds
+        let referenceTargetIdentity = cacheCoordinator?.config.modelKey
+        let referenceDraftIdentity = drafter.nativeCompanionIdentity
+        let referenceBoundary = self.hybridStripBoundary
+        let referenceSalt = self.mediaSalt
+        let makeReferenceSnapshot: (Int) -> DSparkNativeCompanionSnapshot? = { boundary in
+            guard referenceFullHistory, let dtype = referenceDType,
+                  let targetIdentity = referenceTargetIdentity, let draftIdentity = referenceDraftIdentity
+            else { return nil }
+            return DSparkNativeCompanionSnapshot.capture(cache: draftPrefillCache, config: config,
+                draftIdentity: draftIdentity, targetIdentity: targetIdentity,
+                embeddingDType: dtype, tokens: Array(referencePromptIDs.prefix(boundary)), mediaSalt: referenceSalt)
+        }
+        let consumeContext: ((MLXArray) -> Void)? = referenceDType.map { dtype in
+            { hidden in
+                drafter.appendContext(targetHidden: hidden, dtype: dtype, cache: draftPrefillCache)
+                MLX.eval(draftPrefillCache)
+            }
+        }
+        var boundaryCompanion: DSparkNativeCompanionSnapshot?
+        let captureDraftBoundary: () -> Void = {
+            if let boundary = referenceBoundary { boundaryCompanion = makeReferenceSnapshot(boundary) }
+        }
+
         let totalPromptCount = self.promptTokenIds.count
         if restoredCount > 0 {
             prefillProgressHandler?(PrefillProgress(
@@ -721,9 +777,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 stepSize: effectiveParameters.prefillStepSize,
                 restoredPrefix: restored,
                 boundary: captureAt.map { $0 + restored },
-                onBoundary: { boundarySnapshot = cacheRef.map { $0.copy() } }
+                onBoundary: {
+                    boundarySnapshot = cacheRef.map { $0.copy() }
+                    captureDraftBoundary()
+                }
             ) { captured in
                 let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
+                if let consumeContext {
+                    consumeContext(chunkHidden)
+                    retained = chunkHidden[0..., ..<0, 0...]
+                    completedMediaRows += chunkHidden.dim(1)
+                    reportPrefill(completedMediaRows)
+                    return
+                }
                 let combined = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
                 if let limit = hiddenLimit, combined.dim(1) > limit {
                     retained = combined[0..., (combined.dim(1) - limit)..., 0...]
@@ -748,6 +814,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 hiddenLimit: hiddenLimit,
                 stepSize: effectiveParameters.prefillStepSize,
                 captureBoundaryAt: captureAt,
+                contextConsumer: consumeContext,
+                boundaryHandler: captureDraftBoundary,
                 progressHandler: reportPrefill)
         }
         prefillProgressHandler?(PrefillProgress(
@@ -760,6 +828,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
         self.hybridStripSnapshot = prefill.boundarySnapshot
+        self.boundaryDraftCompanionReference = boundaryCompanion
         // Vocabulary agreement, checked against the first real logits row.
         // The drafter borrows the target's LM head, so a mismatch here
         // would not throw — it would silently index a different token
@@ -770,7 +839,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 "drafter vocab_size \(config.vocabSize) != model vocabulary \(targetVocab)")
         }
         self.contextHidden = prefill.hidden
-        self.stats.seededContextRows = prefill.hidden.dim(1)
+        self.stats.seededContextRows = referenceEnabled
+            ? (draftCache.first?.offset ?? 0) : prefill.hidden.dim(1)
 
         // The drafter cache counts PHYSICAL rows from 0; the absolute position of its first row (the retained hidden
         // window's start) is kept apart in `draftPositionBase`. Shifting an empty cache's offset instead left the
@@ -779,9 +849,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // prompt longer than the drafter window) the drafter attended to zero rows and acceptance collapsed (27B
         // JANGH2 prose follow-up 1.41 -> 0.22 accepted per cycle). Drafter RoPE is relative, so the base only
         // matters for the committed-row accounting below.
-        self.draftPositionBase = Swift.max(0, self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0)
+        let consumedContextRows = referenceEnabled ? (draftCache.first?.offset ?? 0) : 0
+        self.draftPositionBase = Swift.max(0, self.cache.first.map {
+            $0.offset - consumedContextRows - prefill.hidden.dim(1)
+        } ?? 0)
 
         self.promptCacheSnapshot = self.cache.map { $0.copy() }
+        if referenceEnabled {
+            if hybridStripBoundary == nil {
+                self.promptDraftCompanionReference = makeReferenceSnapshot(promptTokenIds.count)
+            }
+            FileHandle.standardError.write(Data(
+                "[DSparkNativeCompanionReference] restoredRows=\(restoredReference ? restoredCount : 0) seededRows=\(consumedContextRows) fullHistory=\(referenceFullHistory) base=\(draftPositionBase)\n".utf8))
+        }
 
         let first = self.sampler.sample(logits: prefill.lastLogits)
         MLX.eval(first)
@@ -867,6 +947,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         hiddenLimit: Int?,
         stepSize: Int,
         captureBoundaryAt: Int? = nil,
+        contextConsumer: ((MLXArray) -> Void)? = nil,
+        boundaryHandler: (() -> Void)? = nil,
         progressHandler: ((Int) -> Void)? = nil
     ) throws -> PrefillResult {
         guard !tokens.isEmpty else {
@@ -901,7 +983,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             logits = chunkLogits
             let chunkHidden = extractContextFeature(
                 captured: captured, targetLayerIDs: orderedLayerIDs)
-            if let limit = hiddenLimit {
+            if let contextConsumer {
+                contextConsumer(chunkHidden)
+                retained = chunkHidden[0..., ..<0, 0...]
+            } else if let limit = hiddenLimit {
                 let combined =
                     retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
                 let rows = combined.dim(1)
@@ -914,6 +999,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 try Task.checkCancellation()
                 MLX.eval(cache)
                 boundarySnapshot = cache.map { $0.copy() }
+                boundaryHandler?()
             }
             if end < tokens.count {
                 try Task.checkCancellation()
@@ -1877,6 +1963,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         defer {
             promptCacheSnapshot = nil
             hybridStripSnapshot = nil
+            promptDraftCompanionReference = nil
+            boundaryDraftCompanionReference = nil
         }
 
         // The generation-suffix-stripped boundary is the canonical
@@ -1900,7 +1988,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 perLayerData: extractLayerData(from: snapshot),
                 ssmStates: extractSSMStates(from: snapshot),
                 cache: snapshot,
-                mediaSalt: mediaSalt)
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                dsparkNativeCompanionReference: boundaryDraftCompanionReference)
             return
         }
 
@@ -1916,6 +2006,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             perLayerData: extractLayerData(from: snapshot),
             ssmStates: extractSSMStates(from: snapshot),
             cache: snapshot,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: cacheInitParameters.cacheChainId,
+            dsparkNativeCompanionReference: promptDraftCompanionReference)
     }
 }
