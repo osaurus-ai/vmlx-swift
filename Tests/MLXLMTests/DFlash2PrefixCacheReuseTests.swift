@@ -142,14 +142,16 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
     private let hiddenSize = 8
     private let vocabSize = 256
 
-    private func makeCoordinator(modelKey: String = "recording-dflash2|reasoning=off")
+    private func makeCoordinator(
+        modelKey: String = "recording-dflash2|reasoning=off", usePagedCache: Bool = true
+    )
         -> CacheCoordinator
     {
         let diskDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dflash2-cache-\(UUID().uuidString)")
         tempDirs.append(diskDir)
         let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
-            usePagedCache: true,
+            usePagedCache: usePagedCache,
             enableDiskCache: true,
             diskCacheDir: diskDir,
             modelKey: modelKey))
@@ -237,6 +239,63 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
             let pressure = DiskQuotaPlanner.plan(rows: activeRows + [newerCold],
                                                  capBytes: activeBytes, activeChain: settings.cacheChainId)
             XCTAssertEqual(Set(pressure.evict), ["newer-inactive-chat"])
+        }
+    }
+
+    /// A marked old resume point must not make the next canonical snapshot
+    /// disposable. Exercise the real iterator, writer, quota deletion and
+    /// disk-only restore; a correct answer alone would hide the cold prefill.
+    func testCanonicalResumeSurvivesQuotaBesideAnOlderMarkedBoundary() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+            _ = path.withCString { mlx_metal_set_metallib_path($0) }
+        }
+        try Device.withDefaultDevice(.cpu) {
+            let coordinator = makeCoordinator(usePagedCache: false)
+            let disk = try XCTUnwrap(coordinator.diskCache)
+            let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+            var settings = parameters()
+            settings.cacheChainId = "connected-tool-chat"
+            let firstPrompt = turn1User + genPromptSuffix
+            let salt = computeCacheSalt(for: input(firstPrompt), parameters: settings)
+            var first = try DFlash2TokenIterator(
+                input: input(firstPrompt), target: target, drafter: makeDrafter(),
+                blockSize: nil, parameters: settings, cacheCoordinator: coordinator)
+            first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+            // Seed the existing marked boundary, as produced by AR/native MTP
+            // before the user switches to a bundled drafter.
+            let oldArrays = try XCTUnwrap(disk.fetch(tokens: turn1User, mediaSalt: salt))
+            disk.store(tokens: turn1User, arrays: oldArrays, mediaSalt: salt,
+                       enforceQuota: false, chainId: settings.cacheChainId,
+                       isResumeBoundary: true)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+
+            let secondPrefix = turn1User + turn2Extra
+            var second = try DFlash2TokenIterator(
+                input: input(secondPrefix + genPromptSuffix), target: target,
+                drafter: makeDrafter(), blockSize: nil, parameters: settings,
+                cacheCoordinator: coordinator)
+            second.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+            let newRow = try XCTUnwrap(disk.quotaEntries().first {
+                $0.tokenCount == secondPrefix.count
+            })
+            XCTAssertTrue(newRow.isResumeBoundary)
+            coordinator.updateDiskCap(bytes: Int(newRow.bytes + newRow.companionBytes))
+            coordinator.enforceCombinedDiskQuota(activeChain: settings.cacheChainId)
+            XCTAssertTrue(disk.hasDurableEntry(tokens: secondPrefix, mediaSalt: salt))
+            XCTAssertFalse(disk.hasDurableEntry(tokens: turn1User, mediaSalt: salt))
+
+            target.resetRecording()
+            let newSuffix = [41, 42] + genPromptSuffix
+            _ = try DFlash2TokenIterator(
+                input: input(secondPrefix + newSuffix), target: target,
+                drafter: makeDrafter(), blockSize: nil, parameters: settings,
+                cacheCoordinator: coordinator)
+            XCTAssertEqual(target.forwarded, newSuffix,
+                           "the next tool/chat step must restore disk and forward only its new suffix")
         }
     }
 
