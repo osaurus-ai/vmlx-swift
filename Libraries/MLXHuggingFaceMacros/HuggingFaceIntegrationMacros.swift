@@ -168,6 +168,15 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages, tools: chatTemplateTools,
                                 additionalContext: additionalContext)
                         }
+                        // Keep Liquid's native reasoning/tool template, rather
+                        // than substituting a non-thinking tool-choice template.
+                        if !(tools?.isEmpty ?? true),
+                           MLXLMCommon.LFM2ToolCallParser.preservesNativeReasoningTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools),
+                                additionalContext: additionalContext)
+                        }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
                             + "|EOS|"
@@ -616,6 +625,15 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false, maxLength: nil,
                                 tools: chatTemplateTools, additionalContext: additionalContext)
+                        }
+                        if !(tools?.isEmpty ?? true),
+                           MLXLMCommon.LFM2ToolCallParser.preservesNativeReasoningTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: nil,
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false, maxLength: nil,
+                                tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools), additionalContext: additionalContext)
                         }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
