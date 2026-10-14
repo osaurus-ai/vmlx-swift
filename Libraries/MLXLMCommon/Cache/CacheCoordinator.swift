@@ -1868,6 +1868,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 isPostAnswer: kv.isPostAnswer,
                 isCanonicalCheckpoint: kv.isCanonicalCheckpoint,
                 chainId: kv.chainId,
+                modelKey: kv.modelKey,
                 isLegacyCompanion: false))
         }
         // A KV hash is hex, so the prefix keeps the two id spaces apart.
@@ -1903,7 +1904,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         let selectStart = DispatchTime.now().uptimeNanoseconds
-        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: planCap, activeChain: activeChain)
+        let plan = DiskQuotaPlanner.plan(
+            rows: rows, capBytes: planCap, activeChain: activeChain, activeModelKey: diskCache.modelKey)
         let selectMs = msSince(selectStart)
         guard !plan.evict.isEmpty else { return }
 
@@ -1977,7 +1979,9 @@ public final class CacheCoordinator: @unchecked Sendable {
             evictedGroups: evictedGroups, evictedBytes: evictedBytes, milliseconds: totalMs,
             event: confirmedEvent,
             tipTokenCount: DiskQuotaPlanner.resumePoint(
-                of: rows.filter { $0.chainId == activeChain })?.tokenCount ?? 0)
+                of: rows.filter {
+                    $0.chainId == activeChain && ($0.modelKey ?? "") == (diskCache.modelKey ?? "")
+                })?.tokenCount ?? 0)
         _lastQuotaPassTiming = QuotaPassTiming(
             rowsMs: rowsMs, selectMs: selectMs, deleteMs: deleteMs, totalMs: totalMs,
             evictedGroups: evictedGroups)
