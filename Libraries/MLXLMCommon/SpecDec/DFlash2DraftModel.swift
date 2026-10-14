@@ -411,6 +411,23 @@ final class DFlash2Attention: Module {
         super.init()
     }
 
+    /// Shared by proposal attention and full-attention prefill context seeding.
+    func appendContext(_ context: MLXArray, rope: RoPE, cache: KVCache)
+        -> (MLXArray, MLXArray)
+    {
+        let b = context.dim(0)
+        let s = context.dim(1)
+        if s == 0 {
+            let state = cache.state
+            if state.count >= 2 { return (state[0], state[1]) }
+        }
+        var keys = wk(context).reshaped(b, s, numKVHeads, headDim)
+        keys = kNorm(keys).transposed(0, 2, 1, 3)
+        let values = wv(context).reshaped(b, s, numKVHeads, headDim).transposed(0, 2, 1, 3)
+        keys = rope(keys, offset: cache.offset)
+        return cache.update(keys: keys, values: values)
+    }
+
     func callAsFunction(
         _ x: MLXArray, context: MLXArray, rope: RoPE, cache: KVCache
     ) -> MLXArray {
@@ -438,20 +455,15 @@ final class DFlash2Attention: Module {
         var queries = wq(x).reshaped(b, l, numHeads, headDim)
         queries = qNorm(queries).transposed(0, 2, 1, 3)
 
-        var ctxKeys = wk(xCtx).reshaped(b, s, numKVHeads, headDim)
-        ctxKeys = kNorm(ctxKeys).transposed(0, 2, 1, 3)
-        let ctxValues = wv(xCtx).reshaped(b, s, numKVHeads, headDim).transposed(0, 2, 1, 3)
-
         var propKeys = wk(x).reshaped(b, l, numKVHeads, headDim)
         propKeys = kNorm(propKeys).transposed(0, 2, 1, 3)
         let propValues = wv(x).reshaped(b, l, numKVHeads, headDim).transposed(0, 2, 1, 3)
 
         let offset = cache.offset
         queries = rope(queries, offset: offset + s)
-        ctxKeys = rope(ctxKeys, offset: offset)
         propKeys = rope(propKeys, offset: offset + s)
 
-        var (keys, values) = cache.update(keys: ctxKeys, values: ctxValues)
+        var (keys, values) = appendContext(xCtx, rope: rope, cache: cache)
         // A wrapped ring buffer comes back in rotation order, which would
         // misalign the position-derived mask below. The rotating cache
         // exposes a temporally-ordered view for exactly this case.
@@ -801,6 +813,10 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     private let rope: RoPE
 
+    /// Loader-owned bundle/effective-weight fingerprint for the opt-in SSD
+    /// reference. Unstamped synthetic/in-memory models never persist by default.
+    var nativeCompanionIdentity: String?
+
     /// Whether this drafter can produce a draft-tree lattice (needs the DFlash 2 candidate selector).
     public var supportsLattice: Bool { candidateSelector != nil }
 
@@ -842,6 +858,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         }
     }
 
+    /// Only append-only DSpark context is seeded during prefill. General
+    /// DFlash/rotating context retains its existing pending-hidden behavior.
+    var supportsChunkedContextPrefill: Bool {
+        config.isDSpark && config.layerTypes.allSatisfy { $0 == "full_attention" }
+    }
+
+    /// Consume target features without queries, proposals, or random draws.
+    /// `dtype` is the target embedding dtype used by `hiddenStates`.
+    func appendContext(targetHidden: MLXArray, dtype: DType, cache: [KVCache]) {
+        precondition(supportsChunkedContextPrefill && cache.count == layers.count)
+        let context = hiddenNorm(fc(targetHidden.asType(dtype)))
+        for (layer, c) in zip(layers, cache) {
+            _ = layer.attention.appendContext(context, rope: rope, cache: c)
+        }
+    }
+
     /// Run the drafter backbone.
     ///
     /// - Parameters:
@@ -863,7 +895,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
         if config.dflash.inputEmbeddingScale != 1.0 {
             h = h * config.dflash.inputEmbeddingScale
         }
-        let context = hiddenNorm(fc(targetHidden.asType(h.dtype)))
+        let context = targetHidden.dim(1) == 0
+            ? MLXArray.zeros([h.dim(0), 0, config.hiddenSize], dtype: h.dtype)
+            : hiddenNorm(fc(targetHidden.asType(h.dtype)))
         for (layer, c) in zip(layers, cache) {
             h = layer(h, context: context, rope: rope, cache: c)
         }

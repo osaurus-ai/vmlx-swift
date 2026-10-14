@@ -1365,7 +1365,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         chainId: String? = nil,
         isStableRoot: Bool = false,
         isResumeBoundary: Bool = false,
-        isPostAnswer: Bool = false
+        isPostAnswer: Bool = false,
+        dsparkNativeCompanionReference: DSparkNativeCompanionSnapshot? = nil
     ) {
         var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
         defer { trace.mark("return") }
@@ -1504,10 +1505,14 @@ public final class CacheCoordinator: @unchecked Sendable {
         var diskArrays: [String: MLXArray]?
         if diskCache != nil {
             if let cache {
-                let arrays = TQDiskSerializer.serialize(
+                var arrays = TQDiskSerializer.serialize(
                     cache: cache,
                     ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
                     preserveStandardKVStorageDType: config.preserveStandardKVStorageDType)
+                if let companion = dsparkNativeCompanionReference,
+                   companion.matches(tokens: promptTokens, targetIdentity: config.modelKey, mediaSalt: mediaSalt) {
+                    arrays.merge(companion.arrays) { original, _ in original }
+                }
                 if !arrays.isEmpty {
                     diskArrays = arrays
                 }
