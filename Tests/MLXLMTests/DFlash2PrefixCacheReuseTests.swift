@@ -251,7 +251,7 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
             _ = path.withCString { mlx_metal_set_metallib_path($0) }
         }
-        try Device.withDefaultDevice(.cpu) {
+        try Device.withDefaultDevice(.gpu) {
             let coordinator = makeCoordinator(usePagedCache: false)
             let disk = try XCTUnwrap(coordinator.diskCache)
             let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
