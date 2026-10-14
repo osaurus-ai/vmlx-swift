@@ -31,6 +31,7 @@ public struct LFM2MoEConfiguration: Codable, Sendable {
     public let convBias: Bool
     public let convLCache: Int
     public let ropeTheta: Float
+    public let routedScalingFactor: Float
 
     private let _fullAttnIdxs: [Int]?
     private let layerTypes: [String]?
@@ -67,6 +68,7 @@ public struct LFM2MoEConfiguration: Codable, Sendable {
         case convBias = "conv_bias"
         case convLCache = "conv_L_cache"
         case ropeTheta = "rope_theta"
+        case routedScalingFactor = "routed_scaling_factor"
         case ropeParameters = "rope_parameters"
         case _fullAttnIdxs = "full_attn_idxs"
         case layerTypes = "layer_types"
@@ -97,6 +99,8 @@ public struct LFM2MoEConfiguration: Codable, Sendable {
 
         let ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1000000.0
         self.ropeTheta = ropeParameters?["rope_theta"]?.asFloat() ?? ropeTheta
+        self.routedScalingFactor =
+            try container.decodeIfPresent(Float.self, forKey: .routedScalingFactor) ?? 1
         self._fullAttnIdxs = try container.decodeIfPresent([Int].self, forKey: ._fullAttnIdxs)
         self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
     }
@@ -295,19 +299,26 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var gates = MLX.softmax(gate(x), axis: -1, precise: true)
-
-        if useExpertBias, let expertBias {
-            gates = gates + expertBias
-        }
-
+        // Sigmoid routing, matching the HF Transformers Lfm2Moe reference
+        // (and mlx-lm 0.32): expert_bias only picks the top-k experts; the
+        // mixing weights are the unbiased sigmoid scores, renormalized and
+        // scaled by routed_scaling_factor.
         let k = topK
-        let indices = argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        let probabilities = sigmoid(gate(x).asType(.float32))
+        let selection: MLXArray
+        if useExpertBias, let expertBias {
+            selection = probabilities + expertBias.asType(.float32)
+        } else {
+            selection = probabilities
+        }
+        let indices = argPartition(-selection, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
-        var scores = takeAlong(gates, indices, axis: -1)
+        var scores = takeAlong(probabilities, indices, axis: -1)
         if normTopKProb {
-            let denom = scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype)
-            scores = scores / denom
+            scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-6)
+        }
+        if args.routedScalingFactor != 1 {
+            scores = scores * args.routedScalingFactor
         }
         scores = scores.asType(x.dtype)
 
