@@ -221,6 +221,22 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
             XCTAssertFalse(rows.isEmpty)
             XCTAssertTrue(rows.allSatisfy { $0.chainId == "active-chat-owner" },
                           "ownership must be recorded at store, not adopted at the next cache hit")
+            // A newer inactive chat must not displace this first-write resume
+            // point merely because no cache hit has adopted its owner yet.
+            let activeRows = rows.map {
+                QuotaRow(id: $0.hash, tokenCount: $0.tokenCount,
+                         bytes: $0.bytes + $0.companionBytes, recency: 1,
+                         isStableRoot: $0.isStableRoot, isResumeBoundary: $0.isResumeBoundary,
+                         isPostAnswer: $0.isPostAnswer, isCanonicalCheckpoint: $0.isCanonicalCheckpoint,
+                         chainId: $0.chainId, isLegacyCompanion: false)
+            }
+            let activeBytes = activeRows.reduce(Int64(0)) { $0 + $1.bytes }
+            let newerCold = QuotaRow(id: "newer-inactive-chat", tokenCount: 100,
+                                    bytes: activeBytes, recency: 2, isStableRoot: false,
+                                    chainId: "inactive-chat", isLegacyCompanion: false)
+            let pressure = DiskQuotaPlanner.plan(rows: activeRows + [newerCold],
+                                                 capBytes: activeBytes, activeChain: settings.cacheChainId)
+            XCTAssertEqual(Set(pressure.evict), ["newer-inactive-chat"])
         }
     }
 
