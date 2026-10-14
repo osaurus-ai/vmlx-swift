@@ -1900,7 +1900,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 perLayerData: extractLayerData(from: snapshot),
                 ssmStates: extractSSMStates(from: snapshot),
                 cache: snapshot,
-                mediaSalt: mediaSalt)
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                isResumeBoundary: true)
             return
         }
 
@@ -1916,6 +1918,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             perLayerData: extractLayerData(from: snapshot),
             ssmStates: extractSSMStates(from: snapshot),
             cache: snapshot,
-            mediaSalt: mediaSalt)
+            mediaSalt: mediaSalt,
+            chainId: cacheInitParameters.cacheChainId)
     }
 }
