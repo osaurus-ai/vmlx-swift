@@ -182,6 +182,43 @@ struct Glm5NextBoundedCacheTests {
         close(concatenated(a, axis: 1), concatenated(b, axis: 1), tolerance: 1e-4)
     }
 
+    // The Metal chunk-vs-row gap is the GEMM precision policy, not the cache: with
+    // MLX_ENABLE_TF32 (mlx/utils.h, default on) the multi-row float32 projections run through
+    // the TF32-eligible NAX GEMM (backend/metal/matmul.cpp use_nax) while a single row routes to
+    // the full-precision GEMV, so the two prefill shapes disagree by ~1e-3 on the existing
+    // uncapped path as well. The CPU stream has one float32 matmul for every row count, so
+    // the same contract with the same 1e-4 tolerance isolates the bounded-cache arithmetic
+    // (selection, window, ring remapping, companion retention) from that policy. The nil cap
+    // is the production-path control; it must pass for the capped rows to mean anything.
+    @Test("precision-matched chunked prefill matches single token appends on the CPU stream", arguments: [
+        (nil, 4, 4), (7, 4, 4), (9, 4, 4), (3, 4, 4), (7, 64, 4), (7, 8, 8),
+    ] as [(Int?, Int, Int)])
+    func chunkingPrecisionMatched(cap: Int?, topK: Int, pool: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let module = try attention(topK: topK, pool: pool)
+            let x = hidden(37)
+            let single = Glm5NextIndexedKVCache(maxSize: cap, poolSize: pool)
+            let chunks = Glm5NextIndexedKVCache(maxSize: cap, poolSize: pool)
+            var reference: [MLXArray] = []
+            for i in 0..<37 { reference.append(try module(x[0..., i..<(i + 1)], cache: single)) }
+            var output: [MLXArray] = []
+            var start = 0
+            for count in [4, 3, 9, 1, 12, 8] {
+                output.append(try module(x[0..., start..<(start + count)], cache: chunks))
+                start += count
+                if let cap {
+                    #expect(chunks.state[0].dim(2) <= cap)
+                    #expect(chunks.state[2].dim(1) <= cap + 2 * (pool - 1))
+                }
+            }
+            let a = concatenated(reference, axis: 1), b = concatenated(output, axis: 1)
+            // Fail closed: an all-zero output would pass any parity check vacuously.
+            #expect(abs(a).max().item(Float.self) > 1e-3)
+            print("GLM_CPU_CHUNK_PARITY cap=\(String(describing: cap)) topK=\(topK) pool=\(pool) maxabs=\(abs(a - b).max().item(Float.self))")
+            close(a, b, tolerance: 1e-4)
+        }
+    }
+
     @Test("exact selected positions and windows match an independent scalar oracle", arguments: [3, 7, 9])
     func selectedPositionOracle(cap: Int) throws {
         let indexer = Glm5NextIndexer(numHeads: 1, headDim: 2, topK: 4, poolSize: 4,

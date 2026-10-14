@@ -76,3 +76,26 @@ A further 257-row diagnostic compares native indexer selection from single-row c
 This run does not reproduce the earlier row-25 outlier and does not establish its cause. It supplies a counterfactual diagnostic that can attribute selection-only effects when flips occur; no such effect was observed in this run. Generated weights are not seeded or tuned, so later invocations may have different ranking margins. The diagnostic can report host double-dot ranking margins for flipped rows, but that branch was not exercised in this receipt. It is not proof of chunk parity or actual model behavior. The six strict numerical failures remain unresolved and enabled.
 
 Reproduce with `swift test --build-system swiftbuild --filter Glm5NextBoundedCacheTests/selectionAmplificationProbe`. Runtime source and precision policy are unchanged.
+
+## TF32 two-arm control
+
+The chunk-versus-single-row gap was re-run with the one supported precision switch in the test process only: `MLX_ENABLE_TF32` (`mlx/utils.h` `env::enable_tf32`, default on; consumed by the `use_nax` predicate in `backend/metal/matmul.cpp`, `quantized.cpp` and `scaled_dot_product_attention.cpp`). Nothing in the product, the tests, the tolerances, the seeds or the weights was changed between arms; the variable is the GEMM precision policy of the float32 projections.
+
+| Case (1e-4 tolerance) | Default (TF32 on), 5 runs | `MLX_ENABLE_TF32=0`, 4 runs |
+|---|---|---|
+| capped (7,4,4) | 0.00091 / 0.00112 / 0.00116 / 0.00101 / 0.00130 FAIL | pass |
+| capped (9,4,4) | 0.00081 / 0.00094 / 0.00109 / 0.00092 / 0.00106 FAIL | pass |
+| capped (3,4,4) | 0.00111 / 0.00093 / 0.00106 / 0.00115 / 0.00121 FAIL | pass |
+| capped (7,64,4) | 0.00084 / 0.00097 / 0.00133 / 0.00099 / 0.00077 FAIL | pass |
+| capped (7,8,8) | 0.00083 / 0.00074 / 0.00104 / 0.00103 / 0.00101 FAIL | pass |
+| uncapped control | 0.00101 / 0.00085 / 0.00103 / 0.00096 / **0.262** FAIL | 2.4e-7 / 2.4e-7 / 2.2e-7 / 3.0e-7 pass |
+| q_a batch vs double-dot oracle | 0.00135 | 4.8e-7 |
+| attention cap=nil vs cap=7 (stage probe) | 0.00081–0.0017, same magnitude | 2.4e-7–2.7e-7 |
+
+With TF32 off every strict test passes, the uncapped control and the capped cases alike, and the chunked projections agree with a host double-precision oracle to 5e-7. The 1e-3 chunk gap is therefore the multi-row TF32 NAX GEMM versus the full-precision singleton GEMV, present identically on the existing uncapped path; it is not introduced by the bounded cache. The BF16 affine8/MXFP8 stage differences (0.0078 / 0.0039) are unchanged between arms, as expected for non-float32 inputs.
+
+The ~0.24 outlier class reproduced. The MLX default random key is time-seeded (`mlx/random.h` `KeySequence::default_`) and the fixtures do not seed it, so the historical row-25 fixture is unrecoverable; the property is not. Under the default arm, three of five processes produced one ~0.18–0.27 row: twice in the selection probe (rows 42 and 232), where the chunked and single-row paths selected different pools and the host double-dot ranking showed the top two pool scores separated by 1.5e-5 and 1.4e-8 respectively, and once in the strict **uncapped** control itself (0.262). With TF32 off, zero flips and no outliers in four processes. The outlier is a near-tie top-k pool flip amplified from TF32 rounding of the indexer scores on the existing uncapped path; it is not caused by the cap.
+
+A precision-matched contract was added as an additional test, `chunkingPrecisionMatched`: the identical chunk plan, caps, pool sizes and 1e-4 tolerance, executed on the CPU stream where float32 matmul has a single precision for every row count. All six cases, including the uncapped control, pass at 0.9e-7–3.0e-7 under both environment arms. The original six strict Metal tests remain unchanged and still fail under the default policy; they are retained as the record that the default-precision Metal path is not row-shape invariant.
+
+Not shown here: actual GLM bundle inference, 128k context, app behaviour, sustained speed, and whether near-tie indexer flips under default TF32 affect real-model output. No production precision policy was changed.
