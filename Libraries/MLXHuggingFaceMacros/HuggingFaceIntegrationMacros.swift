@@ -174,7 +174,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            MLXLMCommon.LFM2ToolCallParser.preservesNativeReasoningTemplate(
                             upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
                             return try upstream.applyChatTemplate(
-                                messages: messages, tools: tools,
+                                messages: messages, tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools),
                                 additionalContext: additionalContext)
                         }
                         let lagunaEos =
@@ -633,7 +633,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages, chatTemplate: nil,
                                 addGenerationPrompt: addGenerationPrompt,
                                 truncation: false, maxLength: nil,
-                                tools: tools, additionalContext: additionalContext)
+                                tools: MLXLMCommon.LFM2ToolCallParser.nativeTemplateTools(tools), additionalContext: additionalContext)
                         }
                         let lagunaEos =
                             String(UnicodeScalar(0x3008)!)
