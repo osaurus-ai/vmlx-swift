@@ -68,3 +68,11 @@ An additional same-module FP32 probe observed an uncapped row-25 output differen
 The inspected GLM bundle uses BF16-backed affine-eight projections with group size 64, except indexer wq_b using MXFP8 with group size 32. The original unquantized FP32 fixture therefore does not establish actual quantized bundle behavior. An additional tiny generated-weight fixture using those formats observed projection row-shape differences of **0.0078125**, and attention differences of **0.00390625** for both uncapped and cap-seven cases. This reproduces a row-shape precision distinction in the format-matched synthetic path; it is not real-weight inference, a JANGHT routed-kernel check, or a coherence verdict.
 
 The new stage probes report measurements without asserting parity. The original strict failing tests remain unchanged. No production arithmetic fix, changed seed, tolerance relaxation, or disabled failure was introduced. Reproduce the added bounded diagnostics with filters Glm5NextBoundedCacheTests/numericalStageProbe, /nativeQuantizedStageProbe, and /thresholdCrossingSelectionControl.
+
+## Selection-only counterfactual
+
+A further 257-row diagnostic compares native indexer selection from single-row calls against chunks repeating 4, 3, 9, 1, 12, 8, using one shared module and identical inputs. Both plain FP32 and synthetic BF16 affine-eight/MXFP8 variants observed **zero selected-key-set flips**. Holding all attention projections and operands fixed and changing only the observed selection masks consequently gave **maxabs 0.0**; unchanged-mask rows are asserted exactly equal.
+
+This run does not reproduce the earlier row-25 outlier and does not establish its cause. It supplies a counterfactual diagnostic that can attribute selection-only effects when flips occur; no such effect was observed in this run. Generated weights are not seeded or tuned, so later invocations may have different ranking margins. The diagnostic can report host double-dot ranking margins for flipped rows, but that branch was not exercised in this receipt. It is not proof of chunk parity or actual model behavior. The six strict numerical failures remain unresolved and enabled.
+
+Reproduce with `swift test --build-system swiftbuild --filter Glm5NextBoundedCacheTests/selectionAmplificationProbe`. Runtime source and precision policy are unchanged.

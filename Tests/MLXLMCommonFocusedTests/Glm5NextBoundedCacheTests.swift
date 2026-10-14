@@ -400,6 +400,100 @@ struct Glm5NextBoundedCacheTests {
         print("GLM_THRESHOLD_CONTROL topK=8 pool=8 total=16 early_rows=8 exact_causal=true")
     }
 
+
+    @Test("diagnostic native selection flips with frozen-attention counterfactual", arguments: [false, true])
+    func selectionAmplificationProbe(nativeQuantized: Bool) throws {
+        let json = Self.tinyJSON.replacingOccurrences(of: "\"index_topk\":2048", with: "\"index_topk\":4")
+            .replacingOccurrences(of: "\"q_lora_rank\":32", with: "\"q_lora_rank\":64")
+            .replacingOccurrences(of: "\"kv_lora_rank\":16", with: "\"kv_lora_rank\":64")
+        let configuration = try JSONDecoder().decode(Glm5NextConfiguration.self, from: Data(json.utf8))
+        let module = Glm5NextSparseAttention(configuration.textConfig)
+        if nativeQuantized {
+            module.update(parameters: module.parameters().mapValues { $0.asType(.bfloat16) })
+            quantize(model: module, filter: { path, layer in
+                guard layer is Linear else { return nil }
+                return path == "indexer.wq_b" ? (32, 8, .mxfp8) : (64, 8, .affine)
+            })
+        }
+        let length = 257
+        let x = hidden(length).asType(nativeQuantized ? .bfloat16 : .float32)
+        let heads = module.indexer.numHeads, dim = module.indexer.headDim
+        func trace(_ plan: [Int]) throws -> (selected: [[Int]], query: MLXArray, weights: MLXArray, packed: MLXArray) {
+            let cache = Glm5NextIndexedKVCache()
+            var selected: [[Int]] = [], queries: [MLXArray] = [], weights: [MLXArray] = []
+            var start = 0
+            for count in plan {
+                let part = x[0..., start..<(start + count)]
+                let qResid = module.qALayerNorm(module.qAProj(part))
+                let indices = try module.indexer(hidden: part, qResid: qResid, cache: cache, selecting: start + count > 4)
+                let flat = indices?.asArray(Int32.self)
+                let width = indices?.dim(-1) ?? 0
+                for row in 0..<count {
+                    selected.append(flat.map { Array($0[(row * width)..<((row + 1) * width)]).filter { $0 >= 0 }.map(Int.init) }
+                        ?? Array(0...(start + row)))
+                }
+                queries.append(module.indexer.wqB(qResid).reshaped(1, count, heads, dim))
+                weights.append(module.indexer.weightsProj(part))
+                let placeholder = MLXArray.zeros([1, 1, count, 1], dtype: x.dtype)
+                _ = cache.update(keys: placeholder, values: placeholder)
+                start += count
+            }
+            return (selected, concatenated(queries, axis: 1), concatenated(weights, axis: 1), cache.indexerPacked!)
+        }
+        var chunkPlan: [Int] = [], left = length, chunkIndex = 0
+        let pattern = [4, 3, 9, 1, 12, 8]
+        while left > 0 {
+            let count = min(left, pattern[chunkIndex % pattern.count])
+            chunkPlan.append(count); left -= count; chunkIndex += 1
+        }
+        let single = try trace(Array(repeating: 1, count: length))
+        let chunked = try trace(chunkPlan)
+        let flipped = (0..<length).filter { Set(single.selected[$0]) != Set(chunked.selected[$0]) }
+        print("GLM_SELECTION_FLIPS native_quantized=\(nativeQuantized) rows=\(length) flips=\(flipped.count) positions=\(flipped)")
+
+        // Freeze every projection and every attention operand. Only the native
+        // selected-key mask differs between these two otherwise identical calls.
+        let qResid = module.qALayerNorm(module.qAProj(x))
+        let q = module.qBProj(qResid).reshaped(1, length, module.numHeads, module.qHeadDim).transposed(0, 2, 1, 3)
+        let latent = module.kvALayerNorm(module.kvAProjWithMqa(x))
+        let kv = module.kvBProj(latent).reshaped(1, length, module.numHeads, module.qkNopeHeadDim + module.vHeadDim).transposed(0, 2, 1, 3)
+        func frozen(_ selected: [[Int]]) -> MLXArray {
+            var mask = Array(repeating: false, count: length * length)
+            for row in 0..<length { for key in selected[row] { mask[row * length + key] = true } }
+            let bias = MLX.where(MLXArray(mask, [1, 1, length, length]), MLXArray(Float(0)), MLXArray(-Float.greatestFiniteMagnitude)).asType(q.dtype)
+            let out = MLXFast.scaledDotProductAttention(queries: q, keys: kv[.ellipsis, ..<module.qkNopeHeadDim],
+                values: kv[.ellipsis, module.qkNopeHeadDim...], scale: module.scale, mask: .array(bias))
+            return module.oProj(out.transposed(0, 2, 1, 3).reshaped(1, length, -1))
+        }
+        let delta = abs(frozen(single.selected).asType(.float32) - frozen(chunked.selected).asType(.float32))
+            .max(axis: -1).reshaped(-1).asArray(Float.self)
+        let stable = (0..<length).filter { !flipped.contains($0) }
+        #expect(stable.allSatisfy { delta[$0] == 0 })
+        print("GLM_FROZEN_SELECTION_EFFECT native_quantized=\(nativeQuantized) maxabs=\(delta.max() ?? 0) unchanged_mask_rows_maxabs=\(stable.map { delta[$0] }.max() ?? 0)")
+
+        func oracleRanks(_ trace: (selected: [[Int]], query: MLXArray, weights: MLXArray, packed: MLXArray), row: Int) throws -> [(Int, Double)] {
+            // Double-dot oracle over each arm's actual projected operands. This
+            // diagnoses ranking margins; it does not replace native selection.
+            let pooled = try module.indexer.pooledStates(packed: trace.packed).keys.asArray(Float.self)
+            let queries = trace.query.asArray(Float.self), weights = trace.weights.asArray(Float.self)
+            return (0..<((row + 1) / 4)).map { pool in
+                var score = 0.0
+                for head in 0..<heads {
+                    var dot = 0.0
+                    for channel in 0..<dim {
+                        dot += Double(queries[(row * heads + head) * dim + channel]) * Double(pooled[pool * dim + channel])
+                    }
+                    score += max(dot / Double(dim).squareRoot(), 0) * Double(weights[row * heads + head]) / Double(heads).squareRoot()
+                }
+                return (pool, score)
+            }.sorted { $0.1 > $1.1 }
+        }
+        for row in flipped.prefix(6) {
+            let rankA = try oracleRanks(single, row: row), rankB = try oracleRanks(chunked, row: row)
+            print("GLM_SELECTION_BOUNDARY native_quantized=\(nativeQuantized) row=\(row) single_indices=\(single.selected[row]) chunk_indices=\(chunked.selected[row]) single_double_top2=\(Array(rankA.prefix(2))) chunk_double_top2=\(Array(rankB.prefix(2))) frozen_output_maxabs=\(delta[row])")
+        }
+    }
+
     static let tinyJSON = #"""
         {"model_type":"glm5_next","image_token_id":9,"video_token_id":10,
          "text_config":{"model_type":"glm5_next_text","hidden_size":64,
