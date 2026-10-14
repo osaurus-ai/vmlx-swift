@@ -1901,7 +1901,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 ssmStates: extractSSMStates(from: snapshot),
                 cache: snapshot,
                 mediaSalt: mediaSalt,
-                chainId: cacheInitParameters.cacheChainId)
+                chainId: cacheInitParameters.cacheChainId,
+                isResumeBoundary: true)
             return
         }
 
