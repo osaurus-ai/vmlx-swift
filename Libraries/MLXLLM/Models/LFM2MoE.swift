@@ -303,13 +303,23 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         // (and mlx-lm 0.32): expert_bias only picks the top-k experts; the
         // mixing weights are the unbiased sigmoid scores, renormalized and
         // scaled by routed_scaling_factor.
+        //
+        // The dtype path is part of the contract. The reference takes the
+        // sigmoid in the activation dtype, adds the checkpoint's float32
+        // expert_bias (promoting the selection scores to float32) and mixes
+        // with the activation-dtype scores. The bias must stay float32: the
+        // checkpoint biases differ by ~1e-2 while sigmoid scores of competing
+        // experts can sit within 1e-5 of each other, so a bias rounded to
+        // bfloat16 collapses those near-ties into exact ties that argPartition
+        // breaks arbitrarily, routing the token to a different expert than
+        // the reference (see `preservesCheckpointParameterDTypes`).
         let k = topK
-        let probabilities = sigmoid(gate(x).asType(.float32))
+        let probabilities = sigmoid(gate(x))
         let selection: MLXArray
         if useExpertBias, let expertBias {
-            selection = probabilities + expertBias.asType(.float32)
+            selection = probabilities.asType(.float32) + expertBias
         } else {
-            selection = probabilities
+            selection = probabilities.asType(.float32)
         }
         let indices = argPartition(-selection, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
@@ -320,7 +330,6 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         if args.routedScalingFactor != 1 {
             scores = scores * args.routedScalingFactor
         }
-        scores = scores.asType(x.dtype)
 
         let expertOutputs = switchMLP(x, indices)
         let weighted = expertOutputs * scores[.ellipsis, .newAxis]
@@ -449,6 +458,13 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         self.model = LFM2MoEModelInner(args)
     }
+
+    /// LFM2 MoE checkpoints store every floating parameter in the activation
+    /// dtype except `feed_forward.expert_bias`, which HF keeps as a float32
+    /// buffer and mlx-lm loads unchanged. The loader's blanket bfloat16
+    /// materialization would round that bias and change expert selection on
+    /// near-tied tokens, so this model keeps the checkpoint dtypes as loaded.
+    public var preservesCheckpointParameterDTypes: Bool { true }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
