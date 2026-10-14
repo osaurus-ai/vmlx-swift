@@ -152,7 +152,12 @@ final class LFM2MoEJANGHPreparationTests: XCTestCase {
             }
             XCTAssertFalse(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.feed_forward.gate.weight"))
             XCTAssertEqual(model.kvHeads,[0,1])
-            XCTAssertThrowsError(try preparation.construct(requesting:[.vision]))
+            for requesting: Set<ModelRuntimeRequestModality> in [[], [.text, .tools, .reasoning], [.tools, .reasoning]] {
+                XCTAssertTrue(try preparation.construct(requesting: requesting).requiresExactTensorMmapBuffers)
+            }
+            for requesting: Set<ModelRuntimeRequestModality> in [[.vision], [.text, .vision], [.video], [.audio]] {
+                XCTAssertThrowsError(try preparation.construct(requesting: requesting))
+            }
         }
     }
 
@@ -212,6 +217,20 @@ final class LFM2MoEJANGHPreparationTests: XCTestCase {
                 configuration: JSONSerialization.data(withJSONObject: Self.architecture()),
                 modelType: "lfm2_moe", requesting: [.text])
             XCTAssertTrue(ordinary is LFM2MoEModel)
+            for requesting: Set<ModelRuntimeRequestModality> in [[], [.text, .tools, .reasoning], [.tools, .reasoning]] {
+                let model = try await LLMTypeRegistry.shared.createModel(
+                    configuration: JSONSerialization.data(withJSONObject: Self.architecture()),
+                    modelType: "lfm2_moe", requesting: requesting)
+                XCTAssertTrue(model is LFM2MoEModel)
+            }
+            for requesting: Set<ModelRuntimeRequestModality> in [[.vision], [.text, .vision], [.video], [.audio]] {
+                do {
+                    _ = try await LLMTypeRegistry.shared.createModel(
+                        configuration: JSONSerialization.data(withJSONObject: Self.architecture()),
+                        modelType: "lfm2_moe", requesting: requesting)
+                    XCTFail("real media must not construct the text-only LFM runtime")
+                } catch {}
+            }
             let directory = try Self.temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: directory) }
             do {

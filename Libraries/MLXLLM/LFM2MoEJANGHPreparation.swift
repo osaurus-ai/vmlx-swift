@@ -34,10 +34,16 @@ struct LFM2MoEJANGHPreparation {
         return Self(configuration: config, banks: banks)
     }
 
-    func construct(requesting: Set<ModelRuntimeRequestModality>?) throws -> LFM2MoEModel {
-        guard requesting == nil || requesting == [.text] else {
+    static func validateRequestedModalities(_ requesting: Set<ModelRuntimeRequestModality>?) throws {
+        // Pure text families have no optional tower to select. Empty requests,
+        // tools and reasoning keep the same language core; media needs a VLM.
+        if requesting?.isDisjoint(with: [.vision, .video, .audio]) == false {
             throw LFM2MoEJANGHError.invalid("LFM2-MoE accepts text input only")
         }
+    }
+
+    func construct(requesting: Set<ModelRuntimeRequestModality>?) throws -> LFM2MoEModel {
+        try Self.validateRequestedModalities(requesting)
         return try LFM2MoEModel(configuration,
             routedExperts: banks.makeRoutedExperts(activationLimit: nil),
             excludedTensorNames: banks.excludedTensorNames)

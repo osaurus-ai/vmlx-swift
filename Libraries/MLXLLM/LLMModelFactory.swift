@@ -254,9 +254,7 @@ public enum LLMTypeRegistry {
                 guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil) else {
                     throw LFM2MoEJANGHError.invalid("LFM JANGH requires validated directory-backed loading")
                 }
-                guard requesting == nil || requesting == [.text] else {
-                    throw LFM2MoEJANGHError.invalid("LFM2-MoE accepts text input only")
-                }
+                try LFM2MoEJANGHPreparation.validateRequestedModalities(requesting)
                 return LFM2MoEModel(try JSONDecoder.json5().decode(LFM2MoEConfiguration.self, from: data))
             },
             "step": dispatchStep3p5,
