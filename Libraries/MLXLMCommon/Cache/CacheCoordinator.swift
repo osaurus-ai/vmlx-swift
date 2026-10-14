@@ -1628,16 +1628,16 @@ public final class CacheCoordinator: @unchecked Sendable {
                 isResumeBoundary: isResumeBoundary,
                 isPostAnswer: isPostAnswer,
                 allowWriteBehind: !storesCompanion,
-                afterPublish: { [self] in
+                afterPublish: { [self] finalizedChainId in
                     if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.lock() }
                     defer { if usesCombinedQuota { CombinedDiskCacheQuotaLock.shared.unlock() } }
                     adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
                     if usesCombinedQuota {
-                        enforceCombinedDiskQuotaLocked(activeChain: chainId)
+                        enforceCombinedDiskQuotaLocked(activeChain: finalizedChainId)
                     } else {
-                        enforceCombinedDiskQuota(activeChain: chainId)
+                        enforceCombinedDiskQuota(activeChain: finalizedChainId)
                     }
-                    diskCache?.reconcileCapacityPressure(chainId: chainId, requiresCompanion: isHybrid)
+                    diskCache?.reconcileCapacityPressure(chainId: finalizedChainId, requiresCompanion: isHybrid)
                 }) ?? false
             if !deferred, !storesCompanion {
                 adoptEarlyCompanion(tokens: tokens, mediaSalt: mediaSalt)
