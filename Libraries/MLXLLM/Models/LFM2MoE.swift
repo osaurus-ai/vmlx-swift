@@ -274,10 +274,13 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     let useExpertBias: Bool
 
     @ModuleInfo(key: "gate") var gate: Linear
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var experts: Module
+    /// Ordinary affine accessor retained for router diagnostics.
+    var switchMLP: any SwitchGLULayer { experts as! any SwitchGLULayer }
     @ModuleInfo(key: "expert_bias") var expertBias: MLXArray?
 
-    init(_ args: LFM2MoEConfiguration, layerIdx: Int) {
+    init(_ args: LFM2MoEConfiguration, layerIdx: Int,
+         routedExperts: (Module & WeightedRoutedExpertLayer)? = nil) {
         self.args = args
         self.layerIdx = layerIdx
         self.numExperts = args.numExperts
@@ -286,12 +289,16 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         self.useExpertBias = args.useExpertBias
 
         _gate.wrappedValue = Linear(args.hiddenSize, numExperts, bias: false)
-        _switchMLP.wrappedValue = SwitchGLU(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: numExperts,
-            bias: false
-        )
+        if let routedExperts {
+            _experts.wrappedValue = routedExperts
+        } else {
+            _experts.wrappedValue = SwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: numExperts,
+                bias: false
+            )
+        }
 
         if useExpertBias {
             _expertBias.wrappedValue = MLXArray.zeros([numExperts])
@@ -337,7 +344,12 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
 
         scores = scores.asType(x.dtype)
 
-        let expertOutputs = switchMLP(x, indices)
+        // SwitchGLU also conforms to the shared weighted protocol, but LFM's
+        // ordinary branch must retain its native contribution rounding.
+        guard let affine = experts as? any SwitchGLULayer else {
+            return (experts as! any WeightedRoutedExpertLayer).callRouted(x, indices: indices, scores: scores)
+        }
+        let expertOutputs = affine(x, indices)
         let weighted = expertOutputs * scores[.ellipsis, .newAxis]
         return weighted.sum(axis: -2)
     }
@@ -353,7 +365,8 @@ class LFM2MoEDecoderLayer: Module {
     @ModuleInfo(key: "operator_norm") var operatorNorm: RMSNorm
     @ModuleInfo(key: "ffn_norm") var ffnNorm: RMSNorm
 
-    init(_ args: LFM2MoEConfiguration, layerIdx: Int) {
+    init(_ args: LFM2MoEConfiguration, layerIdx: Int,
+         routedExperts: (Module & WeightedRoutedExpertLayer)? = nil) {
         self.isAttentionLayer = args.fullAttnIdxs.contains(layerIdx)
         self.usesDenseFeedForward = layerIdx < args.numDenseLayers
 
@@ -366,7 +379,7 @@ class LFM2MoEDecoderLayer: Module {
         if usesDenseFeedForward {
             _feedForward.wrappedValue = LFM2MoEMLP(args)
         } else {
-            _feedForward.wrappedValue = Lfm2MoeSparseMoeBlock(args, layerIdx: layerIdx)
+            _feedForward.wrappedValue = Lfm2MoeSparseMoeBlock(args, layerIdx: layerIdx, routedExperts: routedExperts)
         }
 
         _operatorNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.normEps)
@@ -402,7 +415,7 @@ public class LFM2MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "embedding_norm") var embeddingNorm: RMSNorm
 
-    init(_ args: LFM2MoEConfiguration) {
+    init(_ args: LFM2MoEConfiguration, routedExperts: [Int: Module & WeightedRoutedExpertLayer] = [:]) {
         self.args = args
         precondition(args.vocabularySize > 0)
 
@@ -411,7 +424,9 @@ public class LFM2MoEModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { LFM2MoEDecoderLayer(args, layerIdx: $0) }
+        self.layers = (0 ..< args.hiddenLayers).map {
+            LFM2MoEDecoderLayer(args, layerIdx: $0, routedExperts: routedExperts[$0])
+        }
         self.firstAttentionIndex = args.fullAttnIdxs.first
         self.firstConvIndex = layers.firstIndex(where: { !$0.isAttentionLayer })
 
@@ -455,6 +470,7 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: LFM2MoEConfiguration
 
     public let model: LFM2MoEModelInner
+    private var customTensorNames: Set<String> = []
 
     public init(_ args: LFM2MoEConfiguration) {
         self.configuration = args
@@ -463,6 +479,20 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
             args.fullAttnIdxs.contains(layerIdx) ? args.kvHeads : 0
         }
         self.model = LFM2MoEModelInner(args)
+    }
+
+    init(_ args: LFM2MoEConfiguration,
+         routedExperts: [Int: Module & WeightedRoutedExpertLayer], excludedTensorNames: Set<String>) throws {
+        let sparseLayers = Set(args.numDenseLayers ..< args.hiddenLayers)
+        guard Set(routedExperts.keys) == sparseLayers,
+            JANGHModelPreparation.isCanonicalRoutedExclusionSet(
+                excludedTensorNames, routedLayers: sparseLayers, feedForwardModule: "feed_forward")
+        else { throw LFM2MoEJANGHError.invalid("incomplete LFM custom routed installation") }
+        configuration = args
+        vocabularySize = args.vocabularySize
+        kvHeads = (0 ..< args.hiddenLayers).map { args.fullAttnIdxs.contains($0) ? args.kvHeads : 0 }
+        model = LFM2MoEModelInner(args, routedExperts: routedExperts)
+        customTensorNames = excludedTensorNames
     }
 
     /// LFM2 MoE checkpoints store every floating parameter in the activation
@@ -548,4 +578,9 @@ extension LFM2MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+extension LFM2MoEModel: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool { customTensorNames.contains(key) }
+    public var requiresExactTensorMmapBuffers: Bool { !customTensorNames.isEmpty }
 }

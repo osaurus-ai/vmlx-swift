@@ -55,7 +55,48 @@ struct JANGHConfigurationPartition: Sendable {
             let other = try Self.object(sidecar)
             // MiniCPM-V 4.7 JANGH2 is produced by the same converter: authoritative header in config.json, sidecar
             // with chat/runtime metadata and a scalar summary.
-            if modelType == "qwen3_5" || modelType == "minicpmv4_7", let authoritative = header {
+            if modelType == "lfm2_moe", let authoritative = header,
+                other["format"] as? String == "jang", other["format_version"] as? String == "2.0"
+            {
+                // The LFM converter stores the executable plan/header in config.json.
+                // jang_config.json is descriptive chat/calibration metadata, not a second plan.
+                guard other["quantization_config"] == nil else {
+                    throw Failure.invalid("LFM sidecar quantization ownership is not supported")
+                }
+                if let declared = try Self.optionalObject(other, "jangtq"),
+                    try Self.encode(authoritative) != Self.encode(declared)
+                {
+                    throw Failure.invalid("conflicting LFM config and sidecar JANGH headers")
+                }
+                if let summary = try Self.optionalObject(other, "quantization") {
+                    guard !summary.keys.contains(where: { $0.contains(".") }),
+                        summary["per_tensor"] == nil, summary["quantization_config"] == nil,
+                        summary["method"] as? String == "jang", summary["bits"] is Int,
+                        summary["group_size"] is Int, summary["bit_widths_used"] is [Int],
+                        let modes = summary["modes"] as? [String], modes.count == 2,
+                        Set(modes) == ["affine", "jangtq2"]
+                    else { throw Failure.invalid("LFM sidecar quantization must be summary metadata") }
+                    guard summary["bits"] as? Int == plan["bits"] as? Int,
+                        summary["group_size"] as? Int == plan["group_size"] as? Int
+                    else { throw Failure.invalid("LFM sidecar summary disagrees with the config plan") }
+                    if let routed = summary["routed_experts"] as? [String: Any] {
+                        let customEntries = plan.filter { ($0.value as? [String: Any])?["mode"] as? String == "jangtq2" }
+                        func widths(_ roles: [String]) -> [Int] {
+                            Set(customEntries.compactMap { name, value in
+                                roles.contains(String(name.split(separator: ".").last ?? ""))
+                                    ? (value as? [String: Any])?["bits"] as? Int : nil
+                            }).sorted()
+                        }
+                        guard !routed.keys.contains(where: { $0.contains(".") }), routed["per_tensor"] == nil,
+                            routed["mode"] as? String == "jangtq2",
+                            routed["gate_up_bits"] as? [Int] == widths(["gate_proj", "up_proj"]),
+                            routed["down_bits"] as? [Int] == widths(["down_proj"])
+                        else { throw Failure.invalid("LFM routed summary disagrees with the config plan") }
+                    } else if summary["routed_experts"] != nil {
+                        throw Failure.invalid("invalid LFM routed summary")
+                    }
+                }
+            } else if modelType == "qwen3_5" || modelType == "minicpmv4_7", let authoritative = header {
                 // This converter's sidecar carries chat/runtime metadata and a
                 // scalar summary, not another per-module quantization owner.
                 let version = other["format_version"]
@@ -141,7 +182,8 @@ struct JANGHConfigurationPartition: Sendable {
             }
             guard components.count == 6, components[0] == "model",
                 components[1] == "layers", let layer = Int(components[2]), layer >= 0,
-                String(layer) == String(components[2]), components[3] == "mlp",
+                String(layer) == String(components[2]),
+                components[3] == (modelType == "lfm2_moe" ? "feed_forward" : "mlp"),
                 components[4] == "switch_mlp"
             else { throw Failure.invalid("unsupported custom routed module path \(name)") }
         }

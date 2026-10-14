@@ -12,12 +12,15 @@ public struct JANGHRoutedModelLayout: Sendable {
     public let routesPerToken: Int
     /// Wrapper in front of `model.layers.L.mlp.switch_mlp` in the checkpoint (`language_model.` for MiniCPM-V 4.7).
     public let modulePrefix: String
+    /// Checkpoint-local feed-forward child; the default preserves existing families.
+    public let feedForwardModule: String
 
     public init(modelType: String, hiddenSize: Int, intermediateSize: Int,
                 expertCount: Int, sparseLayers: Set<Int>, routesPerToken: Int = 8,
-                modulePrefix: String = "") {
+                modulePrefix: String = "", feedForwardModule: String = "mlp") {
         self.routesPerToken = routesPerToken
         self.modulePrefix = modulePrefix
+        self.feedForwardModule = feedForwardModule
         self.modelType = modelType
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -72,14 +75,15 @@ public final class JANGHModelPreparation {
         guard partition.modelType == layout.modelType,
               layout.hiddenSize > 0, layout.intermediateSize > 0,
               layout.expertCount > 0, !layout.sparseLayers.isEmpty,
-              layout.sparseLayers.allSatisfy({ $0 >= 0 }) else {
+              layout.sparseLayers.allSatisfy({ $0 >= 0 }),
+              layout.feedForwardModule == (layout.modelType == "lfm2_moe" ? "feed_forward" : "mlp") else {
             throw JANGHFormatContract.ValidationError.invalid(
                 "JANGH architecture layout does not match configuration")
         }
         var dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var modules: [Int: String] = [:]
         for layer in layout.sparseLayers.sorted() {
-            let parent = layout.modulePrefix + "model.layers.\(layer).mlp.switch_mlp"
+            let parent = layout.modulePrefix + "model.layers.\(layer).\(layout.feedForwardModule).switch_mlp"
             modules[layer] = parent
             for role in ["gate_proj", "up_proj", "down_proj"] {
                 dimensions[parent + "." + role] = .init(
@@ -113,13 +117,14 @@ public final class JANGHModelPreparation {
 
     /// Architecture-side audit of the loader exclusions: every routed (layer, role) is excluded as exactly one whole
     /// custom format — the codebook pair (`tq2_packed`, `tq2_scales`) or the JANGT trellis set — and nothing else is.
-    public static func isCanonicalRoutedExclusionSet(_ names: Set<String>, routedLayers: Set<Int>) -> Bool {
+    public static func isCanonicalRoutedExclusionSet(_ names: Set<String>, routedLayers: Set<Int>,
+                                                   feedForwardModule: String = "mlp") -> Bool {
         let codebook = ["tq2_packed", "tq2_scales"]
         let trellis = JANGHTensorIndexPlan.trellisSuffixes.map { String($0.dropFirst()) }
         var covered = 0
         for layer in routedLayers {
             for role in ["gate_proj", "up_proj", "down_proj"] {
-                let prefix = "model.layers.\(layer).mlp.switch_mlp.\(role)."
+                let prefix = "model.layers.\(layer).\(feedForwardModule).switch_mlp.\(role)."
                 let format = names.contains(prefix + "tq2_packed") ? codebook : trellis
                 guard format.allSatisfy({ names.contains(prefix + $0) }) else { return false }
                 covered += format.count
