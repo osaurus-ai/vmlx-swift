@@ -250,7 +250,15 @@ public enum LLMTypeRegistry {
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
             "bailing_hybrid": dispatchBailingHybrid,
-            "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
+            "lfm2_moe": { data, requesting in
+                guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil) else {
+                    throw LFM2MoEJANGHError.invalid("LFM JANGH requires validated directory-backed loading")
+                }
+                guard requesting == nil || requesting == [.text] else {
+                    throw LFM2MoEJANGHError.invalid("LFM2-MoE accepts text input only")
+                }
+                return LFM2MoEModel(try JSONDecoder.json5().decode(LFM2MoEConfiguration.self, from: data))
+            },
             "step": dispatchStep3p5,
             "step3p5": dispatchStep3p5,
             "step3p7": dispatchStep3p5,
@@ -1599,6 +1607,10 @@ public final class LLMModelFactory: ModelFactory {
             directory: modelDirectory, configurationData: configData)
         if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
 
+        let lfmJANGHPreparation = try LFM2MoEJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let lfmJANGHPreparation { configData = lfmJANGHPreparation.banks.ordinaryConfiguration }
+
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
         // dispatch on them (e.g. minimax_m2 → MiniMaxJANGTQModel). The real
@@ -1606,7 +1618,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if jangHPreparation == nil, k2JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1806,7 +1818,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if jangHPreparation == nil && k2JANGHPreparation == nil {
+        if jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -1870,7 +1882,9 @@ public final class LLMModelFactory: ModelFactory {
         }
         let model: LanguageModel
         do {
-            if let k2JANGHPreparation {
+            if let lfmJANGHPreparation {
+                model = try lfmJANGHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let k2JANGHPreparation {
                 model = try k2JANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else if let jangHPreparation {
                 model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
@@ -1881,7 +1895,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if jangHPreparation != nil || k2JANGHPreparation != nil { throw error }
+            if jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2061,14 +2075,14 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil || jangHPreparation != nil || k2JANGHPreparation != nil
+            quantization: jangConfig != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangHPreparation == nil && k2JANGHPreparation == nil ? jangConfig : nil,
+            jangConfig: jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
