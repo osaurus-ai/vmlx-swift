@@ -518,6 +518,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Judged every verify cycle over the last `arSafetyWindow` cycles once
     /// `arSafetyWarmupCycles` have run: earliest trip = cycle 16 (~0.65 s at
     /// d3), a later drop is caught within ~8 cycles (~0.3 s).
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // SPEED-CRITICAL GOVERNOR. This block decides whether Flash-Next / Allosaurus / every
+    // native-MTP model speculates in the APP. It has regressed in-app MTP speed repeatedly while
+    // RunBench still looked fine (short 300-token rows never reach the 256-token calibration).
+    // Before changing any constant or the calibration / probe / pause logic below:
+    //   1. RunBench Allosaurus adaptive with BENCH_SPEED_MAXTOK=1500 BENCH_SPEED_SAMPLED=1
+    //      BENCH_SPEED_FILLER=4000, base vs change, alternating, GPU clock logged;
+    //   2. an in-app long code reply (>1000 tokens) on the release app;
+    // and record both in the commit. Reference (2026-10-14, cc6d96cd3): easy code 83-85 vs
+    // 60 tok/s before; prose must stay at AR speed (46-47). See the PR #593 description.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
     private static let arSafetyWindow = 8
     private static let arSafetyWarmupCycles = 8
     private static let arSafetyMargin = 1.25

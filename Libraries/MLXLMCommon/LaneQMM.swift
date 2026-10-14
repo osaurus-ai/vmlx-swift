@@ -327,6 +327,9 @@ extension LaneQMM {
                 tiling == "1" || !directWeightReaderPaths.contains { path.contains($0) }
             },
             untiledMinRows: policy?.laneQMMUntiledMinRows ?? minRows,
+            // SPEED-CRITICAL (Qwen3.8-27B DFlash2): the 27B keeps the PACKED scale copy — reading
+            // its scales in place measured 2x per verify matmul and DFlash2 fell to AR speed
+            // (dbf4459a7). Per-target choice; do not flip the default for every model.
             packedScales: policy?.laneQMMPackedScales ?? true)
         lastInstallReport = report
         // Lane-flat = every packed (uint32) weight of the language model now runs on the lane, so verify

@@ -70,6 +70,10 @@ public struct JangPressLoadOptions: Sendable, Equatable {
 
     /// Sane production-grade default — feature off, ready to be turned
     /// on per-call via the constructor parameters below.
+    // SPEED + PRODUCT CONTRACT (Eric): JangPress / MLXPress stay OFF by default and are never
+    // enabled in benches or speed proofs. Compressed / pressure-evicted expert tiers make MTP verify
+    // (2-8 rows touching many experts) page in from storage, which is exactly the in-app MTP collapse
+    // pattern. Do not change this default or route Flash-Next / Allosaurus / 27B through it.
     public static let disabled = JangPressLoadOptions()
 
     public init(

@@ -226,6 +226,10 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         if ["1", "true", "yes", "on"].contains(raw) { return true }
         return nil
     }()
+    // SPEED + RAM CONTRACT (Eric, 2026-10-07/10-13): the 54-58 GB n-gram table STAYS ON SSD. Do not
+    // turn a whole-table page-cache warm or a resident copy on by default to "speed up" decode — it
+    // is the difference between Allosaurus fitting a 48 GB Mac or not, and decode rows are tiny
+    // pread()s (2.9 KB per token) that never limited tok/s in any measured run.
     static var warmEnabled: Bool { warmOverride ?? true }
 
     /// AUTOMATIC WARM = only when the whole bundle comfortably fits in RAM (bundle bytes <= 60 % of physical).

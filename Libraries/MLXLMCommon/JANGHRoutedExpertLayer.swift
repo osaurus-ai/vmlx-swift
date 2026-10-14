@@ -57,6 +57,10 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 indices: indices.reshaped(tokens, routes),
                 scores: scores.reshaped(tokens, routes).asType(.float32),
                 outputDType: input.dtype,
+                // SPEED-CRITICAL: small MTP/DFlash verify batches (2-8 rows) of mapped JANGH experts
+                // MUST take the decode kernel; the sorted prefill tiles re-read whole expert banks per
+                // verify and MTP stops beating AR. Do not remove or narrow without an Allosaurus
+                // adaptive RunBench + in-app code turn A/B.
                 forceDecode: FlashVerificationScope.usesMappedDecode(
                     inputShape: input.shape, routes: routes))
             precondition(result.shape == [tokens, inputDimensions] && result.dtype == input.dtype,
