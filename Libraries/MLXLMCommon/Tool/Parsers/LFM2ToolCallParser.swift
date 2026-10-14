@@ -47,6 +47,19 @@ public struct LFM2ToolCallParser: ToolCallParser, Sendable {
     }
 
 
+    /// Liquid's native tool list consumes bare function definitions. Preserve
+    /// every function/schema field, and leave noncanonical or already-bare
+    /// dictionaries intact instead of dropping unknown transport metadata.
+    public static func nativeTemplateTools(_ tools: [ToolSpec]?) -> [ToolSpec]? {
+        tools?.map { tool in
+            guard tool["type"] as? String == "function",
+                tool.keys.allSatisfy({ $0 == "type" || $0 == "function" }),
+                let function = tool["function"] as? ToolSpec
+            else { return tool }
+            return function
+        }
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         if let call = native.parse(content: content, tools: tools) {
             return call
