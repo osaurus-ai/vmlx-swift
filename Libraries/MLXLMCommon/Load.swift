@@ -1294,6 +1294,12 @@ public func loadWeights(
     // Recasting zero-points to BF16 both materializes a second bank and can
     // alter logits; activation dtype is owned by each model runtime.
     // Split DSV4 bundles intentionally remain on the resident conversion path.
+    // SPEED-CRITICAL (Flash-Next / Allosaurus MTP, 2026-10-14): preserving the f16 affine metadata
+    // file-backed here is correct, but it means every runtime "copy must replace" gate must look at
+    // the packed WEIGHTS only (`WeightBacking.storage(of:)`). Counting this mapped metadata there
+    // disabled the fused GDN verify path for every qwen4_exp load and Allosaurus fell from ~100 to
+    // 27-35 tok/s in the app. Changing this mmap/dtype policy needs a matched Allosaurus adaptive
+    // RunBench AND an in-app code turn before and after — record both in the commit.
     let preserveJANGAffineMmapDtypes = mmapSafetensorsActive
         && !isJANGTQNative
         && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)

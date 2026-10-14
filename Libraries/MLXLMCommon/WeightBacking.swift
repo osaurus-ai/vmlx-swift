@@ -96,11 +96,29 @@ public enum WeightBacking {
         MLX.eval(members.flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) })
     }
 
-    /// Everything a fused copy of `members` duplicates: packed weights, scales and biases. ALL of it
-    /// must be replaceable. (Flash-Next materializes its weights but keeps its f16 affine metadata
-    /// file-backed; fusing there kept a +0.6 GB metadata copy for +5 % decode, and Eric's rule is no
-    /// resident memory above the model's size for a speedup, 2026-10-11.)
+    /// The packed weights of `members` — the bulk of their bytes — for ``copyWouldReplace(_:)``.
+    ///
+    /// ┌─────────────────────────────────────────────────────────────────────────────────────────┐
+    /// │ SPEED-CRITICAL — DO NOT ADD `scales` / `biases` HERE. THIS REGRESSED FLASH-NEXT MTP.    │
+    /// └─────────────────────────────────────────────────────────────────────────────────────────┘
+    /// Scales and biases are deliberately NOT consulted. Flash-Next / Allosaurus (qwen4_exp)
+    /// materialize their GDN projection weights but keep the f16 affine metadata (~1/8 of the bytes
+    /// at 4-bit g64) as windows into the mapped shard. Counting that metadata here (dbf4459a7,
+    /// 2026-10-11) made this gate false for every qwen4_exp load, which silently disabled:
+    ///   1. the fused GDN decode input projection (one QMV instead of four per GDN layer), and
+    ///   2. the bit-exact multi-row `full4` verify kernel, reachable ONLY through that fused
+    ///      projection (`Qwen35.swift` `ensureFusedDecodeInputProjection(exactRowVerifier:)`).
+    /// Measured 2026-10-14, Allosaurus JANGH2, RunBench adaptive MTP at matched GPU clock
+    /// (1419-1451 MHz): fused 52-54 / 78 / 90-91 / 107 tok/s vs unfused 51-52 / 76-77 / 86-88 / 107
+    /// (prose / code / easy code / easy prose). Unfused verify rows are slower, so the AR-safety
+    /// resume probe loses more often (17 vs 8 lost probes per run) and long in-app replies fall back
+    /// to AR — Allosaurus dropped from ~100 to 27-35 tok/s in the app.
+    /// The metadata copy is ~0.6 GB on a 54 GB Flash-Next bundle; after `rebindAsRows` the mapped
+    /// originals are never touched again, so their pages are clean, reclaimable file cache, not
+    /// process footprint. Bundles whose WEIGHTS are mapped (Qwen3.8-27B dense: +4.1 GB) still skip.
+    /// If you want to change this rule, re-run the Allosaurus/Flash-Next adaptive RunBench AND an
+    /// in-app long code turn first, and record both numbers here. Do not trade this away silently.
     public static func storage(of members: [QuantizedLinear]) -> [MLXArray] {
-        members.flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
+        members.map(\.weight)
     }
 }

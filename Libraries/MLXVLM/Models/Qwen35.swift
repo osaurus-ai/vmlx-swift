@@ -1813,6 +1813,11 @@ enum Qwen35Language {
                 // The fused copy must REPLACE the four projections (rebindAsRows below). Weights that
                 // are windows into a mapped shard (the shipped mmap loader) cannot be released, so the
                 // copy would be a permanent duplicate: Qwen3.8-27B +4.1 GB for ~2 % decode. Skip.
+                // SPEED-CRITICAL (Flash-Next / Allosaurus MTP): this fusion is also the ONLY route to
+                // the bit-exact multi-row verify kernel. `WeightBacking.storage(of:)` must stay
+                // weights-only — counting the mapped f16 scales/biases there disabled this path for
+                // every qwen4_exp load (2026-10-11 → 2026-10-14 regression). Read the note on
+                // `WeightBacking.storage(of:)` before touching this guard.
                 guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: quantized)) else {
                     Self.reportFusionSkippedForMappedWeights()
                     return nil
@@ -1931,6 +1936,8 @@ enum Qwen35Language {
             else { return nil }
             let q = quantizedModules.map { $0! }
             // Same rule as the uniform path: only fuse when the copy replaces the members.
+            // SPEED-CRITICAL: keep `WeightBacking.storage(of:)` weights-only (see its note) or
+            // Flash-Next / Allosaurus lose the fused verify path and MTP falls back to AR in the app.
             guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: q)) else {
                 Self.reportFusionSkippedForMappedWeights()
                 return nil
