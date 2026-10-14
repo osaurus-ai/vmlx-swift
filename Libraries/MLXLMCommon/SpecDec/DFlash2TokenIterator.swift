@@ -94,6 +94,40 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     }
 }
 
+/// Captures exactly the same rows/order/dtype as iterative concatenation, but
+/// full-attention prefill only materializes the combined history once. Sliding
+/// drafters keep the existing bounded trailing-window behavior.
+struct DFlash2PrefillHiddenCapture {
+    let limit: Int?
+    private var chunks: [MLXArray] = []
+    private var trailing: MLXArray?
+
+    init(limit: Int?) {
+        self.limit = limit
+    }
+
+    /// Return the newly retained array for the caller's existing per-chunk eval.
+    mutating func append(_ chunk: MLXArray) -> MLXArray {
+        if let limit {
+            let combined = trailing.map { concatenated([$0, chunk], axis: 1) } ?? chunk
+            let rows = combined.dim(1)
+            let retained = rows > limit ? combined[0..., (rows - limit)..., 0...] : combined
+            trailing = retained
+            return retained
+        }
+        chunks.append(chunk)
+        return chunk
+    }
+
+    mutating func finish() -> MLXArray? {
+        if limit != nil { return trailing }
+        guard let first = chunks.first else { return nil }
+        let result = chunks.count == 1 ? first : concatenated(chunks, axis: 1)
+        chunks.removeAll(keepingCapacity: false)
+        return result
+    }
+}
+
 struct DFlash2TokenIterator: TokenIteratorProtocol {
 
     private let target: any DFlash2Target
@@ -710,7 +744,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         try Task.checkCancellation()
         let prefill: PrefillResult
         if mediaPrefill, let mediaTarget {
-            var retained: MLXArray?
+            var hiddenCapture = DFlash2PrefillHiddenCapture(limit: hiddenLimit)
             var completedMediaRows = 0
             var boundarySnapshot: [KVCache]?
             let ordered = self.orderedLayerIDs
@@ -724,17 +758,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 onBoundary: { boundarySnapshot = cacheRef.map { $0.copy() } }
             ) { captured in
                 let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
-                let combined = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-                if let limit = hiddenLimit, combined.dim(1) > limit {
-                    retained = combined[0..., (combined.dim(1) - limit)..., 0...]
-                } else {
-                    retained = combined
-                }
-                if let retained { MLX.eval(retained) }
+                MLX.eval(hiddenCapture.append(chunkHidden))
                 completedMediaRows += chunkHidden.dim(1)
                 reportPrefill(completedMediaRows)
             }
-            guard let retained else { throw DFlash2RuntimeError.emptyPrompt }
+            guard let retained = hiddenCapture.finish() else { throw DFlash2RuntimeError.emptyPrompt }
             MLX.eval(lastLogits, retained)
             prefill = PrefillResult(
                 lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
@@ -874,7 +902,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         let step = Swift.max(1, stepSize)
         var logits: MLXArray?
-        var retained: MLXArray?
+        var hiddenCapture = DFlash2PrefillHiddenCapture(limit: hiddenLimit)
         var boundarySnapshot: [KVCache]?
         var start = 0
         while start < tokens.count {
@@ -901,15 +929,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             logits = chunkLogits
             let chunkHidden = extractContextFeature(
                 captured: captured, targetLayerIDs: orderedLayerIDs)
-            if let limit = hiddenLimit {
-                let combined =
-                    retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-                let rows = combined.dim(1)
-                retained =
-                    rows > limit ? combined[0..., (rows - limit)..., 0...] : combined
-            } else {
-                retained = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-            }
+            let retainedChunk = hiddenCapture.append(chunkHidden)
             if end == captureBoundaryAt {
                 try Task.checkCancellation()
                 MLX.eval(cache)
@@ -918,13 +938,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             if end < tokens.count {
                 try Task.checkCancellation()
                 MLX.eval(cache)
-                if let retained { MLX.eval(retained) }
+                MLX.eval(retainedChunk)
                 Memory.clearCache()
                 progressHandler?(end)
             }
             start = end
         }
-        guard let logits, let retained else {
+        guard let logits, let retained = hiddenCapture.finish() else {
             throw DFlash2RuntimeError.emptyPrompt
         }
         let lastLogits = logits[0..., (logits.dim(1) - 1)..., 0...]
