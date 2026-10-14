@@ -7,7 +7,7 @@ import Testing
 
 @Suite("LFM2 MoE router matches the HF Lfm2Moe reference")
 struct LFM2MoERouterTests {
-    private func block(scaling: Float, experts: Int = 4, topK: Int = 2) throws -> Lfm2MoeSparseMoeBlock {
+    private func block(scaling: Float, experts: Int = 4, topK: Int = 2, useBias: Bool = true) throws -> Lfm2MoeSparseMoeBlock {
         let config = """
             {
               "model_type": "lfm2_moe",
@@ -22,7 +22,7 @@ struct LFM2MoERouterTests {
               "num_attention_heads": 1,
               "num_key_value_heads": 1,
               "max_position_embeddings": 128,
-              "use_expert_bias": true,
+              "use_expert_bias": \(useBias),
               "num_dense_layers": 0,
               "norm_eps": 0.00001,
               "conv_bias": false,
@@ -86,6 +86,30 @@ struct LFM2MoERouterTests {
             let probabilities = sigmoid(moe.gate(x))
             let selection = probabilities.asType(.float32) + moe.expertBias!
             let indices = argPartition(selection, kth: -4, axis: -1)[.ellipsis, (-4)...]
+            let selected = takeAlong(probabilities, indices, axis: -1)
+            let scores = (selected / (selected.sum(axis: -1, keepDims: true) + 1e-6))
+                .asType(x.dtype)
+            let expected = (moe.switchMLP(x, indices) * scores[.ellipsis, .newAxis])
+                .sum(axis: -2)
+            #expect(arrayEqual(moe(x), expected).item(Bool.self))
+        }
+    }
+
+    @Test("unbiased BF16 routing uses the native tied-score partition")
+    func bfloat16UnbiasedReferencePartition() throws {
+        try MLXMetalTestLock.withLock {
+            let moe = try block(scaling: 1, experts: 8, topK: 4, useBias: false)
+            var parameters = Dictionary(uniqueKeysWithValues: moe.parameters().flattened().map { name, array in
+                (name, sin(MLXArray(0..<array.size).asType(.float32) * 0.13)
+                    .reshaped(array.shape).asType(.bfloat16))
+            })
+            let logits: [Float] = [2, 2, 2, 2, 1, 1, 1, 1]
+            parameters["gate.weight"] = MLXArray(logits.flatMap { [$0, 0] }, [8, 2])
+                .asType(.bfloat16)
+            moe.update(parameters: ModuleParameters.unflattened(parameters))
+            let x = MLXArray([1, 0] as [Float], [1, 1, 2]).asType(.bfloat16)
+            let probabilities = sigmoid(moe.gate(x))
+            let indices = argPartition(probabilities, kth: -4, axis: -1)[.ellipsis, (-4)...]
             let selected = takeAlong(probabilities, indices, axis: -1)
             let scores = (selected / (selected.sum(axis: -1, keepDims: true) + 1e-6))
                 .asType(x.dtype)

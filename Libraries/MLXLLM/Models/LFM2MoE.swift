@@ -319,7 +319,7 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         if useExpertBias, let expertBias {
             selection = probabilities.asType(.float32) + expertBias
         } else {
-            selection = probabilities.asType(.float32)
+            selection = probabilities
         }
         // Preserve the reference's selected-slot order as well as its set.
         // Negating then taking the first k chooses the same experts, but a
