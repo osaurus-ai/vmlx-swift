@@ -736,7 +736,7 @@ public final class Glm5NextSparseAttention: Module {
         latent: MLXArray,  // [B, 1, total, rank]
         indices: MLXArray,  // [B, S, K]
         valid: MLXArray,  // [B, S, K], true where the index is usable
-        past: Int
+        past: Int, keyPositions: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0), H = queries.dim(1), S = queries.dim(2), rank = queries.dim(3)
         let K = indices.dim(-1)
@@ -771,7 +771,8 @@ public final class Glm5NextSparseAttention: Module {
             // past this query's own position, and there is no causal mask left to catch it.
             let qPos = (MLXArray(Int32(start) ..< Int32(stop)) + MLXArray(Int32(past)))
                 .expandedDimensions(axis: 0).expandedDimensions(axis: -1)
-            let allowed = validRows .&& (idx .<= qPos.asType(idx.dtype))
+            let absolute = keyPositions.map { take($0, safe, axis: 0) } ?? idx
+            let allowed = validRows .&& (absolute .<= qPos.asType(idx.dtype))
             let bias = MLX.where(
                 allowed, MLXArray(Float(0)),
                 MLXArray(-Float.greatestFiniteMagnitude)
@@ -805,6 +806,9 @@ public final class Glm5NextSparseAttention: Module {
         let T = x.dim(1)
         let cached = cache?.offset ?? 0
         let indexed = cache as? Glm5NextIndexedKVCache
+        if let bounded = indexed?.bounded, bounded.capacity <= 0 {
+            throw Glm5NextDecoderUnavailable(detail: "maxKVSize must be positive for GLM indexed attention")
+        }
         let selecting = cached + T > indexer.topK
         if selecting, !indexer.alwaysSelectTail {
             throw Glm5NextDecoderUnavailable(
@@ -814,7 +818,7 @@ public final class Glm5NextSparseAttention: Module {
         }
 
         let qResid = qALayerNorm(qAProj(x))
-        let selected = try indexer(
+        var selected = try indexer(
             hidden: x, qResid: qResid, cache: indexed, selecting: selecting)
 
         var q = qBProj(qResid)
@@ -839,6 +843,13 @@ public final class Glm5NextSparseAttention: Module {
                     MLX.where(
                         visible, MLXArray(Float(0)).asType(dtype),
                         MLXArray(-Float.greatestFiniteMagnitude).asType(dtype)))
+            }
+            if let bounded = indexed?.bounded, cached + T > bounded.capacity {
+                let visible = bounded.visibility(positions: bounded.attentionStoragePositions, queryOffset: cached, count: T)
+                var bias = MLX.where(visible, MLXArray(Float(0)), MLXArray(-Float.greatestFiniteMagnitude)).asType(dtype)
+                    .expandedDimensions(axis: 1)
+                if let mask { bias = bias + mask }
+                return .array(bias)
             }
             if let mask { return .array(mask) }
             if T > 1 {
@@ -876,6 +887,7 @@ public final class Glm5NextSparseAttention: Module {
                 // needs none of the reference's hand-written absorbed-capacity machinery.
                 let stub = MLXArray.zeros([B, 1, T, 1], dtype: latent.dtype)
                 (latent, _) = cache.update(keys: latent, values: stub)
+                if let current = selected, let bounded = indexed?.bounded { selected = bounded.storageIndices(current) }
             }
             let total = latent.dim(2)
 
@@ -908,7 +920,7 @@ public final class Glm5NextSparseAttention: Module {
                         .&& (selected .< MLXArray(Int32(total)))
                     attended = gatherAbsorbedAttention(
                         queries: qEff, latent: latent, indices: selected, valid: valid,
-                        past: cached)
+                        past: cached, keyPositions: indexed?.bounded?.attentionStoragePositions.array)
                 } else {
                     attended = MLXFast.scaledDotProductAttention(
                         queries: qEff, keys: latent, values: latent,
@@ -927,6 +939,7 @@ public final class Glm5NextSparseAttention: Module {
             var values = kv[.ellipsis, qkNopeHeadDim...]
             if let cache {
                 (keys, values) = cache.update(keys: keys, values: values)
+                if let current = selected, let bounded = indexed?.bounded { selected = bounded.storageIndices(current) }
             }
             out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: keys, values: values, scale: scale,
@@ -1044,7 +1057,8 @@ public final class Glm5NextIndexer: Module {
         guard selecting else { return nil }
         let q = wqB(qResid).reshaped(B, S, numHeads, headDim)
         return try selectTopK(
-            packed: packed, queries: q, hidden: hidden, queryOffset: queryOffset)
+            packed: packed, queries: q, hidden: hidden, queryOffset: queryOffset,
+            bounded: cache?.bounded)
     }
 }
 
@@ -1071,13 +1085,20 @@ public final class Glm5NextIndexer: Module {
 public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
 
     private var kv = KVCacheSimple()
+    var bounded: Glm5NextBoundedCache?
+    private var boundedRestoreState: [MLXArray]?
+    private var boundedRestoreMetadata: [String]?
 
     /// `(B, N, 2 * indexHeadDim + 1)` — the index key, the gate score, and a validity flag.
     ///
     /// The validity channel is always 1 for the producer in this file, which never pads. It is kept
     /// anyway because the reference's pooling reads it, and a pooler that cannot express "this slot
     /// is padding" would have to be rewritten rather than fed differently if padding ever arrives.
-    public private(set) var indexerPacked: MLXArray?
+    private var unboundedIndexerPacked: MLXArray?
+    public private(set) var indexerPacked: MLXArray? {
+        get { bounded?.packed ?? unboundedIndexerPacked }
+        set { unboundedIndexerPacked = newValue }
+    }
 
     /// Which K/V representation this cache holds: the shared `kv_a` latent (compact) or the expanded
     /// per-head K/V.
@@ -1090,17 +1111,21 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     /// unlikely. The reference does the same, down to refusing to merge caches that disagree.
     public let absorbed: Bool
 
-    public init(absorbed: Bool? = nil) {
+    public init(absorbed: Bool? = nil, maxSize: Int? = nil, poolSize: Int = 1) {
         self.absorbed = absorbed ?? Glm5NextIndexerRuntime.absorbMLA
+        self.bounded = maxSize.map { Glm5NextBoundedCache(capacity: $0, poolSize: poolSize) }
     }
 
     public var diskCacheStateIdentifier: String {
-        "glm5-indexed-kv-v1-" + (absorbed ? "absorbed" : "expanded")
+        (bounded == nil ? "glm5-indexed-kv-v1-" : "glm5-bounded-indexed-kv-v1-") + (absorbed ? "absorbed" : "expanded")
     }
 
     public func restoreDiskCacheState(
         _ state: [MLXArray], metadata: [String], offset: Int
     ) -> Bool {
+        if let bounded {
+            return bounded.restore(state, metadata: metadata, expectedOffset: offset)
+        }
         guard state.count == 3, metadata == kv.metaState, offset > 0 else { return false }
         let keys = state[0], values = state[1], packed = state[2]
         guard keys.ndim == 4, values.ndim == 4, packed.ndim == 3,
@@ -1117,6 +1142,7 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
 
     /// Append this step's rows and return the whole history.
     public func updateIndexer(_ new: MLXArray) -> MLXArray {
+        if let bounded { return bounded.updateIndexer(new) }
         if let existing = indexerPacked {
             indexerPacked = concatenated([existing, new], axis: 1)
         } else {
@@ -1125,20 +1151,30 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
         return indexerPacked!
     }
 
-    public var offset: Int { kv.offset }
-    public var maxSize: Int? { kv.maxSize }
+    public var offset: Int { bounded?.offset ?? kv.offset }
+    public var maxSize: Int? { bounded?.capacity ?? kv.maxSize }
 
     public func innerState() -> [MLXArray] {
-        kv.innerState() + [indexerPacked].compactMap { $0 }
+        bounded?.innerState ?? (kv.innerState() + [indexerPacked].compactMap { $0 })
     }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        kv.update(keys: keys, values: values)
+        if let bounded { return bounded.update(keys: keys, values: values) }
+        return kv.update(keys: keys, values: values)
     }
 
     public var state: [MLXArray] {
-        get { kv.state + [indexerPacked].compactMap { $0 } }
+        get { bounded?.state ?? (kv.state + [indexerPacked].compactMap { $0 }) }
         set {
+            if let bounded {
+                if newValue.isEmpty {
+                    bounded.reset(); boundedRestoreState = nil; boundedRestoreMetadata = nil
+                } else {
+                    boundedRestoreState = newValue
+                    finishBoundedRestore()
+                }
+                return
+            }
             // The serialized layout is [keys, values, optional indexer],
             // independent of whether the destination has received tokens.
             // Inferring the layout from a fresh destination's empty state
@@ -1154,15 +1190,29 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
         }
     }
 
-    public var metaState: [String] {
-        get { kv.metaState }
-        set { kv.metaState = newValue }
+    private func finishBoundedRestore() {
+        if let bounded, let arrays = boundedRestoreState, let metadata = boundedRestoreMetadata {
+            precondition(metadata.count == 5)
+            precondition(bounded.restore(arrays, metadata: metadata, expectedOffset: Int(metadata[4]) ?? -1))
+            boundedRestoreState = nil; boundedRestoreMetadata = nil
+        }
     }
 
-    public var isTrimmable: Bool { kv.isTrimmable }
+    public var metaState: [String] {
+        get { bounded?.metadata ?? kv.metaState }
+        set {
+            if bounded != nil {
+                boundedRestoreMetadata = newValue
+                finishBoundedRestore()
+            } else { kv.metaState = newValue }
+        }
+    }
+
+    public var isTrimmable: Bool { bounded?.isTrimmable ?? kv.isTrimmable }
 
     @discardableResult
     public func trim(_ n: Int) -> Int {
+        if let bounded { return bounded.trim(n) }
         let trimmed = kv.trim(n)
         if trimmed > 0, let packed = indexerPacked {
             let keep = max(0, packed.dim(1) - trimmed)
@@ -1174,11 +1224,17 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     public func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        kv.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        if let bounded {
+            guard bounded.capacity > 0 else { return .none } // forward reports the invalid request
+            return .array(bounded.visibility(
+                positions: bounded.plannedPositions(count: n), queryOffset: offset, count: n))
+        }
+        return kv.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
     }
 
     public func copy() -> any KVCache {
         let copy = Glm5NextIndexedKVCache(absorbed: absorbed)
+        if let bounded { copy.bounded = bounded.copy(); return copy }
         // The inner KVCacheSimple's state setter requires EXACTLY [keys,
         // values] and traps on any other count. A fresh cache (no tokens yet)
         // yields an EMPTY state, so restore it only when present — the same
@@ -1309,6 +1365,13 @@ extension Glm5NextIndexer {
     public func selectTopK(
         packed: MLXArray, queries: MLXArray, hidden: MLXArray, queryOffset: Int
     ) throws -> MLXArray {
+        try selectTopK(packed: packed, queries: queries, hidden: hidden, queryOffset: queryOffset, bounded: nil)
+    }
+
+    func selectTopK(
+        packed: MLXArray, queries: MLXArray, hidden: MLXArray, queryOffset: Int,
+        bounded: Glm5NextBoundedCache?
+    ) throws -> MLXArray {
         let B = packed.dim(0)
         let N = packed.dim(1)
         let S = hidden.dim(1)
@@ -1342,7 +1405,8 @@ extension Glm5NextIndexer {
 
         // A pool is a candidate only if its LAST token is visible to this query — which is what
         // makes the selection causal without materialising a per-token comparison.
-        let kvPositions = Glm5NextIndexerRuntime.layoutRange(N)
+        let kvPositions = bounded.map { $0.packedPositions.array }
+            ?? Glm5NextIndexerRuntime.layoutRange(N)
         let queryPositions = MLXArray(Int32(queryOffset) ..< Int32(queryOffset + S))
         let causal = kvPositions[.newAxis, 0...] .<= queryPositions[0..., .newAxis]  // (S, N)
         let validKeys = packed[.ellipsis, 2 * headDim] .!= MLXArray(Float(0))  // (B, N)
@@ -1357,7 +1421,14 @@ extension Glm5NextIndexer {
             poolIndices[.ellipsis, poolSize - 1].reshaped(-1),
             min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
         let poolVisible = take(visible, poolEnd, axis: -1)  // (B, S, P)
-        let candidates = poolVisible .&& poolValid.expandedDimensions(axis: 1)
+        var candidates = poolVisible .&& poolValid.expandedDimensions(axis: 1)
+        if let bounded {
+            let eligible = bounded.visibility(positions: bounded.packedPositions, queryOffset: queryOffset, count: S)
+            let safePool = clip(poolIndices, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
+            let hasRetainedMember = take(eligible, safePool.reshaped(-1), axis: -1)
+                .reshaped(1, S, poolCount, poolSize).any(axis: -1)
+            candidates = candidates .&& hasRetainedMember
+        }
         indexScores = MLX.where(
             candidates, indexScores, MLXArray(-Float.greatestFiniteMagnitude))
 
@@ -1383,7 +1454,9 @@ extension Glm5NextIndexer {
         var width = topK
         if alwaysSelectTail, poolSize > 1 {
             expanded = concatenated(
-                [expanded, tailIndices(visible: visible, validKeys: validKeys, kvLength: N)],
+                [expanded, bounded.map {
+                    boundedTailIndices($0, queryOffset: queryOffset, count: S, batch: B)
+                } ?? tailIndices(visible: visible, validKeys: validKeys, kvLength: N)],
                 axis: -1)
             width += poolSize - 1
         }
@@ -1393,7 +1466,29 @@ extension Glm5NextIndexer {
                 [B, S, width - expanded.dim(-1)], values: MLXArray(Int32(-1)))
             expanded = concatenated([expanded, padding], axis: -1)
         }
-        return expanded[.ellipsis, ..<width]
+        expanded = expanded[.ellipsis, ..<width]
+        if let bounded {
+            let mapping = bounded.attentionPositions.indices(of: bounded.packedPositions.array)
+            let safe = clip(expanded, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
+            let absolute = take(kvPositions, safe, axis: 0)
+            let query = queryPositions[.newAxis, 0..., .newAxis]
+            let allowed = (expanded .>= MLXArray(Int32(0))) .&& (absolute .<= query)
+                .&& ((absolute .< MLXArray(Int32(bounded.keep)))
+                    .|| (absolute .> query - MLXArray(Int32(bounded.capacity - bounded.keep))))
+            expanded = MLX.where(allowed, take(mapping, safe, axis: 0), MLXArray(Int32(-1)))
+        }
+        return expanded
+    }
+
+    private func boundedTailIndices(
+        _ bounded: Glm5NextBoundedCache, queryOffset: Int, count: Int, batch: Int
+    ) -> MLXArray {
+        let query = arange(queryOffset, queryOffset + count, dtype: .int32)[0..., .newAxis]
+        let tailCount = (query + MLXArray(Int32(1))) % MLXArray(Int32(poolSize))
+        let member = arange(poolSize - 1, dtype: .int32)[.newAxis, 0...]
+        let absolute = query + MLXArray(Int32(1)) - tailCount + member
+        let indices = MLX.where(member .< tailCount, bounded.packedPositions.indices(of: absolute), MLXArray(Int32(-1)))
+        return repeated(indices.expandedDimensions(axis: 0), count: batch, axis: 0)
     }
 
     /// The tokens after the last COMPLETE pool, which pooling alone would drop.
@@ -2979,7 +3074,10 @@ public final class Glm5NextLanguageModel: Module {
     public func makeCache(maxKVSize: Int? = nil) -> [KVCache] {
         (0 ..< numDecoderLayers).map { index in
             if layers[index].kind == .linearAttention { return MambaCache() }
-            if let maxKVSize { return RotatingKVCache(maxSize: maxKVSize, keep: 4) }
+            if let maxKVSize {
+                return Glm5NextIndexedKVCache(
+                    maxSize: maxKVSize, poolSize: layers[index].sparseAttention!.indexer.poolSize)
+            }
             // Sparse layers get the cache that ALSO remembers the indexer's packed rows. A plain
             // KVCacheSimple would still generate — the selection is skipped below index_topk — and
             // would then fail, or worse mis-select, at the moment the sequence crosses it.
