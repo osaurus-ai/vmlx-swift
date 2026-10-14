@@ -174,6 +174,8 @@ struct DiskCacheQuotaEntry: Sendable {
     var isPostAnswer: Bool = false
     var isCanonicalCheckpoint: Bool = false
     var chainId: String? = nil
+    /// The model/quantization cache namespace stored with this row.
+    var modelKey: String? = nil
 }
 
 /// A recurrent companion the v2 index counts but cannot attach to a KV row:
@@ -2072,7 +2074,7 @@ public final class DiskCache: @unchecked Sendable {
         let sql = indexHasV2Columns
             ? """
                 SELECT hash, file_size, created_at, companion_key, companion_bytes,
-                       token_count, kind, chain_id, rowid, \(indexHasReplayChunkColumn ? "replay_chunk_size" : "NULL")
+                       token_count, kind, chain_id, rowid, \(indexHasReplayChunkColumn ? "replay_chunk_size" : "NULL"), model_key
                 FROM cache_entries
                 """
             : "SELECT hash, file_size, created_at, rowid FROM cache_entries"
@@ -2129,6 +2131,7 @@ public final class DiskCache: @unchecked Sendable {
                 entry.isResumeBoundary = kind == 2
                 entry.isPostAnswer = kind == 3
                 entry.chainId = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+                entry.modelKey = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
                 if kind == 0, sqlite3_column_type(stmt, 9) == SQLITE_INTEGER {
                     let step = sqlite3_column_int64(stmt, 9)
                     entry.isCanonicalCheckpoint = step > 0 && entry.tokenCount > 0
@@ -4341,7 +4344,8 @@ public final class DiskCache: @unchecked Sendable {
         lock.unlock()
         guard let pending else { return }
         let retained = quotaEntries(retiringInvalidRecords: false).contains {
-            $0.chainId == chainId && !$0.isStableRoot && !$0.isCanonicalCheckpoint
+            $0.chainId == chainId && ($0.modelKey ?? "") == (modelKey ?? "")
+                && !$0.isStableRoot && !$0.isCanonicalCheckpoint
                 && $0.tokenCount >= pending.tipTokenCount
                 && IndexedBytes.sum($0.bytes, $0.companionBytes) <= Int64(maxSizeBytes)
                 && (!requiresCompanion || $0.companionKey != nil)

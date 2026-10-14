@@ -66,6 +66,8 @@ struct QuotaRow: Equatable, Sendable {
     /// The conversation. `nil` = a row written before chains existed: it is
     /// its own single-row chain.
     let chainId: String?
+    /// Model/quantization namespace; nil and empty retain the legacy namespace.
+    var modelKey: String? = nil
     /// A companion payload with no KV row.
     let isLegacyCompanion: Bool
 }
@@ -105,6 +107,7 @@ struct QuotaPlan: Equatable {
     /// Always `totalBefore - evictedBytes`.
     let totalAfter: Int64
     let event: DiskCachePressureEvent?
+    var activeModelKey: String? = nil
 
     /// A selected victim is not proof of lost progress: its file deletion can fail.
     /// `lostRows` includes a KV payload or required companion actually removed.
@@ -112,6 +115,7 @@ struct QuotaPlan: Equatable {
         guard let event else { return nil }
         let active = rows.filter {
             !$0.isStableRoot && !$0.isLegacyCompanion && $0.chainId == event.chainId
+                && ($0.modelKey ?? "") == (activeModelKey ?? "")
         }
         if event.kind == .activeTipDropped {
             let tip = DiskQuotaPlanner.resumePoint(of: active)
@@ -126,10 +130,11 @@ struct QuotaPlan: Equatable {
 /// SQLite, no locks, no clock.
 ///
 /// Vocabulary. A **chain** is every non-stable, non-legacy row sharing a
-/// `chainId`; a row with `chainId == nil` is a chain of one. A chain's **tip**
+/// `chainId` and model namespace; nil/empty model namespaces are equivalent.
+/// A row with `chainId == nil` is a chain of one. A chain's **tip**
 /// is its row with the greatest `tokenCount` (ties: greatest recency, then
 /// greatest `id`). **Chain recency** is the greatest recency among its rows.
-/// The **active** chain is the one named by `activeChain`; every other chain
+/// The **active** chain is named by `activeChain` and `activeModelKey`; every other chain
 /// is **cold**. `low = Int64(Double(cap) * lowWatermarkFraction)`.
 ///
 /// The policy:
@@ -192,7 +197,7 @@ enum DiskQuotaPlanner {
     static let lowWatermarkFraction = 0.90
 
     private enum ChainKey: Hashable {
-        case named(String)
+        case named(String, modelNamespace: String)
         /// A chain-less row, keyed by its own id so it can never collide with
         /// a named chain or with another chain-less row.
         case solo(String)
@@ -223,7 +228,9 @@ enum DiskQuotaPlanner {
         let recency: Double
     }
 
-    static func plan(rows: [QuotaRow], capBytes: Int64, activeChain: String?) -> QuotaPlan {
+    static func plan(
+        rows: [QuotaRow], capBytes: Int64, activeChain: String?, activeModelKey: String? = nil
+    ) -> QuotaPlan {
         assert(Set(rows.map(\.id)).count == rows.count, "QuotaRow ids must be unique")
         let totalBefore = IndexedBytes.total(rows.lazy.map(\.bytes))
         var total = totalBefore
@@ -233,7 +240,8 @@ enum DiskQuotaPlanner {
         func finish() -> QuotaPlan {
             QuotaPlan(
                 evict: evict, evictedBytes: totalBefore - total,
-                totalBefore: totalBefore, totalAfter: total, event: event)
+                totalBefore: totalBefore, totalAfter: total, event: event,
+                activeModelKey: activeModelKey)
         }
         /// Evicts from `candidates`, in order, until `total <= goal`.
         /// Returns whether it took anything.
@@ -251,7 +259,7 @@ enum DiskQuotaPlanner {
         // 1. The trigger is the cap.
         guard total > capBytes else { return finish() }
 
-        let activeKey = activeChain.map(ChainKey.named)
+        let activeKey = activeChain.map { ChainKey.named($0, modelNamespace: activeModelKey ?? "") }
         let activeTipBefore =
             rows
             .filter { isChainRow($0) && !$0.isCanonicalCheckpoint && chainKey($0) == activeKey }
@@ -356,7 +364,7 @@ enum DiskQuotaPlanner {
     }
 
     private static func chainKey(_ row: QuotaRow) -> ChainKey {
-        row.chainId.map(ChainKey.named) ?? .solo(row.id)
+        row.chainId.map { ChainKey.named($0, modelNamespace: row.modelKey ?? "") } ?? .solo(row.id)
     }
 
     /// The row a conversation resumes from: its newest resume boundary, or
