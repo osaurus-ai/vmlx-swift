@@ -722,6 +722,14 @@ struct Bench {
             return
         }
 
+        if let nllFile = env["BENCH_NLL_FILE"] {
+            try await NLLBench.run(
+                modelDir: modelDir, file: nllFile,
+                maxTokens: Int(env["BENCH_NLL_TOKENS"] ?? "2048") ?? 2048,
+                chunk: Int(env["BENCH_PREFILL_STEP"] ?? "512") ?? 512)
+            return
+        }
+
         // AgenticTaskBench owns a production-tokenizer context.  It must run
         // before the legacy pre-tokenized context below: loading both used to
         // double model residency and made every agentic RAM score false.
