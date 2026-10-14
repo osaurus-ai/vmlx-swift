@@ -596,12 +596,16 @@ public final class DiskCache: @unchecked Sendable {
         let geometry: RecurrentGeometry
         // Read and written under the owning DiskCache lock.
         var invalidated = false
-        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry) {
+        var chainId: String?
+        var rowKind: Int64
+        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry, chainId: String?, rowKind: Int64) {
             self.arrays = arrays
             self.tensors = tensors
             self.tokenCount = tokenCount
             self.bytes = bytes
             self.geometry = geometry
+            self.chainId = chainId
+            self.rowKind = rowKind
         }
 
         /// What `hasValidatedEntry`/`hasDurableEntry` answer for it: the payload passed the store's
@@ -748,9 +752,9 @@ public final class DiskCache: @unchecked Sendable {
     /// Writer-queue half of a write-behind store: file I/O, publish, index row. No MLX calls.
     private func completeWriteBehind(
         hash: String, finalURL: URL, tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int,
-        chainId: String?, rowKind: Int64, replayChunkSize: Int?, enforceQuota: Bool,
+        replayChunkSize: Int?, enforceQuota: Bool,
         layout: [String], geometry: RecurrentGeometry, enqueued: Date, entry: InflightWrite
-    ) {
+    ) -> String? {
         if let delay = writeDelayForTesting { Thread.sleep(forTimeInterval: delay) }
         let start = Date()
         var outcome = "stored"
@@ -794,7 +798,7 @@ public final class DiskCache: @unchecked Sendable {
                         as? Int ?? 0
                     let insertResult = _insertEntryLocked(
                         hash: hash, tokenCount: tokenCount, fileSize: fileSize,
-                        chainId: chainId, kind: rowKind, replayChunkSize: replayChunkSize)
+                        chainId: entry.chainId, kind: entry.rowKind, replayChunkSize: replayChunkSize)
                     if insertResult != SQLITE_DONE {
                         _ = Self.removeRegularFile(at: finalURL)
                         validatedFiles.removeValue(forKey: hash)
@@ -821,6 +825,7 @@ public final class DiskCache: @unchecked Sendable {
         }
         let end = Date()
         lock.lock()
+        let finalizedChainId = entry.chainId
         if inflight[hash] === entry { inflight.removeValue(forKey: hash) }
         inflightBytes -= entry.bytes
         inflightStoreCount -= 1
@@ -839,6 +844,7 @@ public final class DiskCache: @unchecked Sendable {
                     + "outcome=\(outcome) queuedMs=\(Int(start.timeIntervalSince(enqueued) * 1000)) "
                     + "writeMs=\(Int(end.timeIntervalSince(start) * 1000))\n").utf8))
         }
+        return finalizedChainId
     }
 
     /// Entries an engine could not restore into the running model's cache
@@ -1134,9 +1140,11 @@ public final class DiskCache: @unchecked Sendable {
     /// touch the content key. Re-storing a row updates its owner to the
     /// storing conversation, keeps the previous owner when none is given, and
     /// never demotes a stable root.
-    /// Returns true when the write was deferred (write-behind): the file and its index row land
-    /// later, and `afterPublish` runs on the writer once they have (the coordinator's quota pass).
-    /// False: everything happened before return and `afterPublish` is not called.
+    /// Returns true when this call queues a write-behind publication. Its `afterPublish` runs
+    /// on the writer with the finalized row owner, including metadata merged by duplicate stores.
+    /// False queues no new publication: a duplicate pending payload may still be awaiting disk
+    /// and shares the first store's callback; otherwise the store or refusal finished inline.
+    /// A duplicate's own `afterPublish` is not called.
     @discardableResult
     func store(
         tokens: [Int],
@@ -1149,7 +1157,7 @@ public final class DiskCache: @unchecked Sendable {
         isPostAnswer: Bool = false,
         replayChunkSize: Int? = nil,
         allowWriteBehind: Bool = true,
-        afterPublish: (@Sendable () -> Void)? = nil
+        afterPublish: (@Sendable (String?) -> Void)? = nil
     ) -> Bool {
         var deferred = false
         storeImpl(
@@ -1171,7 +1179,7 @@ public final class DiskCache: @unchecked Sendable {
         isPostAnswer: Bool,
         replayChunkSize: Int?,
         allowWriteBehind: Bool,
-        afterPublish: (@Sendable () -> Void)?,
+        afterPublish: (@Sendable (String?) -> Void)?,
         deferred: inout Bool
     ) {
         if let replayChunkSize {
@@ -1250,7 +1258,16 @@ public final class DiskCache: @unchecked Sendable {
         // screen ran first. A skipped store counts in `stores` as before; a refused one does not.
         if let entry = inflight[hash], !entry.invalidated {
             stores += 1
-            // The same content-addressed payload is already on its way to disk.
+            // Deduplicate tensor bytes, but keep the same ownership/kind
+            // contract as a re-store of an already-published payload.
+            entry.chainId = chainId ?? entry.chainId
+            entry.rowKind = Self.rowKind(
+                stableRoot: entry.rowKind == 1 || rowKind == 1,
+                resumeBoundary: entry.rowKind == 2 || rowKind == 2,
+                postAnswer: entry.rowKind == 3 || rowKind == 3)
+            // Publication may have finished before the writer removed its
+            // in-flight entry. Claim that SQL row too, under this same lock.
+            _claimOwnershipLocked(hash: hash, chainId: entry.chainId, kind: entry.rowKind)
             storeSkips += 1
             return
         }
@@ -1346,7 +1363,8 @@ public final class DiskCache: @unchecked Sendable {
             }
             let geometry = Self.recurrentGeometry(arrays)
             let entry = InflightWrite(
-                arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry)
+                arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry,
+                chainId: chainId, rowKind: rowKind)
             inflight[hash] = entry
             inflightBytes += bytes
             inflightStoreCount += 1
@@ -1359,12 +1377,12 @@ public final class DiskCache: @unchecked Sendable {
             let enqueued = Date()
             pendingWrites.enter()
             writerQueue.async { [self] in
-                completeWriteBehind(
+                let finalizedChainId = completeWriteBehind(
                     hash: hash, finalURL: url, tensors: entry.tensors, tokenCount: tokenCount,
-                    chainId: chainId, rowKind: rowKind, replayChunkSize: replayChunkSize,
+                    replayChunkSize: replayChunkSize,
                     enforceQuota: enforceQuota, layout: layout, geometry: geometry,
                     enqueued: enqueued, entry: entry)
-                afterPublish?()
+                afterPublish?(finalizedChainId)
                 pendingWrites.leave()
             }
             deferred = true
