@@ -514,6 +514,11 @@ public protocol LanguageModel: Module {
     /// This preserves the stored dtype, not a forced activation precision.
     var cacheStorageDTypeIdentity: String? { get }
 
+    /// Model-owned namespace for the arithmetic that produces persisted KV/recurrent state.
+    /// Bump only when forward semantics change, not for equivalent kernel/scheduling speedups.
+    /// Nil preserves existing keys for models with no declared arithmetic revision.
+    var cacheComputationIdentity: String? { get }
+
     /// Whether the entire forward can be traced by the generic MLX compiler.
     /// Host routing or file-backed row selection may require eager scheduling
     /// even when individual device kernels support compilation.
@@ -580,6 +585,7 @@ public protocol LanguageModel: Module {
 extension LanguageModel {
     public var preservesCheckpointParameterDTypes: Bool { false }
     public var cacheStorageDTypeIdentity: String? { nil }
+    public var cacheComputationIdentity: String? { nil }
     public var supportsWholeForwardCompilation: Bool { true }
 
     /// Most standard-attention and wrapped recurrent-cache architectures use

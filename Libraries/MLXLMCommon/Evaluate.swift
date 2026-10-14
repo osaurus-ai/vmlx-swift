@@ -3083,20 +3083,20 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func maybeQuantizeCacheForStep() {
-        let hadTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
-        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache)
+        let hadTQ = ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity).turboQuantKVLayerCount > 0
+        let before = hadTQ ? nil : ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity)
         maybeQuantizeKVCache(
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
             quantizedKVStart: quantizedKVStart,
             kvMode: kvMode)
-        let hasTQ = ModelCacheTopologySnapshot(cache: cache).turboQuantKVLayerCount > 0
+        let hasTQ = ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity).turboQuantKVLayerCount > 0
         if !hadTQ, hasTQ, let before {
             turboQuantCompressionCount += 1
             lastTurboQuantCacheTransition = TurboQuantCacheTransitionSnapshot(
                 before: before,
-                after: ModelCacheTopologySnapshot(cache: cache)
+                after: ModelCacheTopologySnapshot(cache: cache, cacheComputationIdentity: model.cacheComputationIdentity)
             )
         }
     }

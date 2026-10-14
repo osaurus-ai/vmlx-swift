@@ -501,6 +501,14 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     /// near-tied tokens, so this model keeps the checkpoint dtypes as loaded.
     public var preservesCheckpointParameterDTypes: Bool { true }
 
+    /// Old softmax routing, rounded expert bias and the negative-k slot order
+    /// produced incompatible hidden states even with identical weights/token IDs.
+    /// This revision names the actual model's corrected forward semantics;
+    /// equivalent kernel optimizations must keep it stable.
+    public var cacheComputationIdentity: String? {
+        "lfm2-moe:sigmoid-f32-bias-positive-topk-v1"
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
         return model.embedTokens.asLinear(out)
