@@ -9,6 +9,7 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     private let block: JANGHRoutedDecodeBlock
     private let inputDimensions: Int
     private let synchronizeRoutesForDiagnostic: Bool
+    private let parentModule: String
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
@@ -33,6 +34,7 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         self.block = try JANGHRoutedDecodeBlock(
             banks: banks, parentModule: parentModule, activationLimit: activationLimit)
         self.inputDimensions = inputDimensions
+        self.parentModule = parentModule
         // Explicit ablation: retain all original kernels/banks while introducing
         // only the host route synchronization required by selected-buffer decode.
         synchronizeRoutesForDiagnostic = ProcessInfo.processInfo.environment[
@@ -52,6 +54,11 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         // rounded its output weights to input dtype; this cast does not undo it.
         do {
             if synchronizeRoutesForDiagnostic { _ = indices.asArray(UInt32.self) }
+            // Diagnostic only (off by default): per-layer expert-use histogram for sizing a hot-expert
+            // residency tier on wire-limited Macs. Forces a host sync per MoE layer when enabled.
+            if JANGHRouteHistogram.enabled {
+                JANGHRouteHistogram.record(layer: parentModule, indices: indices.asArray(UInt32.self))
+            }
             let result = try block.routed(
                 input.reshaped(tokens, inputDimensions),
                 indices: indices.reshaped(tokens, routes),
@@ -70,6 +77,33 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             // Module forwards are nonthrowing throughout MLXNN. Refuse violated
             // invariants explicitly rather than substituting an affine route.
             preconditionFailure("JANGH routed execution rejected admitted bank: \(error)")
+        }
+    }
+}
+
+
+/// Diagnostic route histogram (`VMLX_JANGH_ROUTE_HISTOGRAM=<path>`): counts how often each routed expert is
+/// selected per MoE layer and rewrites `<path>` as JSON every 256 recorded calls. Off by default; never
+/// used for serving decisions.
+enum JANGHRouteHistogram {
+    static let path = ProcessInfo.processInfo.environment["VMLX_JANGH_ROUTE_HISTOGRAM"]
+    static var enabled: Bool { path != nil }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var counts: [String: [UInt32: Int]] = [:]
+    nonisolated(unsafe) private static var calls = 0
+
+    static func record(layer: String, indices: [UInt32]) {
+        guard let path else { return }
+        lock.lock(); defer { lock.unlock() }
+        var layerCounts = counts[layer, default: [:]]
+        for i in indices { layerCounts[i, default: 0] += 1 }
+        counts[layer] = layerCounts
+        calls += 1
+        if calls % 256 == 0 {
+            let json = counts.mapValues { $0.reduce(into: [String: Int]()) { $0[String($1.key)] = $1.value } }
+            if let data = try? JSONSerialization.data(withJSONObject: json) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
         }
     }
 }

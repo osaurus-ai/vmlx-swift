@@ -2,6 +2,9 @@
 
 import Cmlx
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Low-level access to the process-wide wired memory limit.
 ///
@@ -77,7 +80,8 @@ public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
 public func modelResidencyWiredTarget(
     modelBytes: Int,
     workingSet: Int,
-    physicalMemory: Int
+    physicalMemory: Int,
+    wireHeadroom: Int? = nil
 ) -> Int? {
     guard modelBytes > 0, physicalMemory > 0 else { return nil }
     let gib = 1024 * 1024 * 1024
@@ -104,7 +108,34 @@ public func modelResidencyWiredTarget(
     let safeCeiling = max(0, physicalMemory - osReserve)
     let desired = modelBytes.addingReportingOverflow(headroom)
     guard !desired.overflow else { return nil }
-    let target = min(desired.partialValue, workingSet, safeCeiling)
+    var target = min(desired.partialValue, workingSet, safeCeiling)
+    // SPEED-CRITICAL (Allosaurus on 48 GB Macs, 2026-10-15). On 48 GiB+ Macs the kernel itself keeps
+    // part of RAM unwireable: XNU `kmem_set_user_wire_limits` caps total wired pages at 80% (32-63 GiB),
+    // 82% (64-127) or 85% (128-255) of RAM, so a residency REQUEST can never wire the machine into the
+    // #2612 freeze — the kernel refuses the excess. What the request size DOES decide is which of the
+    // model's buffers are in MLX's residency set: MLX inserts allocations in order until the set is
+    // full, so a set sized below weights+KV+scratch leaves the latest (hottest) buffers to be re-wired
+    // on every command buffer, and NO set leaves the memory-mapped experts evictable. Measured under a
+    // 48 GB-like wire budget plus RAM pressure (same binary, Allosaurus, adaptive MTP):
+    //   no residency (old nil path)           →  0.2 tok/s, 740 GB of page-ins in 5.5 min  (the user report)
+    //   set capped to the wire headroom       →  17.9-18.8 tok/s
+    //   set covering the whole working set    →  35.6-41.4 tok/s  (unpressured ≈ 48)
+    // So on wireLimitedClass Macs request the whole working set, bounded only by Metal's working set,
+    // and never return nil merely because the model is a large fraction of RAM. `wireHeadroom` is kept
+    // for diagnostics/advisories and to cover the generation overhead; it does NOT shrink the request.
+    let wireLimitedClass = physicalMemory >= 48 * gib && physicalMemory < 64 * gib
+    if wireLimitedClass {
+        let generationOverhead = 5 * gib / 2  // KV + verify scratch + reuse pool, measured 2.4-3.2 GiB
+        let wanted = modelBytes.addingReportingOverflow(generationOverhead + gib)
+        guard !wanted.overflow else { return nil }
+        // Never ask beyond the kernel's own wire cap for this class (80% of RAM): it could not be wired.
+        let kernelWireCap = physicalMemory / 5 * 4
+        target = max(target, min(wanted.partialValue, workingSet, kernelWireCap))
+        // A partial set still beats none (measured above): return it even when Metal's working set is
+        // below the model, and let the advisory explain the shortfall.
+        return target > 0 ? target : nil
+    }
+    _ = wireHeadroom
     // Only raise when the whole model fits wired inside the safe ceiling.
     // Otherwise leave the default: the model stays swappable (safe), instead of
     // wiring a machine into a memory-pressure panic.
@@ -883,5 +914,85 @@ extension WiredMemoryPolicy {
         kind: WiredMemoryTicketKind = .active
     ) -> WiredMemoryTicket {
         WiredMemoryTicket(size: size, policy: self, manager: manager, kind: kind)
+    }
+}
+
+
+/// Live, rootless view of macOS's wired-memory budget.
+///
+/// Apple GPUs can only access memory that is wired while each command buffer runs, and macOS caps the
+/// TOTAL number of wired pages system-wide (`vm.global_user_wire_limit`). XNU `kmem_set_user_wire_limits`
+/// picks the percentage from `floor(log2(RAM)) - 32`: 80% for 32-63 GiB (a 48 GB Mac: 38.4 GiB total),
+/// 82% for 64-127 GiB, 85% for 128-255 GiB (measured exactly 85% on a 128 GB M5 Max). A model whose GPU working set (weights + KV + scratch + allocator cache) does not fit under
+/// `limit - already wired` cannot run at full speed no matter how much RAM is free: the kernel rejects
+/// wiring, `vm.add_wire_count_over_global_limit` increments, and Metal command submission stalls.
+/// This was the root cause of Allosaurus (37.6 GiB wired with MTP) collapsing to 0.2 tok/s on a 48 GB Mac.
+///
+/// All values are read without privileges. `nil` means "could not read" — never treat that as a limit.
+public struct SystemWireBudget: Sendable, Equatable {
+    /// Margin kept free under the measured wire headroom when sizing model residency.
+    public static let residencyMargin = 512 * 1024 * 1024
+
+    /// Measured extra wired memory a native-MTP MoE generation keeps on top of its weights
+    /// (KV, verify scratch, allocator reuse pool). Allosaurus JANGH2, MTP depth 3, 2026-10-15:
+    /// 37.62 GiB wired vs 34.77 GiB of weights (36.82 GiB with a 128 MiB reuse pool).
+    /// Advisory sizing only — never used to refuse anything.
+    public static let estimatedGenerationOverheadBytes = 5 * 512 * 1024 * 1024  // 2.5 GiB
+
+    /// `vm.global_user_wire_limit`: the kernel's cap on total wired pages.
+    public var userWireLimitBytes: Int?
+    /// `iogpu.wired_limit_mb` in bytes; `nil` when unset (0 = system default).
+    public var gpuWiredLimitBytes: Int?
+    /// Pages wired right now, system-wide.
+    public var wiredBytes: Int?
+    /// `vm.add_wire_count_over_global_limit`: monotonic count of wire requests the kernel rejected.
+    /// A delta > 0 across a generation means that generation hit this failure.
+    public var wireLimitRejections: Int?
+
+    public init(
+        userWireLimitBytes: Int?, gpuWiredLimitBytes: Int?, wiredBytes: Int?, wireLimitRejections: Int?
+    ) {
+        self.userWireLimitBytes = userWireLimitBytes
+        self.gpuWiredLimitBytes = gpuWiredLimitBytes
+        self.wiredBytes = wiredBytes
+        self.wireLimitRejections = wireLimitRejections
+    }
+
+    /// Bytes that can still be wired before the kernel starts rejecting wiring.
+    public var headroomBytes: Int? {
+        guard let limit = userWireLimitBytes, let wired = wiredBytes else { return nil }
+        return max(0, limit - wired)
+    }
+
+    /// Read the current budget. Cheap (four sysctl / host_statistics calls); safe to call per turn.
+    public static func snapshot() -> SystemWireBudget {
+        #if canImport(Darwin)
+        func sysctlInt(_ name: String) -> Int? {
+            var value: UInt64 = 0
+            var size = MemoryLayout<UInt64>.size
+            guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return nil }
+            if size == MemoryLayout<UInt32>.size { return Int(UInt32(truncatingIfNeeded: value)) }
+            return Int(clamping: value)
+        }
+        var wired: Int?
+        var info = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS { wired = Int(info.wire_count) * Int(getpagesize()) }
+        let gpuMB = sysctlInt("iogpu.wired_limit_mb")
+        return SystemWireBudget(
+            userWireLimitBytes: sysctlInt("vm.global_user_wire_limit"),
+            gpuWiredLimitBytes: gpuMB.flatMap { $0 > 0 ? $0 * 1024 * 1024 : nil },
+            wiredBytes: wired,
+            wireLimitRejections: sysctlInt("vm.add_wire_count_over_global_limit"))
+        #else
+        return SystemWireBudget(
+            userWireLimitBytes: nil, gpuWiredLimitBytes: nil, wiredBytes: nil, wireLimitRejections: nil)
+        #endif
     }
 }
