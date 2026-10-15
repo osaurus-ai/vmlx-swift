@@ -44,7 +44,7 @@ public enum ImageMemoryEstimator {
             latentScale = 16; textRows = 512; vaeChannels = 96
         case "qwen-image-2.1", "qwen-image-2.1-turbo":
             hidden = try attentionWidth(heads: 32, dimension: 128)
-            latentScale = 16; textRows = 1024; vaeChannels = 96
+            latentScale = 16; textRows = 1024; vaeChannels = 144
         case "ideogram":
             hidden = integer("hidden_size", 2048); latentScale = 16; textRows = 512; vaeChannels = 128
         case "seedvr2":
@@ -74,7 +74,15 @@ public enum ImageMemoryEstimator {
         // 25.141 GB at 1024², with 10.814 GB live weights. Account for the
         // measured size-dependent workspace; do not multiply the weights or
         // alter allocator limits to make an estimate look correct.
-        let decodeMaps = family == "z-image-turbo" ? 28 : 2
+        let decodeMaps: Int
+        switch family {
+        case "z-image-turbo": decodeMaps = 28
+        // Native Qwen2.1 fp32 decoder uses144 channels, not the96-channel
+        // encoder. 512² measured14.37GB and1536² measured41.26GB on the4bit
+        // bundle; this workspace model is within8% at both sizes.
+        case "qwen-image-2.1", "qwen-image-2.1-turbo": decodeMaps = 24
+        default: decodeMaps = 2
+        }
         var decode = pixels * batch * Double(vaeChannels * decodeMaps + 3) * bytesPerActivation
         if let previewMaxPixel {
             decode += Double(previewMaxPixel) * Double(previewMaxPixel) * Double(vaeChannels * 2 + 3) * bytesPerActivation

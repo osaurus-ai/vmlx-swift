@@ -55,7 +55,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, FluxStageModel, @un
     public func stageEncodeImage(_ image: URL, width: Int, height: Int) throws -> MLXArray {
         try pipeline.encodeStageImage(image, width: width, height: height)
     }
-    public func stageDecode(_ latent: MLXArray) throws -> MLXArray { pipeline.decodeStageLatent(latent) }
+    public func stageDecode(_ latent: MLXArray) throws -> MLXArray { pipeline.decodeStageLatent(latent, boundedWorkspace: true) }
     public func stageSample(_ conditioning: FluxStageConditioning, latent: MLXArray,
                             width: Int, height: Int, options: FluxStageSampling,
                             interrupt: FluxInterrupt?, progress: (Int, Int, Double?) -> Void)

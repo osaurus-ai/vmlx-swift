@@ -1029,9 +1029,9 @@ private final class Q21Up {
         upsample = up ? try Q21Conv(store: store, prefix: "\(p).upsampler.resample.1", padding: 1) : nil
         self.inC = inC; self.outC = outC; ft = temporal ? 2 : 1
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, synchronizeResiduals: Bool = false) -> MLXArray {
         var h = x
-        for r in resnets { h = r(h) }
+        for r in resnets { h = r(h); if synchronizeResiduals { eval(h) } }
         guard let upsample else { return h }
         let shortcut = q21DupUp(x, inC: inC, outC: outC, ft: ft)
         let doubled = repeated(repeated(h, count: 2, axis: 1), count: 2, axis: 2)
@@ -1099,10 +1099,10 @@ final class QwenImage21VAE {
     }
 
     /// latents (1, h, w, 64) normalized → image (1, H, W, 4) in [-1, 1].
-    func decode(_ latents: MLXArray, synchronizeStages: Bool = true) -> MLXArray {
+    func decode(_ latents: MLXArray, synchronizeStages: Bool = true, synchronizeResiduals: Bool = false) -> MLXArray {
         var h = postQuant(latents * std + mean)
         h = dMid(dConvIn(h))
-        for u in ups { h = u(h); if synchronizeStages { eval(h) } }
+        for u in ups { h = u(h, synchronizeResiduals: synchronizeResiduals); if synchronizeStages { eval(h) } }
         h = dConvOut(silu(q21ChannelNorm(h, gamma: dNorm)))
         return clip(h, min: Float(-1), max: Float(1))
     }
@@ -1368,8 +1368,11 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         return decodeStageLatent(latent)
     }
 
-    func decodeStageLatent(_ latent: MLXArray) -> MLXArray {
-        let decoded = vae.decode(latent.asType(.float32))
+    func decodeStageLatent(_ latent: MLXArray, boundedWorkspace: Bool = false) -> MLXArray {
+        // Explicit stage jobs keep latents alive across calls (including hires
+        // inputs). Materialize residual blocks separately to bound their VAE
+        // workspace without tiling, changing precision, or changing arithmetic.
+        let decoded = vae.decode(latent.asType(.float32), synchronizeResiduals: boundedWorkspace)
         return VAEDecoder.postprocess(decoded[.ellipsis, 0 ..< 3].transposed(0, 3, 1, 2))
     }
 

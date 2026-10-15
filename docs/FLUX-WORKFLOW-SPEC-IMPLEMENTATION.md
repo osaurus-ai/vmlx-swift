@@ -90,3 +90,11 @@ Z-Image8bit actual peaks:14,749,918,440 bytes at512² and25,140,704,712 at1024²
 Native original Wan2.1 T2V1.3B,49frames832×480,50Euler steps,seed7 completed in522.164s. Start/middle/end frames show the requested red sailboat on a blue lake. Interrupt after first480p step returned cancelled in0.000261s with no output. Exact MP4 duration required both movie and track time scales to be multiples of FPS: the default600Hz track rounded16fps timestamps. The corrected actual5-frame run reports0.3125s exactly. No50step regeneration was needed for this writer-only correction. Original49-frame movie has old rounded3.063333s duration and is not passed off as exact.
 
 App3103 adds local video discovery/zero-cost jobs/API/tool/delegation, shared parent swap/restore policy and actual completion metadata. Live app acceptance remains pending; CLI video output does not establish it. Source/CI checks continue while the final distinct integration rows run.
+
+### Follow-up acceptance and bounded stage decoding
+
+Non-Turbo Qwen2.1 4-bit, seed7,512²,8steps, linear schedule/shift1 produced distinct Euler/Heun images with matching effective metadata. Heun output was visually inspected; the requested red teapot is present. Runtime8.288s/13.398s (Debug probe, host build active; not an app speed claim).
+
+Hires initially produced the correct1536² image but did NOT beat fresh peak:41.2597GB versus41.2593GB. Stage VAE decode now materializes each residual block separately, reducing live convolution workspace without tiling or changing precision/math. The failed-row rerun passed at36.1011GB versus41.2593GB fresh; old/new hires PNG SHA256 both56f93c0101f0557575d713515437c48d7053dc7758f5271b38979ff80bdee37b. Releasing the final handle dropped active memory by exactly1,179,648bytes, matching `retainedBytes(for:)`. Ordinary generate/decode and seeds are unchanged.
+
+Qwen2.1's estimate now uses its144-channel decoder instead of the96-channel encoder and the observed convolution workspace. The512²/1536² measured rows are within8%;1024²/max-size and other families remain uncalibrated. Admission wiring remains under app review; do not promote the all-family memory guarantee yet.
