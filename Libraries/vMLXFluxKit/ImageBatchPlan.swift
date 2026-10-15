@@ -21,7 +21,9 @@ public struct ImageBatchPlan: Sendable, Equatable {
 
     public init(_ request: ImageGenRequest, maximumImages: Int, maximumParallelImages: Int) throws {
         try Self.validate(request, maximumImages: maximumImages)
-        precondition(maximumParallelImages > 0)
+        guard maximumParallelImages > 0 else {
+            throw FluxError.invalidField(field: "maximumParallelImages", value: "\(maximumParallelImages)", allowed: "a positive integer")
+        }
         batchSize = min(request.batchSize, request.numImages, maximumParallelImages)
         seeds = request.seeds ?? (0..<request.numImages).map { index in
             request.seed.map { $0 &+ UInt64(index) } ?? UInt64.random(in: 0...UInt64(UInt32.max))
