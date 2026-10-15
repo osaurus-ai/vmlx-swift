@@ -79,6 +79,10 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             throw FluxError.invalidRequest("Z-Image steps must be greater than zero")
         }
         let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
         let image = try await pipeline.generate(
             prompt: request.prompt,
             negativePrompt: request.negativePrompt,
@@ -86,12 +90,13 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             width: request.width,
             height: request.height,
             steps: request.steps,
-            seed: seed
+            seed: seed, preview: preview
         ) { step, total, eta in
             continuation.yield(.step(step: step, total: total, etaSeconds: eta))
         }
 
-        let outURL = try ImageIO.writePNG(
+        preview?.close()
+                    let outURL = try ImageIO.writePNG(
             image,
             outputDir: request.outputDir,
             prefix: "z-image"

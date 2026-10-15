@@ -951,6 +951,7 @@ final class QwenImageEditPipeline {
         steps: Int,
         guidance: Float,
         seed: UInt64?,
+        preview: ImagePreviewEmitter? = nil,
         progress: (Int, Int, Double?) -> Void
     ) async throws -> MLXArray {
         try await edit(
@@ -961,7 +962,7 @@ final class QwenImageEditPipeline {
             steps: steps,
             guidance: guidance,
             seed: seed,
-            progress: progress)
+            preview: preview, progress: progress)
     }
 
     func edit(
@@ -972,6 +973,7 @@ final class QwenImageEditPipeline {
         steps: Int,
         guidance: Float,
         seed: UInt64?,
+        preview: ImagePreviewEmitter? = nil,
         progress: (Int, Int, Double?) -> Void
     ) async throws -> MLXArray {
         let plan = try QwenImageEditPreprocessPlan(
@@ -1039,6 +1041,11 @@ final class QwenImageEditPipeline {
                 guidance: plan.guidance)
             latents = scheduler.step(latent: latents, velocity: guided, stepIndex: step)
             eval(latents)
+            preview?.emit(step: step + 1) {
+                let spatial = Self.unpackTargetLatents(latents,
+                    targetPatchRows: targetRows, targetPatchColumns: targetColumns)
+                return decoder.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             let elapsed = Date().timeIntervalSince(start)
             progress(step + 1, plan.steps, elapsed / Double(step + 1) * Double(plan.steps - step - 1))
         }

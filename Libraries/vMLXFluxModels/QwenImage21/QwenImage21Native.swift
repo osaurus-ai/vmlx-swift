@@ -1099,10 +1099,10 @@ final class QwenImage21VAE {
     }
 
     /// latents (1, h, w, 64) normalized → image (1, H, W, 4) in [-1, 1].
-    func decode(_ latents: MLXArray) -> MLXArray {
+    func decode(_ latents: MLXArray, synchronizeStages: Bool = true) -> MLXArray {
         var h = postQuant(latents * std + mean)
         h = dMid(dConvIn(h))
-        for u in ups { h = u(h); eval(h) }
+        for u in ups { h = u(h); if synchronizeStages { eval(h) } }
         h = dConvOut(silu(q21ChannelNorm(h, gamma: dNorm)))
         return clip(h, min: Float(-1), max: Float(1))
     }
@@ -1281,6 +1281,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         width: Int?, height: Int?, steps: Int, guidance: Float, seed: UInt64,
         outputResolution: Int = 1024,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        preview: ImagePreviewEmitter? = nil,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
@@ -1288,7 +1289,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
             references: references, width: width, height: height, steps: steps,
             guidance: guidance, outputResolution: outputResolution)
         return try sample(prepared, seed: seed, sampler: sampler, scheduler: scheduler, shift: shift,
-            resolved: resolved, progress: progress)
+            preview: preview, resolved: resolved, progress: progress)
     }
 
     func prepare(
@@ -1355,6 +1356,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
     func sample(
         _ prepared: Prepared, seed: UInt64, interrupt: FluxInterrupt? = nil,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        preview: ImagePreviewEmitter? = nil,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
@@ -1448,6 +1450,12 @@ final class QwenImage21Pipeline: @unchecked Sendable {
                 latents = proposed
             }
             eval(latents)
+            preview?.emit(step: step + 1) {
+                let spatial = latents.reshaped([1, hLat, wLat, cfg.zDim]).transposed(0, 3, 1, 2)
+                let small = preview!.reducedLatent(spatial, scale: 16).transposed(0, 2, 3, 1)
+                let decoded = vae.decode(small.asType(.float32), synchronizeStages: false)
+                return (decoded[.ellipsis, 0 ..< 3].transposed(0, 3, 1, 2) + 1) / 2
+            }
             if dumpURL != nil, step == 0 { dump["noise_step0"] = noise }
             let elapsed = Date().timeIntervalSince(start)
             progress(step + 1, steps, elapsed / Double(step + 1) * Double(steps - step - 1))

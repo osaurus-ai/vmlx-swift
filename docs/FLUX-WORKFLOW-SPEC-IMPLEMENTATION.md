@@ -35,3 +35,9 @@ Requests and model limits now carry sampler, scheduler and shift choices. Qwen-I
 The default Euler arithmetic and seed sequence are preserved. Two focused tests cover native shift replay and bundle-specific validation; the full package compiles. Actual alternate-sampler output, Osaurus controls/API forwarding, and integrated app verification are pending. No model generation was run for this change yet. Existing image batching proofs are reused; they do not prove the new Heun path.
 
 Per the latest user direction, implementation takes priority over repeated proof runs: run focused tests when behavior changes, retain existing evidence, and perform one integrated live app check per completed stage. Expand verification only for a failure or material risk.
+
+### Preview implementation (stage 1.7)
+
+Optional request preview cadence and maximum pixels now reach every currently implemented native generation/edit pipeline. The real VAE decodes a reduced latent. Graph submission stays on the sampling lane; PNG encoding runs on a utility worker with one in-flight preview per request. Busy work and memory pressure drop previews. Outputs stay below 64 KiB, within the requested size, and stop before terminal events. Defaults remain off.
+
+The engine target compiles. The consolidated generation pass still needs to measure preview count, image quality and <=5% overhead; those are not proven by compilation. Unsupported/stub model entries are not claimed as implemented.

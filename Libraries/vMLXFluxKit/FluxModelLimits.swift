@@ -120,6 +120,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     }
 
     public func validate(_ request: ImageGenRequest) throws {
+        try validatePreview(interval: request.previewInterval, maxPixel: request.previewMaxPixel)
         try validateSampling(sampler: request.sampler, scheduler: request.scheduler, shift: request.shift)
         try validateCommon(width: request.width, height: request.height, steps: request.steps,
                            guidance: request.guidance, format: request.outputFormat)
@@ -131,6 +132,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     }
 
     public func validate(_ request: ImageEditRequest) throws {
+        try validatePreview(interval: request.previewInterval, maxPixel: request.previewMaxPixel)
         try validateSampling(sampler: request.sampler, scheduler: request.scheduler, shift: request.shift)
         try validateEdit(width: request.width, height: request.height, steps: request.steps,
                          guidance: request.guidance, format: request.outputFormat,
@@ -155,6 +157,16 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         }
         if let strength, !supportsStrength, strength != 1 {
             throw FluxError.invalidField(field: "strength", value: "\(strength)", allowed: "omitted or 1; partial denoising is not supported")
+        }
+    }
+
+    public func validatePreview(interval: Int?, maxPixel: Int) throws {
+        guard let interval else { return }
+        guard interval > 0 else {
+            throw FluxError.invalidField(field: "previewInterval", value: "\(interval)", allowed: "a positive step interval")
+        }
+        guard (16...1024).contains(maxPixel) else {
+            throw FluxError.invalidField(field: "previewMaxPixel", value: "\(maxPixel)", allowed: "16...1024 pixels")
         }
     }
 

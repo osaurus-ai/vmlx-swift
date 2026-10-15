@@ -1136,7 +1136,7 @@ final class ZImageNativePipeline {
         height: Int,
         steps: Int,
         seed: UInt64?,
-        progress: (Int, Int, Double?) -> Void
+        preview: ImagePreviewEmitter? = nil, progress: (Int, Int, Double?) -> Void
     ) async throws -> MLXArray {
         guard width % 16 == 0, height % 16 == 0 else {
             throw FluxError.invalidRequest("Z-Image width and height must be divisible by 16")
@@ -1158,6 +1158,10 @@ final class ZImageNativePipeline {
             }
             latents = latents + noise * MLXArray(sigmas[step + 1] - sigmas[step])
             eval(latents)
+            preview?.emit(step: step + 1) {
+                let spatial = latents.reshaped([1, ZImageNative.channels, height / 8, width / 8])
+                return vae.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             let elapsed = Date().timeIntervalSince(start)
             let perStep = elapsed / Double(step + 1)
             progress(step + 1, steps, perStep * Double(steps - step - 1))

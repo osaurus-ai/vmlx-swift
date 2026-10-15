@@ -21,6 +21,8 @@ public struct ImageGenRequest: Sendable {
     public var sampler: String?
     public var scheduler: String?
     public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
 
     public init(
         prompt: String,
@@ -36,7 +38,8 @@ public struct ImageGenRequest: Sendable {
         interrupt: FluxInterrupt? = nil,
         outputDir: URL,
         outputFormat: ImageFormat = .png,
-        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -54,6 +57,8 @@ public struct ImageGenRequest: Sendable {
         self.sampler = sampler
         self.scheduler = scheduler
         self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
     }
 }
 
@@ -75,6 +80,8 @@ public struct ImageEditRequest: Sendable {
     public var sampler: String?
     public var scheduler: String?
     public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
 
     public init(
         prompt: String,
@@ -88,7 +95,8 @@ public struct ImageEditRequest: Sendable {
         seed: UInt64? = nil,
         outputDir: URL,
         outputFormat: ImageFormat = .png,
-        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256
     ) {
         self.prompt = prompt
         self.sourceImage = sourceImage
@@ -105,6 +113,8 @@ public struct ImageEditRequest: Sendable {
         self.sampler = sampler
         self.scheduler = scheduler
         self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
     }
 
     public init(
@@ -119,7 +129,8 @@ public struct ImageEditRequest: Sendable {
         seed: UInt64? = nil,
         outputDir: URL,
         outputFormat: ImageFormat = .png,
-        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
@@ -139,6 +150,8 @@ public struct ImageEditRequest: Sendable {
         self.sampler = sampler
         self.scheduler = scheduler
         self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
     }
 }
 

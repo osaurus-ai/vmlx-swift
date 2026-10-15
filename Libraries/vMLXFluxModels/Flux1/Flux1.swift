@@ -57,16 +57,21 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
                 guard let self else { continuation.finish(); return }
                 do {
                     let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Flux steps must be greater than zero")
                     }
                     let image = try self.pipeline.generate(
                         prompt: request.prompt,
                         width: request.width, height: request.height,
-                        steps: request.steps, seed: seed
+                        steps: request.steps, seed: seed, preview: preview
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
+                    preview?.close()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "flux1-schnell")
                     continuation.yield(.completed(url: outURL, seed: seed,
                         effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: 0, seed: seed, scheduler: "flux-flow", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16)))))

@@ -798,7 +798,7 @@ final class Ideogram4Pipeline {
         steps: Int,
         guidance: Float,
         seed: UInt64?,
-        progress: (Int, Int, Double?) -> Void
+        preview: ImagePreviewEmitter? = nil, progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
         try Ideogram4Latents.validateDimensions(width: width, height: height)
         let tokenIDs = try tokenizer.ids(prompt)
@@ -837,6 +837,10 @@ final class Ideogram4Pipeline {
             let velocity = MLXArray(g) * positiveVelocity + (MLXArray(Float(1)) - MLXArray(g)) * negativeVelocity
             latents = latents + velocity * MLXArray(s - t)
             eval(latents)
+            preview?.emit(step: step + 1) {
+                guard let spatial = try? Ideogram4Latents.unpack(latents, width: width, height: height) else { return nil }
+                return vae.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             let elapsed = Date().timeIntervalSince(start)
             progress(step + 1, steps, elapsed / Double(step + 1) * Double(steps - step - 1))
         }

@@ -107,9 +107,13 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                     let started = Date()
                     for (index, seed) in plan.seeds.enumerated() {
                         try interrupt.check()
+                        let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                            continuation.yield(.preview(pngData: data, step: step))
+                        }
+                        defer { preview?.close() }
                         var effective: EffectiveImageParameters?
                         let image = try pipeline.sample(prepared, seed: seed, interrupt: interrupt,
-                            sampler: request.sampler, scheduler: request.scheduler, shift: request.shift,
+                            sampler: request.sampler, scheduler: request.scheduler, shift: request.shift, preview: preview,
                             resolved: { effective = $0 }, progress: { step, total, eta in
                                 let completed = index * total + step
                                 let all = total * plan.seeds.count
@@ -117,6 +121,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                                 continuation.yield(.step(step: completed, total: all, etaSeconds: remaining))
                             })
                         try interrupt.check()
+                        preview?.close()
                         let url = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: outputPrefix)
                         if interrupt.isCancelled {
                             try FileManager.default.removeItem(at: url)
@@ -147,27 +152,32 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
         do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
         catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
         let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed) { pipeline, progress, resolved in
+        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed, previewInterval: request.previewInterval, previewMaxPixel: request.previewMaxPixel) { pipeline, progress, resolved, preview in
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: nil, references: request.sourceImages,
                 width: request.width, height: request.height, steps: request.steps,
                 guidance: request.guidance, seed: seed, sampler: request.sampler,
-                scheduler: request.scheduler, shift: request.shift, resolved: resolved, progress: progress)
+                scheduler: request.scheduler, shift: request.shift, preview: preview, resolved: resolved, progress: progress)
         }
     }
 
     private func run(
-        prefix: String, outputDir: URL, seed: UInt64,
-        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void) throws -> MLXArray
+        prefix: String, outputDir: URL, seed: UInt64, previewInterval: Int? = nil, previewMaxPixel: Int = 256,
+        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void, ImagePreviewEmitter?) throws -> MLXArray
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let preview = ImagePreviewEmitter(interval: previewInterval, maxPixel: previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     var parameters: EffectiveImageParameters?
                     let image = try body(self.pipeline, { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
-                    }, { parameters = $0 })
+                    }, { parameters = $0 }, preview)
+                    preview?.close()
                     let url = try ImageIO.writePNG(image, outputDir: outputDir, prefix: prefix)
                     continuation.yield(.completed(url: url, seed: seed, effectiveParameters: parameters))
                     continuation.finish()
