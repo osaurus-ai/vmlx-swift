@@ -12,7 +12,7 @@ Active scope: the entire https://gist.github.com/tpae/bb9f4a8384abe07446448128ba
 | 1.5 samplers | Engine602/app3099 implemented | Actual non-Turbo Euler/Heun comparison passed |
 | 1.6 adapters | Engine605/app3101 implemented | Real adapter zero/cache/removal parity passed; integrated app controls |
 | 1.7 previews | Engine603/app3100 implemented, corrected in607 | Z512 3 previews, byte parity, paired ratio0.969 passed; integrated app |
-| 1.8 memory | Engine604 implemented, calibration corrected in607 | Z/Qwen2.1 plus Flux/Ideogram/legacy Qwen measured; SeedVR2 calibration and final app admission pending |
+| 1.8 memory | Engine604 implemented, calibration corrected in607 | Z/Qwen2.1 plus Flux/Ideogram/legacy Qwen measured; SeedVR2 512/1024/4096 calibration passed; final app admission pending |
 | 1.9 local video | Engine607/app3103 implemented | Real T2V49-frame480p and I2V9-frame512×288 rendered; cancel/exact duration passed; app pending |
 | Stage2 | Engine606 implemented | Parity/reuse/mix/cancel/stale/hires/lifetime passed; reuse recorded evidence |
 
@@ -23,7 +23,7 @@ Private evidence and historical proof: `~/vmlx-private-evidence/flux-workflows-2
 ## Remaining-family parameter contracts
 Implemented engine limits and effective output metadata for the existing Flux Schnell, Z-Image, Qwen-Image, Qwen-Image-Edit and Ideogram pipelines. Unsupported registry scaffolds still expose no invented contract. Explicit seeds keep the existing noise paths; unspecified seeds are resolved once and reported for replay. Guidance thresholds describe the actual negative-conditioning math (Z-Image >0; Qwen always runs both branches).
 
-Focused limit validation and backward-compatible decoding pass. Real512² seeded replay is byte-exact for Flux Schnell4steps, Z-Image4steps, Qwen30steps and Ideogram20steps; each checks emitted step count and actual PNG size. Qwen edit's1000-to992 rounding test is implemented but live execution remains pending for the integrated stage check. Raw evidence: ~/vmlx-private-evidence/flux-workflows-20261014/*contract-replay.log. Engine evidence does not imply Osaurus family-wide parameter adoption is complete.
+Focused limit validation and backward-compatible decoding pass. Real512² seeded replay is byte-exact for Flux Schnell4steps, Z-Image4steps, Qwen30steps and Ideogram20steps; each checks emitted step count and actual PNG size. Qwen edit's 1000-to-992 rounding replay also passed with byte-identical output; see the dated calibration receipt below. Raw evidence: ~/vmlx-private-evidence/flux-workflows-20261014/*contract-replay.log. Engine evidence does not imply Osaurus family-wide parameter adoption is complete.
 
 User changed the proof cadence: use focused change-specific checks and reuse prior evidence, then one integrated live application check per completed stage. Do not repeat unrelated whole-model matrices for every edit.
 
@@ -31,7 +31,7 @@ User changed the proof cadence: use focused change-specific checks and reuse pri
 
 Requests and model limits now carry sampler, scheduler and shift choices. Qwen-Image-2.1 implements Euler and Heun, its native schedule and a linear schedule, and an explicit exponential shift. Turbo advertises only Euler with its bundle sigma grid; unsupported overrides return typed errors. Other implemented families advertise their existing Euler/native schedule, without claiming alternate samplers or shift support.
 
-The default Euler arithmetic and seed sequence are preserved. Two focused tests cover native shift replay and bundle-specific validation; the full package compiles. Actual alternate-sampler output, Osaurus controls/API forwarding, and integrated app verification are pending. No model generation was run for this change yet. Existing image batching proofs are reused; they do not prove the new Heun path.
+The default Euler arithmetic and seed sequence are preserved. Two focused tests cover native shift replay and bundle-specific validation; the full package compiles. Actual non-Turbo Euler/Heun output passed in the dated acceptance receipt below. Osaurus controls/API forwarding are implemented; integrated app acceptance remains pending. Existing image batching proofs are reused; they do not prove the new Heun path.
 
 Per the latest user direction, implementation takes priority over repeated proof runs: run focused tests when behavior changes, retain existing evidence, and perform one integrated live app check per completed stage. Expand verification only for a failure or material risk.
 
@@ -39,13 +39,13 @@ Per the latest user direction, implementation takes priority over repeated proof
 
 Optional request preview cadence and maximum pixels now reach every currently implemented native generation/edit pipeline. The real VAE decodes a reduced latent. Graph submission stays on the sampling lane; PNG encoding runs on a utility worker with one in-flight preview per request. Busy work and memory pressure drop previews. Outputs stay below 64 KiB, within the requested size, and stop before terminal events. Defaults remain off.
 
-The engine target compiles. The consolidated generation pass still needs to measure preview count, image quality and <=5% overhead; those are not proven by compilation. Unsupported/stub model entries are not claimed as implemented.
+The engine target compiles. The corrected real preview run emitted three bounded previews, retained final PNG byte parity and measured a 0.969 wall-time ratio; see the dated receipt and its measurement limits below. Unsupported/stub model entries are not claimed as implemented.
 
 ### Request memory estimates (stage 1.8, calibration pending)
 
 Generation/edit/upscale request queries now resolve actual dimensions, native parallel width, reference conditioning and preview workspace. Weight payload bytes are read from the same shard groups as WeightLoader without loading tensors. The API also accepts a model URL for pre-load admission callers.
 
-The per-family activation/VAE coefficients are analytical estimates, not measured bounds. The ±15% acceptance comparison is pending the consolidated run; Osaurus must not use this draft to replace admission decisions yet. Allocator cache and other resident models remain separate host accounting concerns.
+The per-family activation/VAE coefficients are calibrated estimates, not hard bounds. The measured families and sizes are listed below; arbitrary dimensions/adapters/devices do not have a universal ±15% guarantee. SeedVR2 calibration is also recorded below. Allocator cache and other resident models remain separate host accounting concerns.
 
 ### 1.6 Request-scoped LoRA adapters (implementation)
 
@@ -53,7 +53,7 @@ The per-family activation/VAE coefficients are analytical estimates, not measure
 
 An engine operation lease keeps load/unload and concurrent generate/edit operations from replacing adapter state while a stream is active. The last set is cached by file SHA256, scale and target. Scale zero takes the base arithmetic path and does not open an adapter file. Clearing the request removes deltas; it never subtracts rounded fused weights. `adapterLoadCount` counts actual installations. Generation/edit through FluxEngine is the supported adapter entry point.
 
-Compilation passes. A real adapter image, scale-zero/base byte parity, repeated-set load count and removal parity remain part of the combined integration pass. This is not yet a live-accepted capability. No seed changes.
+Compilation and the real Z-Image adapter runtime checks pass: scale-zero/base byte parity, repeated-set load count and removal parity are recorded below. This is engine runtime evidence; Osaurus adapter wiring still needs integrated app acceptance. No seed changes.
 
 ### Stage 2 — native Qwen-Image-2.1/Turbo handles (implementation)
 
@@ -63,7 +63,7 @@ Prompt cache keys include adapter content identity; changing an adapter after en
 
 Stage sample/decode estimates include retained handles, conservatively counting aliases; estimator calibration remains pending. Array buffers are evaluated before storage, and release drops engine ownership without clearing the host allocator cache. A handle shared by another handle naturally remains allocated until the last owner is released.
 
-The engine target compiles (`stages-build.log`). Byte parity, actual handle memory release, cancellation, hires-fix peak memory and visual output are pending the consolidated real integration pass. No claim of completed Stage 2 acceptance or all-family support yet.
+The engine target compiles (`stages-build.log`). The dated runtime receipts below cover byte parity, handle memory release, cancellation, hires-fix peak memory and visual output. Stage support remains limited to Qwen-Image-2.1/Turbo; this does not claim all-family support or an Osaurus workflow graph editor.
 
 ### 1.9 Native Wan 2.1 video (implementation)
 
@@ -77,7 +77,7 @@ A related cancellation correction keeps the engine consuming the inner image/vid
 
 Source reference: Apple MLX examples at `796f5b53cab69a3d48a44233ce21aae889e94a08`, video/wan2.1. License retained in `docs/third-party/mlx-examples-WAN-LICENSE.txt`.
 
-Engine compilation passes (`wan-build.log`). Actual 49-frame 480p output/duration, cancellation latency, first-frame fidelity, runtime memory and Osaurus local-video adoption are not yet accepted. The converter and port still need real original checkpoint validation. Do not claim this implementation draft is a proven video runtime.
+Engine compilation and actual original-checkpoint T2V/I2V runs pass, as recorded below. The 49-frame T2V image content was inspected; exact clock correction was verified on a short clip rather than repeating generation. Osaurus local-video acceptance remains pending after the discovery and duration-validation corrections.
 
 ## Consolidated runtime update — 2026-10-15
 
@@ -104,3 +104,9 @@ Qwen2.1's estimate now uses its144-channel decoder instead of the96-channel enco
 Qwen-Image-Edit1000² rounding replay passed:992²,30steps,seed7,byte-identical output (620.722s combined test). Missing family memory rows then identified additional decoder-workspace underestimates: Flux1024² estimated19.087GB against32.265GB measured, and Ideogram2048² estimated31.296GB against76.615GB. The decoder coefficients now include the measured untiled convolution workspace. Metadata-only queries against the same measured runs yield errors of−2.3%/+2.4% for Flux512/1024;−3.3%/−3.3%/+2.5% for Ideogram512/1024/2048;−3.9%/+0.9% for Qwen512/1024;−2.5%/+1.2% for QwenEdit512/1024. This calibration does not claim a guarantee for arbitrary dimensions, adapters or devices. Adapter payload bytes are now included instead of omitted. SeedVR2 remains the uncalibrated family.
 
 Original Wan-AI/Wan2.1-I2V-14B-480P revision6b73f84e66371cdfe870c72acd6826e1d61cf279 passed a real source-image run:512×288,9frames,16fps,20Euler steps,guidance5,seed7,123.890s. Duration0.5625s is exact; start/middle/end frames preserve the red teapot source with camera motion. Peak80.796GB. This is engine I2V evidence, not app or480p I2V proof. Raw wan-i2v-source.log and contact.png remain private.
+
+### Final SeedVR2 calibration and corrected app replay
+
+SeedVR2's tiled decoder was incorrectly estimated as an untiled two-feature-map VAE. Real output sizes 512/1024/4096 measured MLX peaks 15,490,898,234 / 15,605,734,466 / 15,889,849,410 bytes. The corrected model accounts for the bounded 512px convolution workspace, whole-output buffers, and the transformer's 2x2 patch packing after VAE/8. Metadata-only estimates against those same completed runs are 15,495,044,870 / 15,608,291,078 / 18,153,529,094 bytes: +0.027%, +0.016%, +14.25%. No inference was repeated to evaluate the estimator correction. Raw `memory-seedvr.log`, `seedvr-corrected-estimates.log`, and `seedvr-memory-comparison.json` remain in the private evidence directory. This is MLX peak calibration, not a bound on host color-processing allocations or physical footprint.
+
+Osaurus Release head 128edcaa0, engine 3a0674611, replayed the failed native video scenario successfully: Diplodocus Orchestrator spawned Raptor Helper, the video tool completed in 8.18s, the parent displayed the MP4 artifact and resumed with Diplodocus loaded. File inspection confirms 160x96, 5 frames, 16fps, exactly 0.3125s. The model initially omitted the required duration; typed validation rejected that call, and the next call supplied it. No sampling or prompt override was added. A separate existing file-claim advisory incorrectly retried the successful media answer once; the app follow-up now recognizes completed media artifact receipts. That classification correction is covered by focused app tests, not a repeated video-generation matrix.

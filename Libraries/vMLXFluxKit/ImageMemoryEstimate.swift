@@ -49,7 +49,8 @@ public enum ImageMemoryEstimator {
         case "ideogram":
             hidden = integer("hidden_size", 2048); latentScale = 16; textRows = 512; vaeChannels = 128
         case "seedvr2":
-            hidden = integer("hidden_size", 2560); latentScale = 8; textRows = 0; vaeChannels = 128
+            // VAE downsamples by 8; the transformer then packs 2x2 patches.
+            hidden = integer("hidden_size", 2560); latentScale = 16; textRows = 58; vaeChannels = 128
         default:
             throw FluxError.notImplemented("peak memory estimate for \(family)")
         }
@@ -88,6 +89,16 @@ public enum ImageMemoryEstimator {
         default: decodeMaps = 2
         }
         var decode = pixels * batch * Double(vaeChannels * decodeMaps + 3) * bytesPerActivation
+        if family == "seedvr2" {
+            // SeedVR2VAETiling evaluates at most a 512px decoder tile, even
+            // for a large output. Its convolution workspace dominates small
+            // jobs: measured peaks are 15.491/15.606 GB at 512/1024 with
+            // 4.723 GB of live weights. The calibrated tile workspace is
+            // separate from the full-resolution assembly/output buffers.
+            let tilePixels = Double(min(width, 512)) * Double(min(height, 512))
+            decode = (tilePixels * Double(vaeChannels) * 80 + pixels * 36)
+                * bytesPerActivation * batch
+        }
         if let previewMaxPixel {
             decode += Double(previewMaxPixel) * Double(previewMaxPixel) * Double(vaeChannels * 2 + 3) * bytesPerActivation
         }

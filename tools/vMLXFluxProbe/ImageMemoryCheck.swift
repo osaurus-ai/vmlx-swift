@@ -24,7 +24,12 @@ func runImageMemoryCheck(_ arguments: [String], estimateOnly: Bool = false) asyn
         let start = Date()
         let estimate: Int
         let events: AsyncThrowingStream<ImageGenEvent, Error>?
-        if arguments.count > 4 {
+        if family == "seedvr2", arguments.count > 4 {
+            let source = URL(fileURLWithPath: arguments[4]).appendingPathComponent("\(size / 2).png")
+            let request = UpscaleRequest(sourceImage: source, scale: 2, steps: 1, seed: 7, outputDir: output)
+            estimate = try await engine.estimatedPeakBytes(for: request, modelURL: model, name: family)
+            if estimateOnly { events = nil } else { events = await engine.upscale(request) }
+        } else if arguments.count > 4 {
             let request = ImageEditRequest(prompt: "Make the teapot blue.",
                 sourceImage: URL(fileURLWithPath: arguments[4]), width: size, height: size,
                 steps: limits.fixedSteps ?? 2, guidance: 4, seed: 7, outputDir: output)
