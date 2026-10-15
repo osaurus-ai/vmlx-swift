@@ -205,9 +205,12 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed):
+                            case .completed(let url, let seed, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
+                                if let effectiveParameters {
+                                    record["effective_parameters"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(effectiveParameters))
+                                }
                             case .failed(let message, let hfAuth):
                                 record["status"] = "failed_event"
                                 record["message"] = message
@@ -278,9 +281,12 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed):
+                            case .completed(let url, let seed, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
+                                if let effectiveParameters {
+                                    record["effective_parameters"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(effectiveParameters))
+                                }
                             case .failed(let message, let hfAuth):
                                 record["status"] = "failed_event"
                                 record["message"] = message

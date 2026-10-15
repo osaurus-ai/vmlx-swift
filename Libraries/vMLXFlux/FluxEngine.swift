@@ -28,6 +28,19 @@ public actor FluxEngine {
 
     public init() {}
 
+    /// Query implemented request constraints without loading model weights.
+    /// Supply the canonical name when a bundle directory has a custom name.
+    public func limits(for modelURL: URL, name: String? = nil) throws -> FluxModelLimits {
+        VMLXFluxModels.registerAll()
+        guard let entry = ModelRegistry.lookupFuzzy(name: name ?? modelURL.lastPathComponent) else {
+            throw FluxError.unknownModel(name ?? modelURL.lastPathComponent)
+        }
+        guard let query = entry.limits else {
+            throw FluxError.notImplemented("request limits for \(entry.name)")
+        }
+        return try query(modelURL)
+    }
+
     // MARK: - Load / unload
 
     /// Load a model by canonical name. Mirrors the Python mflux

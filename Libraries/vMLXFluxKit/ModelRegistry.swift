@@ -16,6 +16,8 @@ public struct ModelEntry: Sendable {
     public let defaultSteps: Int
     public let defaultGuidance: Float
     public let supportsLoRA: Bool
+    /// Reads configuration only; must not load tensors or construct the model.
+    public let limits: (@Sendable (URL) throws -> FluxModelLimits)?
     /// Loader — constructs the concrete model from a local weights dir +
     /// optional quantization bits. Called from inside `FluxEngine` actor.
     public let loader: @Sendable (URL, Int?) async throws -> any FluxModel
@@ -27,6 +29,7 @@ public struct ModelEntry: Sendable {
         defaultSteps: Int,
         defaultGuidance: Float,
         supportsLoRA: Bool = false,
+        limits: (@Sendable (URL) throws -> FluxModelLimits)? = nil,
         loader: @Sendable @escaping (URL, Int?) async throws -> any FluxModel
     ) {
         self.name = name
@@ -35,6 +38,7 @@ public struct ModelEntry: Sendable {
         self.defaultSteps = defaultSteps
         self.defaultGuidance = defaultGuidance
         self.supportsLoRA = supportsLoRA
+        self.limits = limits
         self.loader = loader
     }
 }

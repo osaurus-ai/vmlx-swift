@@ -46,7 +46,7 @@ public struct ImageEditRequest: Sendable {
     public var sourceImage: URL
     public var sourceImages: [URL]
     public var mask: URL?          // optional PNG mask — white=edit, black=keep
-    public var strength: Float     // 0..1 — how much to deviate from source
+    public var strength: Float?    // nil uses the backend's native editing behavior
     public var width: Int?         // nil → match source
     public var height: Int?
     public var steps: Int
@@ -59,7 +59,7 @@ public struct ImageEditRequest: Sendable {
         prompt: String,
         sourceImage: URL,
         mask: URL? = nil,
-        strength: Float = 0.75,
+        strength: Float? = nil,
         width: Int? = nil,
         height: Int? = nil,
         steps: Int = 20,
@@ -86,7 +86,7 @@ public struct ImageEditRequest: Sendable {
         prompt: String,
         sourceImages: [URL],
         mask: URL? = nil,
-        strength: Float = 0.75,
+        strength: Float? = nil,
         width: Int? = nil,
         height: Int? = nil,
         steps: Int = 20,
@@ -190,7 +190,9 @@ public enum ImageGenEvent: Sendable {
     /// every N steps if the scheduler supports it.
     case preview(pngData: Data, step: Int)
     /// Generation finished. `url` points to the saved image on disk.
-    case completed(url: URL, seed: UInt64)
+    /// Metadata is nil for backends that have not implemented effective-parameter reporting.
+    /// Callers must not substitute the requested parameters for missing runtime metadata.
+    case completed(url: URL, seed: UInt64, effectiveParameters: EffectiveImageParameters? = nil)
     /// Fatal error. `hfAuth=true` signals a HuggingFace 401/403 so the UI
     /// can show a "Add HF token" CTA instead of a generic error banner.
     case failed(message: String, hfAuth: Bool)

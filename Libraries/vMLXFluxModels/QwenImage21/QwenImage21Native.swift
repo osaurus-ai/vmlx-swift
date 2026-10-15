@@ -1261,6 +1261,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         prompt: String, negativePrompt: String?, references: [URL],
         width requestedWidth: Int?, height requestedHeight: Int?,
         steps requestedSteps: Int, guidance: Float, seed: UInt64, outputResolution: Int = 1024,
+        resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
         // A bundle with a fixed grid (Turbo) samples on it: the grid sets the step count, as in diffusers.
@@ -1290,6 +1291,11 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         guard width >= 32, height >= 32, width % 32 == 0, height % 32 == 0 else {
             throw FluxError.invalidRequest("Qwen-Image-2.1 dimensions must be positive multiples of 32.")
         }
+        resolved(EffectiveImageParameters(
+            width: width, height: height, steps: steps,
+            guidance: guidance > 1 ? guidance : 1, seed: seed,
+            sampler: "euler", scheduler: sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas",
+            sampleSigmas: sampleSigmas))
 
         let (embeds, slots) = encodePrompt(prompt, references: refs)
         var negative: (MLXArray, [Bool])?
