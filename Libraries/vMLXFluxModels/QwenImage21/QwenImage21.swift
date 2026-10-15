@@ -65,7 +65,11 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             dimensionMultiple: 32, minDimension: 32, minimumSteps: 2, fixedSteps: fixedSteps,
             supportsNegativePrompt: true, supportsEditNegativePrompt: false,
             supportsStrength: false, supportsMask: false, maxSourceImages: 10, supportedFormats: [.png],
-            maximumImages: 8, maximumParallelImages: 1)
+            maximumImages: 8, maximumParallelImages: 1,
+            samplers: fixedSteps == nil ? ["euler", "heun"] : ["euler"],
+            schedulers: fixedSteps == nil ? ["qwen-image-2.1", "linear"] : ["bundle-sigmas"],
+            defaultSampler: "euler", defaultScheduler: fixedSteps == nil ? "qwen-image-2.1" : "bundle-sigmas",
+            supportsShift: fixedSteps == nil)
     }
 
     public init(modelPath: URL, quantize: Int?, requiresFixedSchedule: Bool = false) async throws {
@@ -105,6 +109,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                         try interrupt.check()
                         var effective: EffectiveImageParameters?
                         let image = try pipeline.sample(prepared, seed: seed, interrupt: interrupt,
+                            sampler: request.sampler, scheduler: request.scheduler, shift: request.shift,
                             resolved: { effective = $0 }, progress: { step, total, eta in
                                 let completed = index * total + step
                                 let all = total * plan.seeds.count
@@ -146,7 +151,8 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: nil, references: request.sourceImages,
                 width: request.width, height: request.height, steps: request.steps,
-                guidance: request.guidance, seed: seed, resolved: resolved, progress: progress)
+                guidance: request.guidance, seed: seed, sampler: request.sampler,
+                scheduler: request.scheduler, shift: request.shift, resolved: resolved, progress: progress)
         }
     }
 

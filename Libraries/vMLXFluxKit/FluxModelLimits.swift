@@ -16,6 +16,11 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     public let supportsMask: Bool
     public let maxSourceImages: Int
     public let supportedFormats: [ImageFormat]
+    public let samplers: [String]
+    public let schedulers: [String]
+    public let defaultSampler: String?
+    public let defaultScheduler: String?
+    public let supportsShift: Bool
     public let maximumImages: Int
     public let maximumParallelImages: Int
     /// Nil means the pipeline always consumes negative conditioning, even at CFG <= 1.
@@ -28,7 +33,9 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         supportsEditNegativePrompt: Bool, supportsStrength: Bool,
         supportsMask: Bool, maxSourceImages: Int, supportedFormats: [ImageFormat],
         maximumImages: Int = 1, maximumParallelImages: Int = 1,
-        negativePromptRequiresGuidanceAbove: Float? = 1
+        negativePromptRequiresGuidanceAbove: Float? = 1,
+        samplers: [String] = [], schedulers: [String] = [],
+        defaultSampler: String? = nil, defaultScheduler: String? = nil, supportsShift: Bool = false
     ) {
         self.dimensionMultiple = dimensionMultiple
         self.minDimension = minDimension
@@ -43,12 +50,18 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         self.supportsMask = supportsMask
         self.maxSourceImages = maxSourceImages
         self.supportedFormats = supportedFormats
+        self.samplers = samplers
+        self.schedulers = schedulers
+        self.defaultSampler = defaultSampler
+        self.defaultScheduler = defaultScheduler
+        self.supportsShift = supportsShift
         self.maximumImages = maximumImages
         self.maximumParallelImages = maximumParallelImages
         self.negativePromptRequiresGuidanceAbove = negativePromptRequiresGuidanceAbove
     }
 
     private enum CodingKeys: String, CodingKey {
+        case samplers, schedulers, defaultSampler, defaultScheduler, supportsShift
         case dimensionMultiple, minDimension, maxDimension, maxPixels, minimumSteps, maximumSteps, fixedSteps
         case supportsNegativePrompt, supportsEditNegativePrompt, supportsStrength, supportsMask, maxSourceImages
         case supportedFormats, maximumImages, maximumParallelImages, negativePromptRequiresGuidanceAbove
@@ -73,11 +86,21 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
             maximumImages: try c.decodeIfPresent(Int.self, forKey: .maximumImages) ?? 1,
             maximumParallelImages: try c.decodeIfPresent(Int.self, forKey: .maximumParallelImages) ?? 1,
             negativePromptRequiresGuidanceAbove: c.contains(.negativePromptRequiresGuidanceAbove)
-                ? try c.decodeIfPresent(Float.self, forKey: .negativePromptRequiresGuidanceAbove) : 1)
+                ? try c.decodeIfPresent(Float.self, forKey: .negativePromptRequiresGuidanceAbove) : 1,
+            samplers: try c.decodeIfPresent([String].self, forKey: .samplers) ?? [],
+            schedulers: try c.decodeIfPresent([String].self, forKey: .schedulers) ?? [],
+            defaultSampler: try c.decodeIfPresent(String.self, forKey: .defaultSampler),
+            defaultScheduler: try c.decodeIfPresent(String.self, forKey: .defaultScheduler),
+            supportsShift: try c.decodeIfPresent(Bool.self, forKey: .supportsShift) ?? false)
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(samplers, forKey: .samplers)
+        try c.encode(schedulers, forKey: .schedulers)
+        try c.encode(defaultSampler, forKey: .defaultSampler)
+        try c.encode(defaultScheduler, forKey: .defaultScheduler)
+        try c.encode(supportsShift, forKey: .supportsShift)
         try c.encode(dimensionMultiple, forKey: .dimensionMultiple)
         try c.encode(minDimension, forKey: .minDimension)
         try c.encode(maxDimension, forKey: .maxDimension)
@@ -97,6 +120,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     }
 
     public func validate(_ request: ImageGenRequest) throws {
+        try validateSampling(sampler: request.sampler, scheduler: request.scheduler, shift: request.shift)
         try validateCommon(width: request.width, height: request.height, steps: request.steps,
                            guidance: request.guidance, format: request.outputFormat)
         try ImageBatchPlan.validate(request, maximumImages: maximumImages)
@@ -107,6 +131,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     }
 
     public func validate(_ request: ImageEditRequest) throws {
+        try validateSampling(sampler: request.sampler, scheduler: request.scheduler, shift: request.shift)
         try validateEdit(width: request.width, height: request.height, steps: request.steps,
                          guidance: request.guidance, format: request.outputFormat,
                          sourceCount: request.sourceImages.count, hasMask: request.mask != nil, strength: request.strength)
@@ -126,6 +151,18 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         }
         if let strength, !supportsStrength, strength != 1 {
             throw FluxError.invalidField(field: "strength", value: "\(strength)", allowed: "omitted or 1; partial denoising is not supported")
+        }
+    }
+
+    public func validateSampling(sampler: String?, scheduler: String?, shift: Float?) throws {
+        if let sampler, !samplers.contains(sampler) {
+            throw FluxError.invalidField(field: "sampler", value: sampler, allowed: samplers.joined(separator: ", "))
+        }
+        if let scheduler, !schedulers.contains(scheduler) {
+            throw FluxError.invalidField(field: "scheduler", value: scheduler, allowed: schedulers.joined(separator: ", "))
+        }
+        if let shift, !supportsShift || !shift.isFinite {
+            throw FluxError.invalidField(field: "shift", value: "\(shift)", allowed: supportsShift ? "a finite timestep shift" : "the bundle's native schedule")
         }
     }
 

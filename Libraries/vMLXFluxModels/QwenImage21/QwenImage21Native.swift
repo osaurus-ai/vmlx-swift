@@ -1149,11 +1149,11 @@ enum QwenImage21Schedule {
         return Float(m * Double(width * height) / 256 + b)
     }
 
-    static func sigmas(steps: Int, width: Int, height: Int) -> MLXArray {
+    static func sigmas(steps: Int, width: Int, height: Int, shift override: Float? = nil) -> MLXArray {
         let n = steps
         let delta = Float((1.0 / Double(n) - 1.0) / Double(max(n - 1, 1)))
         let raw = q21Range(0, n).asType(.float32) * delta + Float(1)
-        let mu = MLXArray(shift(width: width, height: height))
+        let mu = MLXArray(override ?? shift(width: width, height: height))
         var shifted = exp(mu) / (exp(mu) + (1 / raw - 1))
         let oneMinus = 1 - shifted
         let scale = oneMinus[(n - 1) ..< n] / Float(1 - 0.02)
@@ -1280,13 +1280,15 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         prompt: String, negativePrompt: String?, references: [URL],
         width: Int?, height: Int?, steps: Int, guidance: Float, seed: UInt64,
         outputResolution: Int = 1024,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
         let prepared = try prepare(prompt: prompt, negativePrompt: negativePrompt,
             references: references, width: width, height: height, steps: steps,
             guidance: guidance, outputResolution: outputResolution)
-        return try sample(prepared, seed: seed, resolved: resolved, progress: progress)
+        return try sample(prepared, seed: seed, sampler: sampler, scheduler: scheduler, shift: shift,
+            resolved: resolved, progress: progress)
     }
 
     func prepare(
@@ -1352,6 +1354,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
 
     func sample(
         _ prepared: Prepared, seed: UInt64, interrupt: FluxInterrupt? = nil,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
@@ -1361,11 +1364,14 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let negative = prepared.negative, layout = prepared.layout
         let negativeLayout = prepared.negativeLayout, condition = prepared.condition
         let dtype = embeds.dtype
+        let selectedSampler = sampler ?? "euler"
+        let selectedScheduler = scheduler ?? (sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas")
+        let effectiveShift = sampleSigmas == nil
+            ? (shift ?? (selectedScheduler == "linear" ? nil : QwenImage21Schedule.shift(width: width, height: height))) : nil
         resolved(EffectiveImageParameters(
             width: width, height: height, steps: steps,
             guidance: guidance > 1 ? guidance : 1, seed: seed,
-            sampler: "euler", scheduler: sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas",
-            shift: sampleSigmas == nil ? QwenImage21Schedule.shift(width: width, height: height) : nil,
+            sampler: selectedSampler, scheduler: selectedScheduler, shift: effectiveShift,
             sampleSigmas: sampleSigmas))
 
         // Same values as mflux's `mx.random.seed(seed); mx.random.normal(...)` (the global
@@ -1375,9 +1381,33 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let hLat = height / 16, wLat = width / 16
         var latents = MLXRandom.normal([1, cfg.zDim, 1, hLat, wLat], key: noiseKey).asType(dtype)
         latents = latents[0..., 0..., 0, 0..., 0...].transposed(0, 2, 3, 1).reshaped([1, hLat * wLat, cfg.zDim])
-        let sigmas = sampleSigmas.map { QwenImage21Schedule.sigmas(grid: $0) }
-            ?? QwenImage21Schedule.sigmas(steps: steps, width: width, height: height)
+        let sigmas: MLXArray
+        if let sampleSigmas {
+            sigmas = QwenImage21Schedule.sigmas(grid: sampleSigmas)
+        } else if selectedScheduler == "linear" {
+            let raw = (0...steps).map { 1 - Float($0) / Float(steps) }
+            if let shift {
+                // Evaluate the optional exponential flow shift in Double, then
+                // verify representable nodes before running the transformer.
+                let amount = exp(Double(shift))
+                sigmas = MLXArray(raw.map { t in
+                    t == 0 ? Float(0) : Float(amount / (amount + 1 / Double(t) - 1))
+                })
+            } else {
+                sigmas = MLXArray(raw)
+            }
+        } else {
+            sigmas = QwenImage21Schedule.sigmas(steps: steps, width: width, height: height, shift: shift)
+        }
         eval(sigmas)
+        if shift != nil {
+            let values = sigmas.asArray(Float.self)
+            guard values.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }),
+                zip(values, values.dropFirst()).allSatisfy({ $0 > $1 }) else {
+                throw FluxError.invalidField(field: "shift", value: String(describing: shift!),
+                    allowed: "a shift that produces distinct finite sigma nodes")
+            }
+        }
         let dumpURL = ProcessInfo.processInfo.environment["VMLX_QWEN21_DUMP"].map { URL(fileURLWithPath: $0) }
         var dump: [String: MLXArray] = debugDump
         if dumpURL != nil {
@@ -1393,16 +1423,30 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let start = Date()
         for step in 0 ..< steps {
             try interrupt?.check()
-            let input = condition.map { concatenated([$0, latents], axis: 1) } ?? latents
-            let timestep = (sigmas[step ..< (step + 1)] * 1000).asType(dtype) / 1000
-            var noise = transformer(hidden: input, encoder: embeds, timestep: timestep, layout: layout, cache: &cache)
-            if let negative, let negativeLayout {
-                let uncond = transformer(
-                    hidden: input, encoder: negative.0, timestep: timestep, layout: negativeLayout, cache: &negativeCache)
-                noise = uncond + guidance * (noise - uncond)
+            func predict(_ current: MLXArray, index: Int) -> MLXArray {
+                let input = condition.map { concatenated([$0, current], axis: 1) } ?? current
+                let timestep = (sigmas[index ..< (index + 1)] * 1000).asType(dtype) / 1000
+                var noise = transformer(hidden: input, encoder: embeds, timestep: timestep, layout: layout, cache: &cache)
+                if let negative, let negativeLayout {
+                    let uncond = transformer(hidden: input, encoder: negative.0, timestep: timestep,
+                        layout: negativeLayout, cache: &negativeCache)
+                    noise = uncond + guidance * (noise - uncond)
+                }
+                return noise
             }
+            let noise = predict(latents, index: step)
             let dt = sigmas[step + 1] - sigmas[step]
-            latents = (latents.asType(.float32) + dt * noise.asType(.float32)).asType(dtype)
+            let proposed = (latents.asType(.float32) + dt * noise.asType(.float32)).asType(dtype)
+            if selectedSampler == "heun", step + 1 < steps {
+                eval(proposed)
+                try interrupt?.check()
+                let correctedNoise = predict(proposed, index: step + 1)
+                latents = (latents.asType(.float32)
+                    + dt * (noise.asType(.float32) + correctedNoise.asType(.float32)) * Float(0.5)).asType(dtype)
+            } else {
+                // Preserve the existing Euler expression and cast order exactly.
+                latents = proposed
+            }
             eval(latents)
             if dumpURL != nil, step == 0 { dump["noise_step0"] = noise }
             let elapsed = Date().timeIntervalSince(start)

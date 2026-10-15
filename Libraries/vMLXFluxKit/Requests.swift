@@ -18,6 +18,9 @@ public struct ImageGenRequest: Sendable {
     public var interrupt: FluxInterrupt?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
 
     public init(
         prompt: String,
@@ -32,7 +35,8 @@ public struct ImageGenRequest: Sendable {
         batchSize: Int = 1,
         interrupt: FluxInterrupt? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -47,6 +51,9 @@ public struct ImageGenRequest: Sendable {
         self.interrupt = interrupt
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
     }
 }
 
@@ -65,6 +72,9 @@ public struct ImageEditRequest: Sendable {
     public var seed: UInt64?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
 
     public init(
         prompt: String,
@@ -77,7 +87,8 @@ public struct ImageEditRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
     ) {
         self.prompt = prompt
         self.sourceImage = sourceImage
@@ -91,6 +102,9 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
     }
 
     public init(
@@ -104,7 +118,8 @@ public struct ImageEditRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
@@ -121,6 +136,9 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
     }
 }
 
