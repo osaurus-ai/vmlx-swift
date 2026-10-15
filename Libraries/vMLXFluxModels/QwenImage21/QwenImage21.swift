@@ -129,7 +129,10 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                     continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    let message = String(describing: error)
+                    continuation.yield(.failed(message: message,
+                        hfAuth: message.contains("401") || message.contains("403")))
+                    continuation.finish()
                 }
             }
         }

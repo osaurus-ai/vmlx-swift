@@ -4,6 +4,46 @@ import vMLXFluxKit
 import vMLXFluxModels
 
 final class ImageBatchTests: XCTestCase {
+    func testRealBatchCancellationRetainsCompletedImageAndRecovers() async throws {
+        guard let path = ProcessInfo.processInfo.environment["VMLX_FLUX_BATCH_MODEL"] else {
+            throw XCTSkip("Set VMLX_FLUX_BATCH_MODEL for real-bundle cancellation")
+        }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("flux-batch-cancel-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: out) }
+        let model = try await QwenImage21(modelPath: URL(fileURLWithPath: path), quantize: nil)
+        let interrupt = FluxInterrupt()
+        var request = ImageGenRequest(prompt: "A red cube on a white table", width: 512, height: 512,
+            steps: 8, guidance: 1, seed: 7, numImages: 4, outputDir: out)
+        request.interrupt = interrupt
+        var images: [URL] = [], cancelled = false
+        var startedCancel: Date?
+        for try await event in model.generate(request) {
+            switch event {
+            case .imageCompleted(let url, let seed, let index, _):
+                XCTAssertEqual(index, 0); XCTAssertEqual(seed, 7)
+                images.append(url)
+                startedCancel = Date()
+                interrupt.cancel()
+            case .cancelled: cancelled = true
+            case .failed(let message, _): XCTFail(message)
+            case .completed: XCTFail("A cancelled batch cannot complete")
+            default: break
+            }
+        }
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(images.count, 1)
+        XCTAssertLessThan(Date().timeIntervalSince(try XCTUnwrap(startedCancel)), 2)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(at: out, includingPropertiesForKeys: nil).count, 1)
+        let firstBytes = try Data(contentsOf: XCTUnwrap(images.first))
+        request.numImages = 1; request.interrupt = nil
+        var recovered: URL?
+        for try await event in model.generate(request) {
+            if case .completed(let url, _, _) = event { recovered = url }
+            if case .failed(let message, _) = event { XCTFail(message) }
+        }
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(recovered)), firstBytes)
+    }
+
     func testRealQwenBatchMatchesSinglesAndEncodesOnce() async throws {
         guard let path = ProcessInfo.processInfo.environment["VMLX_FLUX_BATCH_MODEL"] else {
             throw XCTSkip("Set VMLX_FLUX_BATCH_MODEL for real-bundle parity and timing")
