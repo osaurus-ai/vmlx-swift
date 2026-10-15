@@ -32,27 +32,39 @@ public enum SeedVR2Preprocess {
             else { throw FluxError.invalidRequest("Cannot read SeedVR2 source dimensions") }
             try SeedVR2BundleMetadata.validateUpscale(
                 sourceWidth: rawWidth, sourceHeight: rawHeight, scale: scale, format: .png)
-            guard
-                let image = CGImageSourceCreateThumbnailAtIndex(
-                    source, 0,
-                    [
-                        kCGImageSourceCreateThumbnailFromImageAlways: true,
-                        kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceThumbnailMaxPixelSize: max(rawWidth, rawHeight),
-                    ] as CFDictionary)
-            else { throw FluxError.invalidRequest("Cannot decode SeedVR2 source image") }
-            let sourceWidth = image.width
-            let sourceHeight = image.height
+            guard let rep = NSBitmapImageRep(data: try Data(contentsOf: url)),
+                rep.pixelsWide == rawWidth, rep.pixelsHigh == rawHeight,
+                !rep.bitmapFormat.contains(.floatingPointSamples),
+                rep.bitsPerSample == 8 || rep.bitsPerSample == 16
+            else {
+                throw FluxError.invalidRequest("Cannot decode SeedVR2 source samples")
+            }
+            let orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
+            let transpose = (5 ... 8).contains(orientation)
+            let sourceWidth = transpose ? rawHeight : rawWidth
+            let sourceHeight = transpose ? rawWidth : rawHeight
             let width = sourceWidth * scale
             let height = sourceHeight * scale
-            // Host admission belongs to Osaurus; arithmetic here must still be representable.
-            let rep = NSBitmapImageRep(cgImage: image)
+            // Decode original samples: CG thumbnail conversion premultiplies alpha,
+            // permanently erasing RGB under alpha=0, unlike PIL.convert("RGB").
             var bytes = [UInt8](repeating: 0, count: sourceWidth * sourceHeight * 3)
             for y in 0 ..< sourceHeight {
                 try checkpoint()
                 for x in 0 ..< sourceWidth {
                     var pixel = [Int](repeating: 0, count: rep.samplesPerPixel)
-                    rep.getPixel(&pixel, atX: x, y: y)
+                    let sx: Int
+                    let sy: Int
+                    switch orientation {
+                    case 2: (sx, sy) = (rawWidth - 1 - x, y)
+                    case 3: (sx, sy) = (rawWidth - 1 - x, rawHeight - 1 - y)
+                    case 4: (sx, sy) = (x, rawHeight - 1 - y)
+                    case 5: (sx, sy) = (y, x)
+                    case 6: (sx, sy) = (y, rawHeight - 1 - x)
+                    case 7: (sx, sy) = (rawWidth - 1 - y, rawHeight - 1 - x)
+                    case 8: (sx, sy) = (rawWidth - 1 - y, x)
+                    default: (sx, sy) = (x, y)
+                    }
+                    rep.getPixel(&pixel, atX: sx, y: sy)
                     let hasAlpha = rep.hasAlpha
                     let alphaFirst = rep.bitmapFormat.contains(.alphaFirst)
                     let first = hasAlpha && alphaFirst ? 1 : 0

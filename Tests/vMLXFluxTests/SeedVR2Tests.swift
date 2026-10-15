@@ -87,6 +87,60 @@ final class SeedVR2Tests: XCTestCase {
             XCTAssertLessThanOrEqual(maximum, name == "noise" ? 0.0000001 : 0.02, name)
         }
     }
+    func testEXIFOrientationMatchesReference() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("rotated.png")
+        try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAIAAAA2iEnWAAAAGmVYSWZNTQAqAAAACAABARIAAwAAAAEABgAAAAAAANZnS2kAAAAbSURBVHicY/jPwMAAwgz///9nYDghEsBltAUASV0HGPblHrcAAAAASUVORK5CYII="
+            )
+        ).write(to: url)
+        let image = try SeedVR2Preprocess.read(url, scale: 2)
+        XCTAssertEqual(image.width, 6)
+        XCTAssertEqual(image.height, 4)
+        let actual = image.tensor[0, 0..., 0 ..< 4, 0 ..< 6].transposed(1, 2, 0)
+        let bytes = try MLX.round((actual + 1) * 127.5).asType(.uint8).asArrayChecked(UInt8.self)
+        XCTAssertEqual(
+            bytes,
+            [
+                237, 21, 53, 164, 10, 117, 10, 0, 251, 28, 0, 230, 215, 0, 57, 255, 0, 0, 173, 24,
+                92, 137, 31, 125, 67, 47, 194, 79, 53, 167, 171, 53, 41, 202, 53, 0, 45, 30, 169,
+                81, 74, 140, 178, 167, 80, 179, 202, 44, 85, 202, 11, 53, 202, 0, 0, 33, 208, 54,
+                95, 148, 235, 228, 23, 230, 255, 0, 41, 255, 0, 0, 255, 0,
+            ])
+    }
+
+    func testTransparentInputPreservesReferenceRGB() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("alpha.png")
+        try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAGUlEQVR4nGP4IOLGcCLFqEFy2sP/TAxIAABq5gW6drLNRgAAAABJRU5ErkJggg=="
+            )
+        ).write(to: url)
+        let image = try SeedVR2Preprocess.read(url, scale: 2)
+        XCTAssertEqual(image.width, 6)
+        XCTAssertEqual(image.height, 4)
+        let actual = image.tensor[0, 0..., 0 ..< 4, 0 ..< 6].transposed(1, 2, 0)
+        let bytes = try MLX.round((actual + 1) * 127.5).asType(.uint8).asArrayChecked(UInt8.self)
+        XCTAssertEqual(
+            bytes,
+            [
+                244, 13, 72, 236, 34, 62, 221, 79, 42, 159, 117, 87, 57, 142, 191, 10, 154, 240,
+                244, 13, 72, 236, 34, 62, 221, 79, 42, 159, 117, 87, 57, 142, 191, 10, 154, 240,
+                244, 13, 72, 236, 34, 62, 221, 79, 42, 159, 117, 87, 57, 142, 191, 10, 154, 240,
+                244, 13, 72, 236, 34, 62, 221, 79, 42, 159, 117, 87, 57, 142, 191, 10, 154, 240,
+            ])
+    }
+
     func testResizeMatchesPillow() throws {
         let source = (0 ..< (7 * 5 * 3)).map { UInt8(($0 * 37) % 251) }
         let actual = try SeedVR2Preprocess.resizeRGB(
