@@ -212,18 +212,22 @@ public actor FluxEngine {
     public func generate(
         _ request: ImageGenRequest
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task { [weak self] in
+        var request = request
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        request.interrupt = interrupt
+        let job = request
+        return AsyncThrowingStream { continuation in
+            Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
-                    try await self.performGenerate(request, continuation: continuation)
+                    try await self.performGenerate(job, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { reason in
-                if case .cancelled = reason { task.cancel() }
+                if case .cancelled = reason { interrupt.cancel() }
             }
         }
     }
@@ -250,8 +254,11 @@ public actor FluxEngine {
             try adapterState.install(request.adapters) { _ in
                 continuation.yield(.step(step: 0, total: 0, etaSeconds: nil))
             }
-            for try await event in generator.generate(request) {
-                continuation.yield(event)
+            try await FluxInterruptScope.$current.withValue(request.interrupt) {
+                try FluxInterruptScope.check()
+                for try await event in generator.generate(request) {
+                    continuation.yield(event)
+                }
             }
         }
     }
@@ -262,18 +269,22 @@ public actor FluxEngine {
     public func edit(
         _ request: ImageEditRequest
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task { [weak self] in
+        var request = request
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        request.interrupt = interrupt
+        let job = request
+        return AsyncThrowingStream { continuation in
+            Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
-                    try await self.performEdit(request, continuation: continuation)
+                    try await self.performEdit(job, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { reason in
-                if case .cancelled = reason { task.cancel() }
+                if case .cancelled = reason { interrupt.cancel() }
             }
         }
     }
@@ -300,8 +311,11 @@ public actor FluxEngine {
             try adapterState.install(request.adapters) { _ in
                 continuation.yield(.step(step: 0, total: 0, etaSeconds: nil))
             }
-            for try await event in editor.edit(request) {
-                continuation.yield(event)
+            try await FluxInterruptScope.$current.withValue(request.interrupt) {
+                try FluxInterruptScope.check()
+                for try await event in editor.edit(request) {
+                    continuation.yield(event)
+                }
             }
         }
     }
@@ -352,18 +366,34 @@ public actor FluxEngine {
         }
     }
 
-    // MARK: - Video (future — Apple WAN 2.x)
+    // MARK: - Video
 
-    /// Video generation stub — scaffolded for Apple WAN models but not
-    /// implemented yet. See `VMLXFluxVideo/WANModel.swift`.
-    public func generateVideo(
-        _ request: VideoGenRequest
-    ) -> AsyncThrowingStream<VideoGenEvent, Error> {
-        AsyncThrowingStream { continuation in
-            continuation.finish(throwing: FluxError.notImplemented(
-                "Video generation — WAN models scaffolded but not implemented"))
+    public func generateVideo(_ request: VideoGenRequest, interrupt: FluxInterrupt? = nil)
+        -> AsyncThrowingStream<VideoGenEvent, Error> {
+        var request = request
+        let interrupt = interrupt ?? request.interrupt ?? FluxInterrupt()
+        request.interrupt = interrupt
+        let job = request
+        return AsyncThrowingStream { continuation in
+            Task {
+                await self.acquireOperation()
+                defer { self.releaseOperation(); continuation.finish() }
+                do {
+                    try Task.checkCancellation()
+                    try interrupt.check()
+                    guard let generator = self.loaded?.model as? any VideoGenerator else {
+                        throw FluxError.wrongModelKind(expected: "VideoGenerator", actual: self.loaded?.name ?? "unloaded")
+                    }
+                    for try await event in generator.generate(job) { continuation.yield(event) }
+                } catch is CancellationError { continuation.yield(.cancelled) }
+                catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { reason in
+                if case .cancelled = reason { interrupt.cancel() }
+            }
         }
     }
+
 }
 
 /// A loaded model + its canonical name + kind (for fast dispatch).

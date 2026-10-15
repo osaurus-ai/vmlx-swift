@@ -815,6 +815,7 @@ final class Ideogram4Pipeline {
 
         let start = Date()
         for step in 0 ..< steps {
+            try FluxInterruptScope.check()
             let scheduleIndex = steps - 1 - step
             let t = scheduler.tValues[scheduleIndex]
             let s = scheduler.sValues[scheduleIndex]

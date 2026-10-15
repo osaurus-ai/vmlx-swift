@@ -1018,7 +1018,7 @@ let package = Package(
         ),
         .target(
             name: "vMLXFluxVideo",
-            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom"],
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxVideo"
         ),
         .target(

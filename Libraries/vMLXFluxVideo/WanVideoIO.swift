@@ -61,14 +61,16 @@ public enum WanVideoIO {
 
     /// Write the full video as an H.264 MP4 at the requested fps.
     /// Uses AVAssetWriter + CVPixelBuffer. Same tensor shape as writeFrames.
-    @MainActor
     public static func writeMP4(
         _ video: MLXArray,
         outputURL: URL,
-        fps: Int
+        fps: Int, interrupt: FluxInterrupt? = nil
     ) throws {
         #if canImport(AppKit)
-        precondition(video.ndim == 4, "expected (C, T, H, W)")
+        try interrupt?.check()
+        guard video.ndim == 4, fps > 0, fps <= 240 else {
+            throw FluxError.invalidRequest("video requires CTHW frames and fps in 1...240")
+        }
         let c = video.dim(0)
         let t = video.dim(1)
         let h = video.dim(2)
@@ -104,7 +106,11 @@ public enum WanVideoIO {
             throw FluxError.invalidRequest("AVAssetWriter rejected video input")
         }
         writer.add(input)
-        writer.startWriting()
+        var completed = false
+        defer {
+            if !completed { writer.cancelWriting(); try? FileManager.default.removeItem(at: outputURL) }
+        }
+        guard writer.startWriting() else { throw FluxError.invalidRequest("video writer could not start") }
         writer.startSession(atSourceTime: .zero)
 
         for frameIdx in 0..<t {
@@ -116,7 +122,7 @@ public enum WanVideoIO {
             let asUInt8 = scaled.asType(.uint8)
             // (C, H, W) → (H, W, C)
             let interleaved = asUInt8.transposed(1, 2, 0)
-            let rgbBytes = interleaved.asArray(UInt8.self)
+            let rgbBytes = try interleaved.asArrayChecked(UInt8.self)
 
             // Build a CVPixelBuffer in BGRA order.
             var pb: CVPixelBuffer?
@@ -146,24 +152,35 @@ public enum WanVideoIO {
             CVPixelBufferUnlockBaseAddress(buffer, [])
 
             // Wait for the input to be ready, then append.
+            let waitStarted = Date()
             while !input.isReadyForMoreMediaData {
+                try interrupt?.check()
+                guard writer.status == .writing, Date().timeIntervalSince(waitStarted) < 30 else {
+                    throw FluxError.invalidRequest("video writer stopped accepting frames: \(writer.error?.localizedDescription ?? "timeout")")
+                }
                 Thread.sleep(forTimeInterval: 0.001)
             }
+            try interrupt?.check()
             let presentationTime = CMTime(
                 value: CMTimeValue(frameIdx),
                 timescale: CMTimeScale(fps)
             )
-            _ = adaptor.append(buffer, withPresentationTime: presentationTime)
+            guard adaptor.append(buffer, withPresentationTime: presentationTime) else {
+                throw FluxError.invalidRequest("video writer rejected frame")
+            }
         }
 
+        writer.endSession(atSourceTime: CMTime(value: CMTimeValue(t), timescale: CMTimeScale(fps)))
         input.markAsFinished()
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }
-        sem.wait()
+        while sem.wait(timeout: .now() + 0.05) == .timedOut { try interrupt?.check() }
         if writer.status != .completed {
             throw FluxError.invalidRequest(
                 "AVAssetWriter failed: \(writer.error?.localizedDescription ?? "unknown")")
         }
+        try interrupt?.check()
+        completed = true
         #else
         throw FluxError.notImplemented("WanVideoIO.writeMP4 requires AppKit")
         #endif

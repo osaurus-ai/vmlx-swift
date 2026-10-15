@@ -64,9 +64,13 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "flux1-schnell")
                     continuation.yield(.completed(url: outURL, seed: seed,
                         effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: 0, seed: seed, scheduler: "flux-flow", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16)))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

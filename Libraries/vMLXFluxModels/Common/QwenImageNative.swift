@@ -887,6 +887,7 @@ final class QwenImagePipeline {
 
         let start = Date()
         for step in 0 ..< steps {
+            try FluxInterruptScope.check()
             // QwenTimeEmbed applies the ×1000 scale internally (QwenTimesteps scale=1000),
             // so pass the RAW sigma here (not sigma×1000) to avoid double-scaling.
             let t = scheduler.sigmas[step]

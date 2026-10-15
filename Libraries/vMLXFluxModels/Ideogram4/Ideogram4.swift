@@ -88,9 +88,13 @@ public final class Ideogram4: ImageGenerator, FluxAdapterPreparing, @unchecked S
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "ideogram")
                     continuation.yield(.completed(url: outURL, seed: seed,
                         effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: request.guidance, seed: seed, scheduler: "ideogram-logit-normal")))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

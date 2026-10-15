@@ -65,3 +65,17 @@ Prompt cache keys include adapter content identity; changing an adapter after en
 Stage sample/decode estimates include retained handles, conservatively counting aliases; estimator calibration remains pending. Array buffers are evaluated before storage, and release drops engine ownership without clearing the host allocator cache. A handle shared by another handle naturally remains allocated until the last owner is released.
 
 The engine target compiles (`stages-build.log`). Byte parity, actual handle memory release, cancellation, hires-fix peak memory and visual output are pending the consolidated real integration pass. No claim of completed Stage 2 acceptance or all-family support yet.
+
+### 1.9 Native Wan 2.1 video (implementation)
+
+Replaces the former random-weight/zero-text WAN facade with original-weight T2V/I2V inference: UMT5-XXL, full-dimension Q/K RMS normalization, three-axis rotary attention, separate image/text cross-attention for I2V, CLIP's penultimate visual layer and a real causal Conv3d VAE with per-layer temporal history. Sampling uses explicitly reported flow Euler and bundle `sample_sigmas` when supplied. Wan 2.2 dual-expert routing remains unsupported and fails at load instead of rendering noise.
+
+Bundle layout: original `config.json`; original transformer names in `transformer/*.safetensors`; original Wan UMT5 and VAE names in `text_encoder/` and `vae/`; HF UMT5 files in `tokenizer/`; I2V additionally has original `visual.*` CLIP tensors under `image_encoder/`. Convolution arrays preserve PyTorch axes on disk and are transposed once in the native reader. `scripts/flux/convert-wan-original.py` converts the original `.pth` components with `torch.load(weights_only=True)`; it never overwrites an existing bundle. This is not support for arbitrary diffusers/MLX-video layouts without conversion.
+
+Video requests accept sourceImage and cooperative interrupts. Completion includes actual dimensions, scheduler, steps, seed, FPS and frame count. Frame count uses `(frames-1)/4+1` latent frames. MP4 writing runs off MainActor, checks cancellation/backpressure, sets the exact end time and removes partial files on failure. The engine owns the exclusive operation lease through producer drain.
+
+A related cancellation correction keeps the engine consuming the inner image/video stream after the outer consumer cancels, until the producer acknowledges its interrupt. Cancelling the consumer Task early would release adapter state while a producer still used it. Legacy native image denoisers now also check the shared interrupt at step boundaries.
+
+Source reference: Apple MLX examples at `796f5b53cab69a3d48a44233ce21aae889e94a08`, video/wan2.1. License retained in `docs/third-party/mlx-examples-WAN-LICENSE.txt`.
+
+Engine compilation passes (`wan-build.log`). Actual 49-frame 480p output/duration, cancellation latency, first-frame fidelity, runtime memory and Osaurus local-video adoption are not yet accepted. The converter and port still need real original checkpoint validation. Do not claim this implementation draft is a proven video runtime.

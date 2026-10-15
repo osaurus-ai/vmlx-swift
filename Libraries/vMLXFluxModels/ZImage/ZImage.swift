@@ -54,6 +54,9 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
                 do {
                     try await self.performGenerate(request, continuation: continuation)
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
+                    continuation.finish()
                 } catch {
                     let message = String(describing: error)
                     let hfAuth = message.contains("401") || message.contains("403")
@@ -89,6 +92,7 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
         }
 
         preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(
             image,
             outputDir: request.outputDir,

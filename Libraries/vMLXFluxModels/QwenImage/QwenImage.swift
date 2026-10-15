@@ -58,9 +58,13 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "qwen-image")
                     continuation.yield(.completed(url: outURL, seed: seed,
                         effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: request.guidance, seed: seed, scheduler: "qwen-image", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16), baseShift: 0.5, maxShift: 0.9, baseSeqLen: 256, maxSeqLen: 8192))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)
@@ -135,6 +139,7 @@ public final class QwenImageEdit: ImageEditor, FluxAdapterPreparing, @unchecked 
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(
                         image,
                         outputDir: request.outputDir,
@@ -146,6 +151,9 @@ public final class QwenImageEdit: ImageEditor, FluxAdapterPreparing, @unchecked 
                             scheduler: "qwen-image", shift: FlowMatchEulerScheduler.computeShift(
                                 imageSeqLen: (size.width / 16) * (size.height / 16),
                                 baseShift: 0.5, maxShift: 0.9, baseSeqLen: 256, maxSeqLen: 8192))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

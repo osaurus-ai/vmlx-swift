@@ -67,6 +67,7 @@ public struct ImageGenRequest: Sendable {
 // MARK: - ImageEditRequest
 
 public struct ImageEditRequest: Sendable {
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var sourceImage: URL
     public var sourceImages: [URL]
@@ -99,8 +100,9 @@ public struct ImageEditRequest: Sendable {
         outputDir: URL,
         outputFormat: ImageFormat = .png,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
-        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) {
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = [sourceImage]
@@ -134,11 +136,12 @@ public struct ImageEditRequest: Sendable {
         outputDir: URL,
         outputFormat: ImageFormat = .png,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
-        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
         }
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = sourceImages
@@ -193,6 +196,8 @@ public struct UpscaleRequest: Sendable {
 // MARK: - VideoGenRequest (future)
 
 public struct VideoGenRequest: Sendable {
+    public var sourceImage: URL?
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var negativePrompt: String?
     public var width: Int
@@ -214,8 +219,10 @@ public struct VideoGenRequest: Sendable {
         steps: Int = 50,
         guidance: Float = 5.0,
         seed: UInt64? = nil,
-        outputDir: URL
+        outputDir: URL, sourceImage: URL? = nil, interrupt: FluxInterrupt? = nil
     ) {
+        self.sourceImage = sourceImage
+        self.interrupt = interrupt
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.width = width
@@ -256,7 +263,7 @@ public enum ImageGenEvent: Sendable {
 public enum VideoGenEvent: Sendable {
     case step(step: Int, total: Int, etaSeconds: Double?)
     case preview(pngData: Data, frame: Int)
-    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int)
+    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int, effective: EffectiveImageParameters? = nil)
     case failed(message: String, hfAuth: Bool)
     case cancelled
 }

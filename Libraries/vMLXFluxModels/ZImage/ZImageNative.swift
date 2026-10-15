@@ -1151,6 +1151,7 @@ final class ZImageNativePipeline {
         let negativeEncodings = (guidance > 0 && negativePrompt != nil) ? encodePrompt(negativePrompt ?? "") : nil
         let sigmas = linearSigmas(steps: steps)
         for step in 0..<steps {
+            try FluxInterruptScope.check()
             if Task.isCancelled {
                 throw CancellationError()
             }

@@ -1008,6 +1008,7 @@ final class QwenImageEditPipeline {
 
         let start = Date()
         for step in 0 ..< plan.steps {
+            try FluxInterruptScope.check()
             let inputs = try QwenImageEditTransformerInputs(
                 targetLatents: latents,
                 targetPatchRows: targetRows,

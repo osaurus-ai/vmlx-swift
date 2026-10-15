@@ -557,6 +557,7 @@ final class FluxSchnellPipeline {
 
         let start = Date()
         for step in 0 ..< steps {
+            try FluxInterruptScope.check()
             let timestep = scheduler.sigmas[step] * 1000.0
             let noise = transformer(latents: latents, promptEmbeds: promptEmbeds, pooled: pooled,
                                     timestep: timestep, height: height, width: width)
