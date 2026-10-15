@@ -9,7 +9,7 @@ final class WanNativeTransformer {
     let dim: Int, heads: Int, layers: Int, frequencyDim: Int
     let imageConditioned: Bool
     init(weights: [String: MLXArray], config: [String: Any]) throws {
-        self.weights = WanNativeWeights(weights)
+        self.weights = WanNativeWeights(weights, transformerCompute: true)
         dim = config["dim"] as? Int ?? 1536
         heads = config["num_heads"] as? Int ?? 12
         layers = config["num_layers"] as? Int ?? 30

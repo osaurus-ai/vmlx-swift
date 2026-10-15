@@ -9,14 +9,22 @@ import vMLXFluxKit
 /// creates random parameters. PyTorch convolution axes are converted once.
 final class WanNativeWeights {
     let arrays: [String: MLXArray]
+    let transformerCompute: Bool
     private var convolutions: [String: MLXArray] = [:]
-    init(_ arrays: [String: MLXArray]) { self.arrays = arrays }
+    init(_ arrays: [String: MLXArray], transformerCompute: Bool = false) {
+        self.arrays = arrays; self.transformerCompute = transformerCompute
+    }
     func optional(_ name: String) -> MLXArray? { arrays[name] ?? arrays["model." + name] }
     func tensor(_ name: String) throws -> MLXArray {
         guard let value = optional(name) else { throw FluxError.invalidRequest("missing Wan tensor \(name)") }
         return value
     }
     func linear(_ name: String, _ x: MLXArray) throws -> MLXArray {
+        // Original Wan checkpoints store fp32 weights, but the released runtime
+        // uses bf16 autocast for transformer attention/FFN. Keep time embedding,
+        // modulation/residual arithmetic and the final head in fp32.
+        let x = transformerCompute && !name.hasPrefix("time_") && name != "head.head"
+            ? x.asType(.bfloat16) : x
         let weight = try tensor(name + ".weight")
         let output: MLXArray
         if let scales = optional(name + ".scales") {
@@ -59,8 +67,8 @@ final class WanNativeWeights {
             weight = raw.transposed(0, 2, 3, 4, 1)
             convolutions[name] = weight
         }
-        var result = conv3d(x, weight, stride: IntOrTriple((stride[0], stride[1], stride[2])))
-        if let bias = optional(name + ".bias") { result = result + bias }
+        var result = conv3d(x, weight.asType(x.dtype), stride: IntOrTriple((stride[0], stride[1], stride[2])))
+        if let bias = optional(name + ".bias") { result = result + bias.asType(result.dtype) }
         return result
     }
     func conv2(_ name: String, _ x: MLXArray, stride: Int = 1, padding: Int = 0) throws -> MLXArray {

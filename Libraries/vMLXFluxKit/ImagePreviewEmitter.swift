@@ -62,7 +62,10 @@ public final class ImagePreviewEmitter: @unchecked Sendable {
     /// NCHW is the common decoder layout; Qwen 2.1 converts NHWC at its boundary.
     public func reducedLatent(_ latent: MLXArray, scale: Int) -> MLXArray {
         let h = latent.dim(2), w = latent.dim(3)
-        let limit = max(1, maxPixel / scale)
+        // maxPixel is an upper bound, not a demand to run a full 256px VAE
+        // alongside every few denoise steps. A 128px draft retains spatial
+        // feedback while bounding the extra convolution work.
+        let limit = max(1, min(maxPixel, 128) / scale)
         let stride = max(1, Int(ceil(Double(max(h, w)) / Double(limit))))
         let rows = MLXArray(Array(Swift.stride(from: 0, to: h, by: stride)).map(Int32.init))
         let cols = MLXArray(Array(Swift.stride(from: 0, to: w, by: stride)).map(Int32.init))

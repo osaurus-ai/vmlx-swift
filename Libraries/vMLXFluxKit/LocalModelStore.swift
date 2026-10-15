@@ -113,8 +113,15 @@ public struct MLXStudioModelStore: Sendable {
         let configuration = try? Data(contentsOf: directory.appendingPathComponent("config.json"))
         let raw = configuration.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let configuredSeedVR2 = raw?["model_type"] as? String == "seedvr2"
+        let wanFormat = directory.appendingPathComponent("wan_native_format.json")
+        let wanMetadata = (try? Data(contentsOf: wanFormat)).flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }
+        let configuredWan = wanMetadata?["format"] as? String == "wan-original-safetensors-v1"
+            && ["t2v", "i2v"].contains(raw?["model_type"] as? String ?? "")
         let canonical = canonicalOverride
             ?? (configuredSeedVR2 ? "seedvr2" : nil)
+            ?? (configuredWan ? "wan-2.1" : nil)
             ?? canonicalName(for: name)
             ?? ModelRegistry.lookupFuzzy(name: name)?.name
         let entry = canonical.flatMap { ModelRegistry.lookup(name: $0) }
@@ -383,6 +390,9 @@ public struct MLXStudioModelStore: Sendable {
             do { _ = try SeedVR2BundleMetadata(directory: directory); return [] }
             catch { return [String(describing: error)] }
         }
+        if canonicalName == "wan-2.2" {
+            return ["Wan 2.2 dual-transformer routing is not implemented"]
+        }
         var reasons: [String] = []
         if safetensorCount == 0 {
             reasons.append("no safetensors found")
@@ -395,6 +405,18 @@ public struct MLXStudioModelStore: Sendable {
         ]
         if canonicalName == "ideogram" {
             requiredComponents.append(.unconditionalTransformer)
+        }
+        if canonicalName == "wan-2.1" {
+            let config = (try? Data(contentsOf: directory.appendingPathComponent("config.json"))).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            if !["t2v", "i2v"].contains(config?["model_type"] as? String ?? "") {
+                reasons.append("missing original Wan model_type configuration")
+            }
+            if config?["model_type"] as? String == "i2v",
+                !(try hasSafetensors(in: directory.appendingPathComponent("image_encoder"), recursive: true)) {
+                reasons.append("missing image_encoder safetensors for image-to-video")
+            }
         }
         for component in requiredComponents {
             if !components.contains(component) {

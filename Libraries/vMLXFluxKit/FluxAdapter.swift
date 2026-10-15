@@ -114,7 +114,10 @@ public final class FluxAdapterState: @unchecked Sendable {
     }
 
     private static func names(_ raw: String, target: FluxAdapter.Target, available: Dictionary<String, Shape>.Keys) -> [String] {
-        let prefix = raw.replacingOccurrences(of: "base_model.model.", with: "")
+        var prefix = raw.replacingOccurrences(of: "base_model.model.", with: "")
+        if prefix.hasPrefix("diffusion_model.") {
+            prefix = "transformer." + prefix.dropFirst("diffusion_model.".count)
+        }
         return available.filter { name in
             let text = name.hasPrefix("text_encoder.") || name.hasPrefix("text_encoder_2.")
             let transformer = name.hasPrefix("transformer.") || name.hasPrefix("unconditional_transformer.")
