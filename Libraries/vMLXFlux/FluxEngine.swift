@@ -182,13 +182,21 @@ public actor FluxEngine {
 
     /// Run an upscale request. Emits the same progress events as gen/edit.
     public func upscale(
-        _ request: UpscaleRequest
+        _ request: UpscaleRequest,
+        interrupt: FluxInterrupt? = nil
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        var request = request
+        let interrupt = interrupt ?? request.interrupt ?? FluxInterrupt()
+        request.interrupt = interrupt
+        let job = request
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { reason in
+                if case .cancelled = reason { interrupt.cancel() }
+            }
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
-                    try await self.performUpscale(request, continuation: continuation)
+                    try await self.performUpscale(job, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

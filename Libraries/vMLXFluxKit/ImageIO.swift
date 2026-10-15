@@ -132,7 +132,8 @@ public enum ImageIO {
     public static func writePNG(
         _ tensor: MLXArray,
         outputDir: URL,
-        prefix: String = "vmlx"
+        prefix: String = "vmlx",
+        atomic: Bool = false
     ) throws -> URL {
         #if canImport(AppKit)
         guard tensor.ndim == 4 || tensor.ndim == 3 else {
@@ -202,7 +203,7 @@ public enum ImageIO {
             at: outputDir, withIntermediateDirectories: true)
         let filename = "\(prefix)-\(UUID().uuidString).png"
         let url = outputDir.appendingPathComponent(filename)
-        try pngData.write(to: url)
+        try pngData.write(to: url, options: atomic ? .atomic : [])
         return url
         #else
         throw FluxError.notImplemented("ImageIO.writePNG requires AppKit")
