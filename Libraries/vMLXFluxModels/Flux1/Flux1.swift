@@ -27,6 +27,7 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
             defaultSteps: 4,
             defaultGuidance: 0.0,   // Schnell doesn't use CFG
             supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.fluxSchnell },
             loader: { path, quant in
                 _ = Flux1Schnell._register  // ensure registered
                 return try await Flux1Schnell(modelPath: path, quantize: quant)
@@ -49,22 +50,26 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.fluxSchnell.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Flux steps must be greater than zero")
                     }
                     let image = try self.pipeline.generate(
                         prompt: request.prompt,
                         width: request.width, height: request.height,
-                        steps: request.steps, seed: request.seed
+                        steps: request.steps, seed: seed
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "flux1-schnell")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: 0, seed: seed, scheduler: "flux-flow", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16)))))
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

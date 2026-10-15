@@ -20,3 +20,10 @@ Active scope: the entire https://gist.github.com/tpae/bb9f4a8384abe07446448128ba
 Preserve existing seeds and independent random streams. Do not confuse reported sampler metadata with selectable implementations. Do not advertise a scaffold as an implemented backend. Keep Turbo's bundle-defined schedule. Existing singleton image admission and chat-model unload/restore remain authoritative. A source-only or RunBench row is not live-app proof.
 
 Private evidence and historical proof: `~/vmlx-private-evidence/flux-workflows-20261014/`. Full-scope source starts on fresh main in `feat/flux-full-spec-oct14`, using the existing isolated engine/app worktrees; prior dirty default checkouts are untouched. Allosaurus PRs599/3097 remain separately held and their evidence is preserved.
+
+## Remaining-family parameter contracts
+Implemented engine limits and effective output metadata for the existing Flux Schnell, Z-Image, Qwen-Image, Qwen-Image-Edit and Ideogram pipelines. Unsupported registry scaffolds still expose no invented contract. Explicit seeds keep the existing noise paths; unspecified seeds are resolved once and reported for replay. Guidance thresholds describe the actual negative-conditioning math (Z-Image >0; Qwen always runs both branches).
+
+Focused limit validation and backward-compatible decoding pass. Real512² seeded replay is byte-exact for Flux Schnell4steps, Z-Image4steps, Qwen30steps and Ideogram20steps; each checks emitted step count and actual PNG size. Qwen edit's1000-to992 rounding test is implemented but live execution remains pending for the integrated stage check. Raw evidence: ~/vmlx-private-evidence/flux-workflows-20261014/*contract-replay.log. Engine evidence does not imply Osaurus family-wide parameter adoption is complete.
+
+User changed the proof cadence: use focused change-specific checks and reuse prior evidence, then one integrated live application check per completed stage. Do not repeat unrelated whole-model matrices for every edit.

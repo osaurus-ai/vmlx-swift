@@ -26,6 +26,7 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
             defaultSteps: 20,
             defaultGuidance: 7,
             supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.ideogram },
             loader: { path, quant in
                 _ = Ideogram4._register
                 return try Ideogram4(modelPath: path, quantize: quant)
@@ -52,10 +53,13 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.ideogram.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Ideogram steps must be greater than zero")
                     }
@@ -68,12 +72,13 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
                         height: request.height,
                         steps: request.steps,
                         guidance: request.guidance,
-                        seed: request.seed
+                        seed: seed
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "ideogram")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: request.guidance, seed: seed, scheduler: "ideogram-logit-normal")))
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

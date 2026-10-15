@@ -22,6 +22,7 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             defaultSteps: 4,
             defaultGuidance: 0.0,
             supportsLoRA: false,
+            limits: { _ in NativeImageRequestContracts.zImage },
             loader: { path, quant in
                 _ = ZImage._register
                 return try await ZImage(modelPath: path, quantize: quant)
@@ -52,7 +53,9 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.zImage.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
@@ -75,6 +78,7 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
         guard request.steps > 0 else {
             throw FluxError.invalidRequest("Z-Image steps must be greater than zero")
         }
+        let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
         let image = try await pipeline.generate(
             prompt: request.prompt,
             negativePrompt: request.negativePrompt,
@@ -82,7 +86,7 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             width: request.width,
             height: request.height,
             steps: request.steps,
-            seed: request.seed
+            seed: seed
         ) { step, total, eta in
             continuation.yield(.step(step: step, total: total, etaSeconds: eta))
         }
@@ -92,8 +96,10 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             outputDir: request.outputDir,
             prefix: "z-image"
         )
-        let seed = request.seed ?? 0
-        continuation.yield(.completed(url: outURL, seed: seed))
+        continuation.yield(.completed(url: outURL, seed: seed,
+            effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL,
+                steps: request.steps, guidance: request.negativePrompt != nil && request.guidance > 0 ? request.guidance : 0,
+                seed: seed, scheduler: "z-image-linear")))
     }
 
     // MARK: - Placeholder math (to be replaced by real transformer + VAE)

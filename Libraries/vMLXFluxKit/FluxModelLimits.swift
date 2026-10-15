@@ -18,6 +18,8 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     public let supportedFormats: [ImageFormat]
     public let maximumImages: Int
     public let maximumParallelImages: Int
+    /// Nil means the pipeline always consumes negative conditioning, even at CFG <= 1.
+    public let negativePromptRequiresGuidanceAbove: Float?
 
     public init(
         dimensionMultiple: Int, minDimension: Int, maxDimension: Int? = nil,
@@ -25,7 +27,8 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         fixedSteps: Int? = nil, supportsNegativePrompt: Bool,
         supportsEditNegativePrompt: Bool, supportsStrength: Bool,
         supportsMask: Bool, maxSourceImages: Int, supportedFormats: [ImageFormat],
-        maximumImages: Int = 1, maximumParallelImages: Int = 1
+        maximumImages: Int = 1, maximumParallelImages: Int = 1,
+        negativePromptRequiresGuidanceAbove: Float? = 1
     ) {
         self.dimensionMultiple = dimensionMultiple
         self.minDimension = minDimension
@@ -42,6 +45,55 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         self.supportedFormats = supportedFormats
         self.maximumImages = maximumImages
         self.maximumParallelImages = maximumParallelImages
+        self.negativePromptRequiresGuidanceAbove = negativePromptRequiresGuidanceAbove
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case dimensionMultiple, minDimension, maxDimension, maxPixels, minimumSteps, maximumSteps, fixedSteps
+        case supportsNegativePrompt, supportsEditNegativePrompt, supportsStrength, supportsMask, maxSourceImages
+        case supportedFormats, maximumImages, maximumParallelImages, negativePromptRequiresGuidanceAbove
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            dimensionMultiple: try c.decode(Int.self, forKey: .dimensionMultiple),
+            minDimension: try c.decode(Int.self, forKey: .minDimension),
+            maxDimension: try c.decodeIfPresent(Int.self, forKey: .maxDimension),
+            maxPixels: try c.decodeIfPresent(Int.self, forKey: .maxPixels),
+            minimumSteps: try c.decode(Int.self, forKey: .minimumSteps),
+            maximumSteps: try c.decodeIfPresent(Int.self, forKey: .maximumSteps),
+            fixedSteps: try c.decodeIfPresent(Int.self, forKey: .fixedSteps),
+            supportsNegativePrompt: try c.decode(Bool.self, forKey: .supportsNegativePrompt),
+            supportsEditNegativePrompt: try c.decode(Bool.self, forKey: .supportsEditNegativePrompt),
+            supportsStrength: try c.decode(Bool.self, forKey: .supportsStrength),
+            supportsMask: try c.decode(Bool.self, forKey: .supportsMask),
+            maxSourceImages: try c.decode(Int.self, forKey: .maxSourceImages),
+            supportedFormats: try c.decode([ImageFormat].self, forKey: .supportedFormats),
+            maximumImages: try c.decodeIfPresent(Int.self, forKey: .maximumImages) ?? 1,
+            maximumParallelImages: try c.decodeIfPresent(Int.self, forKey: .maximumParallelImages) ?? 1,
+            negativePromptRequiresGuidanceAbove: c.contains(.negativePromptRequiresGuidanceAbove)
+                ? try c.decodeIfPresent(Float.self, forKey: .negativePromptRequiresGuidanceAbove) : 1)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(dimensionMultiple, forKey: .dimensionMultiple)
+        try c.encode(minDimension, forKey: .minDimension)
+        try c.encode(maxDimension, forKey: .maxDimension)
+        try c.encode(maxPixels, forKey: .maxPixels)
+        try c.encode(minimumSteps, forKey: .minimumSteps)
+        try c.encode(maximumSteps, forKey: .maximumSteps)
+        try c.encode(fixedSteps, forKey: .fixedSteps)
+        try c.encode(supportsNegativePrompt, forKey: .supportsNegativePrompt)
+        try c.encode(supportsEditNegativePrompt, forKey: .supportsEditNegativePrompt)
+        try c.encode(supportsStrength, forKey: .supportsStrength)
+        try c.encode(supportsMask, forKey: .supportsMask)
+        try c.encode(maxSourceImages, forKey: .maxSourceImages)
+        try c.encode(supportedFormats, forKey: .supportedFormats)
+        try c.encode(maximumImages, forKey: .maximumImages)
+        try c.encode(maximumParallelImages, forKey: .maximumParallelImages)
+        try c.encode(negativePromptRequiresGuidanceAbove, forKey: .negativePromptRequiresGuidanceAbove)
     }
 
     public func validate(_ request: ImageGenRequest) throws {
@@ -49,8 +101,8 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
                            guidance: request.guidance, format: request.outputFormat)
         try ImageBatchPlan.validate(request, maximumImages: maximumImages)
         if let negative = request.negativePrompt, !negative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           !supportsNegativePrompt || request.guidance <= 1 {
-            throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: "a supported CFG path with guidance > 1")
+           !supportsNegativePrompt || negativePromptRequiresGuidanceAbove.map({ request.guidance <= $0 }) == true {
+            throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: negativePromptRequiresGuidanceAbove.map { "a supported CFG path with guidance > \($0)" } ?? "a supported negative-conditioning path")
         }
     }
 
