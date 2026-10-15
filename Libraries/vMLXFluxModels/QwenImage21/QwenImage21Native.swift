@@ -1360,6 +1360,59 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
+        let latent = try sampleLatent(prepared, seed: seed, interrupt: interrupt,
+            sampler: sampler, scheduler: scheduler, shift: shift, preview: preview,
+            resolved: resolved, progress: progress)
+        try interrupt?.check()
+        return decodeStageLatent(latent)
+    }
+
+    func decodeStageLatent(_ latent: MLXArray) -> MLXArray {
+        let decoded = vae.decode(latent.asType(.float32))
+        return VAEDecoder.postprocess(decoded[.ellipsis, 0 ..< 3].transposed(0, 3, 1, 2))
+    }
+
+    func encodeStagePrompt(_ prompt: String, negativePrompt: String?) -> FluxStageConditioning {
+        let positive = encodePrompt(prompt, references: []).0
+        let negative = encodePrompt(negativePrompt ?? "", references: []).0
+        promptEncodingCount += 2
+        eval(positive, negative)
+        return FluxStageConditioning(arrays: ["positive": positive, "negative": negative])
+    }
+
+    func encodeStageImage(_ image: URL, width: Int, height: Int) throws -> MLXArray {
+        let rgb = MLXArray(try ImageIO.readRGBValues(image, width: width, height: height,
+            normalization: .zeroToOne), [3, height, width]) * 2 - 1
+        let rgba = concatenated([rgb, MLXArray.ones([1, height, width], dtype: .float32)], axis: 0)
+            .transposed(1, 2, 0).expandedDimensions(axis: 0)
+        let latent = vae.encode(rgba).reshaped([1, height / 16, width / 16, cfg.zDim])
+        eval(latent)
+        return latent
+    }
+
+    func stagePrepared(_ conditioning: FluxStageConditioning, width: Int, height: Int,
+                       steps: Int, guidance: Float) throws -> Prepared {
+        guard let embeds = conditioning.arrays["positive"], let neg = conditioning.arrays["negative"] else {
+            throw FluxError.invalidRequest("invalid Qwen stage conditioning")
+        }
+        let slots = Array(repeating: false, count: embeds.dim(1))
+        let negativeSlots = Array(repeating: false, count: neg.dim(1))
+        let shapes = [(1, height / 16, width / 16)]
+        let layout = try QwenImage21Layout.create(slots: slots, shapes: shapes, axes: cfg.axes)
+        let negativeLayout = guidance > 1
+            ? try QwenImage21Layout.create(slots: negativeSlots, shapes: shapes, axes: cfg.axes) : nil
+        return Prepared(width: width, height: height, steps: sampleSigmas?.count ?? steps, guidance: guidance,
+            embeds: embeds, slots: slots, negative: guidance > 1 ? (neg, negativeSlots) : nil,
+            layout: layout, negativeLayout: negativeLayout, condition: nil)
+    }
+
+    func sampleLatent(
+        _ prepared: Prepared, seed: UInt64, interrupt: FluxInterrupt? = nil,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        preview: ImagePreviewEmitter? = nil, initialLatent: MLXArray? = nil, denoise: Float = 1,
+        resolved: (EffectiveImageParameters) -> Void = { _ in },
+        progress: (Int, Int, Double?) -> Void
+    ) throws -> MLXArray {
         try interrupt?.check()
         let width = prepared.width, height = prepared.height, steps = prepared.steps
         let guidance = prepared.guidance, embeds = prepared.embeds, slots = prepared.slots
@@ -1370,11 +1423,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let selectedScheduler = scheduler ?? (sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas")
         let effectiveShift = sampleSigmas == nil
             ? (shift ?? (selectedScheduler == "linear" ? nil : QwenImage21Schedule.shift(width: width, height: height))) : nil
-        resolved(EffectiveImageParameters(
-            width: width, height: height, steps: steps,
-            guidance: guidance > 1 ? guidance : 1, seed: seed,
-            sampler: selectedSampler, scheduler: selectedScheduler, shift: effectiveShift,
-            sampleSigmas: sampleSigmas))
+
 
         // Same values as mflux's `mx.random.seed(seed); mx.random.normal(...)` (the global
         // key sequence hands out split(key(seed))[1] first) WITHOUT touching MLX's global
@@ -1410,6 +1459,29 @@ final class QwenImage21Pipeline: @unchecked Sendable {
                     allowed: "a shift that produces distinct finite sigma nodes")
             }
         }
+        guard denoise.isFinite, (0...1).contains(denoise) else {
+            throw FluxError.invalidField(field: "denoise", value: "\(denoise)", allowed: "0...1")
+        }
+        let firstStep = min(steps, Int(Float(steps) * (1 - denoise)))
+        if denoise == 0, let initialLatent {
+            resolved(EffectiveImageParameters(width: width, height: height, steps: 0,
+                guidance: guidance > 1 ? guidance : 1, seed: seed, sampler: selectedSampler,
+                scheduler: selectedScheduler, shift: effectiveShift, strength: 0, sampleSigmas: sampleSigmas))
+            return initialLatent
+        }
+        if denoise < 1 {
+            guard let initialLatent, initialLatent.shape == [1, hLat, wLat, cfg.zDim] else {
+                throw FluxError.invalidRequest("partial denoise requires a matching spatial latent")
+            }
+            let sigma = sigmas[firstStep]
+            latents = (initialLatent.reshaped(latents.shape).asType(.float32) * (1 - sigma)
+                + latents.asType(.float32) * sigma).asType(dtype)
+        }
+        resolved(EffectiveImageParameters(
+            width: width, height: height, steps: steps - firstStep,
+            guidance: guidance > 1 ? guidance : 1, seed: seed,
+            sampler: selectedSampler, scheduler: selectedScheduler, shift: effectiveShift,
+            strength: denoise < 1 ? denoise : nil, sampleSigmas: sampleSigmas))
         let dumpURL = ProcessInfo.processInfo.environment["VMLX_QWEN21_DUMP"].map { URL(fileURLWithPath: $0) }
         var dump: [String: MLXArray] = debugDump
         if dumpURL != nil {
@@ -1423,7 +1495,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         var cache: [(MLXArray, MLXArray)]? = []
         var negativeCache: [(MLXArray, MLXArray)]? = []
         let start = Date()
-        for step in 0 ..< steps {
+        for step in firstStep ..< steps {
             try interrupt?.check()
             func predict(_ current: MLXArray, index: Int) -> MLXArray {
                 let input = condition.map { concatenated([$0, current], axis: 1) } ?? current
@@ -1458,19 +1530,16 @@ final class QwenImage21Pipeline: @unchecked Sendable {
             }
             if dumpURL != nil, step == 0 { dump["noise_step0"] = noise }
             let elapsed = Date().timeIntervalSince(start)
-            progress(step + 1, steps, elapsed / Double(step + 1) * Double(steps - step - 1))
+            progress(step - firstStep + 1, steps - firstStep, elapsed / Double(step - firstStep + 1) * Double(steps - step - 1))
         }
         try interrupt?.check()
         cache = nil
         negativeCache = nil
-        let unpacked = latents.reshaped([1, hLat, wLat, cfg.zDim]).asType(.float32)
-        let decoded = vae.decode(unpacked)                                    // (1, H, W, 4)
-        let rgb = decoded[.ellipsis, 0 ..< 3].transposed(0, 3, 1, 2)          // (1, 3, H, W)
+        let spatial = latents.reshaped([1, hLat, wLat, cfg.zDim])
         if let dumpURL {
             dump["latents_final"] = latents
-            dump["decoded"] = decoded
             try save(arrays: dump.mapValues { $0.asType(.float32) }, url: dumpURL)
         }
-        return VAEDecoder.postprocess(rgb)
+        return spatial
     }
 }

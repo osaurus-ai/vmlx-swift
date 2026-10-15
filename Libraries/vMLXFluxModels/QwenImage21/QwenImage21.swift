@@ -12,7 +12,7 @@ import vMLXFluxKit
 // fixed 8-node sigma grid in its model_index.json (`sample_sigmas`); the pipeline samples on that grid
 // whenever a bundle defines one. Defaults: 8 steps, guidance 1.0.
 
-public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable {
+public final class QwenImage21: ImageGenerator, ImageEditor, FluxStageModel, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "qwen-image-2.1",
@@ -45,6 +45,33 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     /// Output file prefix: the Turbo bundle (fixed sampling grid) is named as such.
     private var outputPrefix: String {
         pipeline.sampleSigmas == nil ? "qwen-image-2.1" : "qwen-image-2.1-turbo"
+    }
+
+    public var stageSpatialScale: Int { 16 }
+    public var stageChannels: Int { pipeline.cfg.zDim }
+    public func stageEncodePrompt(_ prompt: String, negativePrompt: String?) throws -> FluxStageConditioning {
+        pipeline.encodeStagePrompt(prompt, negativePrompt: negativePrompt)
+    }
+    public func stageEncodeImage(_ image: URL, width: Int, height: Int) throws -> MLXArray {
+        try pipeline.encodeStageImage(image, width: width, height: height)
+    }
+    public func stageDecode(_ latent: MLXArray) throws -> MLXArray { pipeline.decodeStageLatent(latent) }
+    public func stageSample(_ conditioning: FluxStageConditioning, latent: MLXArray,
+                            width: Int, height: Int, options: FluxStageSampling,
+                            interrupt: FluxInterrupt?, progress: (Int, Int, Double?) -> Void)
+        throws -> (MLXArray, EffectiveImageParameters) {
+        let request = ImageGenRequest(prompt: "", width: width, height: height, steps: options.steps,
+            guidance: options.guidance, seed: options.seed, outputDir: modelPath,
+            sampler: options.sampler, scheduler: options.scheduler, shift: options.shift)
+        try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request)
+        let prepared = try pipeline.stagePrepared(conditioning, width: width, height: height,
+            steps: options.steps, guidance: options.guidance)
+        var effective: EffectiveImageParameters?
+        let result = try pipeline.sampleLatent(prepared, seed: options.seed, interrupt: interrupt,
+            sampler: options.sampler, scheduler: options.scheduler, shift: options.shift,
+            initialLatent: latent, denoise: options.denoise, resolved: { effective = $0 }, progress: progress)
+        guard let effective else { throw FluxError.invalidRequest("sampling did not resolve effective parameters") }
+        return (result, effective)
     }
 
     public let modelPath: URL

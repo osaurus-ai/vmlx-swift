@@ -55,3 +55,13 @@ The per-family activation/VAE coefficients are analytical estimates, not measure
 An engine operation lease keeps load/unload and concurrent generate/edit operations from replacing adapter state while a stream is active. The last set is cached by file SHA256, scale and target. Scale zero takes the base arithmetic path and does not open an adapter file. Clearing the request removes deltas; it never subtracts rounded fused weights. `adapterLoadCount` counts actual installations. Generation/edit through FluxEngine is the supported adapter entry point.
 
 Compilation passes. A real adapter image, scale-zero/base byte parity, repeated-set load count and removal parity remain part of the combined integration pass. This is not yet a live-accepted capability. No seed changes.
+
+### Stage 2 — native Qwen-Image-2.1/Turbo handles (implementation)
+
+The engine owns opaque conditioning and spatial latent handles. `encodePrompt`, `encodeImage`, `emptyLatent`, weighted `mix`, `sample`, nearest/bilinear/bislerp `resize`, PNG `decode`, and typed `release` are implemented for Qwen-Image-2.1/Turbo against the same native sampling/VAE code as normal generation. Other families currently return an explicit unsupported-stage error.
+
+Prompt cache keys include adapter content identity; changing an adapter after encoding invalidates sampling rather than pairing old text conditioning with new weights. Handles are cleared on model replacement/unload. Operations share the engine lease and never install a second model copy through the stage loader. Sampling builds a new output and leaves the input latent available after cancellation. A zero-denoise request returns the original latent values. Multiple latent images are sampled sequentially with the same base-seed-plus-index contract as generation.
+
+Stage sample/decode estimates include retained handles, conservatively counting aliases; estimator calibration remains pending. Array buffers are evaluated before storage, and release drops engine ownership without clearing the host allocator cache. A handle shared by another handle naturally remains allocated until the last owner is released.
+
+The engine target compiles (`stages-build.log`). Byte parity, actual handle memory release, cancellation, hires-fix peak memory and visual output are pending the consolidated real integration pass. No claim of completed Stage 2 acceptance or all-family support yet.

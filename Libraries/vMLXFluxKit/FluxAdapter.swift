@@ -34,6 +34,7 @@ public final class FluxAdapterState: @unchecked Sendable {
     private var cached: [String: [Pair]] = [:]
     private var cachedIdentity: [String] = []
     public private(set) var loadCount = 0
+    public var identity: [String] { active.isEmpty ? [] : cachedIdentity }
 
     public init() {}
     public func register(name: String, input: Int, output: Int) {

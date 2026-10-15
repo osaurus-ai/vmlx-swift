@@ -1023,7 +1023,7 @@ let package = Package(
         ),
         .target(
             name: "vMLXFlux",
-            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "MLX"],
             path: "Libraries/vMLXFlux"
         ),
         .executableTarget(

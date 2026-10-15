@@ -18,23 +18,26 @@ public actor FluxEngine {
     // MARK: - State
 
     /// Currently loaded model (nil if no model is resident).
-    public private(set) var loaded: LoadedModel?
+    public internal(set) var loaded: LoadedModel?
 
     /// Cached model registry lookup — `ModelRegistry.lookup(name:)`
     /// is O(1) but we keep a local copy for logging.
-    public private(set) var lastLoadedName: String?
-    private var loadedModelURL: URL?
-    private var adapterState = FluxAdapterState()
+    public internal(set) var lastLoadedName: String?
+    var loadedModelURL: URL?
+    var adapterState = FluxAdapterState()
+    var stageConditionings: [UUID: StoredFluxConditioning] = [:]
+    var stageLatents: [UUID: StoredFluxLatent] = [:]
+    var stagePromptCache: [StagePromptKey: FluxConditioning] = [:]
     private var operationBusy = false
     private var operationWaiters: [CheckedContinuation<Void, Never>] = []
     public var adapterLoadCount: Int { adapterState.loadCount }
 
-    private func acquireOperation() async {
+    func acquireOperation() async {
         if !operationBusy { operationBusy = true; return }
         await withCheckedContinuation { operationWaiters.append($0) }
     }
 
-    private func releaseOperation() {
+    func releaseOperation() {
         if operationWaiters.isEmpty { operationBusy = false }
         else { operationWaiters.removeFirst().resume() }
     }
@@ -151,6 +154,7 @@ public actor FluxEngine {
         let model = try await FluxAdapterScope.$current.withValue(nextAdapters) {
             try await entry.loader(modelPath, quantize)
         }
+        clearStageHandles()
         adapterState = nextAdapters
         self.loaded = LoadedModel(
             name: name,
@@ -194,6 +198,7 @@ public actor FluxEngine {
     public func unload() async {
         await acquireOperation()
         defer { releaseOperation() }
+        clearStageHandles()
         self.loaded = nil
         self.loadedModelURL = nil
         self.adapterState = FluxAdapterState()
