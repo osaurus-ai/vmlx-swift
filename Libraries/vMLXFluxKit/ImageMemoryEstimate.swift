@@ -68,7 +68,14 @@ public enum ImageMemoryEstimator {
             * (guidance > 1 ? 2 : 1)
         // Decode has two full-resolution feature maps plus the RGB output;
         // earlier wider maps occur at lower spatial resolution.
-        var decode = pixels * batch * Double(vaeChannels * 2 + 3) * bytesPerActivation
+        // Z-Image's untiled fp32 VAE retains considerably more than the two
+        // logical feature maps while Metal executes its convolution graph.
+        // Calibrated against the native 8-bit pipeline: 14.750 GB at 512² and
+        // 25.141 GB at 1024², with 10.814 GB live weights. Account for the
+        // measured size-dependent workspace; do not multiply the weights or
+        // alter allocator limits to make an estimate look correct.
+        let decodeMaps = family == "z-image-turbo" ? 28 : 2
+        var decode = pixels * batch * Double(vaeChannels * decodeMaps + 3) * bytesPerActivation
         if let previewMaxPixel {
             decode += Double(previewMaxPixel) * Double(previewMaxPixel) * Double(vaeChannels * 2 + 3) * bytesPerActivation
         }

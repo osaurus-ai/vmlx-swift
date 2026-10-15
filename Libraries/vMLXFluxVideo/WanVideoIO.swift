@@ -84,12 +84,16 @@ public enum WanVideoIO {
             withIntermediateDirectories: true)
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        // The default 600Hz movie clock rounds 16fps durations (5/16 became
+        // 0.313333s). Use an exact multiple of fps for frame-count parity.
+        writer.movieTimeScale = CMTimeScale(fps * 1000)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: w,
             AVVideoHeightKey: h,
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.mediaTimeScale = CMTimeScale(fps * 1000)
         input.expectsMediaDataInRealTime = false
 
         let attrs: [String: Any] = [

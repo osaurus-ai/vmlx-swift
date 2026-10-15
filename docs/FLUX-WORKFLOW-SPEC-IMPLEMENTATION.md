@@ -6,16 +6,15 @@ Active scope: the entire https://gist.github.com/tpae/bb9f4a8384abe07446448128ba
 
 | Item | Status | Remaining acceptance |
 | --- | --- | --- |
-| 1.1 cancellable upscale | Delivered for SeedVR2 3B | Preserve existing cancellation/recovery proof |
-| 1.3 effective parameters | Delivered for Qwen2.1/Turbo and SeedVR2 | Other implemented families; per-family replay |
-| 1.4 typed limits | Delivered for Qwen2.1/Turbo and SeedVR2 | Other implemented families; validation before weight loading |
-| 1.2 native batch | In progress | Encode once, indexed completions, explicit seed list, cancellation, individual-image byte parity, wall time |
-| 1.5 sampler/scheduler/shift | Pending | Real selectable implementations, capability query and invalid-field errors |
-| 1.7 previews | Pending | Bounded cadence/size, cancellation, overhead <=5% |
-| 1.8 memory estimates | Pending | Per-request estimates within 15% of measured peaks at required dimensions |
-| 1.6 adapters | Pending | Supported targets, content identity, reuse, zero-scale and removal parity |
-| 1.9 video | Pending | Real weights/text encoding; 49-frame480p clip, metadata and cancellation |
-| Stage2 | Pending | Conditioning/latent handles, encode/mix/resize/sample/decode/release; parity, ownership, memory release |
+| 1.1 cancellable upscale | Delivered for SeedVR2 3B | Reuse existing app cancellation/recovery proof |
+| 1.2 native batch | Engine600 and app3098 merged | Complete; reuse byte parity, encoder count, cancellation and app evidence |
+| 1.3/1.4 contracts | Engine601/app3099 implemented | Qwen edit rounding replay; broader app adoption |
+| 1.5 samplers | Engine602/app3099 implemented | Actual non-Turbo Euler/Heun comparison |
+| 1.6 adapters | Engine605/app3101 implemented | Real adapter zero/cache/removal parity passed; integrated app controls |
+| 1.7 previews | Engine603/app3100 implemented, corrected in607 | Z512 3 previews, byte parity, paired ratio0.969 passed; integrated app |
+| 1.8 memory | Engine604 implemented, calibration corrected in607 | Z512/1024 measured; other families and app admission pending |
+| 1.9 local video | Engine607/app3103 implemented | Real49-frame480p rendered, cancel passed; exact duration corrected; app/I2V pending |
+| Stage2 | Engine606 implemented | Parity/reuse/mix/cancel/stale passed; hires/lifetime measurements in progress |
 
 Preserve existing seeds and independent random streams. Do not confuse reported sampler metadata with selectable implementations. Do not advertise a scaffold as an implemented backend. Keep Turbo's bundle-defined schedule. Existing singleton image admission and chat-model unload/restore remain authoritative. A source-only or RunBench row is not live-app proof.
 
@@ -79,3 +78,15 @@ A related cancellation correction keeps the engine consuming the inner image/vid
 Source reference: Apple MLX examples at `796f5b53cab69a3d48a44233ce21aae889e94a08`, video/wan2.1. License retained in `docs/third-party/mlx-examples-WAN-LICENSE.txt`.
 
 Engine compilation passes (`wan-build.log`). Actual 49-frame 480p output/duration, cancellation latency, first-frame fidelity, runtime memory and Osaurus local-video adoption are not yet accepted. The converter and port still need real original checkpoint validation. Do not claim this implementation draft is a proven video runtime.
+
+## Consolidated runtime update — 2026-10-15
+
+Do not repeat passed cases from `workflow-integration.log`: Qwen Turbo4 stage/generate PNG parity at seeds7/8, conditioning reuse, zero-weight mixing, cancellation preserving its input, and stale-handle rejection. Real ostris Z-Image adapter v2 passed scale-zero parity, repeated-set one-load reuse and byte-identical base restoration.
+
+The initial preview ratio was1.0828 (FAIL); a128px internal draft decode now produces3 previews under64KiB with byte-identical final output,10.981s versus11.330s control. This is one Debug probe pair with host compilation, not a normalized performance claim or app proof.
+
+Z-Image8bit actual peaks:14,749,918,440 bytes at512² and25,140,704,712 at1024²; live weights after output10,814MB. The old two-feature-map estimate materially understated the untiled fp32 VAE/convolution workspace. The corrected Z-only spatial coefficient is calibrated from those two sizes. Other family estimates are still uncalibrated; do not claim the all-family ±15% gate passed.
+
+Native original Wan2.1 T2V1.3B,49frames832×480,50Euler steps,seed7 completed in522.164s. Start/middle/end frames show the requested red sailboat on a blue lake. Interrupt after first480p step returned cancelled in0.000261s with no output. Exact MP4 duration required both movie and track time scales to be multiples of FPS: the default600Hz track rounded16fps timestamps. The corrected actual5-frame run reports0.3125s exactly. No50step regeneration was needed for this writer-only correction. Original49-frame movie has old rounded3.063333s duration and is not passed off as exact.
+
+App3103 adds local video discovery/zero-cost jobs/API/tool/delegation, shared parent swap/restore policy and actual completion metadata. Live app acceptance remains pending; CLI video output does not establish it. Source/CI checks continue while the final distinct integration rows run.

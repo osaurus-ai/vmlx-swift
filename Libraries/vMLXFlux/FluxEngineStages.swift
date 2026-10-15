@@ -294,6 +294,19 @@ extension FluxEngine {
         return bytes
     }
 
+    /// Logical tensor bytes owned by a handle. Shared buffers remain active
+    /// until their final owner is released; this is not an allocator-cache size.
+    public func retainedBytes(for handle: FluxStageHandle) throws -> Int {
+        switch handle {
+        case .latent(let handle):
+            guard let value = stageLatents[handle.id] else { throw FluxError.staleHandle }
+            return value.value.nbytes
+        case .conditioning(let handle):
+            guard let value = stageConditionings[handle.id] else { throw FluxError.staleHandle }
+            return value.value.arrays.values.reduce(0) { $0 + $1.nbytes }
+        }
+    }
+
     public func release(_ handles: [FluxStageHandle]) async {
         await acquireOperation()
         defer { releaseOperation() }

@@ -56,7 +56,7 @@ func runVideoProbe(_ arguments: [String]) async throws {
         case .preview(_, let step): print("WAN preview=\(step)")
         case .completed(let url, let actualSeed, let fps, let frames, let effective):
             let duration = try await AVURLAsset(url: url).load(.duration).seconds
-            guard abs(duration - Double(frames) / Double(fps)) <= 1.0 / Double(fps) else {
+            guard abs(duration - Double(frames) / Double(fps)) < 0.000001 else {
                 throw NSError(domain: "VideoProbe", code: 2, userInfo: [NSLocalizedDescriptionKey: "MP4 duration mismatch"])
             }
             print("WAN completed path=\(url.path) seed=\(actualSeed) frames=\(frames) fps=\(fps) duration=\(duration) elapsed=\(Date().timeIntervalSince(started)) effective=\(String(describing: effective))")

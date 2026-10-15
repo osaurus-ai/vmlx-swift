@@ -5,10 +5,10 @@ import vMLXFlux
 /// Integration against installed weights, never synthetic tensors or pipelines.
 func runWorkflowCheck(_ arguments: [String]) async throws {
     guard (3...4).contains(arguments.count) else {
-        throw FluxError.invalidRequest("workflow-check MODEL_ROOT OUTPUT_DIRECTORY ZIMAGE_ADAPTER_FILE [all|stages|adapters|previews|memory1024]")
+        throw FluxError.invalidRequest("workflow-check MODEL_ROOT OUTPUT_DIRECTORY ZIMAGE_ADAPTER_FILE [all|stages|adapters|previews|memory1024|hires]")
     }
     let mode = arguments.count == 4 ? arguments[3] : "all"
-    guard ["all", "stages", "adapters", "previews", "memory1024"].contains(mode) else {
+    guard ["all", "stages", "adapters", "previews", "memory1024", "hires"].contains(mode) else {
         throw FluxError.invalidRequest("unknown workflow check mode")
     }
     let root = URL(fileURLWithPath: arguments[0]), output = URL(fileURLWithPath: arguments[1])
@@ -52,6 +52,48 @@ func runWorkflowCheck(_ arguments: [String]) async throws {
             }
         }
         throw FluxError.invalidRequest("sample has no terminal event")
+    }
+    if mode == "hires" {
+        let qwen = root.appendingPathComponent("Qwen-Image-2.1-Turbo-mflux-4bit")
+        try await engine.load(name: "qwen-image-2.1-turbo", modelPath: qwen)
+        let request = ImageGenRequest(prompt: prompt, width: 1536, height: 1536,
+            steps: 8, guidance: 1, seed: 7, outputDir: output)
+        Memory.peakMemory = 0
+        _ = try await generate(request)
+        let freshPeak = Memory.peakMemory
+        report("Hires fresh peak=\(freshPeak)")
+        let conditioning = try await engine.encodePrompt(model: qwen, prompt: prompt)
+        Memory.peakMemory = 0
+        let empty = try await engine.emptyLatent(model: qwen, width: 768, height: 768)
+        guard let first = try await sample(conditioning, empty, seed: 7) else { throw CancellationError() }
+        await engine.release([.latent(empty)])
+        let resized = try await engine.resize(first, width: 1536, height: 1536)
+        await engine.release([.latent(first)])
+        var final: FluxLatent?
+        for try await event in await engine.sample(conditioning, latent: resized,
+            steps: 8, guidance: 1, seed: 7, denoise: 0.45) {
+            switch event {
+            case .completed(let value, _): final = value
+            case .failed(let message, _): throw FluxError.invalidRequest(message)
+            case .cancelled: throw CancellationError()
+            default: break
+            }
+        }
+        guard let final else { throw FluxError.invalidRequest("no hires latent") }
+        await engine.release([.latent(resized), .conditioning(conditioning)])
+        let files = try await engine.decode(final, outputDir: output)
+        let peak = Memory.peakMemory
+        report("Hires output=\(files[0].path) width=\(final.width) height=\(final.height) peak=\(peak) freshPeak=\(freshPeak)")
+        let expectedBytes = try await engine.retainedBytes(for: .latent(final))
+        let activeBefore = Memory.activeMemory
+        await engine.release([.latent(final)])
+        let activeAfter = Memory.activeMemory
+        report("Lifetime before=\(activeBefore) after=\(activeAfter) expectedDrop=\(expectedBytes)")
+        try require(activeBefore - activeAfter >= expectedBytes, "released latent bytes remain active")
+        try require(final.width == 1536 && final.height == 1536, "hires dimensions")
+        try require(peak < freshPeak, "hires peak is not below fresh generation")
+        await engine.unload()
+        return
     }
     if mode == "all" || mode == "stages" {
     let qwen = root.appendingPathComponent("Qwen-Image-2.1-Turbo-mflux-4bit")
