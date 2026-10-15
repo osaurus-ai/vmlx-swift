@@ -1002,7 +1002,7 @@ let package = Package(
         // stack uses one MLX binary. Umbrella import: `import vMLXFlux`.
         .target(
             name: "vMLXFluxKit",
-            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon"],
+            dependencies: ["MLX", "MLXNN", "MLXRandom", "MLXLMCommon", .product(name: "Crypto", package: "swift-crypto")],
             path: "Libraries/vMLXFluxKit"
         ),
         .target(
@@ -1018,12 +1018,12 @@ let package = Package(
         ),
         .target(
             name: "vMLXFluxVideo",
-            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom"],
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxVideo"
         ),
         .target(
             name: "vMLXFlux",
-            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            dependencies: ["vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "MLX"],
             path: "Libraries/vMLXFlux"
         ),
         .executableTarget(

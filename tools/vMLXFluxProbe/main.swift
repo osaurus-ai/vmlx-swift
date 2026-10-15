@@ -9,6 +9,23 @@ import vMLXFluxKit
 struct VMLXFluxProbe {
     static func main() async {
         do {
+            if let command = CommandLine.arguments.dropFirst().first,
+               ["memory-check", "memory-estimate"].contains(command) {
+                try await runImageMemoryCheck(Array(CommandLine.arguments.dropFirst(2)), estimateOnly: command == "memory-estimate")
+                return
+            }
+            if CommandLine.arguments.dropFirst().first == "sampling-check" {
+                try await runSamplingCheck(Array(CommandLine.arguments.dropFirst(2)))
+                return
+            }
+            if CommandLine.arguments.dropFirst().first == "video" {
+                try await runVideoProbe(Array(CommandLine.arguments.dropFirst(2)))
+                return
+            }
+            if CommandLine.arguments.dropFirst().first == "workflow-check" {
+                try await runWorkflowCheck(Array(CommandLine.arguments.dropFirst(2)))
+                return
+            }
             let options = try ProbeOptions(arguments: Array(CommandLine.arguments.dropFirst()))
             VMLXFluxModels.registerAll()
             VMLXFluxVideo.registerAll()

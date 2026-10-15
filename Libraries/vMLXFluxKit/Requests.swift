@@ -18,6 +18,12 @@ public struct ImageGenRequest: Sendable {
     public var interrupt: FluxInterrupt?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
@@ -32,7 +38,9 @@ public struct ImageGenRequest: Sendable {
         batchSize: Int = 1,
         interrupt: FluxInterrupt? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -47,12 +55,19 @@ public struct ImageGenRequest: Sendable {
         self.interrupt = interrupt
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 
 // MARK: - ImageEditRequest
 
 public struct ImageEditRequest: Sendable {
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var sourceImage: URL
     public var sourceImages: [URL]
@@ -65,6 +80,12 @@ public struct ImageEditRequest: Sendable {
     public var seed: UInt64?
     public var outputDir: URL
     public var outputFormat: ImageFormat
+    public var sampler: String?
+    public var scheduler: String?
+    public var shift: Float?
+    public var previewInterval: Int?
+    public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
@@ -77,8 +98,11 @@ public struct ImageEditRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) {
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = [sourceImage]
@@ -91,6 +115,12 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 
     public init(
@@ -104,11 +134,14 @@ public struct ImageEditRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = [], interrupt: FluxInterrupt? = nil
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
         }
+        self.interrupt = interrupt
         self.prompt = prompt
         self.sourceImage = sourceImage
         self.sourceImages = sourceImages
@@ -121,6 +154,12 @@ public struct ImageEditRequest: Sendable {
         self.seed = seed
         self.outputDir = outputDir
         self.outputFormat = outputFormat
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.previewInterval = previewInterval
+        self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 
@@ -157,6 +196,8 @@ public struct UpscaleRequest: Sendable {
 // MARK: - VideoGenRequest (future)
 
 public struct VideoGenRequest: Sendable {
+    public var sourceImage: URL?
+    public var interrupt: FluxInterrupt?
     public var prompt: String
     public var negativePrompt: String?
     public var width: Int
@@ -178,8 +219,10 @@ public struct VideoGenRequest: Sendable {
         steps: Int = 50,
         guidance: Float = 5.0,
         seed: UInt64? = nil,
-        outputDir: URL
+        outputDir: URL, sourceImage: URL? = nil, interrupt: FluxInterrupt? = nil
     ) {
+        self.sourceImage = sourceImage
+        self.interrupt = interrupt
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.width = width
@@ -220,7 +263,7 @@ public enum ImageGenEvent: Sendable {
 public enum VideoGenEvent: Sendable {
     case step(step: Int, total: Int, etaSeconds: Double?)
     case preview(pngData: Data, frame: Int)
-    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int)
+    case completed(url: URL, seed: UInt64, fps: Int, frameCount: Int, effective: EffectiveImageParameters? = nil)
     case failed(message: String, hfAuth: Bool)
     case cancelled
 }

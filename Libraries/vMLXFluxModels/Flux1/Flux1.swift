@@ -7,16 +7,8 @@ import vMLXFluxKit
 // dual-encoder (T5 + CLIP) transformer backbone with flow-matching
 // sampling. Python source: `mflux.models.flux.variants.txt2img.flux.Flux1`.
 //
-// This is a SCAFFOLD — every method throws `notImplemented`. The real
-// port needs:
-//   1. FluxTransformer (DiT-style, ~12B params for Dev, ~2.3B for Schnell)
-//   2. T5-XXL text encoder (~5B params)
-//   3. CLIP-L text encoder
-//   4. Autoencoder (VAE)
-//   5. Flow-matching scheduler (Euler step, sigmas from 0→1)
-//   6. Weight loader for mlx .safetensors layout
-// All of that slots into the method bodies below without touching the
-// rest of the package — the protocol contract is stable.
+// Schnell uses the native pipeline below. Other variants retain explicit
+// unsupported errors until their pipelines are implemented.
 
 public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {
@@ -27,6 +19,7 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
             defaultSteps: 4,
             defaultGuidance: 0.0,   // Schnell doesn't use CFG
             supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.fluxSchnell },
             loader: { path, quant in
                 _ = Flux1Schnell._register  // ensure registered
                 return try await Flux1Schnell(modelPath: path, quantize: quant)
@@ -49,22 +42,35 @@ public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.fluxSchnell.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Flux steps must be greater than zero")
                     }
                     let image = try self.pipeline.generate(
                         prompt: request.prompt,
                         width: request.width, height: request.height,
-                        steps: request.steps, seed: request.seed
+                        steps: request.steps, seed: seed, preview: preview
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
+                    preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "flux1-schnell")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: 0, seed: seed, scheduler: "flux-flow", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16)))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

@@ -140,6 +140,8 @@ private final class ZImageWeightStore {
 }
 
 private final class ZImageLinear {
+    private let adapterState = FluxAdapterScope.current
+    private let adapterName: String
     private let weight: MLXArray
     private let scales: MLXArray?
     private let biases: MLXArray?
@@ -156,6 +158,8 @@ private final class ZImageLinear {
         outputDimensions: Int,
         name: String
     ) throws {
+        self.adapterName = name
+        adapterState?.register(name: name, input: inputDimensions, output: outputDimensions)
         guard weight.dim(0) == outputDimensions else {
             throw FluxError.invalidRequest(
                 "\(name) output mismatch: weight=\(weight.shape), expected output \(outputDimensions)")
@@ -213,7 +217,7 @@ private final class ZImageLinear {
         if let bias {
             y = y + bias
         }
-        return y
+        return adapterState?.apply(name: adapterName, input: x, output: y) ?? y
     }
 }
 
@@ -1136,7 +1140,7 @@ final class ZImageNativePipeline {
         height: Int,
         steps: Int,
         seed: UInt64?,
-        progress: (Int, Int, Double?) -> Void
+        preview: ImagePreviewEmitter? = nil, progress: (Int, Int, Double?) -> Void
     ) async throws -> MLXArray {
         guard width % 16 == 0, height % 16 == 0 else {
             throw FluxError.invalidRequest("Z-Image width and height must be divisible by 16")
@@ -1147,6 +1151,7 @@ final class ZImageNativePipeline {
         let negativeEncodings = (guidance > 0 && negativePrompt != nil) ? encodePrompt(negativePrompt ?? "") : nil
         let sigmas = linearSigmas(steps: steps)
         for step in 0..<steps {
+            try FluxInterruptScope.check()
             if Task.isCancelled {
                 throw CancellationError()
             }
@@ -1158,6 +1163,10 @@ final class ZImageNativePipeline {
             }
             latents = latents + noise * MLXArray(sigmas[step + 1] - sigmas[step])
             eval(latents)
+            preview?.emit(step: step + 1) {
+                let spatial = latents.reshaped([1, ZImageNative.channels, height / 8, width / 8])
+                return vae.decode(preview!.reducedLatent(spatial, scale: 8))
+            }
             let elapsed = Date().timeIntervalSince(start)
             let perStep = elapsed / Double(step + 1)
             progress(step + 1, steps, perStep * Double(steps - step - 1))

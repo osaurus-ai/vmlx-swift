@@ -107,6 +107,43 @@ final class QwenImage21Tests: XCTestCase {
         for (a, b) in zip(sigmas, expected) { XCTAssertEqual(a, b, accuracy: 1e-6) }
     }
 
+    func testSamplingControlsRespectBundleSchedule() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let native = try QwenImage21.requestLimits(modelPath: root)
+        var request = ImageGenRequest(prompt: "cube", width: 512, height: 512, steps: 8,
+            seed: 7, outputDir: root, sampler: "heun", scheduler: "linear", shift: 0.5)
+        XCTAssertNoThrow(try native.validate(request))
+        request.shift = .nan
+        XCTAssertThrowsError(try native.validate(request))
+        request.shift = nil
+        request.sampler = "unsupported"
+        XCTAssertThrowsError(try native.validate(request))
+        try Data("{\"sample_sigmas\":[1,0.7,0.3]}".utf8)
+            .write(to: root.appendingPathComponent("model_index.json"))
+        let turbo = try QwenImage21.requestLimits(modelPath: root, requiresFixedSchedule: true)
+        request.sampler = "euler"
+        request.scheduler = "bundle-sigmas"
+        XCTAssertNoThrow(try turbo.validate(request))
+        request.sampler = "heun"
+        XCTAssertThrowsError(try turbo.validate(request))
+        request.sampler = "euler"
+        request.shift = 0.5
+        XCTAssertThrowsError(try turbo.validate(request))
+    }
+
+    func testExplicitNativeShiftReplaysDefaultAndChangesSchedule() {
+        let implicit = QwenImage21Schedule.sigmas(steps: 8, width: 512, height: 512).asArray(Float.self)
+        let explicit = QwenImage21Schedule.sigmas(steps: 8, width: 512, height: 512,
+            shift: QwenImage21Schedule.shift(width: 512, height: 512)).asArray(Float.self)
+        XCTAssertEqual(implicit, explicit)
+        let changed = QwenImage21Schedule.sigmas(steps: 8, width: 512, height: 512,
+            shift: 1.5).asArray(Float.self)
+        XCTAssertNotEqual(implicit, changed)
+        XCTAssertTrue(zip(changed, changed.dropFirst()).allSatisfy { $0.0 > $0.1 })
+    }
+
     // MARK: mflux-saved key layout
 
     func testTextEncoderLookupFallsBackToPrefixFreeMfluxKeys() {

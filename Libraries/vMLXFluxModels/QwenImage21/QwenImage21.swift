@@ -12,7 +12,7 @@ import vMLXFluxKit
 // fixed 8-node sigma grid in its model_index.json (`sample_sigmas`); the pipeline samples on that grid
 // whenever a bundle defines one. Defaults: 8 steps, guidance 1.0.
 
-public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable {
+public final class QwenImage21: ImageGenerator, ImageEditor, FluxStageModel, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "qwen-image-2.1",
@@ -20,6 +20,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 40,
             defaultGuidance: 1.0,
+            supportsLoRA: true,
             limits: { try requestLimits(modelPath: $0) },
             loader: { path, quant in
                 _ = QwenImage21._register
@@ -32,6 +33,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 8,
             defaultGuidance: 1.0,
+            supportsLoRA: true,
             limits: { try requestLimits(modelPath: $0, requiresFixedSchedule: true) },
             loader: { path, quant in
                 _ = QwenImage21._register
@@ -43,6 +45,33 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     /// Output file prefix: the Turbo bundle (fixed sampling grid) is named as such.
     private var outputPrefix: String {
         pipeline.sampleSigmas == nil ? "qwen-image-2.1" : "qwen-image-2.1-turbo"
+    }
+
+    public var stageSpatialScale: Int { 16 }
+    public var stageChannels: Int { pipeline.cfg.zDim }
+    public func stageEncodePrompt(_ prompt: String, negativePrompt: String?) throws -> FluxStageConditioning {
+        pipeline.encodeStagePrompt(prompt, negativePrompt: negativePrompt)
+    }
+    public func stageEncodeImage(_ image: URL, width: Int, height: Int) throws -> MLXArray {
+        try pipeline.encodeStageImage(image, width: width, height: height)
+    }
+    public func stageDecode(_ latent: MLXArray) throws -> MLXArray { pipeline.decodeStageLatent(latent, boundedWorkspace: true) }
+    public func stageSample(_ conditioning: FluxStageConditioning, latent: MLXArray,
+                            width: Int, height: Int, options: FluxStageSampling,
+                            interrupt: FluxInterrupt?, progress: (Int, Int, Double?) -> Void)
+        throws -> (MLXArray, EffectiveImageParameters) {
+        let request = ImageGenRequest(prompt: "", width: width, height: height, steps: options.steps,
+            guidance: options.guidance, seed: options.seed, outputDir: modelPath,
+            sampler: options.sampler, scheduler: options.scheduler, shift: options.shift)
+        try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request)
+        let prepared = try pipeline.stagePrepared(conditioning, width: width, height: height,
+            steps: options.steps, guidance: options.guidance)
+        var effective: EffectiveImageParameters?
+        let result = try pipeline.sampleLatent(prepared, seed: options.seed, interrupt: interrupt,
+            sampler: options.sampler, scheduler: options.scheduler, shift: options.shift,
+            initialLatent: latent, denoise: options.denoise, resolved: { effective = $0 }, progress: progress)
+        guard let effective else { throw FluxError.invalidRequest("sampling did not resolve effective parameters") }
+        return (result, effective)
     }
 
     public let modelPath: URL
@@ -65,7 +94,11 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             dimensionMultiple: 32, minDimension: 32, minimumSteps: 2, fixedSteps: fixedSteps,
             supportsNegativePrompt: true, supportsEditNegativePrompt: false,
             supportsStrength: false, supportsMask: false, maxSourceImages: 10, supportedFormats: [.png],
-            maximumImages: 8, maximumParallelImages: 1)
+            maximumImages: 8, maximumParallelImages: 1,
+            samplers: fixedSteps == nil ? ["euler", "heun"] : ["euler"],
+            schedulers: fixedSteps == nil ? ["qwen-image-2.1", "linear"] : ["bundle-sigmas"],
+            defaultSampler: "euler", defaultScheduler: fixedSteps == nil ? "qwen-image-2.1" : "bundle-sigmas",
+            supportsShift: fixedSteps == nil)
     }
 
     public init(modelPath: URL, quantize: Int?, requiresFixedSchedule: Bool = false) async throws {
@@ -103,8 +136,13 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                     let started = Date()
                     for (index, seed) in plan.seeds.enumerated() {
                         try interrupt.check()
+                        let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                            continuation.yield(.preview(pngData: data, step: step))
+                        }
+                        defer { preview?.close() }
                         var effective: EffectiveImageParameters?
                         let image = try pipeline.sample(prepared, seed: seed, interrupt: interrupt,
+                            sampler: request.sampler, scheduler: request.scheduler, shift: request.shift, preview: preview,
                             resolved: { effective = $0 }, progress: { step, total, eta in
                                 let completed = index * total + step
                                 let all = total * plan.seeds.count
@@ -112,6 +150,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
                                 continuation.yield(.step(step: completed, total: all, etaSeconds: remaining))
                             })
                         try interrupt.check()
+                        preview?.close()
                         let url = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: outputPrefix)
                         if interrupt.isCancelled {
                             try FileManager.default.removeItem(at: url)
@@ -142,28 +181,45 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
         do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
         catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
         let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed) { pipeline, progress, resolved in
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed, interrupt: interrupt, previewInterval: request.previewInterval, previewMaxPixel: request.previewMaxPixel) { pipeline, progress, resolved, preview in
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: nil, references: request.sourceImages,
                 width: request.width, height: request.height, steps: request.steps,
-                guidance: request.guidance, seed: seed, resolved: resolved, progress: progress)
+                guidance: request.guidance, seed: seed, sampler: request.sampler,
+                scheduler: request.scheduler, shift: request.shift, interrupt: interrupt, preview: preview, resolved: resolved, progress: progress)
         }
     }
 
     private func run(
-        prefix: String, outputDir: URL, seed: UInt64,
-        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void) throws -> MLXArray
+        prefix: String, outputDir: URL, seed: UInt64, interrupt: FluxInterrupt, previewInterval: Int? = nil, previewMaxPixel: Int = 256,
+        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void, ImagePreviewEmitter?) throws -> MLXArray
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
+            continuation.onTermination = { if case .cancelled = $0 { interrupt.cancel() } }
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    try interrupt.check()
+                    let preview = ImagePreviewEmitter(interval: previewInterval, maxPixel: previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     var parameters: EffectiveImageParameters?
                     let image = try body(self.pipeline, { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
-                    }, { parameters = $0 })
+                    }, { parameters = $0 }, preview)
+                    try interrupt.check()
+                    preview?.close()
                     let url = try ImageIO.writePNG(image, outputDir: outputDir, prefix: prefix)
+                    if interrupt.isCancelled {
+                        try FileManager.default.removeItem(at: url)
+                        throw CancellationError()
+                    }
                     continuation.yield(.completed(url: url, seed: seed, effectiveParameters: parameters))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

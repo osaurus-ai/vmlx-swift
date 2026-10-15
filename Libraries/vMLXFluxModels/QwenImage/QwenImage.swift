@@ -12,6 +12,8 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
             kind: .imageGen,
             defaultSteps: 30,
             defaultGuidance: 4.0,
+            supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.qwenImage },
             loader: { path, quant in
                 _ = QwenImage._register
                 return try await QwenImage(modelPath: path, quantize: quant)
@@ -34,22 +36,35 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.qwenImage.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Qwen steps must be greater than zero")
                     }
                     let image = try self.pipeline.generate(
                         prompt: request.prompt, negativePrompt: request.negativePrompt,
                         width: request.width, height: request.height, steps: request.steps,
-                        guidance: request.guidance, seed: request.seed
+                        guidance: request.guidance, seed: seed, preview: preview
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
+                    preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: "qwen-image")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL, steps: request.steps, guidance: request.guidance, seed: seed, scheduler: "qwen-image", shift: FlowMatchEulerScheduler.computeShift(imageSeqLen: (request.width / 16) * (request.height / 16), baseShift: 0.5, maxShift: 0.9, baseSeqLen: 256, maxSeqLen: 8192))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)
@@ -61,7 +76,7 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
     }
 }
 
-public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
+public final class QwenImageEdit: ImageEditor, FluxAdapterPreparing, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "qwen-image-edit",
@@ -69,6 +84,8 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
             kind: .imageEdit,
             defaultSteps: 30,
             defaultGuidance: 4.0,
+            supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.qwenEdit },
             loader: { path, quant in
                 _ = QwenImageEdit._register
                 return try QwenImageEdit(modelPath: path, quantize: quant)
@@ -78,6 +95,11 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
 
     public let modelPath: URL
     public let quantize: Int?
+    private var adapterPipeline: QwenImageEditPipeline?
+
+    public func prepareAdapterLayers() async throws {
+        if adapterPipeline == nil { adapterPipeline = try QwenImageEditPipeline(modelPath: modelPath) }
+    }
 
     public init(modelPath: URL, quantize: Int?) throws {
         self.modelPath = modelPath
@@ -90,14 +112,21 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
     }
 
     public func edit(_ request: ImageEditRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.qwenEdit.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
                     if request.mask != nil {
                         throw FluxError.notImplemented("QwenImageEdit masks are not wired yet")
                     }
-                    let pipeline = try QwenImageEditPipeline(modelPath: self.modelPath)
+                    let pipeline = try adapterPipeline ?? QwenImageEditPipeline(modelPath: self.modelPath)
                     let image = try await pipeline.edit(
                         prompt: request.prompt,
                         sourceImages: request.sourceImages,
@@ -105,15 +134,26 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
                         height: request.height,
                         steps: request.steps,
                         guidance: request.guidance,
-                        seed: request.seed
+                        seed: seed, preview: preview
                     ) { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }
+                    preview?.close()
+                    try FluxInterruptScope.check()
                     let outURL = try ImageIO.writePNG(
                         image,
                         outputDir: request.outputDir,
                         prefix: "qwen-image-edit")
-                    continuation.yield(.completed(url: outURL, seed: request.seed ?? 0))
+                    let size = try ImageIO.dimensions(of: outURL)
+                    continuation.yield(.completed(url: outURL, seed: seed,
+                        effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL,
+                            steps: request.steps, guidance: request.guidance, seed: seed,
+                            scheduler: "qwen-image", shift: FlowMatchEulerScheduler.computeShift(
+                                imageSeqLen: (size.width / 16) * (size.height / 16),
+                                baseShift: 0.5, maxShift: 0.9, baseSeqLen: 256, maxSeqLen: 8192))))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

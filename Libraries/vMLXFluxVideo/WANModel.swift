@@ -3,246 +3,162 @@ import Foundation
 import MLXRandom
 import vMLXFluxKit
 
-// MARK: - WAN (Wan 2.1 / Wan 2.2) — Apple Silicon video generation
-//
-// End-to-end scaffold: scheduler → noise latent → WanDiT forward →
-// WanVAEDecoder → MP4. The transformer velocity predictor and the VAE
-// are module-complete (FP32 weights would load directly via
-// WeightLoader) but ship initialized to random weights, so current
-// output is a random noise MP4 — real weights decode into real video
-// once we wire a safetensors loader for Wan's specific file layout.
-//
-// Architecture flow:
-//   1. text → T5-XXL → (B, N_txt, 4096)     [STUB — currently zero tensor]
-//   2. noise latent: (1, 16, T/4, H/8, W/8) via LatentSpace
-//   3. patchify video latent: (1, N_vid, patch_t*patch_h*patch_w*16)
-//   4. For each scheduler step:
-//        velocity = WanDiTModel(video_patched, txt, t)
-//        latent = scheduler.step(latent, velocity, i)
-//        yield progress event
-//   5. unpatchify latent back to (1, 16, T/4, H/8, W/8)
-//   6. WanVAEDecoder(latent) → (1, 3, T, H, W) in [-1, 1]
-//   7. Postprocess → [0, 1]
-//   8. Write MP4 via WanVideoIO
-//   9. Yield .completed
-//
-// This is the REAL pipeline — the only placeholders are the
-// un-loaded weights inside WanDiTModel + WanVAEDecoder.
-
+/// Native Wan 2.1 T2V/I2V using original tensor names in safetensors
+/// components. See docs/FLUX-WORKFLOW-SPEC-IMPLEMENTATION.md for layout.
 public final class WANModel: VideoGenerator, @unchecked Sendable {
-    /// Wan 2.1 — the original 1.3B / 14B variants.
     public static let _registerWan21: Void = {
-        ModelRegistry.register(ModelEntry(
-            name: "wan-2.1",
-            displayName: "Wan 2.1",
-            kind: .videoGen,
-            defaultSteps: 50,
-            defaultGuidance: 5.0,
-            loader: { path, quant in
-                _ = WANModel._registerWan21
-                return try WANModel(modelPath: path, quantize: quant, version: .wan21)
-            }
-        ))
+        ModelRegistry.register(ModelEntry(name: "wan-2.1", displayName: "Wan 2.1",
+            kind: .videoGen, defaultSteps: 50, defaultGuidance: 5,
+            loader: { path, quant in try await WANModel(modelPath: path, quantize: quant, version: .wan21) }))
     }()
-
-    /// Wan 2.2 — second generation with higher resolution defaults.
     public static let _registerWan22: Void = {
-        ModelRegistry.register(ModelEntry(
-            name: "wan-2.2",
-            displayName: "Wan 2.2",
-            kind: .videoGen,
-            defaultSteps: 50,
-            defaultGuidance: 5.0,
-            loader: { path, quant in
-                _ = WANModel._registerWan22
-                return try WANModel(modelPath: path, quantize: quant, version: .wan22)
-            }
-        ))
+        ModelRegistry.register(ModelEntry(name: "wan-2.2", displayName: "Wan 2.2",
+            kind: .videoGen, defaultSteps: 50, defaultGuidance: 5,
+            loader: { _, _ in throw FluxError.notImplemented("Wan 2.2 dual-transformer routing") }))
     }()
-
     public enum Version: Sendable { case wan21, wan22 }
-
     public let modelPath: URL
     public let quantize: Int?
     public let version: Version
-    public let config: WanDiTConfig
-    public let transformer: WanDiTModel
-    public let vae: WanVAEDecoder
-    public let loadedWeights: LoadedWeights
+    private let transformer: WanNativeTransformer
+    private let encoder: WanNativeTextEncoder
+    private let vae: WanNativeVAE
+    private let clip: WanNativeCLIP?
+    private let shift: Float
+    private let fixedSigmas: [Float]?
 
-    public init(modelPath: URL, quantize: Int?, version: Version) throws {
-        self.modelPath = modelPath
-        self.quantize = quantize
-        self.version = version
-
-        // Pick the right config for the version. 1.3B vs 14B is decided
-        // at load time by inspecting the checkpoint file sizes; for now
-        // we default to the larger 14B topology.
-        self.config = {
-            switch version {
-            case .wan21: return .wan21_14B
-            case .wan22: return .wan22
-            }
-        }()
-
-        guard FileManager.default.fileExists(atPath: modelPath.path) else {
-            throw FluxError.weightsNotFound(modelPath)
+    public init(modelPath: URL, quantize: Int?, version: Version) async throws {
+        guard version == .wan21 else { throw FluxError.notImplemented("Wan 2.2 dual-transformer routing") }
+        self.modelPath = modelPath; self.quantize = quantize; self.version = version
+        let configURL = modelPath.appendingPathComponent("config.json")
+        guard let config = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],
+              let modelType = config["model_type"] as? String, ["t2v", "i2v"].contains(modelType),
+              config["dim"] != nil, config["num_heads"] != nil, config["num_layers"] != nil else {
+            throw FluxError.localModelIncomplete(modelPath, reasons: ["original Wan config.json with model_type, dim, num_heads and num_layers is required"])
         }
-
-        // Module construction. Real safetensors → module tree application
-        // plugs in once the Wan-specific key mapping is written; for now
-        // the modules initialize with random weights from their Linear
-        // constructors so the forward pass compiles and runs.
-        self.transformer = WanDiTModel(config: config)
-        self.vae = WanVAEDecoder()
-
-        // Eagerly scan the weights dir so JANG config / missing-shard
-        // errors surface at `.load` time, same as ZImage.
-        self.loadedWeights = try WeightLoader.load(from: modelPath)
+        let loaded = try WeightLoader.load(from: modelPath)
+        guard let text = loaded.componentWeights["text_encoder"], let vaeWeights = loaded.componentWeights["vae"] else {
+            throw FluxError.localModelIncomplete(modelPath, reasons: ["text_encoder/ and vae/ safetensor components are required"])
+        }
+        let transformerWeights = loaded.componentWeights["transformer"] ?? loaded.weights
+        transformer = try WanNativeTransformer(weights: transformerWeights, config: config)
+        encoder = try await WanNativeTextEncoder(weights: text, modelURL: modelPath)
+        vae = try WanNativeVAE(weights: vaeWeights)
+        if modelType == "i2v" {
+            let directory = modelPath.appendingPathComponent("image_encoder")
+            var arrays: [String: MLXArray] = [:]
+            for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                .filter({ $0.pathExtension == "safetensors" }).sorted(by: { $0.path < $1.path }) {
+                for (key, value) in try MLX.loadArrays(url: file) {
+                    guard arrays[key] == nil else { throw FluxError.invalidRequest("duplicate Wan image encoder tensor \(key)") }
+                    arrays[key] = value
+                }
+            }
+            clip = try WanNativeCLIP(arrays: arrays)
+        } else { clip = nil }
+        shift = (config["sample_shift"] as? NSNumber)?.floatValue ?? (modelType == "i2v" ? 5 : 3)
+        fixedSigmas = (config["sample_sigmas"] as? [NSNumber])?.map(\.floatValue)
+        guard shift.isFinite, shift > 0 else { throw FluxError.invalidRequest("Wan sample_shift must be positive") }
+        if let fixedSigmas {
+            guard !fixedSigmas.isEmpty, fixedSigmas.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 1 }),
+                zip(fixedSigmas, fixedSigmas.dropFirst()).allSatisfy({ $0 > $1 }) else {
+                throw FluxError.invalidRequest("Wan sample_sigmas must be strictly decreasing in (0,1]")
+            }
+        }
     }
 
     public func generate(_ request: VideoGenRequest) -> AsyncThrowingStream<VideoGenEvent, Error> {
-        AsyncThrowingStream { continuation in
-            Task { [weak self] in
-                guard let self else { continuation.finish(); return }
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        return AsyncThrowingStream { continuation in
+            let task = Task {
                 do {
-                    try await self.performGenerate(request, continuation: continuation)
+                    try self.run(request, interrupt: interrupt, continuation: continuation)
                     continuation.finish()
-                } catch {
-                    let msg = String(describing: error)
-                    let hfAuth = msg.contains("401") || msg.contains("403")
-                    continuation.yield(.failed(message: msg, hfAuth: hfAuth))
-                    continuation.finish()
-                }
+                } catch is CancellationError {
+                    continuation.yield(.cancelled); continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { reason in
+                if case .cancelled = reason { interrupt.cancel(); task.cancel() }
             }
         }
     }
 
-    private func performGenerate(
-        _ request: VideoGenRequest,
-        continuation: AsyncThrowingStream<VideoGenEvent, Error>.Continuation
-    ) async throws {
-        // 1. Scheduler. Video image-seq-len is (T/4) × (H/8 × W/8) patches,
-        // typically much larger than still-image so the shift is saturated
-        // at maxShift.
-        let patchedSpatial = (request.width / 8 / config.patchSizeH)
-            * (request.height / 8 / config.patchSizeW)
-        let patchedTemporal = (request.numFrames / 4 / config.patchSizeT)
-        let videoSeqLen = max(256, patchedSpatial * patchedTemporal)
-        let scheduler = FlowMatchEulerScheduler(
-            steps: request.steps,
-            imageSeqLen: videoSeqLen,
-            baseShift: 0.5,
-            maxShift: 1.15
-        )
-
-        // 2. Noise latent: (1, 16, T/4, H/8, W/8). LatentSpace only
-        // supports 2D layouts, so we allocate a flat (1, seq, 16)
-        // and reshape.
-        let tLatent = request.numFrames / 4
-        let hLatent = request.height / 8
-        let wLatent = request.width / 8
-        if let seed = request.seed {
-            MLXRandom.seed(seed)
+    private func run(_ request: VideoGenRequest, interrupt: FluxInterrupt,
+                     continuation: AsyncThrowingStream<VideoGenEvent, Error>.Continuation) throws {
+        try interrupt.check()
+        guard request.width >= 16, request.height >= 16, request.width % 16 == 0, request.height % 16 == 0,
+              request.numFrames > 0, request.numFrames % 4 == 1, (1...240).contains(request.fps),
+              request.steps > 0, request.guidance.isFinite, request.guidance >= 0 else {
+            throw FluxError.invalidRequest("Wan requires positive multiples of 16, 4n+1 frames, positive steps, finite guidance and fps in 1...240")
         }
-        var latent5D = MLXRandom.normal([1, 16, tLatent, hLatent, wLatent])
-
-        // 3. Patchify: (B, 16, T, H, W) → (B, N_vid, patch_t*patch_h*patch_w*16).
-        // For patch (1, 2, 2): reshape + transpose to collect each 1×2×2×16
-        // block into one vector.
-        func patchify(_ x: MLXArray) -> MLXArray {
-            let pT = config.patchSizeT
-            let pH = config.patchSizeH
-            let pW = config.patchSizeW
-            let b = x.dim(0)
-            let c = x.dim(1)
-            let t = x.dim(2)
-            let h = x.dim(3)
-            let w = x.dim(4)
-            // (B, C, T, H, W) → (B, C, T/pT, pT, H/pH, pH, W/pW, pW)
-            let r = x.reshaped([b, c, t / pT, pT, h / pH, pH, w / pW, pW])
-            // → (B, T/pT, H/pH, W/pW, pT, pH, pW, C)
-            let p = r.transposed(0, 2, 4, 6, 3, 5, 7, 1)
-            // → (B, N, pT*pH*pW*C)
-            let n = (t / pT) * (h / pH) * (w / pW)
-            return p.reshaped([b, n, pT * pH * pW * c])
+        let pixels = request.width.multipliedReportingOverflow(by: request.height)
+        guard !pixels.overflow, pixels.partialValue <= Int(Int32.max) / request.numFrames else {
+            throw FluxError.invalidRequest("Wan video dimensions exceed tensor indexing limits")
         }
-        func unpatchify(_ x: MLXArray, t: Int, h: Int, w: Int) -> MLXArray {
-            let pT = config.patchSizeT
-            let pH = config.patchSizeH
-            let pW = config.patchSizeW
-            let b = x.dim(0)
-            let c = 16
-            // (B, N, pT*pH*pW*C) → (B, T/pT, H/pH, W/pW, pT, pH, pW, C)
-            let r = x.reshaped([b, t / pT, h / pH, w / pW, pT, pH, pW, c])
-            // → (B, C, T/pT, pT, H/pH, pH, W/pW, pW)
-            let p = r.transposed(0, 7, 1, 4, 2, 5, 3, 6)
-            return p.reshaped([b, c, t, h, w])
+        guard transformer.imageConditioned == (request.sourceImage != nil) else {
+            throw FluxError.invalidField(field: "sourceImage", value: request.sourceImage == nil ? "missing" : "provided",
+                allowed: transformer.imageConditioned ? "required by this I2V bundle" : "omitted for this T2V bundle")
         }
-
-        // 4. Text encoding. REAL T5-XXL Swift port is future work; for
-        // now feed a zero tensor of the right shape. Wan uses ~256
-        // max tokens for the text stream.
-        let nTxt = 256
-        let txt = MLXArray.zeros([1, nTxt, config.textDim])
-
-        // 5. Sampling loop.
-        let total = scheduler.stepCount
-        let startedAt = Date()
-        for step in 0..<total {
-            if Task.isCancelled {
-                continuation.yield(.cancelled)
-                return
-            }
-            let patched = patchify(latent5D)
-            let timestep = MLXArray([scheduler.timesteps[step]])
-            let velocityPatched = transformer(
-                videoPatched: patched,
-                txt: txt,
-                timestep: timestep
-            )
-            let velocity5D = unpatchify(velocityPatched, t: tLatent, h: hLatent, w: wLatent)
-            // Euler step in 5D space — the scheduler only cares about
-            // shape, not dimensionality.
-            let sigmaCurrent = scheduler.sigmas[step]
-            let sigmaNext = scheduler.sigmas[step + 1]
-            let delta = sigmaNext - sigmaCurrent
-            latent5D = latent5D + velocity5D * MLXArray(Float(delta))
-            _ = latent5D.shape  // force eval
-
-            let elapsed = Date().timeIntervalSince(startedAt)
-            let perStep = elapsed / Double(step + 1)
-            let eta = perStep * Double(total - step - 1)
-            continuation.yield(.step(step: step + 1, total: total, etaSeconds: eta))
+        let positive = try encoder.encode(request.prompt, interrupt: interrupt)
+        let negative = request.guidance == 1 ? nil : try encoder.encode(request.negativePrompt ?? "", interrupt: interrupt)
+        let frames = (request.numFrames - 1) / 4 + 1, h = request.height / 8, w = request.width / 8
+        let seed = request.seed ?? UInt64.random(in: 0...UInt64.max)
+        var latent = MLXRandom.normal([frames, h, w, 16], key: MLXRandom.key(seed)).asType(.bfloat16)
+        var imageFeatures: MLXArray?, imageLatent: MLXArray?
+        if let source = request.sourceImage, let clip {
+            imageFeatures = try clip.encode(source, interrupt: interrupt)
+            let size = try ImageIO.dimensions(of: source)
+            let scale = max(Double(request.width) / Double(size.width), Double(request.height) / Double(size.height))
+            let resizedW = max(request.width, Int((Double(size.width) * scale).rounded()))
+            let resizedH = max(request.height, Int((Double(size.height) * scale).rounded()))
+            let values = try ImageIO.readRGBValues(source, width: resizedW, height: resizedH, normalization: .minusOneToOne)
+            let top = (resizedH - request.height) / 2, left = (resizedW - request.width) / 2
+            let resized = MLXArray(values, [3, resizedH, resizedW])
+            let image = resized[0..., top..<(top + request.height), left..<(left + request.width)].transposed(1, 2, 0)
+            let video = concatenated([image.expandedDimensions(axis: 0),
+                MLXArray.zeros([request.numFrames - 1, request.height, request.width, 3])], axis: 0)
+            let encoded = try vae.encode(video, interrupt: interrupt)
+            let mask = concatenated([MLXArray.ones([1, h, w, 4]), MLXArray.zeros([frames - 1, h, w, 4])], axis: 0)
+            imageLatent = concatenated([mask, encoded], axis: -1).asType(latent.dtype)
         }
-
-        // 6. VAE decode.
-        let rescaled = WanVAEDecoder.preprocessLatent(latent5D)
-        let decoded = vae(rescaled)   // (1, 3, T, H, W) in ~[-1, 1]
-        let processed = WanVAEDecoder.postprocess(decoded)
-
-        // 7. Drop batch dim and write MP4 + frame PNG sequence.
-        let video = processed[0]   // (3, T, H, W)
-        try FileManager.default.createDirectory(
-            at: request.outputDir, withIntermediateDirectories: true)
-        let mp4URL = request.outputDir.appendingPathComponent(
-            "wan-\(UUID().uuidString.prefix(8)).mp4"
-        )
-        try await MainActor.run {
-            try WanVideoIO.writeMP4(video, outputURL: mp4URL, fps: request.fps)
+        let grid = fixedSigmas ?? (0..<request.steps).map { index -> Float in
+            let sigma = 1 - Float(index) / Float(request.steps)
+            return shift * sigma / (1 + (shift - 1) * sigma)
         }
-
-        let seed = request.seed ?? 0
-        continuation.yield(.completed(
-            url: mp4URL,
-            seed: seed,
-            fps: request.fps,
-            frameCount: request.numFrames
-        ))
+        let sigmas = grid + [0]
+        let start = Date()
+        for step in grid.indices {
+            try interrupt.check()
+            let prediction = try transformer.predict(latent, time: grid[step] * 1000,
+                context: positive, imageFeatures: imageFeatures, imageLatent: imageLatent, interrupt: interrupt)
+            let velocity: MLXArray
+            if let negative {
+                let unconditioned = try transformer.predict(latent, time: grid[step] * 1000,
+                    context: negative, imageFeatures: imageFeatures, imageLatent: imageLatent, interrupt: interrupt)
+                velocity = unconditioned + request.guidance * (prediction - unconditioned)
+            } else { velocity = prediction }
+            latent = (latent.asType(.float32) + velocity.asType(.float32) * (sigmas[step + 1] - sigmas[step])).asType(latent.dtype)
+            eval(latent)
+            let elapsed = Date().timeIntervalSince(start)
+            continuation.yield(.step(step: step + 1, total: grid.count,
+                etaSeconds: elapsed / Double(step + 1) * Double(grid.count - step - 1)))
+        }
+        var chunks: [MLXArray] = []
+        try vae.decode(latent.asType(.float32), interrupt: interrupt) { chunks.append(($0 + 1) / 2) }
+        let video = concatenated(chunks, axis: 0)
+        guard video.dim(0) == request.numFrames else { throw FluxError.invalidRequest("Wan VAE produced an unexpected frame count") }
+        try interrupt.check()
+        let url = request.outputDir.appendingPathComponent("wan-\(UUID().uuidString).mp4")
+        try WanVideoIO.writeMP4(video.transposed(3, 0, 1, 2), outputURL: url, fps: request.fps, interrupt: interrupt)
+        if interrupt.isCancelled { try? FileManager.default.removeItem(at: url); throw CancellationError() }
+        continuation.yield(.completed(url: url, seed: seed, fps: request.fps, frameCount: request.numFrames,
+            effective: EffectiveImageParameters(width: request.width, height: request.height,
+                steps: grid.count, guidance: request.guidance, seed: seed, sampler: "euler",
+                scheduler: fixedSigmas == nil ? "wan-flow" : "bundle-sigmas", shift: shift, sampleSigmas: fixedSigmas)))
     }
 }
 
-/// Force-register the video models. Call once at app launch.
 public enum VMLXFluxVideo {
     public static func registerAll() {
         _ = WANModel._registerWan21

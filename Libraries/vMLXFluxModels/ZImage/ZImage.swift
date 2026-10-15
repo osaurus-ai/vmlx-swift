@@ -6,13 +6,6 @@ import vMLXFluxKit
 // Z-Image-Turbo — single-encoder turbo model, ~2B params, 4-8 steps.
 // Python source: `mflux.models.z_image.variants.z_image.ZImage`.
 //
-// STATUS: end-to-end wiring + scheduler + weight loading + PNG output.
-// The transformer velocity predictor is a PLACEHOLDER (returns a scaled
-// noise field) until the DiT port lands. With this placeholder the UI
-// gets real progress events, step counts match, and a valid PNG lands
-// on disk. Replacing the velocity predictor with the real transformer
-// forward pass is a localized change.
-
 public final class ZImage: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
@@ -21,7 +14,8 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             kind: .imageGen,
             defaultSteps: 4,
             defaultGuidance: 0.0,
-            supportsLoRA: false,
+            supportsLoRA: true,
+            limits: { _ in NativeImageRequestContracts.zImage },
             loader: { path, quant in
                 _ = ZImage._register
                 return try await ZImage(modelPath: path, quantize: quant)
@@ -52,11 +46,16 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        AsyncThrowingStream { continuation in
+        do { try NativeImageRequestContracts.zImage.validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+        return AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
                     try await self.performGenerate(request, continuation: continuation)
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)
@@ -75,6 +74,11 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
         guard request.steps > 0 else {
             throw FluxError.invalidRequest("Z-Image steps must be greater than zero")
         }
+        let seed = request.seed ?? UInt64.random(in: 0...UInt64(UInt32.max))
+                    let preview = ImagePreviewEmitter(interval: request.previewInterval, maxPixel: request.previewMaxPixel) { data, step in
+                        continuation.yield(.preview(pngData: data, step: step))
+                    }
+                    defer { preview?.close() }
         let image = try await pipeline.generate(
             prompt: request.prompt,
             negativePrompt: request.negativePrompt,
@@ -82,18 +86,22 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             width: request.width,
             height: request.height,
             steps: request.steps,
-            seed: request.seed
+            seed: seed, preview: preview
         ) { step, total, eta in
             continuation.yield(.step(step: step, total: total, etaSeconds: eta))
         }
 
-        let outURL = try ImageIO.writePNG(
+        preview?.close()
+                    try FluxInterruptScope.check()
+                    let outURL = try ImageIO.writePNG(
             image,
             outputDir: request.outputDir,
             prefix: "z-image"
         )
-        let seed = request.seed ?? 0
-        continuation.yield(.completed(url: outURL, seed: seed))
+        continuation.yield(.completed(url: outURL, seed: seed,
+            effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL,
+                steps: request.steps, guidance: request.negativePrompt != nil && request.guidance > 0 ? request.guidance : 0,
+                seed: seed, scheduler: "z-image-linear")))
     }
 
     // MARK: - Placeholder math (to be replaced by real transformer + VAE)
