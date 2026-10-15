@@ -68,5 +68,15 @@ extension SeedVR2BundleMetadata {
                 field: "dimensions", value: "\(sourceWidth)x\(sourceHeight) at \(scale)x",
                 allowed: "positive dimensions and at most \(maximumOutputPixels) output pixels")
         }
+        // The transformer/VAE process a 16-aligned canvas, not just the crop.
+        // Very thin images can otherwise exceed the allocation budget by 8x.
+        let paddedWidth = (width.partialValue + 15) / 16 * 16
+        let paddedHeight = (height.partialValue + 15) / 16 * 16
+        guard paddedWidth <= maximumOutputPixels / paddedHeight else {
+            throw FluxError.invalidField(
+                field: "dimensions",
+                value: "\(width.partialValue)x\(height.partialValue)",
+                allowed: "at most \(maximumOutputPixels) pixels including 16-pixel canvas padding")
+        }
     }
 }

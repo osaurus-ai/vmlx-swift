@@ -38,6 +38,9 @@ final class SeedVR2Tests: XCTestCase {
     }
 
     func testUpscaleValidationRejectsBeforeAllocation() throws {
+        XCTAssertThrowsError(
+            try SeedVR2BundleMetadata.validateUpscale(
+                sourceWidth: 2_000_000, sourceHeight: 1, scale: 2, format: .png))
         for scale in [0, 1, 3, Int.max] {
             XCTAssertThrowsError(
                 try SeedVR2BundleMetadata.validateUpscale(
