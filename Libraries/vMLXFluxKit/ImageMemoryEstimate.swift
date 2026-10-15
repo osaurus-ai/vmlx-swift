@@ -23,18 +23,27 @@ public enum ImageMemoryEstimator {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
         } ?? [:]
         func integer(_ key: String, _ fallback: Int) -> Int { (config[key] as? NSNumber)?.intValue ?? fallback }
+        func attentionWidth(heads: Int, dimension: Int) throws -> Int {
+            let count = integer("num_attention_heads", heads)
+            let size = integer("attention_head_dim", dimension)
+            let product = count.multipliedReportingOverflow(by: size)
+            guard count > 0, size > 0, !product.overflow else {
+                throw FluxError.invalidRequest("invalid attention dimensions in model configuration")
+            }
+            return product.partialValue
+        }
         let hidden: Int, latentScale: Int, textRows: Int, vaeChannels: Int
         switch family {
         case "flux1-schnell":
-            hidden = integer("num_attention_heads", 24) * integer("attention_head_dim", 128)
+            hidden = try attentionWidth(heads: 24, dimension: 128)
             latentScale = 16; textRows = 256; vaeChannels = 128
         case "z-image-turbo":
             hidden = integer("dim", 3840); latentScale = 16; textRows = 512; vaeChannels = 128
         case "qwen-image", "qwen-image-edit":
-            hidden = integer("num_attention_heads", 24) * integer("attention_head_dim", 128)
+            hidden = try attentionWidth(heads: 24, dimension: 128)
             latentScale = 16; textRows = 512; vaeChannels = 96
         case "qwen-image-2.1", "qwen-image-2.1-turbo":
-            hidden = integer("num_attention_heads", 32) * integer("attention_head_dim", 128)
+            hidden = try attentionWidth(heads: 32, dimension: 128)
             latentScale = 16; textRows = 1024; vaeChannels = 96
         case "ideogram":
             hidden = integer("hidden_size", 2048); latentScale = 16; textRows = 512; vaeChannels = 128
@@ -42,6 +51,9 @@ public enum ImageMemoryEstimator {
             hidden = integer("hidden_size", 2560); latentScale = 8; textRows = 0; vaeChannels = 128
         default:
             throw FluxError.notImplemented("peak memory estimate for \(family)")
+        }
+        guard hidden > 0, previewMaxPixel == nil || previewMaxPixel! > 0 else {
+            throw FluxError.invalidRequest("memory estimate requires positive hidden and preview dimensions")
         }
         let pixels = Double(width) * Double(height)
         let source = Double(sourcePixels)
@@ -65,7 +77,15 @@ public enum ImageMemoryEstimator {
         guard total.isFinite, total < Double(Int.max) else {
             throw FluxError.invalidRequest("memory estimate exceeds representable size")
         }
-        return ImageMemoryEstimate(weightBytes: weights, conditioningBytes: Int(ceil(conditioning)),
-            denoisingBytes: Int(ceil(denoise)), decodingBytes: Int(ceil(decode)))
+        let conditioningBytes = Int(ceil(conditioning))
+        let denoisingBytes = Int(ceil(denoise))
+        let decodingBytes = Int(ceil(decode))
+        let resident = weights.addingReportingOverflow(conditioningBytes)
+        let peak = resident.partialValue.addingReportingOverflow(max(denoisingBytes, decodingBytes))
+        guard !resident.overflow, !peak.overflow else {
+            throw FluxError.invalidRequest("memory estimate exceeds representable size")
+        }
+        return ImageMemoryEstimate(weightBytes: weights, conditioningBytes: conditioningBytes,
+            denoisingBytes: denoisingBytes, decodingBytes: decodingBytes)
     }
 }

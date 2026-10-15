@@ -1281,6 +1281,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         width: Int?, height: Int?, steps: Int, guidance: Float, seed: UInt64,
         outputResolution: Int = 1024,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
+        interrupt: FluxInterrupt? = nil,
         preview: ImagePreviewEmitter? = nil,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
@@ -1288,7 +1289,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let prepared = try prepare(prompt: prompt, negativePrompt: negativePrompt,
             references: references, width: width, height: height, steps: steps,
             guidance: guidance, outputResolution: outputResolution)
-        return try sample(prepared, seed: seed, sampler: sampler, scheduler: scheduler, shift: shift,
+        return try sample(prepared, seed: seed, interrupt: interrupt, sampler: sampler, scheduler: scheduler, shift: shift,
             preview: preview, resolved: resolved, progress: progress)
     }
 

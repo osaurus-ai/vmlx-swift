@@ -181,23 +181,26 @@ public final class QwenImage21: ImageGenerator, ImageEditor, FluxStageModel, @un
         do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
         catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
         let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed, previewInterval: request.previewInterval, previewMaxPixel: request.previewMaxPixel) { pipeline, progress, resolved, preview in
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed, interrupt: interrupt, previewInterval: request.previewInterval, previewMaxPixel: request.previewMaxPixel) { pipeline, progress, resolved, preview in
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: nil, references: request.sourceImages,
                 width: request.width, height: request.height, steps: request.steps,
                 guidance: request.guidance, seed: seed, sampler: request.sampler,
-                scheduler: request.scheduler, shift: request.shift, preview: preview, resolved: resolved, progress: progress)
+                scheduler: request.scheduler, shift: request.shift, interrupt: interrupt, preview: preview, resolved: resolved, progress: progress)
         }
     }
 
     private func run(
-        prefix: String, outputDir: URL, seed: UInt64, previewInterval: Int? = nil, previewMaxPixel: Int = 256,
+        prefix: String, outputDir: URL, seed: UInt64, interrupt: FluxInterrupt, previewInterval: Int? = nil, previewMaxPixel: Int = 256,
         _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void, ImagePreviewEmitter?) throws -> MLXArray
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
+            continuation.onTermination = { if case .cancelled = $0 { interrupt.cancel() } }
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
+                    try interrupt.check()
                     let preview = ImagePreviewEmitter(interval: previewInterval, maxPixel: previewMaxPixel) { data, step in
                         continuation.yield(.preview(pngData: data, step: step))
                     }
@@ -206,9 +209,17 @@ public final class QwenImage21: ImageGenerator, ImageEditor, FluxStageModel, @un
                     let image = try body(self.pipeline, { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
                     }, { parameters = $0 }, preview)
+                    try interrupt.check()
                     preview?.close()
                     let url = try ImageIO.writePNG(image, outputDir: outputDir, prefix: prefix)
+                    if interrupt.isCancelled {
+                        try FileManager.default.removeItem(at: url)
+                        throw CancellationError()
+                    }
                     continuation.yield(.completed(url: url, seed: seed, effectiveParameters: parameters))
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)
