@@ -20,6 +20,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 40,
             defaultGuidance: 1.0,
+            limits: { try requestLimits(modelPath: $0) },
             loader: { path, quant in
                 _ = QwenImage21._register
                 return try await QwenImage21(modelPath: path, quantize: quant)
@@ -31,6 +32,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 8,
             defaultGuidance: 1.0,
+            limits: { try requestLimits(modelPath: $0, requiresFixedSchedule: true) },
             loader: { path, quant in
                 _ = QwenImage21._register
                 return try await QwenImage21(modelPath: path, quantize: quant, requiresFixedSchedule: true)
@@ -46,6 +48,22 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     public let modelPath: URL
     public let quantize: Int?
     private let pipeline: QwenImage21Pipeline
+
+    /// No weights are loaded by this query. Host admission limits are separate.
+    public static func requestLimits(modelPath: URL, requiresFixedSchedule: Bool = false) throws -> FluxModelLimits {
+        let grid = try QwenImage21Schedule.sampleSigmas(modelPath: modelPath)
+        if requiresFixedSchedule && grid == nil {
+            throw FluxError.localModelIncomplete(modelPath, reasons: ["Turbo requires model_index.json sample_sigmas"])
+        }
+        return limits(fixedSteps: grid?.count)
+    }
+
+    private static func limits(fixedSteps: Int?) -> FluxModelLimits {
+        FluxModelLimits(
+            dimensionMultiple: 32, minDimension: 32, minimumSteps: 2, fixedSteps: fixedSteps,
+            supportsNegativePrompt: true, supportsEditNegativePrompt: false,
+            supportsStrength: false, supportsMask: false, maxSourceImages: 10, supportedFormats: [.png])
+    }
 
     public init(modelPath: URL, quantize: Int?, requiresFixedSchedule: Bool = false) async throws {
         self.modelPath = modelPath
@@ -65,44 +83,43 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     }
 
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
+        do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
         let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix, outputDir: request.outputDir, seed: seed) { pipeline, progress in
+        return run(prefix: outputPrefix, outputDir: request.outputDir, seed: seed) { pipeline, progress, resolved in
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: request.negativePrompt, references: [],
                 width: request.width, height: request.height, steps: request.steps,
-                guidance: request.guidance, seed: seed, progress: progress)
+                guidance: request.guidance, seed: seed, resolved: resolved, progress: progress)
         }
     }
 
     public func edit(_ request: ImageEditRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
-        if request.mask != nil {
-            return AsyncThrowingStream { continuation in
-                continuation.yield(.failed(message: "Qwen-Image-2.1 masks are not wired yet", hfAuth: false))
-                continuation.finish()
-            }
-        }
+        do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
         let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed) { pipeline, progress in
+        return run(prefix: outputPrefix + "-edit", outputDir: request.outputDir, seed: seed) { pipeline, progress, resolved in
             try pipeline.generate(
                 prompt: request.prompt, negativePrompt: nil, references: request.sourceImages,
                 width: request.width, height: request.height, steps: request.steps,
-                guidance: request.guidance, seed: seed, progress: progress)
+                guidance: request.guidance, seed: seed, resolved: resolved, progress: progress)
         }
     }
 
     private func run(
         prefix: String, outputDir: URL, seed: UInt64,
-        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void) throws -> MLXArray
+        _ body: @escaping @Sendable (QwenImage21Pipeline, (Int, Int, Double?) -> Void, (EffectiveImageParameters) -> Void) throws -> MLXArray
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
             Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
-                    let image = try body(self.pipeline) { step, total, eta in
+                    var parameters: EffectiveImageParameters?
+                    let image = try body(self.pipeline, { step, total, eta in
                         continuation.yield(.step(step: step, total: total, etaSeconds: eta))
-                    }
+                    }, { parameters = $0 })
                     let url = try ImageIO.writePNG(image, outputDir: outputDir, prefix: prefix)
-                    continuation.yield(.completed(url: url, seed: seed))
+                    continuation.yield(.completed(url: url, seed: seed, effectiveParameters: parameters))
                     continuation.finish()
                 } catch {
                     let message = String(describing: error)

@@ -205,9 +205,12 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed):
+                            case .completed(let url, let seed, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
+                                if let effectiveParameters {
+                                    record["effective_parameters"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(effectiveParameters))
+                                }
                             case .failed(let message, let hfAuth):
                                 record["status"] = "failed_event"
                                 record["message"] = message
@@ -249,7 +252,7 @@ struct VMLXFluxProbe {
                         width: options.widthExplicit ? options.width : nil,
                         height: options.heightExplicit ? options.height : nil,
                         steps: options.steps,
-                        guidance: options.guidance ?? 4.0,
+                        guidance: options.guidance ?? defaultGuidance(for: loaded),
                         seed: options.seed ?? UInt64(index + 1),
                         outputDir: options.outputDirectory)
                     let turnStart = Date()
@@ -278,9 +281,12 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed):
+                            case .completed(let url, let seed, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
+                                if let effectiveParameters {
+                                    record["effective_parameters"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(effectiveParameters))
+                                }
                             case .failed(let message, let hfAuth):
                                 record["status"] = "failed_event"
                                 record["message"] = message
@@ -510,14 +516,7 @@ struct VMLXFluxProbe {
     }
 
     private static func defaultGuidance(for model: LocalFluxModel) -> Float {
-        switch model.canonicalName {
-        case "z-image-turbo":
-            return 0
-        case "ideogram":
-            return 7
-        default:
-            return 3.5
-        }
+        model.canonicalName.flatMap { ModelRegistry.lookup(name: $0)?.defaultGuidance } ?? 3.5
     }
 
     private static func matrixRow(
@@ -869,7 +868,7 @@ struct ProbeOptions {
     var sourceImages: [URL] = []
     var sourceImage: URL? { sourceImages.first }
     var maskImage: URL?
-    var strength: Float = 0.75
+    var strength: Float?
     var turns = Self.defaultTurns
 
     init(arguments: [String]) throws {

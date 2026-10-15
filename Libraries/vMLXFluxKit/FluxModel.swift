@@ -56,6 +56,7 @@ public enum FluxError: Error, CustomStringConvertible {
     case localModelIncomplete(URL, reasons: [String])
     case notImplemented(String)
     case invalidRequest(String)
+    case invalidField(field: String, value: String, allowed: String)
 
     public var description: String {
         switch self {
@@ -70,6 +71,8 @@ public enum FluxError: Error, CustomStringConvertible {
             return "local model incomplete at \(u.path): \(reasons.joined(separator: ", "))"
         case .notImplemented(let s): return "not implemented: \(s)"
         case .invalidRequest(let s): return "invalid request: \(s)"
+        case .invalidField(let field, let value, let allowed):
+            return "invalid request: \(field)=\(value); expected \(allowed)"
         }
     }
 }

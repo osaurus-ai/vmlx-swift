@@ -1143,13 +1143,17 @@ enum QwenImage21Schedule {
     }
 
     /// mflux LinearScheduler with resolution shift (base 0.5@256 → max 0.9@8192) and terminal 0.02.
+    static func shift(width: Int, height: Int) -> Float {
+        let m = (0.9 - 0.5) / Double(8192 - 256)
+        let b = 0.5 - m * 256
+        return Float(m * Double(width * height) / 256 + b)
+    }
+
     static func sigmas(steps: Int, width: Int, height: Int) -> MLXArray {
         let n = steps
         let delta = Float((1.0 / Double(n) - 1.0) / Double(max(n - 1, 1)))
         let raw = q21Range(0, n).asType(.float32) * delta + Float(1)
-        let m = (0.9 - 0.5) / Double(8192 - 256)
-        let b = 0.5 - m * 256
-        let mu = MLXArray(Float(m * Double(width * height) / 256 + b))
+        let mu = MLXArray(shift(width: width, height: height))
         var shifted = exp(mu) / (exp(mu) + (1 / raw - 1))
         let oneMinus = 1 - shifted
         let scale = oneMinus[(n - 1) ..< n] / Float(1 - 0.02)
@@ -1261,6 +1265,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         prompt: String, negativePrompt: String?, references: [URL],
         width requestedWidth: Int?, height requestedHeight: Int?,
         steps requestedSteps: Int, guidance: Float, seed: UInt64, outputResolution: Int = 1024,
+        resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
         // A bundle with a fixed grid (Turbo) samples on it: the grid sets the step count, as in diffusers.
@@ -1290,6 +1295,12 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         guard width >= 32, height >= 32, width % 32 == 0, height % 32 == 0 else {
             throw FluxError.invalidRequest("Qwen-Image-2.1 dimensions must be positive multiples of 32.")
         }
+        resolved(EffectiveImageParameters(
+            width: width, height: height, steps: steps,
+            guidance: guidance > 1 ? guidance : 1, seed: seed,
+            sampler: "euler", scheduler: sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas",
+            shift: sampleSigmas == nil ? QwenImage21Schedule.shift(width: width, height: height) : nil,
+            sampleSigmas: sampleSigmas))
 
         let (embeds, slots) = encodePrompt(prompt, references: refs)
         var negative: (MLXArray, [Bool])?
