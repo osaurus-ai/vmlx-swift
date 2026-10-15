@@ -838,7 +838,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
            modelResidencyWiredTarget(
                 modelBytes: Int(clamping: facts.gpuResidentWeightBytes),
                 workingSet: workingSet, physicalMemory: Int(clamping: physicalMemory)) == nil {
-            warnings.append("This model cannot be kept fully in GPU memory within this Mac's working-set ceiling and OS reserve. It will still load, but memory pressure can cause disk reads and slower replies.")
+            warnings.append("This model cannot be kept fully in GPU memory within this Mac's working-set ceiling and OS reserve. If admitted by the selected memory policy, memory pressure can cause disk reads and slower replies.")
         }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 

@@ -88,7 +88,7 @@ public func modelResidencyWiredTarget(
     // not need a third of a big machine: an uncapped 35% reserve is 44.8 GB on a
     // 128 GB Mac, which declined to wire GLM-5.3-Flash / Naive-N0.5 JANGHT (91 GB)
     // and left ~11 GB of their weight buffers outside the Metal residency set
-    // (MLX's default wired limit is ~75% of the working set). Metal then makes
+    // (this fork starts with explicit residency disabled). Metal then makes
     // those buffers resident again on every command-buffer submission: decode
     // measured 1.4-1.8 tok/s vs 25-26.5 with the model wired (2026-10-11,
     // 3 alternating rounds each), at random depending on which buffers were
