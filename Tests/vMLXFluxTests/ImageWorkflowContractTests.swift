@@ -50,6 +50,8 @@ final class ImageWorkflowContractTests: XCTestCase {
         request.guidance = .nan
         assertField("guidance") { try limits.validate(request) }
         request.guidance = 1
+        request.negativePrompt = " \n "
+        try limits.validate(request) // Same empty-prompt policy as Osaurus.
         request.negativePrompt = "blur"
         assertField("negativePrompt") { try limits.validate(request) }
         request.guidance = 2

@@ -45,7 +45,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         guard request.numImages == 1 else {
             throw FluxError.invalidField(field: "numImages", value: "\(request.numImages)", allowed: "1 (native batching is not implemented)")
         }
-        if let negative = request.negativePrompt, !negative.isEmpty,
+        if let negative = request.negativePrompt, !negative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !supportsNegativePrompt || request.guidance <= 1 {
             throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: "a supported CFG path with guidance > 1")
         }
