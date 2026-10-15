@@ -676,15 +676,25 @@ public func loadModel(
     let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
     let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
     let physical = Int(clamping: facts.physicalMemory)
+    // SPEED-CRITICAL (Allosaurus on 48 GB Macs, 2026-10-15): size residency against the SYSTEM WIRE
+    // BUDGET, not only RAM / Metal's working set. Clear our own previous residency first so the snapshot
+    // does not count this process's earlier wiring against the new model.
+    _ = setModelResidencyWiredLimit(0)
+    let wireBudget = SystemWireBudget.snapshot()
     let residencyTarget = loadConfiguration.keepModelInMemory
         ? modelResidencyWiredTarget(
-            modelBytes: modelBytes, workingSet: workingSet, physicalMemory: physical)
+            modelBytes: modelBytes, workingSet: workingSet, physicalMemory: physical,
+            wireHeadroom: wireBudget.headroomBytes, systemWireLimit: wireBudget.userWireLimitBytes)
         : nil
     // Explicitly reset on Off or non-fitting loads: the allocator is process-wide
     // and otherwise retains the previous model's wiring limit after unloading.
     let residencyApplied = setModelResidencyWiredLimit(residencyTarget ?? 0)
+    let wireReport = ModelWireBudgetReport(
+        modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
+    ModelWireBudgetReport.recordLastLoad(wireReport)
     FileHandle.standardError.write(Data(
         "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
+    FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
 
     // 4. Optional disk-layout preparation. The permanent prestacked
     //    safetensors overlay is now explicit opt-in via
