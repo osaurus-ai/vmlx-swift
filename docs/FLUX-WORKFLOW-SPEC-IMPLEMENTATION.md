@@ -41,3 +41,9 @@ Per the latest user direction, implementation takes priority over repeated proof
 Optional request preview cadence and maximum pixels now reach every currently implemented native generation/edit pipeline. The real VAE decodes a reduced latent. Graph submission stays on the sampling lane; PNG encoding runs on a utility worker with one in-flight preview per request. Busy work and memory pressure drop previews. Outputs stay below 64 KiB, within the requested size, and stop before terminal events. Defaults remain off.
 
 The engine target compiles. The consolidated generation pass still needs to measure preview count, image quality and <=5% overhead; those are not proven by compilation. Unsupported/stub model entries are not claimed as implemented.
+
+### Request memory estimates (stage 1.8, calibration pending)
+
+Generation/edit/upscale request queries now resolve actual dimensions, native parallel width, reference conditioning and preview workspace. Weight payload bytes are read from the same shard groups as WeightLoader without loading tensors. The API also accepts a model URL for pre-load admission callers.
+
+The per-family activation/VAE coefficients are analytical estimates, not measured bounds. The ±15% acceptance comparison is pending the consolidated run; Osaurus must not use this draft to replace admission decisions yet. Allocator cache and other resident models remain separate host accounting concerns.

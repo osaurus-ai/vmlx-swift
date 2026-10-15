@@ -101,6 +101,31 @@ public enum WeightLoader {
             jangConfig: jang.config)
     }
 
+    /// Bytes occupied by tensor payloads in the exact shard groups the loader
+    /// consumes. Reads only the 8-byte safetensors header length, never weights.
+    public static func storedWeightBytes(in directory: URL) throws -> Int {
+        let groups = try enumerateShardGroups(in: directory)
+        guard !groups.isEmpty else { throw FluxError.weightsNotFound(directory) }
+        var total = 0
+        for url in Set(groups.flatMap(\.shards)) {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
+                throw FluxError.invalidRequest("invalid safetensors header at \(url.path)")
+            }
+            let length = prefix.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
+            let fileBytes = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard length <= UInt64(max(0, fileBytes - 8)) else {
+                throw FluxError.invalidRequest("safetensors header exceeds file size at \(url.path)")
+            }
+            let payload = fileBytes - 8 - Int(length)
+            let sum = total.addingReportingOverflow(payload)
+            guard !sum.overflow else { throw FluxError.invalidRequest("weight byte count overflow") }
+            total = sum.partialValue
+        }
+        return total
+    }
+
     private struct ShardGroup {
         let component: String
         let shards: [URL]

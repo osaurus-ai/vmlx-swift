@@ -23,6 +23,7 @@ public actor FluxEngine {
     /// Cached model registry lookup — `ModelRegistry.lookup(name:)`
     /// is O(1) but we keep a local copy for logging.
     public private(set) var lastLoadedName: String?
+    private var loadedModelURL: URL?
 
     // MARK: - Init
 
@@ -39,6 +40,72 @@ public actor FluxEngine {
             throw FluxError.notImplemented("request limits for \(entry.name)")
         }
         return try query(modelURL)
+    }
+
+    /// Metadata-only preflight, also usable before `load` through the modelURL overload.
+    public func estimatedPeakBytes(for request: ImageGenRequest) throws -> Int {
+        guard let loadedModelURL, let loaded else { throw FluxError.notLoaded }
+        return try estimatedPeakBytes(for: request, modelURL: loadedModelURL, name: loaded.name)
+    }
+
+    public func estimatedPeakBytes(for request: ImageGenRequest, modelURL: URL, name: String? = nil) throws -> Int {
+        let family = try estimateFamily(modelURL, name: name)
+        let constraints = try limits(for: modelURL, name: family)
+        try constraints.validate(request)
+        return try ImageMemoryEstimator.estimate(model: modelURL, family: family,
+            width: request.width, height: request.height,
+            parallelImages: min(request.batchSize, constraints.maximumParallelImages), guidance: request.guidance,
+            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel).peakBytes
+    }
+
+    public func estimatedPeakBytes(for request: ImageEditRequest) throws -> Int {
+        guard let loadedModelURL, let loaded else { throw FluxError.notLoaded }
+        return try estimatedPeakBytes(for: request, modelURL: loadedModelURL, name: loaded.name)
+    }
+
+    public func estimatedPeakBytes(for request: ImageEditRequest, modelURL: URL, name: String? = nil) throws -> Int {
+        let family = try estimateFamily(modelURL, name: name)
+        try limits(for: modelURL, name: family).validate(request)
+        let width: Int, height: Int
+        if family == "qwen-image-edit" {
+            let plan = try QwenImageEditPreprocessPlan(sourceImages: request.sourceImages,
+                requestedWidth: request.width, requestedHeight: request.height,
+                steps: request.steps, guidance: request.guidance)
+            width = plan.outputWidth; height = plan.outputHeight
+        } else {
+            let size = try ImageIO.dimensions(of: request.sourceImages.last ?? request.sourceImage)
+            let ratio = Double(size.width) / Double(size.height)
+            let w = max(32, Int((sqrt(1024 * 1024 * ratio) / 32).rounded(.toNearestOrEven)) * 32)
+            let h = max(32, Int((Double(w) / ratio / 32).rounded(.toNearestOrEven)) * 32)
+            width = request.width ?? w; height = request.height ?? h
+        }
+        return try ImageMemoryEstimator.estimate(model: modelURL, family: family, width: width, height: height,
+            sourcePixels: request.sourceImages.count * 1024 * 1024, guidance: request.guidance,
+            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel).peakBytes
+    }
+
+    public func estimatedPeakBytes(for request: UpscaleRequest) throws -> Int {
+        guard let loadedModelURL, let loaded else { throw FluxError.notLoaded }
+        return try estimatedPeakBytes(for: request, modelURL: loadedModelURL, name: loaded.name)
+    }
+
+    public func estimatedPeakBytes(for request: UpscaleRequest, modelURL: URL, name: String? = nil) throws -> Int {
+        let family = try estimateFamily(modelURL, name: name)
+        guard family == "seedvr2" else { throw FluxError.wrongModelKind(expected: "seedvr2", actual: family) }
+        let size = try ImageIO.dimensions(of: request.sourceImage)
+        try SeedVR2BundleMetadata.validateUpscale(sourceWidth: size.width, sourceHeight: size.height,
+            scale: request.scale, format: request.outputFormat)
+        let width = (size.width * request.scale + 15) / 16 * 16
+        let height = (size.height * request.scale + 15) / 16 * 16
+        return try ImageMemoryEstimator.estimate(model: modelURL, family: family, width: width, height: height).peakBytes
+    }
+
+    private func estimateFamily(_ model: URL, name: String?) throws -> String {
+        VMLXFluxModels.registerAll()
+        guard let entry = ModelRegistry.lookupFuzzy(name: name ?? model.lastPathComponent) else {
+            throw FluxError.unknownModel(name ?? model.lastPathComponent)
+        }
+        return entry.name
     }
 
     // MARK: - Load / unload
@@ -70,6 +137,7 @@ public actor FluxEngine {
             model: model
         )
         self.lastLoadedName = name
+        self.loadedModelURL = modelPath
     }
 
     /// Resolve and load a local image-generation bundle from
@@ -104,6 +172,7 @@ public actor FluxEngine {
     /// Unload the current model and release weights.
     public func unload() {
         self.loaded = nil
+        self.loadedModelURL = nil
     }
 
     // MARK: - Generate (text-to-image)
