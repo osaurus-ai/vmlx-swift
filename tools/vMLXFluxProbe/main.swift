@@ -516,14 +516,7 @@ struct VMLXFluxProbe {
     }
 
     private static func defaultGuidance(for model: LocalFluxModel) -> Float {
-        switch model.canonicalName {
-        case "z-image-turbo":
-            return 0
-        case "ideogram":
-            return 7
-        default:
-            return 3.5
-        }
+        model.canonicalName.flatMap { ModelRegistry.lookup(name: $0)?.defaultGuidance } ?? 3.5
     }
 
     private static func matrixRow(
