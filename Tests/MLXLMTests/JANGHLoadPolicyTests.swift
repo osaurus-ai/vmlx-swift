@@ -95,12 +95,35 @@ final class JANGHLoadPolicyTests: XCTestCase {
         }
     }
 
+    func testAutomaticSchedulingBudgetClampsScratchRatherThanDroppingBelowWeights() throws {
+        var facts = try inspect(config(modelType: "qwen4_exp"))
+        facts.totalSafetensorsBytes = 36_971_767_160
+        facts.physicalMemory = 48 << 30
+        let automatic = LoadConfiguration()
+        for ceilingGiB in [36, 37, 38] {
+            let ceiling = UInt64(ceilingGiB) << 30
+            XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: Int(ceiling)), .absolute(ceiling))
+        }
+        // Plenty of GPU budget: retain the original four-GiB allowance.
+        XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+            recommendedWorkingSetBytes: 42 << 30),
+            .absolute(facts.gpuResidentWeightBytes + (4 << 30)))
+        // An explicit user limit is never silently raised.
+        let explicit = LoadConfiguration(memoryLimit: .fraction(0.70))
+        XCTAssertEqual(explicit.resolvedSchedulingMemoryLimit(facts: facts,
+            recommendedWorkingSetBytes: 38 << 30), .fraction(0.70))
+        // Missing capacity is not invented by this scheduling policy.
+        XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+            recommendedWorkingSetBytes: 34 << 30), .default)
+    }
+
     func testAutomaticSchedulingBudgetRefusesOversizedUnknownAndOverflowRows() throws {
         var facts = try inspect(config())
         facts.totalSafetensorsBytes = 96 << 30
         facts.physicalMemory = 128 << 30
         let automatic = LoadConfiguration()
-        for workingSet: Int? in [nil, 0, 99 << 30] {
+        for workingSet: Int? in [nil, 0, 96 << 30] {
             XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
                 recommendedWorkingSetBytes: workingSet), .default)
         }
@@ -161,6 +184,21 @@ final class JANGHLoadPolicyTests: XCTestCase {
             let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
             XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
             XCTAssertFalse(plan.warnings.contains { $0.contains("loading materialized") })
+        }
+    }
+
+    func testResidencyPreferencePersistsAndReachesBothLoadResolvers() throws {
+        let defaults = try JSONDecoder().decode(VMLXMemorySafetySettings.self, from: Data("{}".utf8))
+        XCTAssertTrue(defaults.keepModelInMemory)
+        var settings = VMLXServerRuntimeSettings()
+        for enabled in [false, true] {
+            settings.memorySafety.keepModelInMemory = enabled
+            let saved = try JSONEncoder().encode(settings)
+            let restored = try JSONDecoder().decode(VMLXServerRuntimeSettings.self, from: saved)
+            XCTAssertEqual(restored.memorySafety.keepModelInMemory, enabled)
+            XCTAssertEqual(restored.resolvedLoadConfiguration(
+                configData: nil, jangConfig: nil, status: nil).keepModelInMemory, enabled)
+            XCTAssertEqual(restored.resolvedMemorySafetyPlan().loadConfiguration.keepModelInMemory, enabled)
         }
     }
 

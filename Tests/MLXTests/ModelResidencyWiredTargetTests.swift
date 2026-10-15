@@ -16,7 +16,8 @@ struct ModelResidencyWiredTargetTests {
 
     // Reserve mirrors the policy: 35% of physical RAM, floored at 8 GB, capped at 24 GB.
     private func osReserve(physical: Int) -> Int {
-        max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
+        physical >= gb(48) && physical < gb(64)
+            ? gb(10) : max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
     }
 
     @Test("128 GB Mac: a 91 GB bundle (GLM-5.3-Flash / Naive-N0.5 JANGHT) wires with a 24 GB reserve")
@@ -77,7 +78,7 @@ struct ModelResidencyWiredTargetTests {
 
     @Test("invariant: any returned target preserves the reclaim reserve")
     func returnedTargetAlwaysLeavesReserve() {
-        let physicals = [gb(8), gb(16), gb(24), gb(32), gb(64), gb(96), gb(128), gb(192)]
+        let physicals = [gb(8), gb(16), gb(24), gb(32), gb(48), gb(64), gb(96), gb(128), gb(192)]
         let models = [gb(2), gb(5), gb(9), gb(14), gb(30), gb(48), gb(76), gb(101), gb(140)]
         for physical in physicals {
             let workingSet = physical * 3 / 4  // rough Metal working-set fraction
@@ -90,6 +91,21 @@ struct ModelResidencyWiredTargetTests {
                 #expect(target >= modelBytes)
             }
         }
+    }
+
+    @Test("48 GiB: Allosaurus fits only within the device ceiling and ten-GiB reserve")
+    func allosaurusOn48GiB() {
+        let weights = 36_971_767_160 + 357_581_088
+        for ceiling in [gb(36), gb(37), gb(40)] {
+            let target = modelResidencyWiredTarget(
+                modelBytes: weights, workingSet: ceiling, physicalMemory: gb(48))
+            #expect(target == min(ceiling, gb(38)))
+            #expect((target ?? 0) >= weights)
+        }
+        #expect(modelResidencyWiredTarget(
+            modelBytes: weights, workingSet: gb(34), physicalMemory: gb(48)) == nil)
+        #expect(modelResidencyWiredTarget(
+            modelBytes: gb(39), workingSet: gb(42), physicalMemory: gb(48)) == nil)
     }
 
     @Test("zero/invalid inputs leave the default")
