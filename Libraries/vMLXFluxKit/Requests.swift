@@ -116,6 +116,7 @@ public struct ImageEditRequest: Sendable {
 // MARK: - UpscaleRequest (SeedVR2)
 
 public struct UpscaleRequest: Sendable {
+    public var interrupt: FluxInterrupt?
     public var sourceImage: URL
     public var scale: Int          // 2, 4
     public var steps: Int
@@ -129,8 +130,10 @@ public struct UpscaleRequest: Sendable {
         steps: Int = 10,
         seed: UInt64? = nil,
         outputDir: URL,
-        outputFormat: ImageFormat = .png
+        outputFormat: ImageFormat = .png,
+        interrupt: FluxInterrupt? = nil
     ) {
+        self.interrupt = interrupt
         self.sourceImage = sourceImage
         self.scale = scale
         self.steps = steps

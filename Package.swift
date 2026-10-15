@@ -1006,8 +1006,14 @@ let package = Package(
             path: "Libraries/vMLXFluxKit"
         ),
         .target(
+            name: "vMLXSeedVR2",
+            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXFast", "MLXRandom"],
+            path: "Libraries/vMLXSeedVR2",
+            exclude: ["NOTICE.md"]
+        ),
+        .target(
             name: "vMLXFluxModels",
-            dependencies: ["vMLXFluxKit", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
+            dependencies: ["vMLXFluxKit", "vMLXSeedVR2", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxModels"
         ),
         .target(
@@ -1027,7 +1033,7 @@ let package = Package(
         ),
         .testTarget(
             name: "vMLXFluxTests",
-            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo"],
+            dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "vMLXSeedVR2"],
             path: "Tests/vMLXFluxTests"
         ),
 

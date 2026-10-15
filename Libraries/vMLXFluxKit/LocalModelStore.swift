@@ -110,7 +110,11 @@ public struct MLXStudioModelStore: Sendable {
         quantizationBits quantizationOverride: Int? = nil
     ) throws -> LocalFluxModel {
         let name = directoryName
+        let configuration = try? Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let raw = configuration.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let configuredSeedVR2 = raw?["model_type"] as? String == "seedvr2"
         let canonical = canonicalOverride
+            ?? (configuredSeedVR2 ? "seedvr2" : nil)
             ?? canonicalName(for: name)
             ?? ModelRegistry.lookupFuzzy(name: name)?.name
         let entry = canonical.flatMap { ModelRegistry.lookup(name: $0) }
@@ -139,7 +143,9 @@ public struct MLXStudioModelStore: Sendable {
             canonicalName: canonical,
             displayName: entry?.displayName ?? displayName(forCanonicalName: canonical) ?? name,
             kind: entry?.kind ?? defaultKind(forCanonicalName: canonical),
-            quantizationBits: quantizationOverride ?? quantizationBits(in: name),
+            quantizationBits: quantizationOverride
+                ?? (canonical == "seedvr2" ? (try? SeedVR2BundleMetadata(directory: directory).bits) : nil)
+                ?? quantizationBits(in: name),
             components: components,
             safetensorCount: safetensors.count,
             totalBytes: safetensors.bytes,
@@ -372,6 +378,10 @@ public struct MLXStudioModelStore: Sendable {
     ) throws -> [String] {
         guard canonicalName != nil else {
             return safetensorCount == 0 ? ["no safetensors found"] : ["unknown flux-family model"]
+        }
+        if canonicalName == "seedvr2" {
+            do { _ = try SeedVR2BundleMetadata(directory: directory); return [] }
+            catch { return [String(describing: error)] }
         }
         var reasons: [String] = []
         if safetensorCount == 0 {
