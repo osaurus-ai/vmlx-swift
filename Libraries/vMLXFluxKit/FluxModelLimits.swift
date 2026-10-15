@@ -140,9 +140,13 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     /// The host can validate staged or in-memory sources before loading weights.
     public func validateEdit(
         width: Int?, height: Int?, steps: Int, guidance: Float, format: ImageFormat,
-        sourceCount: Int, hasMask: Bool, strength: Float?
+        sourceCount: Int, hasMask: Bool, strength: Float?, negativePrompt: String? = nil
     ) throws {
         try validateCommon(width: width, height: height, steps: steps, guidance: guidance, format: format)
+        if let negativePrompt, !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            !supportsEditNegativePrompt {
+            throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: "no edit negative prompt")
+        }
         guard sourceCount >= 1, sourceCount <= maxSourceImages else {
             throw FluxError.invalidField(field: "sourceImages", value: "\(sourceCount)", allowed: "1...\(maxSourceImages)")
         }
