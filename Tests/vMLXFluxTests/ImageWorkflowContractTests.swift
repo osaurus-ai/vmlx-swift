@@ -44,7 +44,7 @@ final class ImageWorkflowContractTests: XCTestCase {
         request.outputFormat = .jpeg
         assertField("outputFormat") { try limits.validate(request) }
         request.outputFormat = .png
-        request.numImages = 2
+        request.numImages = 9
         assertField("numImages") { try limits.validate(request) }
         request.numImages = 1
         request.guidance = .nan

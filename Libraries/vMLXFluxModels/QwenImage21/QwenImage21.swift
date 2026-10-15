@@ -48,6 +48,8 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     public let modelPath: URL
     public let quantize: Int?
     private let pipeline: QwenImage21Pipeline
+    /// Diagnostic count of actual text-encoder executions (positive and CFG).
+    public var promptEncodingCount: Int { pipeline.promptEncodingCount }
 
     /// No weights are loaded by this query. Host admission limits are separate.
     public static func requestLimits(modelPath: URL, requiresFixedSchedule: Bool = false) throws -> FluxModelLimits {
@@ -62,7 +64,8 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
         FluxModelLimits(
             dimensionMultiple: 32, minDimension: 32, minimumSteps: 2, fixedSteps: fixedSteps,
             supportsNegativePrompt: true, supportsEditNegativePrompt: false,
-            supportsStrength: false, supportsMask: false, maxSourceImages: 10, supportedFormats: [.png])
+            supportsStrength: false, supportsMask: false, maxSourceImages: 10, supportedFormats: [.png],
+            maximumImages: 8, maximumParallelImages: 1)
     }
 
     public init(modelPath: URL, quantize: Int?, requiresFixedSchedule: Bool = false) async throws {
@@ -85,12 +88,50 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
     public func generate(_ request: ImageGenRequest) -> AsyncThrowingStream<ImageGenEvent, Error> {
         do { try Self.limits(fixedSteps: pipeline.sampleSigmas?.count).validate(request) }
         catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
-        let seed = request.seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
-        return run(prefix: outputPrefix, outputDir: request.outputDir, seed: seed) { pipeline, progress, resolved in
-            try pipeline.generate(
-                prompt: request.prompt, negativePrompt: request.negativePrompt, references: [],
-                width: request.width, height: request.height, steps: request.steps,
-                guidance: request.guidance, seed: seed, resolved: resolved, progress: progress)
+        let interrupt = request.interrupt ?? FluxInterrupt()
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { if case .cancelled = $0 { interrupt.cancel() } }
+            Task { [self] in
+                do {
+                    try interrupt.check()
+                    let plan = try ImageBatchPlan(request, maximumImages: 8, maximumParallelImages: 1)
+                    let before = pipeline.promptEncodingCount
+                    let prepared = try pipeline.prepare(
+                        prompt: request.prompt, negativePrompt: request.negativePrompt, references: [],
+                        width: request.width, height: request.height, steps: request.steps,
+                        guidance: request.guidance)
+                    let started = Date()
+                    for (index, seed) in plan.seeds.enumerated() {
+                        try interrupt.check()
+                        var effective: EffectiveImageParameters?
+                        let image = try pipeline.sample(prepared, seed: seed, interrupt: interrupt,
+                            resolved: { effective = $0 }, progress: { step, total, eta in
+                                let completed = index * total + step
+                                let all = total * plan.seeds.count
+                                let remaining = Date().timeIntervalSince(started) / Double(completed) * Double(all - completed)
+                                continuation.yield(.step(step: completed, total: all, etaSeconds: remaining))
+                            })
+                        try interrupt.check()
+                        let url = try ImageIO.writePNG(image, outputDir: request.outputDir, prefix: outputPrefix)
+                        if interrupt.isCancelled {
+                            try FileManager.default.removeItem(at: url)
+                            throw CancellationError()
+                        }
+                        if plan.seeds.count == 1 {
+                            continuation.yield(.completed(url: url, seed: seed, effectiveParameters: effective))
+                        } else {
+                            continuation.yield(.imageCompleted(url: url, seed: seed, index: index, effectiveParameters: effective))
+                        }
+                    }
+                    print("[FluxBatch] family=\(outputPrefix) images=\(plan.seeds.count) parallel=\(plan.batchSize) prompt_encodes=\(pipeline.promptEncodingCount - before)")
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.yield(.cancelled)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
         }
     }
 

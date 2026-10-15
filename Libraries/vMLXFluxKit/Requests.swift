@@ -11,6 +11,11 @@ public struct ImageGenRequest: Sendable {
     public var guidance: Float
     public var seed: UInt64?
     public var numImages: Int
+    /// Explicit per-image seeds. Otherwise preserve seed + index (wrapping UInt64).
+    public var seeds: [UInt64]?
+    /// Requested parallel sampling width; implementations may lower this to fit.
+    public var batchSize: Int
+    public var interrupt: FluxInterrupt?
     public var outputDir: URL
     public var outputFormat: ImageFormat
 
@@ -23,6 +28,9 @@ public struct ImageGenRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64? = nil,
         numImages: Int = 1,
+        seeds: [UInt64]? = nil,
+        batchSize: Int = 1,
+        interrupt: FluxInterrupt? = nil,
         outputDir: URL,
         outputFormat: ImageFormat = .png
     ) {
@@ -34,6 +42,9 @@ public struct ImageGenRequest: Sendable {
         self.guidance = guidance
         self.seed = seed
         self.numImages = numImages
+        self.seeds = seeds
+        self.batchSize = batchSize
+        self.interrupt = interrupt
         self.outputDir = outputDir
         self.outputFormat = outputFormat
     }
@@ -196,6 +207,8 @@ public enum ImageGenEvent: Sendable {
     /// Metadata is nil for backends that have not implemented effective-parameter reporting.
     /// Callers must not substitute the requested parameters for missing runtime metadata.
     case completed(url: URL, seed: UInt64, effectiveParameters: EffectiveImageParameters? = nil)
+    /// One durable output of a multi-image job; stream termination ends the batch.
+    case imageCompleted(url: URL, seed: UInt64, index: Int, effectiveParameters: EffectiveImageParameters? = nil)
     /// Fatal error. `hfAuth=true` signals a HuggingFace 401/403 so the UI
     /// can show a "Add HF token" CTA instead of a generic error banner.
     case failed(message: String, hfAuth: Bool)
