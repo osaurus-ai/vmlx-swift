@@ -16,13 +16,16 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     public let supportsMask: Bool
     public let maxSourceImages: Int
     public let supportedFormats: [ImageFormat]
+    public let maximumImages: Int
+    public let maximumParallelImages: Int
 
     public init(
         dimensionMultiple: Int, minDimension: Int, maxDimension: Int? = nil,
         maxPixels: Int? = nil, minimumSteps: Int, maximumSteps: Int? = nil,
         fixedSteps: Int? = nil, supportsNegativePrompt: Bool,
         supportsEditNegativePrompt: Bool, supportsStrength: Bool,
-        supportsMask: Bool, maxSourceImages: Int, supportedFormats: [ImageFormat]
+        supportsMask: Bool, maxSourceImages: Int, supportedFormats: [ImageFormat],
+        maximumImages: Int = 1, maximumParallelImages: Int = 1
     ) {
         self.dimensionMultiple = dimensionMultiple
         self.minDimension = minDimension
@@ -37,14 +40,14 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         self.supportsMask = supportsMask
         self.maxSourceImages = maxSourceImages
         self.supportedFormats = supportedFormats
+        self.maximumImages = maximumImages
+        self.maximumParallelImages = maximumParallelImages
     }
 
     public func validate(_ request: ImageGenRequest) throws {
         try validateCommon(width: request.width, height: request.height, steps: request.steps,
                            guidance: request.guidance, format: request.outputFormat)
-        guard request.numImages == 1 else {
-            throw FluxError.invalidField(field: "numImages", value: "\(request.numImages)", allowed: "1 (native batching is not implemented)")
-        }
+        try ImageBatchPlan.validate(request, maximumImages: maximumImages)
         if let negative = request.negativePrompt, !negative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !supportsNegativePrompt || request.guidance <= 1 {
             throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: "a supported CFG path with guidance > 1")

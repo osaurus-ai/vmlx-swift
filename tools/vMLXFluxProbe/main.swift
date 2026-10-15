@@ -205,7 +205,8 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed, let effectiveParameters):
+                            case .completed(let url, let seed, let effectiveParameters),
+                                 .imageCompleted(let url, let seed, _, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
                                 if let effectiveParameters {
@@ -281,7 +282,8 @@ struct VMLXFluxProbe {
                                     "preview_step": step,
                                     "preview_bytes": data.count,
                                 ])
-                            case .completed(let url, let seed, let effectiveParameters):
+                            case .completed(let url, let seed, let effectiveParameters),
+                                 .imageCompleted(let url, let seed, _, let effectiveParameters):
                                 completedURL = url.path
                                 record["seed"] = seed
                                 if let effectiveParameters {

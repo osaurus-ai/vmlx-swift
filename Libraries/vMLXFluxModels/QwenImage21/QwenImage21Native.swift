@@ -1261,13 +1261,39 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         return (embeds, slots)
     }
 
+    struct Prepared {
+        let width: Int
+        let height: Int
+        let steps: Int
+        let guidance: Float
+        let embeds: MLXArray
+        let slots: [Bool]
+        let negative: (MLXArray, [Bool])?
+        let layout: QwenImage21Layout
+        let negativeLayout: QwenImage21Layout?
+        let condition: MLXArray?
+    }
+
+    private(set) var promptEncodingCount = 0
+
     func generate(
         prompt: String, negativePrompt: String?, references: [URL],
-        width requestedWidth: Int?, height requestedHeight: Int?,
-        steps requestedSteps: Int, guidance: Float, seed: UInt64, outputResolution: Int = 1024,
+        width: Int?, height: Int?, steps: Int, guidance: Float, seed: UInt64,
+        outputResolution: Int = 1024,
         resolved: (EffectiveImageParameters) -> Void = { _ in },
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
+        let prepared = try prepare(prompt: prompt, negativePrompt: negativePrompt,
+            references: references, width: width, height: height, steps: steps,
+            guidance: guidance, outputResolution: outputResolution)
+        return try sample(prepared, seed: seed, resolved: resolved, progress: progress)
+    }
+
+    func prepare(
+        prompt: String, negativePrompt: String?, references: [URL],
+        width requestedWidth: Int?, height requestedHeight: Int?,
+        steps requestedSteps: Int, guidance: Float, outputResolution: Int = 1024
+    ) throws -> Prepared {
         // A bundle with a fixed grid (Turbo) samples on it: the grid sets the step count, as in diffusers.
         let steps = sampleSigmas?.count ?? requestedSteps
         guard references.count <= 10 else {
@@ -1295,17 +1321,12 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         guard width >= 32, height >= 32, width % 32 == 0, height % 32 == 0 else {
             throw FluxError.invalidRequest("Qwen-Image-2.1 dimensions must be positive multiples of 32.")
         }
-        resolved(EffectiveImageParameters(
-            width: width, height: height, steps: steps,
-            guidance: guidance > 1 ? guidance : 1, seed: seed,
-            sampler: "euler", scheduler: sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas",
-            shift: sampleSigmas == nil ? QwenImage21Schedule.shift(width: width, height: height) : nil,
-            sampleSigmas: sampleSigmas))
-
         let (embeds, slots) = encodePrompt(prompt, references: refs)
+        promptEncodingCount += 1
         var negative: (MLXArray, [Bool])?
         if guidance > 1 {
             negative = encodePrompt(negativePrompt ?? "", references: refs)
+            promptEncodingCount += 1
         }
         eval(embeds)
         let dtype = embeds.dtype
@@ -1323,6 +1344,29 @@ final class QwenImage21Pipeline: @unchecked Sendable {
             }
             condition = concatenated(latents, axis: 1)
         }
+
+        return Prepared(width: width, height: height, steps: steps, guidance: guidance,
+                        embeds: embeds, slots: slots, negative: negative,
+                        layout: layout, negativeLayout: negativeLayout, condition: condition)
+    }
+
+    func sample(
+        _ prepared: Prepared, seed: UInt64, interrupt: FluxInterrupt? = nil,
+        resolved: (EffectiveImageParameters) -> Void = { _ in },
+        progress: (Int, Int, Double?) -> Void
+    ) throws -> MLXArray {
+        try interrupt?.check()
+        let width = prepared.width, height = prepared.height, steps = prepared.steps
+        let guidance = prepared.guidance, embeds = prepared.embeds, slots = prepared.slots
+        let negative = prepared.negative, layout = prepared.layout
+        let negativeLayout = prepared.negativeLayout, condition = prepared.condition
+        let dtype = embeds.dtype
+        resolved(EffectiveImageParameters(
+            width: width, height: height, steps: steps,
+            guidance: guidance > 1 ? guidance : 1, seed: seed,
+            sampler: "euler", scheduler: sampleSigmas == nil ? "qwen-image-2.1" : "bundle-sigmas",
+            shift: sampleSigmas == nil ? QwenImage21Schedule.shift(width: width, height: height) : nil,
+            sampleSigmas: sampleSigmas))
 
         // Same values as mflux's `mx.random.seed(seed); mx.random.normal(...)` (the global
         // key sequence hands out split(key(seed))[1] first) WITHOUT touching MLX's global
@@ -1348,6 +1392,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         var negativeCache: [(MLXArray, MLXArray)]? = []
         let start = Date()
         for step in 0 ..< steps {
+            try interrupt?.check()
             let input = condition.map { concatenated([$0, latents], axis: 1) } ?? latents
             let timestep = (sigmas[step ..< (step + 1)] * 1000).asType(dtype) / 1000
             var noise = transformer(hidden: input, encoder: embeds, timestep: timestep, layout: layout, cache: &cache)
@@ -1363,6 +1408,7 @@ final class QwenImage21Pipeline: @unchecked Sendable {
             let elapsed = Date().timeIntervalSince(start)
             progress(step + 1, steps, elapsed / Double(step + 1) * Double(steps - step - 1))
         }
+        try interrupt?.check()
         cache = nil
         negativeCache = nil
         let unpacked = latents.reshaped([1, hLat, wLat, cfg.zDim]).asType(.float32)
