@@ -72,7 +72,8 @@ public actor FluxEngine {
         return try ImageMemoryEstimator.estimate(model: modelURL, family: family,
             width: request.width, height: request.height,
             parallelImages: min(request.batchSize, constraints.maximumParallelImages), guidance: request.guidance,
-            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel).peakBytes
+            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel,
+            adapters: request.adapters).peakBytes
     }
 
     public func estimatedPeakBytes(for request: ImageEditRequest) throws -> Int {
@@ -98,7 +99,8 @@ public actor FluxEngine {
         }
         return try ImageMemoryEstimator.estimate(model: modelURL, family: family, width: width, height: height,
             sourcePixels: request.sourceImages.count * 1024 * 1024, guidance: request.guidance,
-            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel).peakBytes
+            previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel,
+            adapters: request.adapters).peakBytes
     }
 
     public func estimatedPeakBytes(for request: UpscaleRequest) throws -> Int {

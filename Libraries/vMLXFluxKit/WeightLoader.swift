@@ -106,8 +106,14 @@ public enum WeightLoader {
     public static func storedWeightBytes(in directory: URL) throws -> Int {
         let groups = try enumerateShardGroups(in: directory)
         guard !groups.isEmpty else { throw FluxError.weightsNotFound(directory) }
+        return try storedWeightBytes(inFiles: Array(Set(groups.flatMap(\.shards))))
+    }
+
+    /// Header-only payload accounting for standalone adapter files as well as shards.
+    /// Repeated files count separately when callers install separate adapter copies.
+    public static func storedWeightBytes(inFiles files: [URL]) throws -> Int {
         var total = 0
-        for url in Set(groups.flatMap(\.shards)) {
+        for url in files {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {

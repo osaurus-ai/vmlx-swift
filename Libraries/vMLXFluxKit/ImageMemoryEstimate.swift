@@ -14,7 +14,8 @@ public struct ImageMemoryEstimate: Sendable, Equatable {
 public enum ImageMemoryEstimator {
     public static func estimate(model: URL, family: String, width: Int, height: Int,
                                 sourcePixels: Int = 0, parallelImages: Int = 1,
-                                guidance: Float = 1, previewMaxPixel: Int? = nil) throws -> ImageMemoryEstimate {
+                                guidance: Float = 1, previewMaxPixel: Int? = nil,
+                                adapters: [FluxAdapter] = []) throws -> ImageMemoryEstimate {
         guard width > 0, height > 0, parallelImages > 0, sourcePixels >= 0 else {
             throw FluxError.invalidRequest("memory estimate requires positive dimensions and batch")
         }
@@ -66,17 +67,20 @@ public enum ImageMemoryEstimator {
         let denoise = (rows * batch + referenceRows + Double(textRows)) * Double(hidden) * bytesPerActivation * 20
         let conditioning = (Double(textRows) + referenceRows) * Double(hidden) * bytesPerActivation
             * (guidance > 1 ? 2 : 1)
-        // Decode has two full-resolution feature maps plus the RGB output;
-        // earlier wider maps occur at lower spatial resolution.
-        // Z-Image's untiled fp32 VAE retains considerably more than the two
-        // logical feature maps while Metal executes its convolution graph.
+        // Untiled fp32 VAEs retain considerably more than the two logical
+        // feature maps while Metal executes their convolution graphs.
         // Calibrated against the native 8-bit pipeline: 14.750 GB at 512² and
         // 25.141 GB at 1024², with 10.814 GB live weights. Account for the
         // measured size-dependent workspace; do not multiply the weights or
         // alter allocator limits to make an estimate look correct.
         let decodeMaps: Int
         switch family {
-        case "z-image-turbo": decodeMaps = 28
+        case "z-image-turbo", "flux1-schnell": decodeMaps = 28
+        // Native Flux peaks22.268/32.265GB at512/1024 with17.932GB live
+        // weights. Ideogram peaks31.213/41.209/76.615GB at512/1024/2048
+        // with26.880GB live weights. Legacy Qwen and Edit share the96-channel
+        // decoder; measured1024 peaks45.405/46.675GB respectively.
+        case "ideogram", "qwen-image", "qwen-image-edit": decodeMaps = 24
         // Native Qwen2.1 fp32 decoder uses144 channels, not the96-channel
         // encoder. 512² measured14.37GB and1536² measured41.26GB on the4bit
         // bundle; this workspace model is within8% at both sizes.
@@ -87,7 +91,11 @@ public enum ImageMemoryEstimator {
         if let previewMaxPixel {
             decode += Double(previewMaxPixel) * Double(previewMaxPixel) * Double(vaeChannels * 2 + 3) * bytesPerActivation
         }
-        let weights = try WeightLoader.storedWeightBytes(in: model)
+        let baseWeights = try WeightLoader.storedWeightBytes(in: model)
+        let adapterWeights = try WeightLoader.storedWeightBytes(inFiles: adapters.filter { $0.scale != 0 }.map(\.url))
+        let combined = baseWeights.addingReportingOverflow(adapterWeights)
+        guard !combined.overflow else { throw FluxError.invalidRequest("adapter weight byte count overflow") }
+        let weights = combined.partialValue
         let total = Double(weights) + conditioning + max(denoise, decode)
         guard total.isFinite, total < Double(Int.max) else {
             throw FluxError.invalidRequest("memory estimate exceeds representable size")

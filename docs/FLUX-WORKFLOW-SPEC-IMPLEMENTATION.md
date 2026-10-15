@@ -8,13 +8,13 @@ Active scope: the entire https://gist.github.com/tpae/bb9f4a8384abe07446448128ba
 | --- | --- | --- |
 | 1.1 cancellable upscale | Delivered for SeedVR2 3B | Reuse existing app cancellation/recovery proof |
 | 1.2 native batch | Engine600 and app3098 merged | Complete; reuse byte parity, encoder count, cancellation and app evidence |
-| 1.3/1.4 contracts | Engine601/app3099 implemented | Qwen edit rounding replay; broader app adoption |
-| 1.5 samplers | Engine602/app3099 implemented | Actual non-Turbo Euler/Heun comparison |
+| 1.3/1.4 contracts | Engine601/app3099 implemented | Qwen edit rounding replay passed; final app adoption pending |
+| 1.5 samplers | Engine602/app3099 implemented | Actual non-Turbo Euler/Heun comparison passed |
 | 1.6 adapters | Engine605/app3101 implemented | Real adapter zero/cache/removal parity passed; integrated app controls |
 | 1.7 previews | Engine603/app3100 implemented, corrected in607 | Z512 3 previews, byte parity, paired ratio0.969 passed; integrated app |
-| 1.8 memory | Engine604 implemented, calibration corrected in607 | Z512/1024 measured; other families and app admission pending |
-| 1.9 local video | Engine607/app3103 implemented | Real49-frame480p rendered, cancel passed; exact duration corrected; app/I2V pending |
-| Stage2 | Engine606 implemented | Parity/reuse/mix/cancel/stale passed; hires/lifetime measurements in progress |
+| 1.8 memory | Engine604 implemented, calibration corrected in607 | Z/Qwen2.1 plus Flux/Ideogram/legacy Qwen measured; SeedVR2 calibration and final app admission pending |
+| 1.9 local video | Engine607/app3103 implemented | Real T2V49-frame480p and I2V9-frame512×288 rendered; cancel/exact duration passed; app pending |
+| Stage2 | Engine606 implemented | Parity/reuse/mix/cancel/stale/hires/lifetime passed; reuse recorded evidence |
 
 Preserve existing seeds and independent random streams. Do not confuse reported sampler metadata with selectable implementations. Do not advertise a scaffold as an implemented backend. Keep Turbo's bundle-defined schedule. Existing singleton image admission and chat-model unload/restore remain authoritative. A source-only or RunBench row is not live-app proof.
 
@@ -98,3 +98,9 @@ Non-Turbo Qwen2.1 4-bit, seed7,512²,8steps, linear schedule/shift1 produced dis
 Hires initially produced the correct1536² image but did NOT beat fresh peak:41.2597GB versus41.2593GB. Stage VAE decode now materializes each residual block separately, reducing live convolution workspace without tiling or changing precision/math. The failed-row rerun passed at36.1011GB versus41.2593GB fresh; old/new hires PNG SHA256 both56f93c0101f0557575d713515437c48d7053dc7758f5271b38979ff80bdee37b. Releasing the final handle dropped active memory by exactly1,179,648bytes, matching `retainedBytes(for:)`. Ordinary generate/decode and seeds are unchanged.
 
 Qwen2.1's estimate now uses its144-channel decoder instead of the96-channel encoder and the observed convolution workspace. The512²/1536² measured rows are within8%;1024²/max-size and other families remain uncalibrated. Admission wiring remains under app review; do not promote the all-family memory guarantee yet.
+
+### Final family calibration and I2V check
+
+Qwen-Image-Edit1000² rounding replay passed:992²,30steps,seed7,byte-identical output (620.722s combined test). Missing family memory rows then identified additional decoder-workspace underestimates: Flux1024² estimated19.087GB against32.265GB measured, and Ideogram2048² estimated31.296GB against76.615GB. The decoder coefficients now include the measured untiled convolution workspace. Metadata-only queries against the same measured runs yield errors of−2.3%/+2.4% for Flux512/1024;−3.3%/−3.3%/+2.5% for Ideogram512/1024/2048;−3.9%/+0.9% for Qwen512/1024;−2.5%/+1.2% for QwenEdit512/1024. This calibration does not claim a guarantee for arbitrary dimensions, adapters or devices. Adapter payload bytes are now included instead of omitted. SeedVR2 remains the uncalibrated family.
+
+Original Wan-AI/Wan2.1-I2V-14B-480P revision6b73f84e66371cdfe870c72acd6826e1d61cf279 passed a real source-image run:512×288,9frames,16fps,20Euler steps,guidance5,seed7,123.890s. Duration0.5625s is exact; start/middle/end frames preserve the red teapot source with camera motion. Peak80.796GB. This is engine I2V evidence, not app or480p I2V proof. Raw wan-i2v-source.log and contact.png remain private.
