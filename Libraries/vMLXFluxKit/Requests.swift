@@ -47,7 +47,7 @@ public struct ImageEditRequest: Sendable {
     public var sourceImages: [URL]
     public var mask: URL?          // optional PNG mask — white=edit, black=keep
     public var strength: Float?    // nil uses the backend's native editing behavior
-    public var width: Int?         // nil → match source
+    public var width: Int?         // nil uses the backend's reference-aspect/resolution policy
     public var height: Int?
     public var steps: Int
     public var guidance: Float

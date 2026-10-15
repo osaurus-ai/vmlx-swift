@@ -252,7 +252,7 @@ struct VMLXFluxProbe {
                         width: options.widthExplicit ? options.width : nil,
                         height: options.heightExplicit ? options.height : nil,
                         steps: options.steps,
-                        guidance: options.guidance ?? 4.0,
+                        guidance: options.guidance ?? defaultGuidance(for: loaded),
                         seed: options.seed ?? UInt64(index + 1),
                         outputDir: options.outputDirectory)
                     let turnStart = Date()
@@ -875,7 +875,7 @@ struct ProbeOptions {
     var sourceImages: [URL] = []
     var sourceImage: URL? { sourceImages.first }
     var maskImage: URL?
-    var strength: Float = 0.75
+    var strength: Float?
     var turns = Self.defaultTurns
 
     init(arguments: [String]) throws {
