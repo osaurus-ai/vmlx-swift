@@ -32,8 +32,13 @@ public enum SeedVR2Preprocess {
             else { throw FluxError.invalidRequest("Cannot read SeedVR2 source dimensions") }
             try SeedVR2BundleMetadata.validateUpscale(
                 sourceWidth: rawWidth, sourceHeight: rawHeight, scale: scale, format: .png)
-            guard let rep = NSBitmapImageRep(data: try Data(contentsOf: url)),
-                rep.pixelsWide == rawWidth, rep.pixelsHigh == rawHeight,
+            guard let rawImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                throw FluxError.invalidRequest("Cannot decode SeedVR2 source image")
+            }
+            // Decode at the original orientation; NSBitmapImageRep(data:) applies
+            // EXIF orientation implicitly, whereas the raw CG image does not.
+            let rep = NSBitmapImageRep(cgImage: rawImage)
+            guard rep.pixelsWide == rawWidth, rep.pixelsHigh == rawHeight,
                 !rep.bitmapFormat.contains(.floatingPointSamples),
                 rep.bitsPerSample == 8 || rep.bitsPerSample == 16
             else {
