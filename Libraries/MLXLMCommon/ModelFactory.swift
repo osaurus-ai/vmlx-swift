@@ -684,7 +684,7 @@ public func loadModel(
     let residencyTarget = loadConfiguration.keepModelInMemory
         ? modelResidencyWiredTarget(
             modelBytes: modelBytes, workingSet: workingSet, physicalMemory: physical,
-            wireHeadroom: wireBudget.headroomBytes)
+            wireHeadroom: wireBudget.headroomBytes, systemWireLimit: wireBudget.userWireLimitBytes)
         : nil
     // Explicitly reset on Off or non-fitting loads: the allocator is process-wide
     // and otherwise retains the previous model's wiring limit after unloading.

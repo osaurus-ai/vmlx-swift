@@ -8,7 +8,7 @@ import MLX
 ///
 /// Root cause this exists for (2026-10-15): Apple GPUs need every buffer a command buffer touches to be
 /// WIRED, and macOS caps total wired memory (`vm.global_user_wire_limit`). Allosaurus with adaptive MTP
-/// keeps ~37.6 GiB wired during decode; a 48 GB Mac leaves ~33-34 GiB of wire headroom after macOS's own
+/// keeps ~37.6 GiB wired during decode; a 48 GB Mac (wire cap 37.92 GiB = 79%) leaves ~30.9 GiB of wire headroom after macOS.s own
 /// wiring. Every command buffer then fights the kernel for wiring and decode fell to 0.2 tok/s on a user's
 /// M4 Pro — with plenty of free RAM and a green memory-pressure graph, so nothing in the UI explained it.
 ///

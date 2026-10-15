@@ -50,6 +50,19 @@ final class WireBudgetPolicyTests: XCTestCase {
         XCTAssertEqual(unbounded, tight)
     }
 
+    func testXNUDefaultWireLimitMatchesMeasuredDevices() {
+        XCTAssertEqual(xnuDefaultUserWireLimit(physicalMemory: 51_539_607_552), 40_716_289_966)  // 48 GiB M4 Pro
+        XCTAssertEqual(xnuDefaultUserWireLimit(physicalMemory: 137_438_953_472), 116_823_110_451)  // 128 GiB M5 Max
+    }
+
+    func testReporterFortyEightGigabyteMacExactValues() {
+        // tpae, M4 Pro 48 GB: hw.memsize, recommendedMaxWorkingSetSize, vm.global_user_wire_limit.
+        let target = modelResidencyWiredTarget(
+            modelBytes: allosaurusBytes, workingSet: 40_200_896_512, physicalMemory: 51_539_607_552,
+            wireHeadroom: 40_716_289_966 - 8_140_000_000, systemWireLimit: 40_716_289_966)
+        XCTAssertEqual(target, 40_200_896_512, "the whole working set, bounded by Metal's ceiling — never nil")
+    }
+
     func testSmallMacKeepsTheFreezeGuard() {
         // osaurus#2612: 16 GB Macs keep the conservative reserve.
         XCTAssertNil(modelResidencyWiredTarget(
@@ -71,7 +84,7 @@ final class WireBudgetPolicyTests: XCTestCase {
 
     func testAdvisoryNamesShortfallOnlyWhenTheWorkingSetDoesNotFit() {
         let tight = SystemWireBudget(
-            userWireLimitBytes: Int(38.4 * Double(gib)), gpuWiredLimitBytes: nil,
+            userWireLimitBytes: 40_716_289_966, gpuWiredLimitBytes: nil,
             wiredBytes: Int(7.06 * Double(gib)), wireLimitRejections: 0)
         let report = ModelWireBudgetReport(
             modelBytes: allosaurusBytes, budget: tight, residencyTargetBytes: nil)

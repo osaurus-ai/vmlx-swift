@@ -16,9 +16,10 @@ struct ModelResidencyWiredTargetTests {
 
     // Reserve mirrors the policy: 35% of physical RAM, floored at 8 GB, capped at 24 GB.
     private func osReserve(physical: Int) -> Int {
-        // 48-63 GiB: the request is bounded by XNU's own 80% wire cap, so >= 20% always stays unwired.
+        // 48-63 GiB: the request is bounded by XNU's own 79% wire cap, so >= 21% always stays unwired.
         physical >= gb(48) && physical < gb(64)
-            ? physical - physical / 5 * 4 : max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
+            ? physical - xnuDefaultUserWireLimit(physicalMemory: physical)
+            : max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
     }
 
     @Test("128 GB Mac: a 91 GB bundle (GLM-5.3-Flash / Naive-N0.5 JANGHT) wires with a 24 GB reserve")
@@ -102,7 +103,7 @@ struct ModelResidencyWiredTargetTests {
         // (740 GB page-ins), a set capped at the wire headroom 18 tok/s, the whole working set 36-41 tok/s.
         let weights = 36_971_767_160 + 357_581_088
         let wanted = weights + 5 * Self.gib / 2 + Self.gib
-        let kernelCap = gb(48) / 5 * 4
+        let kernelCap = xnuDefaultUserWireLimit(physicalMemory: gb(48))
         for ceiling in [gb(34), gb(36), gb(37), gb(40)] {
             let target = modelResidencyWiredTarget(
                 modelBytes: weights, workingSet: ceiling, physicalMemory: gb(48))

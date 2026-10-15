@@ -81,7 +81,8 @@ public func modelResidencyWiredTarget(
     modelBytes: Int,
     workingSet: Int,
     physicalMemory: Int,
-    wireHeadroom: Int? = nil
+    wireHeadroom: Int? = nil,
+    systemWireLimit: Int? = nil
 ) -> Int? {
     guard modelBytes > 0, physicalMemory > 0 else { return nil }
     let gib = 1024 * 1024 * 1024
@@ -110,8 +111,9 @@ public func modelResidencyWiredTarget(
     guard !desired.overflow else { return nil }
     var target = min(desired.partialValue, workingSet, safeCeiling)
     // SPEED-CRITICAL (Allosaurus on 48 GB Macs, 2026-10-15). On 48 GiB+ Macs the kernel itself keeps
-    // part of RAM unwireable: XNU `kmem_set_user_wire_limits` caps total wired pages at 80% (32-63 GiB),
-    // 82% (64-127) or 85% (128-255) of RAM, so a residency REQUEST can never wire the machine into the
+    // part of RAM unwireable: XNU `kmem_set_user_wire_limits` caps total wired pages at 79% (32-63 GiB),
+    // 82% (64-127) or 85% (128-255) of RAM (measured: 48 GiB M4 Pro 0.7900, 128 GiB M5 Max 0.8500), so a
+    // residency REQUEST can never wire the machine into the
     // #2612 freeze — the kernel refuses the excess. What the request size DOES decide is which of the
     // model's buffers are in MLX's residency set: MLX inserts allocations in order until the set is
     // full, so a set sized below weights+KV+scratch leaves the latest (hottest) buffers to be re-wired
@@ -128,8 +130,9 @@ public func modelResidencyWiredTarget(
         let generationOverhead = 5 * gib / 2  // KV + verify scratch + reuse pool, measured 2.4-3.2 GiB
         let wanted = modelBytes.addingReportingOverflow(generationOverhead + gib)
         guard !wanted.overflow else { return nil }
-        // Never ask beyond the kernel's own wire cap for this class (80% of RAM): it could not be wired.
-        let kernelWireCap = physicalMemory / 5 * 4
+        // Never ask beyond the kernel's own wire cap (the live sysctl when the loader read it, else XNU's
+        // default for this RAM size): anything above it could not be wired.
+        let kernelWireCap = systemWireLimit ?? xnuDefaultUserWireLimit(physicalMemory: physicalMemory)
         target = max(target, min(wanted.partialValue, workingSet, kernelWireCap))
         // A partial set still beats none (measured above): return it even when Metal's working set is
         // below the model, and let the advisory explain the shortfall.
@@ -922,8 +925,9 @@ extension WiredMemoryPolicy {
 ///
 /// Apple GPUs can only access memory that is wired while each command buffer runs, and macOS caps the
 /// TOTAL number of wired pages system-wide (`vm.global_user_wire_limit`). XNU `kmem_set_user_wire_limits`
-/// picks the percentage from `floor(log2(RAM)) - 32`: 80% for 32-63 GiB (a 48 GB Mac: 38.4 GiB total),
-/// 82% for 64-127 GiB, 85% for 128-255 GiB (measured exactly 85% on a 128 GB M5 Max). A model whose GPU working set (weights + KV + scratch + allocator cache) does not fit under
+/// picks the percentage from `floor(log2(RAM)) - 32` in the non-jetsam table macOS uses
+/// (`{70, 73, 76, 79, 82, 85, 88, 91, 94, 97}`): 79% for 32-63 GiB (a 48 GB M4 Pro reports 40,716,289,966 B
+/// = 37.92 GiB), 82% for 64-127 GiB, 85% for 128-255 GiB (a 128 GB M5 Max reports exactly 85%). A model whose GPU working set (weights + KV + scratch + allocator cache) does not fit under
 /// `limit - already wired` cannot run at full speed no matter how much RAM is free: the kernel rejects
 /// wiring, `vm.add_wire_count_over_global_limit` increments, and Metal command submission stalls.
 /// This was the root cause of Allosaurus (37.6 GiB wired with MTP) collapsing to 0.2 tok/s on a 48 GB Mac.
@@ -995,4 +999,18 @@ public struct SystemWireBudget: Sendable, Equatable {
             userWireLimitBytes: nil, gpuWiredLimitBytes: nil, wiredBytes: nil, wireLimitRejections: nil)
         #endif
     }
+}
+
+/// XNU's default `vm.global_user_wire_limit` for a Mac with `physicalMemory` bytes (macOS non-jetsam table,
+/// `kmem_set_user_wire_limits`; the non-wireable amount is capped at 32 GB). Used only when the live sysctl
+/// cannot be read. Verified against two devices: 48 GiB → 40,716,289,966 B; 128 GiB → 116,823,110,451 B.
+public func xnuDefaultUserWireLimit(physicalMemory: Int) -> Int {
+    guard physicalMemory > 0 else { return 0 }
+    let percents = [70, 73, 76, 79, 82, 85, 88, 91, 94, 97]
+    let log2 = Int.bitWidth - 1 - physicalMemory.leadingZeroBitCount
+    let index = Swift.min(Swift.max(log2 - 32, 0), percents.count - 1)
+    var limit = Int((Double(physicalMemory) * Double(percents[index]) / 100).rounded(.down))
+    let maxNotWireable = 32 * 1024 * 1024 * 1024
+    if physicalMemory - limit > maxNotWireable { limit = physicalMemory - maxNotWireable }
+    return limit
 }
