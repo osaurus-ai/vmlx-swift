@@ -17,7 +17,7 @@ import vMLXFluxKit
 // that flux/qwen/z-image use via MFluxStore. Typography has current fp8 live
 // proof; strict object-icon prompts have current fp8 and NF4 live proof.
 
-public final class Ideogram4: ImageGenerator, @unchecked Sendable {
+public final class Ideogram4: ImageGenerator, FluxAdapterPreparing, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "ideogram",
@@ -38,6 +38,13 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
     public let quantize: Int?
     public let loadedWeights: LoadedWeights
     private let store: MFluxStore
+    private var adapterPipeline: Ideogram4Pipeline?
+
+    public func prepareAdapterLayers() async throws {
+        if adapterPipeline == nil {
+            adapterPipeline = try await Ideogram4Pipeline(modelPath: modelPath, loadedWeights: loadedWeights)
+        }
+    }
 
     public init(modelPath: URL, quantize: Int?) throws {
         self.modelPath = modelPath
@@ -67,9 +74,9 @@ public final class Ideogram4: ImageGenerator, @unchecked Sendable {
                     guard request.steps > 0 else {
                         throw FluxError.invalidRequest("Ideogram steps must be greater than zero")
                     }
-                    let pipeline = try await Ideogram4Pipeline(
-                        modelPath: self.modelPath,
-                        loadedWeights: self.loadedWeights)
+                    let pipeline: Ideogram4Pipeline
+                    if let adapterPipeline { pipeline = adapterPipeline }
+                    else { pipeline = try await Ideogram4Pipeline(modelPath: self.modelPath, loadedWeights: self.loadedWeights) }
                     let image = try pipeline.generate(
                         prompt: request.prompt,
                         width: request.width,

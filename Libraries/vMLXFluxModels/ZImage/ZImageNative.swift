@@ -140,6 +140,8 @@ private final class ZImageWeightStore {
 }
 
 private final class ZImageLinear {
+    private let adapterState = FluxAdapterScope.current
+    private let adapterName: String
     private let weight: MLXArray
     private let scales: MLXArray?
     private let biases: MLXArray?
@@ -156,6 +158,8 @@ private final class ZImageLinear {
         outputDimensions: Int,
         name: String
     ) throws {
+        self.adapterName = name
+        adapterState?.register(name: name, input: inputDimensions, output: outputDimensions)
         guard weight.dim(0) == outputDimensions else {
             throw FluxError.invalidRequest(
                 "\(name) output mismatch: weight=\(weight.shape), expected output \(outputDimensions)")
@@ -213,7 +217,7 @@ private final class ZImageLinear {
         if let bias {
             y = y + bias
         }
-        return y
+        return adapterState?.apply(name: adapterName, input: x, output: y) ?? y
     }
 }
 

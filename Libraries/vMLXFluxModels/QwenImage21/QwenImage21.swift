@@ -20,6 +20,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 40,
             defaultGuidance: 1.0,
+            supportsLoRA: true,
             limits: { try requestLimits(modelPath: $0) },
             loader: { path, quant in
                 _ = QwenImage21._register
@@ -32,6 +33,7 @@ public final class QwenImage21: ImageGenerator, ImageEditor, @unchecked Sendable
             kind: .imageGen,
             defaultSteps: 8,
             defaultGuidance: 1.0,
+            supportsLoRA: true,
             limits: { try requestLimits(modelPath: $0, requiresFixedSchedule: true) },
             loader: { path, quant in
                 _ = QwenImage21._register

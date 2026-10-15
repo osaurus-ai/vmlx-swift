@@ -7,16 +7,8 @@ import vMLXFluxKit
 // dual-encoder (T5 + CLIP) transformer backbone with flow-matching
 // sampling. Python source: `mflux.models.flux.variants.txt2img.flux.Flux1`.
 //
-// This is a SCAFFOLD — every method throws `notImplemented`. The real
-// port needs:
-//   1. FluxTransformer (DiT-style, ~12B params for Dev, ~2.3B for Schnell)
-//   2. T5-XXL text encoder (~5B params)
-//   3. CLIP-L text encoder
-//   4. Autoencoder (VAE)
-//   5. Flow-matching scheduler (Euler step, sigmas from 0→1)
-//   6. Weight loader for mlx .safetensors layout
-// All of that slots into the method bodies below without touching the
-// rest of the package — the protocol contract is stable.
+// Schnell uses the native pipeline below. Other variants retain explicit
+// unsupported errors until their pipelines are implemented.
 
 public final class Flux1Schnell: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {

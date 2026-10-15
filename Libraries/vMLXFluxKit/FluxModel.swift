@@ -76,3 +76,8 @@ public enum FluxError: Error, CustomStringConvertible {
         }
     }
 }
+
+/// Models that construct linear layers lazily prepare them before adapter matching.
+public protocol FluxAdapterPreparing: FluxModel {
+    func prepareAdapterLayers() async throws
+}

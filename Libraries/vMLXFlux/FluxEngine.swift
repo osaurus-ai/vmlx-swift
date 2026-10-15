@@ -24,6 +24,20 @@ public actor FluxEngine {
     /// is O(1) but we keep a local copy for logging.
     public private(set) var lastLoadedName: String?
     private var loadedModelURL: URL?
+    private var adapterState = FluxAdapterState()
+    private var operationBusy = false
+    private var operationWaiters: [CheckedContinuation<Void, Never>] = []
+    public var adapterLoadCount: Int { adapterState.loadCount }
+
+    private func acquireOperation() async {
+        if !operationBusy { operationBusy = true; return }
+        await withCheckedContinuation { operationWaiters.append($0) }
+    }
+
+    private func releaseOperation() {
+        if operationWaiters.isEmpty { operationBusy = false }
+        else { operationWaiters.removeFirst().resume() }
+    }
 
     // MARK: - Init
 
@@ -127,10 +141,17 @@ public actor FluxEngine {
         modelPath: URL,
         quantize: Int? = nil
     ) async throws {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
         guard let entry = ModelRegistry.lookup(name: name) else {
             throw FluxError.unknownModel(name)
         }
-        let model = try await entry.loader(modelPath, quantize)
+        let nextAdapters = FluxAdapterState()
+        let model = try await FluxAdapterScope.$current.withValue(nextAdapters) {
+            try await entry.loader(modelPath, quantize)
+        }
+        adapterState = nextAdapters
         self.loaded = LoadedModel(
             name: name,
             kind: entry.kind,
@@ -170,9 +191,12 @@ public actor FluxEngine {
     }
 
     /// Unload the current model and release weights.
-    public func unload() {
+    public func unload() async {
+        await acquireOperation()
+        defer { releaseOperation() }
         self.loaded = nil
         self.loadedModelURL = nil
+        self.adapterState = FluxAdapterState()
     }
 
     // MARK: - Generate (text-to-image)
@@ -184,7 +208,7 @@ public actor FluxEngine {
         _ request: ImageGenRequest
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task { [weak self] in
+            let task = Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
                     try await self.performGenerate(request, continuation: continuation)
@@ -193,6 +217,9 @@ public actor FluxEngine {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { reason in
+                if case .cancelled = reason { task.cancel() }
+            }
         }
     }
 
@@ -200,6 +227,9 @@ public actor FluxEngine {
         _ request: ImageGenRequest,
         continuation: AsyncThrowingStream<ImageGenEvent, Error>.Continuation
     ) async throws {
+        await acquireOperation()
+        defer { adapterState.clear(); releaseOperation() }
+        try Task.checkCancellation()
         guard let loaded else { throw FluxError.notLoaded }
         guard let generator = loaded.model as? ImageGenerator else {
             throw FluxError.wrongModelKind(
@@ -207,8 +237,17 @@ public actor FluxEngine {
                 actual: String(describing: type(of: loaded.model))
             )
         }
-        for try await event in generator.generate(request) {
-            continuation.yield(event)
+        try await FluxAdapterScope.$current.withValue(adapterState) {
+            if request.adapters.contains(where: { $0.scale != 0 }),
+                let preparer = loaded.model as? FluxAdapterPreparing {
+                try await preparer.prepareAdapterLayers()
+            }
+            try adapterState.install(request.adapters) { _ in
+                continuation.yield(.step(step: 0, total: 0, etaSeconds: nil))
+            }
+            for try await event in generator.generate(request) {
+                continuation.yield(event)
+            }
         }
     }
 
@@ -219,7 +258,7 @@ public actor FluxEngine {
         _ request: ImageEditRequest
     ) -> AsyncThrowingStream<ImageGenEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task { [weak self] in
+            let task = Task { [weak self] in
                 guard let self else { continuation.finish(); return }
                 do {
                     try await self.performEdit(request, continuation: continuation)
@@ -228,6 +267,9 @@ public actor FluxEngine {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { reason in
+                if case .cancelled = reason { task.cancel() }
+            }
         }
     }
 
@@ -235,6 +277,9 @@ public actor FluxEngine {
         _ request: ImageEditRequest,
         continuation: AsyncThrowingStream<ImageGenEvent, Error>.Continuation
     ) async throws {
+        await acquireOperation()
+        defer { adapterState.clear(); releaseOperation() }
+        try Task.checkCancellation()
         guard let loaded else { throw FluxError.notLoaded }
         guard let editor = loaded.model as? ImageEditor else {
             throw FluxError.wrongModelKind(
@@ -242,8 +287,17 @@ public actor FluxEngine {
                 actual: String(describing: type(of: loaded.model))
             )
         }
-        for try await event in editor.edit(request) {
-            continuation.yield(event)
+        try await FluxAdapterScope.$current.withValue(adapterState) {
+            if request.adapters.contains(where: { $0.scale != 0 }),
+                let preparer = loaded.model as? FluxAdapterPreparing {
+                try await preparer.prepareAdapterLayers()
+            }
+            try adapterState.install(request.adapters) { _ in
+                continuation.yield(.step(step: 0, total: 0, etaSeconds: nil))
+            }
+            for try await event in editor.edit(request) {
+                continuation.yield(event)
+            }
         }
     }
 
@@ -278,6 +332,9 @@ public actor FluxEngine {
         _ request: UpscaleRequest,
         continuation: AsyncThrowingStream<ImageGenEvent, Error>.Continuation
     ) async throws {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
         guard let loaded else { throw FluxError.notLoaded }
         guard let upscaler = loaded.model as? ImageUpscaler else {
             throw FluxError.wrongModelKind(

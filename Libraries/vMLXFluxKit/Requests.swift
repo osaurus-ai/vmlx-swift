@@ -23,6 +23,7 @@ public struct ImageGenRequest: Sendable {
     public var shift: Float?
     public var previewInterval: Int?
     public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
@@ -39,7 +40,7 @@ public struct ImageGenRequest: Sendable {
         outputDir: URL,
         outputFormat: ImageFormat = .png,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
-        previewInterval: Int? = nil, previewMaxPixel: Int = 256
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -59,6 +60,7 @@ public struct ImageGenRequest: Sendable {
         self.shift = shift
         self.previewInterval = previewInterval
         self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 
@@ -82,6 +84,7 @@ public struct ImageEditRequest: Sendable {
     public var shift: Float?
     public var previewInterval: Int?
     public var previewMaxPixel: Int
+    public var adapters: [FluxAdapter]
 
     public init(
         prompt: String,
@@ -96,7 +99,7 @@ public struct ImageEditRequest: Sendable {
         outputDir: URL,
         outputFormat: ImageFormat = .png,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
-        previewInterval: Int? = nil, previewMaxPixel: Int = 256
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
     ) {
         self.prompt = prompt
         self.sourceImage = sourceImage
@@ -115,6 +118,7 @@ public struct ImageEditRequest: Sendable {
         self.shift = shift
         self.previewInterval = previewInterval
         self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 
     public init(
@@ -130,7 +134,7 @@ public struct ImageEditRequest: Sendable {
         outputDir: URL,
         outputFormat: ImageFormat = .png,
         sampler: String? = nil, scheduler: String? = nil, shift: Float? = nil,
-        previewInterval: Int? = nil, previewMaxPixel: Int = 256
+        previewInterval: Int? = nil, previewMaxPixel: Int = 256, adapters: [FluxAdapter] = []
     ) throws {
         guard let sourceImage = sourceImages.first else {
             throw FluxError.invalidRequest("ImageEditRequest requires at least one source image")
@@ -152,6 +156,7 @@ public struct ImageEditRequest: Sendable {
         self.shift = shift
         self.previewInterval = previewInterval
         self.previewMaxPixel = previewMaxPixel
+        self.adapters = adapters
     }
 }
 

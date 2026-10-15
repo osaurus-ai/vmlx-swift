@@ -6,13 +6,6 @@ import vMLXFluxKit
 // Z-Image-Turbo — single-encoder turbo model, ~2B params, 4-8 steps.
 // Python source: `mflux.models.z_image.variants.z_image.ZImage`.
 //
-// STATUS: end-to-end wiring + scheduler + weight loading + PNG output.
-// The transformer velocity predictor is a PLACEHOLDER (returns a scaled
-// noise field) until the DiT port lands. With this placeholder the UI
-// gets real progress events, step counts match, and a valid PNG lands
-// on disk. Replacing the velocity predictor with the real transformer
-// forward pass is a localized change.
-
 public final class ZImage: ImageGenerator, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
@@ -21,7 +14,7 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
             kind: .imageGen,
             defaultSteps: 4,
             defaultGuidance: 0.0,
-            supportsLoRA: false,
+            supportsLoRA: true,
             limits: { _ in NativeImageRequestContracts.zImage },
             loader: { path, quant in
                 _ = ZImage._register

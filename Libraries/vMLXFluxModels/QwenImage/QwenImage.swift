@@ -12,6 +12,7 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
             kind: .imageGen,
             defaultSteps: 30,
             defaultGuidance: 4.0,
+            supportsLoRA: true,
             limits: { _ in NativeImageRequestContracts.qwenImage },
             loader: { path, quant in
                 _ = QwenImage._register
@@ -71,7 +72,7 @@ public final class QwenImage: ImageGenerator, @unchecked Sendable {
     }
 }
 
-public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
+public final class QwenImageEdit: ImageEditor, FluxAdapterPreparing, @unchecked Sendable {
     public static let _register: Void = {
         ModelRegistry.register(ModelEntry(
             name: "qwen-image-edit",
@@ -79,6 +80,7 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
             kind: .imageEdit,
             defaultSteps: 30,
             defaultGuidance: 4.0,
+            supportsLoRA: true,
             limits: { _ in NativeImageRequestContracts.qwenEdit },
             loader: { path, quant in
                 _ = QwenImageEdit._register
@@ -89,6 +91,11 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
 
     public let modelPath: URL
     public let quantize: Int?
+    private var adapterPipeline: QwenImageEditPipeline?
+
+    public func prepareAdapterLayers() async throws {
+        if adapterPipeline == nil { adapterPipeline = try QwenImageEditPipeline(modelPath: modelPath) }
+    }
 
     public init(modelPath: URL, quantize: Int?) throws {
         self.modelPath = modelPath
@@ -115,7 +122,7 @@ public final class QwenImageEdit: ImageEditor, @unchecked Sendable {
                     if request.mask != nil {
                         throw FluxError.notImplemented("QwenImageEdit masks are not wired yet")
                     }
-                    let pipeline = try QwenImageEditPipeline(modelPath: self.modelPath)
+                    let pipeline = try adapterPipeline ?? QwenImageEditPipeline(modelPath: self.modelPath)
                     let image = try await pipeline.edit(
                         prompt: request.prompt,
                         sourceImages: request.sourceImages,

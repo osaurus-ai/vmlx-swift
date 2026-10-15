@@ -47,3 +47,11 @@ The engine target compiles. The consolidated generation pass still needs to meas
 Generation/edit/upscale request queries now resolve actual dimensions, native parallel width, reference conditioning and preview workspace. Weight payload bytes are read from the same shard groups as WeightLoader without loading tensors. The API also accepts a model URL for pre-load admission callers.
 
 The per-family activation/VAE coefficients are analytical estimates, not measured bounds. The ±15% acceptance comparison is pending the consolidated run; Osaurus must not use this draft to replace admission decisions yet. Allocator cache and other resident models remain separate host accounting concerns.
+
+### 1.6 Request-scoped LoRA adapters (implementation)
+
+`ImageGenRequest` and `ImageEditRequest` accept local safetensor adapters with scale and transformer/text-encoder/both targeting. Native MFlux and Z-Image linear layers apply low-rank deltas without changing base packed weights. PEFT A/B and Kohya down/up pairs are matched against actual registered layer names and dimensions; unsupported targets/tensors fail explicitly. Qwen edit's separately constructed VLM text encoder is not an adapter target yet.
+
+An engine operation lease keeps load/unload and concurrent generate/edit operations from replacing adapter state while a stream is active. The last set is cached by file SHA256, scale and target. Scale zero takes the base arithmetic path and does not open an adapter file. Clearing the request removes deltas; it never subtracts rounded fused weights. `adapterLoadCount` counts actual installations. Generation/edit through FluxEngine is the supported adapter entry point.
+
+Compilation passes. A real adapter image, scale-zero/base byte parity, repeated-set load count and removal parity remain part of the combined integration pass. This is not yet a live-accepted capability. No seed changes.
