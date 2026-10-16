@@ -808,15 +808,15 @@ internal class NemotronHMoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var eSCB: MLXArray
 
-    init(_ args: NemotronHConfiguration) {
-        self.topK = args.numExpertsPerTok
+    init(_ args: NemotronHConfiguration, experts: Int, topK: Int) {
+        self.topK = topK
         self.nGroup = args.nGroup
         self.topkGroup = args.topkGroup
         self.routedScalingFactor = args.routedScalingFactor
         self.normTopkProb = args.normTopkProb
 
-        self._weight.wrappedValue = MLXArray.zeros([args.nRoutedExperts, args.hiddenSize])
-        self._eSCB.wrappedValue = MLXArray.zeros([args.nRoutedExperts])
+        self._weight.wrappedValue = MLXArray.zeros([experts, args.hiddenSize])
+        self._eSCB.wrappedValue = MLXArray.zeros([experts])
 
         super.init()
     }
@@ -905,13 +905,22 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
-    init(_ args: NemotronHConfiguration, layerIdx: Int, jangtq: NemotronHJANGTQContext? = nil) {
+    init(
+        _ args: NemotronHConfiguration, layerIdx: Int, jangtq: NemotronHJANGTQContext? = nil,
+        routed: (any WeightedRoutedExpertLayer)? = nil, geometryLayer: Int? = nil
+    ) {
+        // `geometryLayer` is the backbone block index used to look up per-block
+        // MoE geometry (nil for the MTP head, which uses the global fields).
+        let geometry = geometryLayer.map { args.moeGeometry(layer: $0) }
+            ?? (experts: args.nRoutedExperts, intermediate: args.moeIntermediateSize,
+                topK: args.numExpertsPerTok)
         self.layerIdx = layerIdx
-        self.numExpertsPerTok = args.numExpertsPerTok
+        self.numExpertsPerTok = geometry.topK
         self.hasSharedExperts = args.nSharedExperts != nil && args.nSharedExperts! > 0
         self.moeLatentSize = args.moeLatentSize
 
-        self._gate.wrappedValue = NemotronHMoEGate(args)
+        self._gate.wrappedValue = NemotronHMoEGate(
+            args, experts: geometry.experts, topK: geometry.topK)
         let expertInputDims = args.moeLatentSize ?? args.hiddenSize
         if let latentSize = args.moeLatentSize {
             self._fc1LatentProj.wrappedValue = Linear(
@@ -919,7 +928,11 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             self._fc2LatentProj.wrappedValue = Linear(
                 latentSize, args.hiddenSize, bias: false)
         }
-        if let jangtq {
+        if let routed {
+            // Mapped custom banks (JANGH relu2): owned outside the parameter
+            // tree, never touched by the affine quantizer or weight update.
+            self._switchMLP.wrappedValue = routed
+        } else if let jangtq {
             let streamJANGTQExperts =
                 JANGTQStreamingExperts.isEnabled
                 || JANGTQStreamingExperts.shouldAutoEnableNemotronUltra(
@@ -947,8 +960,8 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         } else {
             self._switchMLP.wrappedValue = NemotronHSwitchMLP(
                 inputDims: expertInputDims,
-                hiddenDims: args.moeIntermediateSize,
-                numExperts: args.nRoutedExperts
+                hiddenDims: geometry.intermediate,
+                numExperts: geometry.experts
             )
         }
 
@@ -977,6 +990,19 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         if profile {
             MLX.eval(expertInput)
             NemotronHLayerProfiler.shared.record("moe.fc1_latent", seconds: CFAbsoluteTimeGetCurrent() - fc1Start)
+        }
+        if let routed = switchMLP as? any WeightedRoutedExpertLayer {
+            // JANGH relu2 banks reduce over the routes themselves (F32).
+            let switchStart = profile ? CFAbsoluteTimeGetCurrent() : 0
+            var y = routed.callRouted(
+                expertInput, indices: inds.asType(.uint32), scores: scores.asType(.float32))
+            if profile {
+                MLX.eval(y)
+                NemotronHLayerProfiler.shared.record("moe.switch_mlp", seconds: CFAbsoluteTimeGetCurrent() - switchStart)
+            }
+            if let fc2LatentProj { y = fc2LatentProj(y) }
+            if let sharedExperts { y = y + sharedExperts(x) }
+            return y
         }
         // Dispatch through the type-erased protocol — both
         // `NemotronHSwitchMLP` (affine) and `NemotronHJANGTQSwitchMLP`
@@ -1050,7 +1076,8 @@ internal class NemotronHBlock: Module {
         _ args: NemotronHConfiguration,
         layerIdx: Int,
         blockType: Character,
-        jangtq: NemotronHJANGTQContext? = nil
+        jangtq: NemotronHJANGTQContext? = nil,
+        routed: (any WeightedRoutedExpertLayer)? = nil
     ) {
         self.blockType = NemotronHBlockType(from: blockType)
 
@@ -1067,7 +1094,8 @@ internal class NemotronHBlock: Module {
         case .mlp:
             _mixer.wrappedValue = NemotronHMLP(args)
         case .moe:
-            _mixer.wrappedValue = NemotronHMoE(args, layerIdx: layerIdx, jangtq: jangtq)
+            _mixer.wrappedValue = NemotronHMoE(
+                args, layerIdx: layerIdx, jangtq: jangtq, routed: routed, geometryLayer: layerIdx)
         }
 
         super.init()
@@ -1263,7 +1291,10 @@ internal class NemotronHBackbone: Module {
     let firstAttentionCacheIndex: Int?
     let firstMambaCacheIndex: Int?
 
-    init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil) {
+    init(
+        _ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil,
+        routed: [Int: any WeightedRoutedExpertLayer] = [:]
+    ) {
         self.args = args
         precondition(args.vocabSize > 0)
 
@@ -1272,7 +1303,9 @@ internal class NemotronHBackbone: Module {
 
         let pattern = Array(args.hybridOverridePattern)
         self._layers.wrappedValue = pattern.enumerated().map { layerIdx, blockType in
-            NemotronHBlock(args, layerIdx: layerIdx, blockType: blockType, jangtq: jangtq)
+            NemotronHBlock(
+                args, layerIdx: layerIdx, blockType: blockType, jangtq: jangtq,
+                routed: routed[layerIdx])
         }
 
         self._normF.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
@@ -1408,15 +1441,30 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     /// declares `mtp_layers_block_type`; absent everywhere else, which is what
     /// makes `nativeMTPAvailable` honest rather than aspirational.
     @ModuleInfo(key: "mtp") var mtp: NemotronHMTP?
+    /// Raw checkpoint keys owned by mapped custom banks (JANGH); the generic
+    /// safetensors load must not read them.
+    let excludedSafetensorsKeys: Set<String>
 
     public var loraLayers: [Module] {
         backbone.layers
     }
 
-    public init(_ args: NemotronHConfiguration) {
+    public convenience init(_ args: NemotronHConfiguration) {
+        self.init(args, routedLayers: [:], excludedSafetensorsKeys: [])
+    }
+
+    /// JANGH relu2 bundles (Nemotron 3.5 Bolt): `routedLayers` holds the
+    /// admitted mapped bank per routed block; `excludedSafetensorsKeys` the raw
+    /// tensor names those banks own.
+    public init(
+        _ args: NemotronHConfiguration,
+        routedLayers: [Int: any WeightedRoutedExpertLayer],
+        excludedSafetensorsKeys: Set<String>
+    ) {
         self.configuration = args
         self.jangtqContext = nil
         self.vocabularySize = args.vocabSize
+        self.excludedSafetensorsKeys = excludedSafetensorsKeys
 
         // kvHeads array: non-zero for attention layers, zero for others
         let pattern = Array(args.hybridOverridePattern)
@@ -1428,7 +1476,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             return nil
         }
 
-        self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: nil)
+        self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: nil, routed: routedLayers)
         if nemotronHNativeMTPEnabled(), !args.mtpLayersBlockType.isEmpty {
             self._mtp.wrappedValue = NemotronHMTP(args, jangtq: nil)
         }
@@ -1447,6 +1495,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         self.configuration = args
         self.jangtqContext = jangtqContext
         self.vocabularySize = args.vocabSize
+        self.excludedSafetensorsKeys = []
         let pattern = Array(args.hybridOverridePattern)
         self.kvHeads = pattern.compactMap { char -> Int? in
             let blockType = NemotronHBlockType(from: char)
@@ -1692,7 +1741,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             let prefix = "backbone.layers.\(l).mixer"
             for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {
                 if sanitized["\(prefix).experts.0.\(m).weight"] != nil {
-                    let toJoin = (0 ..< configuration.nRoutedExperts).compactMap { e in
+                    let toJoin = (0 ..< configuration.moeGeometry(layer: l).experts).compactMap { e in
                         sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
                     }
                     if !toJoin.isEmpty {
@@ -1825,6 +1874,26 @@ public struct NemotronHConfiguration: Codable, Sendable {
     /// `NemotronHBlock` and the weights land on their shipped key paths.
     public var mtpLayersBlockType: [String]
 
+    /// Per-block MoE geometry (Nemotron 3.5 Bolt "puzzle" blocks). Each MoE
+    /// block declares its own expert count, intermediate width and top-k; the
+    /// config's global MoE fields are absent or stale (`num_experts: 512`) on
+    /// such bundles. `nil` on uniform bundles.
+    public var blockConfigs: [NemotronHBlockConfig]?
+
+    /// Expert count, intermediate width and top-k of `layer`'s MoE mixer.
+    public func moeGeometry(layer: Int) -> (experts: Int, intermediate: Int, topK: Int) {
+        if let blockConfigs, layer < blockConfigs.count, blockConfigs[layer].blockType == "moe" {
+            let block = blockConfigs[layer]
+            return (
+                block.nRoutedExperts ?? nRoutedExperts,
+                block.moeIntermediateSize ?? moeIntermediateSize,
+                RuntimeMoETopKOverride.effectiveTopK(
+                    currentTopK: block.numExpertsPerTok ?? numExpertsPerTok,
+                    modelType: modelType, field: "num_experts_per_tok"))
+        }
+        return (nRoutedExperts, moeIntermediateSize, numExpertsPerTok)
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case vocabSize = "vocab_size"
@@ -1867,6 +1936,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
     private enum RawCodingKeys: String, CodingKey {
         case timeStepLimit = "time_step_limit"
         case layersBlockType = "layers_block_type"
+        case blockConfigs = "block_configs"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1886,14 +1956,30 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel = try container.decode(Int.self, forKey: .convKernel)
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
         moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         moeSharedExpertIntermediateSize = try container.decode(
             Int.self, forKey: .moeSharedExpertIntermediateSize)
-        nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
+        // Puzzle bundles carry the MoE geometry per block only; the globals are
+        // then filled from the first MoE block (vMLX Python PuzzleModelArgs).
+        blockConfigs = try rawContainer.decodeIfPresent(
+            [NemotronHBlockConfig].self, forKey: .blockConfigs)
+        let firstMoE = blockConfigs?.first { $0.blockType == "moe" }
+        guard let experts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts)
+                ?? firstMoE?.nRoutedExperts,
+            let moeIntermediate = try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize)
+                ?? firstMoE?.moeIntermediateSize,
+            let topK = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok)
+                ?? firstMoE?.numExpertsPerTok
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .nRoutedExperts, in: container,
+                debugDescription: "n_routed_experts / moe_intermediate_size / num_experts_per_tok missing globally and in block_configs")
+        }
+        nRoutedExperts = experts
+        moeIntermediateSize = moeIntermediate
         numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
-            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerTok),
+            currentTopK: topK,
             modelType: modelType,
             field: CodingKeys.numExpertsPerTok.rawValue)
         layerNormEpsilon =
@@ -1937,6 +2023,21 @@ public struct NemotronHConfiguration: Codable, Sendable {
         numHiddenLayers =
             try container.decodeIfPresent(Int.self, forKey: .numHiddenLayers)
             ?? hybridOverridePattern.count
+        if let blockConfigs {
+            let pattern = Array(hybridOverridePattern)
+            guard blockConfigs.count == pattern.count,
+                zip(blockConfigs, pattern).allSatisfy({ config, char in
+                    (try? Self.pattern(fromLayerBlockTypes: [config.blockType])) == String(char)
+                }),
+                blockConfigs.allSatisfy({ $0.blockType != "moe"
+                    || ($0.nRoutedExperts ?? 0) > 0 && ($0.moeIntermediateSize ?? 0) > 0
+                        && ($0.numExpertsPerTok ?? 0) > 0 })
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hybridOverridePattern, in: container,
+                    debugDescription: "block_configs disagree with the layer pattern or lack MoE geometry")
+            }
+        }
 
         // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]` and clips
         // dt to exactly that range (`compute_dt`, mlx-lm 0.31: a missing limit
@@ -2046,5 +2147,30 @@ public struct NemotronHConfiguration: Codable, Sendable {
         // unless a bundle's JSON declares it.
         self.numNextnPredictLayers = 0
         self.mtpLayersBlockType = []
+        self.blockConfigs = nil
     }
+}
+
+/// One entry of Nemotron-H `block_configs` (puzzle architectures).
+public struct NemotronHBlockConfig: Codable, Sendable, Equatable {
+    public var blockType: String
+    public var nRoutedExperts: Int?
+    public var moeIntermediateSize: Int?
+    public var numExpertsPerTok: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case blockType = "block_type"
+        case nRoutedExperts = "n_routed_experts"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case numExpertsPerTok = "num_experts_per_tok"
+    }
+}
+
+
+extension NemotronHModel: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        excludedSafetensorsKeys.contains(key)
+    }
+
+    public var requiresExactTensorMmapBuffers: Bool { !excludedSafetensorsKeys.isEmpty }
 }

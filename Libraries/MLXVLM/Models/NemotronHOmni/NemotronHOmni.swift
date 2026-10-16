@@ -194,15 +194,21 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.loraLayers }
 
-    public init(_ config: NemotronHOmniConfiguration) {
-        self.config = config
-
+    public convenience init(_ config: NemotronHOmniConfiguration) {
+        let languageModel: NemotronHModel
         if let jangtq = config.jangtqContext {
-            self._languageModel.wrappedValue = NemotronHModel(
-                jangtqContext: jangtq, configuration: config.llmConfig)
+            languageModel = NemotronHModel(jangtqContext: jangtq, configuration: config.llmConfig)
         } else {
-            self._languageModel.wrappedValue = NemotronHModel(config.llmConfig)
+            languageModel = NemotronHModel(config.llmConfig)
         }
+        self.init(config, languageModel: languageModel)
+    }
+
+    /// Wrap an already-constructed language model (Nemotron 3.5 Bolt: routed
+    /// blocks bound to mapped JANGH banks by `NemotronHJANGHPreparation`).
+    public init(_ config: NemotronHOmniConfiguration, languageModel: NemotronHModel) {
+        self.config = config
+        self._languageModel.wrappedValue = languageModel
         self._radioModel.wrappedValue = NemotronHRADIOVisionModel(
             embedDim: config.vitHiddenSize,
             numBlocks: config.visionNumBlocks,
@@ -1446,4 +1452,12 @@ public enum NemotronHOmniMediaError: Error, LocalizedError, CustomStringConverti
     }
 
     public var errorDescription: String? { description }
+}
+
+extension NemotronHOmni: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        languageModel.excludeFromGenericSafetensorsLoad(key: key)
+    }
+
+    public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
 }

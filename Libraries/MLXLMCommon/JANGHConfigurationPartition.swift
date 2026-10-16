@@ -175,6 +175,17 @@ struct JANGHConfigurationPartition: Sendable {
                 continue
             }
             var components = name.split(separator: ".", omittingEmptySubsequences: false)
+            // Nemotron-H latent MoE (Nemotron 3.5 Bolt): gate-less relu2 banks at
+            // `backbone.layers.L.mixer.switch_mlp.{fc1,fc2}`; admitted for that model type only.
+            if modelType == "nemotron_h" {
+                guard components.count == 6, components[0] == "backbone",
+                    components[1] == "layers", let layer = Int(components[2]), layer >= 0,
+                    String(layer) == String(components[2]), components[3] == "mixer",
+                    components[4] == "switch_mlp",
+                    JANGHFormatContract.relu2Roles.contains(String(components[5]))
+                else { throw Failure.invalid("unsupported nemotron_h custom module path \(name)") }
+                continue
+            }
             // MiniCPM-V 4.7 (Qwen3.5-MoE text under a VLM wrapper) keeps its routed banks at
             // `language_model.model.layers.L.mlp.switch_mlp.*`; admitted for that model type only.
             if modelType == "minicpmv4_7", components.first == "language_model" {
