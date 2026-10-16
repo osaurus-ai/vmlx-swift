@@ -790,9 +790,10 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
 
 /// Fail-closed native-MTP activation policy.
 ///
-/// The runtime never enables native MTP from a path or marketing name. The first
-/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires an
-/// explicit per-load request, supported config model type, and real MTP tensor keys.
+/// The runtime never enables native MTP from a path or marketing name. Loading
+/// requires an explicit per-load request, a supported config model type, and
+/// complete physical MTP tensor evidence. Automatic depth selection also needs
+/// measured tuning or an explicitly validated family policy.
 public enum NativeMTPActivation {
     @TaskLocal public static var explicitRequestOverride: Bool?
 

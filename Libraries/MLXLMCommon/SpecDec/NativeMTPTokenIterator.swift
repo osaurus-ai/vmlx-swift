@@ -2269,11 +2269,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let checkpoint = NativeMTPCacheCheckpoint(cache)
         cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
         let verifyStart = NativeMTPClock.now()
-        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(
-            NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
-        ) {
-            model.nativeBackboneMTPVerifyForward(input, cache: cache)
+        // Native MLX operations may omit an explicit stream. Core 0.32's
+        // implicit default belongs to the calling OS thread, whereas this
+        // graph is scheduled on prefetchQueue below. Bind native operations
+        // to Swift's cross-thread stream while constructing AND scheduling
+        // the graph; otherwise hybrid verify can trap on the worker thread.
+        let stream = MLX.Stream()
+        let capturedModel = model
+        let capturedCache = cache
+        var preparedVerifier: NativeMTPForwardResult!
+        stream.runWith {
+            preparedVerifier = NativeMTPVerifierStatePolicy.withVerifierMode(
+                NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
+            ) {
+                capturedModel.nativeBackboneMTPVerifyForward(input, cache: capturedCache)
+            }
         }
+        let verifier = preparedVerifier!
         // Schedule the verify graph on a background thread. Scheduling — not
         // just executing — a big graph blocks the caller once mlx-core's
         // MAX_ACTIVE_TASKS throttle engages, so an inline asyncEval here
@@ -2286,7 +2298,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let box = SendableBox((logits, hidden))
         Self.prefetchQueue.async {
             let (logits, hidden) = box.consume()
-            asyncEval(logits, hidden)
+            stream.runWith { asyncEval(logits, hidden) }
             scheduled.signal()
         }
         let verifyElapsed = NativeMTPClock.now() - verifyStart

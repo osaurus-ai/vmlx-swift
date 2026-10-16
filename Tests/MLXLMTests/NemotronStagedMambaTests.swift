@@ -1,10 +1,44 @@
 import MLX
 @testable import MLXLLM
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
 final class NemotronStagedMambaTests: XCTestCase {
+    func testHybridVerifyPrefetchSchedulesOnAnotherThread() throws {
+        var config = NemotronHConfiguration(
+            vocabSize: 32, hiddenSize: 32, numHiddenLayers: 3,
+            numAttentionHeads: 4, numKeyValueHeads: 2,
+            mambaNumHeads: 4, mambaHeadDim: 8, ssmStateSize: 128,
+            convKernel: 4, nGroups: 2, intermediateSize: 64,
+            moeIntermediateSize: 32, moeSharedExpertIntermediateSize: 32,
+            nRoutedExperts: 4, numExpertsPerTok: 2, hybridOverridePattern: "M*E",
+            nGroup: 1, topkGroup: 1)
+        config.numNextnPredictLayers = 1
+        config.mtpLayersBlockType = ["attention", "moe"]
+        let model = NativeMTPActivation.$explicitRequestOverride.withValue(true) {
+            NemotronHModel(config)
+        }
+        // A shared zero projection makes target and draft greedily select
+        // token zero, deterministically reaching the asynchronous prefetch.
+        let head = try XCTUnwrap(model.lmHead)
+        head.update(parameters: ModuleParameters.unflattened([
+            "weight": MLXArray.zeros(head.weight.shape),
+        ]))
+        eval(model)
+        var parameters = GenerateParameters(maxTokens: 24, temperature: 0)
+        parameters.draftStrategy = .nativeMTP(depth: 2)
+        var iterator = try NativeMTPTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4])),
+            model: model, parameters: parameters, depth: 2)
+        var tokens: [Int] = []
+        while let token = iterator.next() { tokens.append(token) }
+        XCTAssertEqual(tokens.count, 24)
+        XCTAssertGreaterThan(iterator.verifyPrefetchSubmitCount, 0)
+        XCTAssertGreaterThan(iterator.verifyPrefetchConsumedCount, 0)
+        XCTAssertTrue(tokens.allSatisfy { (0..<32).contains($0) })
+    }
+
     func testFusedDecodeConvolutionPreservesActivationRounding() throws {
         let channels = 256
         for dtype: DType in [.bfloat16, .float16, .float32] {
