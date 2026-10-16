@@ -1159,11 +1159,9 @@ public enum NativeMTPAutoDecodePolicy {
                 depth: familyColdStartDepth,
                 verifierMode: nil,
                 reason:
-                    "Measured family cold-start depth \(familyColdStartDepth) (Qwen3.8 Flash-Next, Nemotron 3.5 latent-MoE MTP); live acceptance may adapt downward.",
+                    "Measured family cold-start depth \(familyColdStartDepth) (Qwen3.8 Flash-Next); live acceptance may adapt downward.",
                 evidence: evidence + [
-                    modelTypes.contains(where: isQwen4ExpModelType)
-                        ? "activation=qwen4_exp_measured_family_cold_start"
-                        : "activation=nemotron_h_latent_moe_measured_family_cold_start",
+                    "activation=qwen4_exp_measured_family_cold_start",
                     "family_cold_start_depth=\(familyColdStartDepth)",
                     "tuning_state=\(tuningState)",
                 ] + supersededBlockEvidence)
@@ -1261,32 +1259,11 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> Int? {
         let types = modelTypes(config: config, fallback: fallback)
         if types.contains(where: isQwen4ExpModelType) { return 3 }
-        // Nemotron-H latent-MoE MTP (Nemotron 3.5 Super-VL: one [attention, moe]
-        // head over a moe_latent_size MoE). Measured on the JANG_4M bundle,
-        // RunBench, M5 Max, staged Mamba-2 verify rollback, 3 runs x 2 rounds:
-        // app-default sampling (T 1.0, top-p 0.95, thinking on) AR 36.4-37.3,
-        // d1 39.4-40.1, d3 39.6-42.6 tok/s; greedy thinking-on AR 37.1, d1 42.3,
-        // d3 48.2. Greedy d1 is byte-identical to AR; d3's multi-row verify is
-        // not row-exact and can flip near-ties. Keyed from config, never a name.
-        if types.contains(where: isNemotronHModelType), isNemotronLatentMoEMTP(config) { return 3 }
+        // Nemotron's row-exact verifier and LiLiCorr proposer still need an
+        // in-app speedup measurement. Physical head presence establishes
+        // capability, not profitability. Keep Auto tuning-file driven;
+        // explicit manual depths remain available for measurement.
         return nil
-    }
-
-    private static func isNemotronLatentMoEMTP(_ config: [String: Any]?) -> Bool {
-        let text = (config?["text_config"] as? [String: Any]) ?? config
-        guard let text, (text["moe_latent_size"] as? Int ?? 0) > 0,
-            let pattern = text["mtp_layers_block_type"] as? [String]
-        else { return false }
-        return pattern.map { $0.lowercased() } == ["attention", "moe"]
-    }
-
-    private static func isNemotronHModelType(_ value: String) -> Bool {
-        switch normalize(value) {
-        case "nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text":
-            return true
-        default:
-            return false
-        }
     }
 
     private static func isQwen4ExpModelType(_ value: String) -> Bool {
