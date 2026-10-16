@@ -1300,6 +1300,10 @@ internal class NemotronHBackbone: Module {
     let firstAttentionCacheIndex: Int?
     let firstMambaCacheIndex: Int?
 
+    /// Optional recorder of block OUTPUTS (before `norm_f`), e.g. the LiLiCorr drafter's target
+    /// taps. Nil by default: the loop then pays one optional check per block and nothing else.
+    var blockOutputTap: NemotronHBlockOutputTap? = nil
+
     init(
         _ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil,
         routed: [Int: any WeightedRoutedExpertLayer] = [:]
@@ -1390,7 +1394,8 @@ internal class NemotronHBackbone: Module {
 
         // Track which cache to use for each layer
         var cacheCounter = 0
-        for layer in layers {
+        let tap = blockOutputTap
+        for (layerIndex, layer) in layers.enumerated() {
             let c: KVCache?
             if layer.blockType == .mamba || layer.blockType == .attention {
                 c = cache?[cacheCounter]
@@ -1400,6 +1405,9 @@ internal class NemotronHBackbone: Module {
             }
 
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: c)
+            if let tap, tap.layerIndices.contains(layerIndex) {
+                tap.record(layerIndex, hidden)
+            }
         }
 
         return hidden
@@ -1436,10 +1444,17 @@ internal class NemotronHBackbone: Module {
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
-    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel
+    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    NemotronHBlockOutputTappable
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
+
+    /// `NemotronHBlockOutputTappable`: block-output recorder on the backbone (nil by default).
+    public var blockOutputTap: NemotronHBlockOutputTap? {
+        get { backbone.blockOutputTap }
+        set { backbone.blockOutputTap = newValue }
+    }
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     public let configuration: NemotronHConfiguration

@@ -171,10 +171,17 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
 // MARK: - Multimodal model
 
 public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAModel,
-    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel
+    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    NemotronHBlockOutputTappable
 {
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
+
+    /// `NemotronHBlockOutputTappable`: forwarded to the language model's backbone.
+    public var blockOutputTap: NemotronHBlockOutputTap? {
+        get { languageModel.blockOutputTap }
+        set { languageModel.blockOutputTap = newValue }
+    }
 
     // Tower modules may contain affine-quantized linears alongside fp16/bf16
     // normalization tensors; sanitize() routes both through the remap helpers.
