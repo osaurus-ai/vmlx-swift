@@ -167,7 +167,9 @@ struct JANGHTensorIndexPlan: Sendable {
             let (ocol, oc) = try locate(module + ".jt_ocol", bytesPerElement: 4)
             let (wout, wo) = try locate(module + ".jt_wout", bytesPerElement: 2)
             let outliers = ocol.shape.count == 2 ? ocol.shape[1] : 0
-            guard d.input.isMultiple(of: 512), d.output.isMultiple(of: 8),
+            // kin % 128: Hadamard-128 input basis (a kin % 512 remainder runs the decode kernels' masked tail block;
+            // Qwen3.8-Flash-Next down has kin = 640). outliers <= 32: one decode SIMD lane per outlier column.
+            guard d.input.isMultiple(of: 128), d.output.isMultiple(of: 8),
                 packed.dtype == "U32",
                 packed.shape == [d.experts, d.output, JANGTCode.wordsPerRow(inputs: d.input, k: k)],
                 scale.dtype == "F32", scale.shape == [d.experts, d.output],
