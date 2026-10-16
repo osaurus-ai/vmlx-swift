@@ -34,15 +34,10 @@ private enum WiredMemoryBackend {
 /// Directly set the process-wide wired memory limit so a just-loaded model's
 /// weights stay GPU-resident.
 ///
-/// MLX's default wired limit is ~75% of the device's recommended max working
-/// set. A model LARGER than that default has its pages swapped during every
-/// `eval`, which stalls Metal command buffers — observed live as a 95 GB
-/// bundle pinning memory and thrashing ~15-20 GB of swap while warmup never
-/// finishes. This mirrors the Python engine's load-time
-/// `_set_wired_limit_for_model`: a loaded model is a LONG-LIVED residency
-/// requirement, not the transient active work that ``WiredMemoryManager``
-/// tickets model, so the limit is applied directly and persists until the next
-/// load sets it again.
+/// This fork starts explicit Metal residency at zero. The model loader sets
+/// a bounded process-wide budget so mapped expert pages are not continually
+/// evicted under pressure. A zero budget removes explicit residency; it does
+/// not unload the model or alter its tensors.
 ///
 /// The caller must clamp `bytes` to the OS working set
 /// (``GPU/maxRecommendedWorkingSetBytes()``) — Apple rejects a wired limit
@@ -57,7 +52,7 @@ public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
 }
 
 /// Compute the model-residency wired-limit target for a just-loaded model, or
-/// `nil` to leave the OS/MLX default untouched.
+/// `nil` when the complete model cannot fit in the residency budget.
 ///
 /// Wired pages cannot be reclaimed — not swapped, not compressed — so wiring a
 /// model that leaves a constrained Mac too little headroom removes the OS's
@@ -66,17 +61,11 @@ public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
 /// before began flickering, freezing, and triggering kernel restarts
 /// (osaurus#2612), with much higher resident RAM.
 ///
-/// This policy reserves a generous slice of PHYSICAL RAM for the OS plus the
-/// decode transients (KV cache, Metal scratch) that must stay reclaimable, and
-/// only raises the wired limit when the whole model fits inside that safe
-/// ceiling — precisely the case the residency raise was meant to help (a large
-/// bundle on a Mac with room to spare, which would otherwise swap its pages on
-/// every `eval`). When the model is a large fraction of RAM it returns `nil`:
-/// the pages stay swappable, which is slower under pressure but never panics —
-/// the pre-residency default that constrained Macs relied on.
-///
-/// The reserve scales with the machine (a fraction, floored at a flat minimum)
-/// so large Macs still get the residency win while small Macs stay safe.
+/// Small Macs retain the conservative reserve required by osaurus#2612.
+/// 48 GiB-class machines reserve ten GiB for the OS; larger machines retain
+/// the existing scaled reserve. The target always respects the actual Metal
+/// ceiling. If the whole model cannot fit, return nil so the loader leaves
+/// the model reclaimable and can report an advisory.
 ///
 /// - Parameters:
 ///   - modelBytes: on-disk weight size of the model.
@@ -84,7 +73,7 @@ public func setModelResidencyWiredLimit(_ bytes: Int) -> Bool {
 ///     limit above this. Pass `Int.max` when unknown (non-Metal backends).
 ///   - physicalMemory: total installed RAM in bytes.
 /// - Returns: a byte target for ``setModelResidencyWiredLimit(_:)``, or `nil`
-///   to leave the default (the safe choice on a constrained Mac).
+///   when the model must remain reclaimable.
 public func modelResidencyWiredTarget(
     modelBytes: Int,
     workingSet: Int,
@@ -99,14 +88,23 @@ public func modelResidencyWiredTarget(
     // not need a third of a big machine: an uncapped 35% reserve is 44.8 GB on a
     // 128 GB Mac, which declined to wire GLM-5.3-Flash / Naive-N0.5 JANGHT (91 GB)
     // and left ~11 GB of their weight buffers outside the Metal residency set
-    // (MLX's default wired limit is ~75% of the working set). Metal then makes
+    // (this fork starts with explicit residency disabled). Metal then makes
     // those buffers resident again on every command-buffer submission: decode
     // measured 1.4-1.8 tok/s vs 25-26.5 with the model wired (2026-10-11,
     // 3 alternating rounds each), at random depending on which buffers were
     // left out. vMLX Python wires the same bundle on the same machine.
-    let osReserve = max(8 * gib, min(physicalMemory / 100 * 35, 24 * gib))
+    // 48 GiB-class Macs need about 35 GiB for Allosaurus weights (excluding
+    // its SSD n-gram table). The old 35% reserve left only 31.2 GiB, so no
+    // weights were wired. Keep a 10 GiB OS reserve in this class, still clamp
+    // to Metal's reported ceiling, and retain the #2612 small-Mac policy.
+    // Hosts expose the opt-out through LoadConfiguration.keepModelInMemory.
+    let osReserve = physicalMemory >= 48 * gib && physicalMemory < 64 * gib
+        ? 10 * gib
+        : max(8 * gib, min(physicalMemory / 100 * 35, 24 * gib))
     let safeCeiling = max(0, physicalMemory - osReserve)
-    let target = min(modelBytes + headroom, workingSet, safeCeiling)
+    let desired = modelBytes.addingReportingOverflow(headroom)
+    guard !desired.overflow else { return nil }
+    let target = min(desired.partialValue, workingSet, safeCeiling)
     // Only raise when the whole model fits wired inside the safe ceiling.
     // Otherwise leave the default: the model stays swappable (safe), instead of
     // wiring a machine into a memory-pressure panic.
