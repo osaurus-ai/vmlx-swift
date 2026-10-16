@@ -176,8 +176,8 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
 
-    // Tower modules. The on-disk weights for these are fp16/bf16 (NOT
-    // quantized); sanitize() routes them through the remap helpers.
+    // Tower modules may contain affine-quantized linears alongside fp16/bf16
+    // normalization tensors; sanitize() routes both through the remap helpers.
     //
     // NOTE: @ModuleInfo keys must be single-segment (no dots). Multi-level
     // namespaces from the bundle's safetensors keys are flattened by
@@ -232,7 +232,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 llmHidden: config.llmConfig.hiddenSize)
         }
         if config.hasVisionFinalLayerNorm {
-            self._visionFinalLayerNorm.wrappedValue = LayerNorm(
+            self._visionFinalLayerNorm.wrappedValue = NemotronHVisionLayerNorm(
                 dimensions: config.vitHiddenSize, eps: config.visionLayerNormEps, affine: true,
                 bias: true)
         }

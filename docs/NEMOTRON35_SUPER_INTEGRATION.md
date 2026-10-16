@@ -18,7 +18,8 @@ Status: partial; engine #609 and app #3114 remain drafts. No release/tag.
 - Rectangular/square image shuffle: 2 tests; independent PyTorch image-resize vectors: 2 tests; FP32 CPE interpolation: 1 test; physical final-norm tensor checks: 4 tests, including stale indexes and incomplete files.
 - Native staged-Mamba, normalization, fused-convolution rounding and cross-thread prefetch: 4/4 tests. Native MTP depth policy: 7/7 tests.
 - Matched TF32 settings give exact teacher-forced agreement for all three text cases (77, 49 and 301 positions) and matching independent greedy outputs. No production precision policy changed.
-- Independent image parity remains under investigation; do not call the raw default-backend teacher row passing. The supplied Python reference used the wrong vision block LayerNorm epsilon and omitted the source's post-interpolation dtype cast. The original fixture is preserved; separate corrected-reference receipts document both differences. Matched-input language-path isolation passes 349/349 positions with KL 1.04e-13 and all 23 greedy tokens through EOS. This is not independent image acceptance. A separate control using the same compiled Metal library makes all 32 RADIO blocks bit-exact; the default Python and Swift Metal builds first differ at five bf16 elements in block-0 LayerNorm. No production Metal library or precision policy is replaced.
+- Independent image parity passes with the normal Swift Metal library: 349/349 teacher positions, KL 5.394e-14, matching vision checksums and all 23 greedy tokens through EOS. Two reference-helper deviations (vision block epsilon and post-interpolation dtype cast) were corrected in a separate fixture from the vendor source; the original fixture remains untouched. RADIO now explicitly fuses variance accumulation and applies its rounded normalization's affine weight in FP32, eliminating toolchain-dependent LayerNorm differences without changing shared MLX kernels.
+- Vision projector regressions pass 2/2; patch interpolation/dtype regressions pass 2/2. A focused RADIO strided-row/affine regression is running.
 - Native MTP real-bundle diagnostic: explicit depth 2, two capped easy-code rows, 36.98/41.97 tok/s versus AR 26.66/28.74; 124 prefetched verify cycles consumed in each row. These are diagnostic rows, not app acceptance, sustained performance or matched-clock speed claims.
 
 ## Live Osaurus evidence
@@ -30,7 +31,7 @@ App fdc7f95d8, engine 11df5292e9d3e51e52fcca00cebef13fb35d0d33:
 - Direct Stop in a delegated child chat incorrectly returned partial work as success. App commit 0f62d0332 shares cancellation cleanup and preserves the cancellation result; 6/6 observer tests pass. Live Debug app after-check passes: child Stop returns ok:false/retryable:false, and a subsequent delegated calculator task completes with 20413. Raw records and public proof comment are on #3114.
 
 ## Remaining gates
-1. Independent image comparison after the vendor dtype correction; focused regression for patch dtype.
+1. Complete the focused RADIO normalization regression and updated live app image/follow-up check.
 2. Re-pin all six app sites to the final engine commit; rebuild and repeat affected image/delegation rows.
 3. Native MTP sampled, media, cache and connected app checks before assigning measured defaults. No fabricated tuning, sampler changes or bundle writes.
 4. Long-context resource/cache hardening, cancellation during model load and concurrent admission remain unproven for this family.

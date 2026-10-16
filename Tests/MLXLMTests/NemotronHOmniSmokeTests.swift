@@ -5,7 +5,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
-import MLXVLM
+@testable import MLXVLM
 import XCTest
 
 /// Smoke tests for the Nemotron-3-Nano-Omni multimodal Swift wrapper.
@@ -70,6 +70,34 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         // SquaredReLU then rounds to 0.71875. Rounding before the affine
         // multiply instead produces 0.8515625, changing the projected row.
         XCTAssertEqual(output.item(Float.self), 0.71875)
+    }
+
+    func testRADIONormalizationPreservesAffineRoundingAndStridedRows() throws {
+        // A non-contiguous transpose exercises the kernel input materialization;
+        // 33 features exercises the partially occupied SIMD group.
+        for dtype: DType in [.float32, .float16, .bfloat16] {
+            let norm = NemotronHVisionLayerNorm(dimensions: 33, eps: 1e-6)
+            let weights = (MLXArray(0 ..< 33).asType(.float32) / 32 + 0.75).asType(dtype)
+            let biases = (MLXArray(0 ..< 33).asType(.float32) / 64 - 0.25).asType(dtype)
+            try norm.update(parameters: ModuleParameters.unflattened([
+                "weight": weights, "bias": biases,
+            ]), verify: .all)
+            let input = (MLXArray(0 ..< 99).asType(.float32) / 16 - 3)
+                .reshaped([33, 3]).transposed().asType(dtype)
+            let xf = input.asType(.float32)
+            let centered = xf - MLX.mean(xf, axis: -1, keepDims: true)
+            let normalized = (centered * MLX.rsqrt(
+                MLX.mean(centered * centered, axis: -1, keepDims: true) + 1e-6))
+                .asType(dtype).asType(.float32)
+            let expected = (normalized * weights.asType(.float32) + biases.asType(.float32))
+                .asType(dtype)
+            let actual = norm(input)
+            XCTAssertEqual(actual.shape, input.shape)
+            XCTAssertEqual(actual.dtype, dtype)
+            XCTAssertLessThanOrEqual(
+                MLX.max(MLX.abs(actual.asType(.float32) - expected.asType(.float32)))
+                    .item(Float.self), dtype == .float32 ? 1e-6 : 0.002)
+        }
     }
 
     func testRADIOForwardShape() throws {

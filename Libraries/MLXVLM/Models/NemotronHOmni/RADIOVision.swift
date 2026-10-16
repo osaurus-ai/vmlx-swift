@@ -105,6 +105,75 @@ public func nemotronOmniPixelShuffle(
 
 // MARK: - ViT building blocks
 
+/// RADIO's bf16 LayerNorm needs stable reduction and affine rounding across
+/// Metal toolchains. Match the reference's fused variance accumulation explicitly,
+/// round the normalized activation once, then apply the affine weight in fp32.
+/// Keep this kernel scoped to RADIO; shared text normalization is unchanged.
+internal final class NemotronHVisionLayerNorm: LayerNorm {
+    #if canImport(Metal)
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_radio_layer_norm", inputNames: ["x", "w", "b", "epsilon"],
+        outputNames: ["out"], source: """
+            #pragma clang fp contract(off)
+            #pragma clang fp reassociate(off)
+            uint row = threadgroup_position_in_grid.x;
+            uint lid = thread_position_in_threadgroup.x;
+            uint lane = thread_index_in_simdgroup;
+            uint group = simdgroup_index_in_threadgroup;
+            threadgroup float sums[32];
+            if (group == 0) sums[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float values[8] = {0};
+            uint column = lid * 8;
+            for (uint i = 0; i < 8; ++i) {
+                if (column + i < WIDTH) values[i] = float(x[row * WIDTH + column + i]);
+            }
+            float mean = 0.0f;
+            for (uint i = 0; i < 8; ++i) mean += values[i];
+            mean = simd_sum(mean);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) sums[group] = mean;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mean = simd_sum(sums[lane]) / float(WIDTH);
+            float variance = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                values[i] = column + i < WIDTH ? values[i] - mean : 0.0f;
+                variance = fma(values[i], values[i], variance);
+            }
+            variance = simd_sum(variance);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) sums[group] = variance;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv = metal::precise::rsqrt(simd_sum(sums[lane]) / float(WIDTH) + epsilon[0]);
+            for (uint i = 0; i < 8; ++i) {
+                if (column + i < WIDTH) {
+                    T normalized = T(values[i] * inv);
+                    out[row * WIDTH + column + i] = T(float(w[column + i]) * float(normalized) + float(b[column + i]));
+                }
+            }
+            """)
+    #endif
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        #if canImport(Metal)
+        if let weight, let bias, dimensions > 0, dimensions <= 8192,
+            x.ndim > 0, x.dim(-1) == dimensions, x.size > 0,
+            weight.dtype == x.dtype, bias.dtype == x.dtype,
+            [.float32, .float16, .bfloat16].contains(x.dtype),
+            Device.defaultDevice().deviceType == .gpu
+        {
+            let threads = ((dimensions + 255) / 256) * 32
+            return Self.kernel(
+                [x, weight, bias, MLXArray([eps])],
+                template: [("T", x.dtype), ("WIDTH", dimensions)],
+                grid: (x.size / dimensions * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+        }
+        #endif
+        return super.callAsFunction(x)
+    }
+}
+
 public class NemotronHViTAttention: Module, UnaryLayer {
     let numHeads: Int
     let headDim: Int
@@ -161,9 +230,9 @@ public class NemotronHViTBlock: Module, UnaryLayer {
         // timm's ViT blocks use LayerNorm(eps=1e-6). MLXNN defaults to
         // 1e-5, which compounds across RADIO's 32 blocks and materially
         // changes the vision embeddings.
-        self._norm1.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
+        self._norm1.wrappedValue = NemotronHVisionLayerNorm(dimensions: dim, eps: 1e-6)
         self._attn.wrappedValue = NemotronHViTAttention(dim: dim, numHeads: numHeads)
-        self._norm2.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
+        self._norm2.wrappedValue = NemotronHVisionLayerNorm(dimensions: dim, eps: 1e-6)
         self._mlp.wrappedValue = NemotronHViTMLP(dim: dim, hiddenDim: Int(Float(dim) * mlpRatio))
     }
 
