@@ -71,17 +71,19 @@ public class NemotronHSoundProjector: Module, UnaryLayer {
 /// Maps on-disk `mlp1.{0,1,3}.*` keys to NemotronHVisionMLPProjector
 /// attribute names (single-segment, no leading prefix).
 public func remapMlp1Weights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
-    let rename: [String: String] = [
-        "mlp1.0.weight": "layer_norm.weight",
-        "mlp1.1.weight": "fc1.weight",
-        "mlp1.1.bias": "fc1.bias",
-        "mlp1.3.weight": "fc2.weight",
-        "mlp1.3.bias": "fc2.bias",
+    // Prefix rules, not a fixed key list: quantized projectors (Nemotron 3.5
+    // Bolt / Super-VL ship mlp1.1 / mlp1.3 8-bit) also carry `.scales` and
+    // `.biases`, which a weight/bias-only map silently dropped.
+    let prefixes: [(String, String)] = [
+        ("mlp1.0.", "layer_norm."),
+        ("mlp1.1.", "fc1."),
+        ("mlp1.3.", "fc2."),
     ]
     var out = [String: MLXArray]()
     for (oldKey, v) in weights {
-        if let newKey = rename[oldKey] {
-            out[newKey] = v
+        for (from, to) in prefixes where oldKey.hasPrefix(from) {
+            out[to + oldKey.dropFirst(from.count)] = v
+            break
         }
     }
     return out

@@ -16,6 +16,27 @@ final class NativeMTPDepthPolicyTests: XCTestCase {
         }
     }
 
+    func testNemotronManualControlsUseArchitectureAndRequirePhysicalHead() throws {
+        for modelType in ["nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text"] {
+            let data = try JSONSerialization.data(withJSONObject: ["model_type": modelType])
+            XCTAssertTrue(NativeMTPAutoDecodePolicy.supportsModel(configData: data))
+            XCTAssertNil(NativeMTPAutoDecodePolicy.manualRecommendation(
+                depth: 2, configData: data, jangConfig: nil, status: nil))
+            let status = MTPBundleStatus(
+                bundleHasMTP: true, configuredLayers: 1, tensorCount: 40,
+                mode: .preservedEnabled, nativeMTPTuning: nil)
+            let manual = try XCTUnwrap(NativeMTPAutoDecodePolicy.manualRecommendation(
+                depth: 2, configData: data, jangConfig: nil, status: status))
+            XCTAssertEqual(manual.depth, 2)
+            // Hardware presence makes the manual control available. It does
+            // not invent performance tuning or change the family default.
+            XCTAssertNil(NativeMTPAutoDecodePolicy.recommendation(
+                configData: data, jangConfig: nil, status: status))
+        }
+        XCTAssertFalse(NativeMTPAutoDecodePolicy.supportsModel(
+            configData: Data("{\"model_type\":\"unsupported\"}".utf8)))
+    }
+
     func testFixedRequestsCannotPromoteAboveSelectedDepth() throws {
         for depth in 1...3 {
             let result = try NativeMTPDepthPolicy.fixed.resolve(requestedDepth: depth, runtimeCap: 5)

@@ -108,6 +108,46 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertEqual(outX.shape, [1, 2, 2, 64])
     }
 
+    func testPositionInterpolationKeepsFloat32FractionsForBFloat16Weights() {
+        let input = MLXArray([Float(1), 9, 3, 7]).reshaped([1, 1, 2, 2]).asType(.bfloat16)
+        let output = nemotronOmniBilinearResize2D(input, targetH: 3, targetW: 5)
+        let reference = nemotronOmniBilinearResize2D(input.asType(.float32), targetH: 3, targetW: 5)
+        XCTAssertEqual(output.dtype, .float32)
+        XCTAssertEqual(output.asArray(Float.self), reference.asArray(Float.self))
+        // At target column 1, align-corners-false samples x=0.1.
+        XCTAssertEqual(output[0, 0, 0, 1].item(Float.self), 1.8, accuracy: 1e-6)
+    }
+
+    func testPixelShufflePreservesRectangularPatchNeighborhoods() throws {
+        // A coordinate-coded image makes row/column swaps observable. Each
+        // output patch must contain its original 2x2 neighborhood in row order.
+        for (height, width) in [(4, 6), (6, 4), (4, 4)] {
+            let batches = 2
+            let channels = 3
+            let values = (0 ..< batches * height * width * channels).map { Float($0) }
+            let input = MLXArray(values).reshaped([batches, height, width, channels])
+            let output = nemotronOmniPixelShuffle(input, scaleFactor: 0.5)
+            var expected: [Float] = []
+            for batch in 0 ..< batches {
+                for row in stride(from: 0, to: height, by: 2) {
+                    for column in stride(from: 0, to: width, by: 2) {
+                        for dy in 0 ..< 2 {
+                            for dx in 0 ..< 2 {
+                                for channel in 0 ..< channels {
+                                    expected.append(values[
+                                        ((batch * height + row + dy) * width + column + dx)
+                                            * channels + channel])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            XCTAssertEqual(output.shape, [batches, height / 2, width / 2, channels * 4])
+            XCTAssertEqual(output.asArray(Float.self), expected)
+        }
+    }
+
     func testVideoEVSMatchesSourceTokenCount() throws {
         let feats = MLXArray.zeros([16, 256, 8])
         let pruned = nemotronOmniApplyEVS(feats, pruningRate: 0.7)

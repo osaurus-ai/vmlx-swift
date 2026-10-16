@@ -67,9 +67,11 @@ public func nemotronOmniBilinearResize2D(
     let f10 = gather(x, y1, x0)
     let f11 = gather(x, y1, x1)
 
-    let wxB = wx.reshaped([1, 1, 1, targetW]).asType(x.dtype)
-    let wyB = wy.reshaped([1, 1, targetH, 1]).asType(x.dtype)
-    let one = MLXArray(1.0, dtype: x.dtype)
+    // CPE interpolation uses fp32 coordinates even for bf16 checkpoint
+    // positions. Rounding the fractions first changes every vision token.
+    let wxB = wx.reshaped([1, 1, 1, targetW])
+    let wyB = wy.reshaped([1, 1, targetH, 1])
+    let one = MLXArray(Float(1))
     return f00 * (one - wxB) * (one - wyB)
         + f01 * wxB * (one - wyB)
         + f10 * (one - wxB) * wyB
@@ -91,10 +93,12 @@ public func nemotronOmniPixelShuffle(
     let cMid = Int(Float(C) / s)
     let cOut = Int(Float(C) / (s * s))
 
-    // (B, H, W, C) → (B, W, H*s, C/s)
-    var out = x.reshaped([B, W, hOut, cMid])
-    out = out.transposed(0, 2, 1, 3) // (B, H*s, W, C/s)
-    out = out.reshaped([B, hOut, wOut, cOut]) // (B, H*s, W*s, C/s²)
+    // Group adjacent columns, then rows. The source names its spatial axes
+    // `w, h`; keep their positional order when using our `H, W` names.
+    // Swapping them in the first reshape silently scrambles rectangular grids.
+    var out = x.reshaped([B, H, wOut, cMid])
+    out = out.transposed(0, 2, 1, 3) // (B, W*s, H, C/s)
+    out = out.reshaped([B, wOut, hOut, cOut])
     out = out.transposed(0, 2, 1, 3)
     return out
 }
@@ -199,6 +203,10 @@ public class NemotronHViTPatchGenerator: Module {
     }
 
     public func callAsFunction(_ x: MLXArray, video: Bool = false) -> MLXArray {
+        // The processor produces fp32 pixels; the source tower casts those to
+        // its loaded floating-point dtype before the quantized patch linear.
+        // clsToken remains floating point when embedder.weight is packed U32.
+        let x = x.asType(clsToken.dtype)
         let B = x.dim(0)
         let H = x.dim(2)
         let W = x.dim(3)
@@ -216,13 +224,12 @@ public class NemotronHViTPatchGenerator: Module {
         patches = video ? videoEmbedder(patches) : embedder(patches)
 
         // Add bilinear-interpolated pos_embed
-        let pos = getPosEmbed(inputH: H, inputW: W).asType(patches.dtype)
+        let pos = getPosEmbed(inputH: H, inputW: W)
         patches = patches + pos
 
         // Concat cls/register tokens at front
         let clsExpanded = clsToken.expandedDimensions(axis: 0)
         let cls = MLX.broadcast(clsExpanded, to: [B, numClsTokens, embedDim])
-            .asType(patches.dtype)
         return MLX.concatenated([cls, patches], axis: 1)
     }
 

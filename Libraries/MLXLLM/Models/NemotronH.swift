@@ -402,7 +402,9 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
-    private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
+    private func applyConv(
+        _ input: MLXArray, mask: MLXArray?, cache: MambaCache?, stageVerify: Bool = false
+    ) -> MLXArray {
         var convInput = input
 
         // Apply mask if present
@@ -444,7 +446,15 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            let tail = padded[0..., start ..< end, 0...]
+            if stageVerify {
+                // Staged MTP verify: the committed conv state stays untouched;
+                // commitVerifyStaged picks the accepted prefix's tail.
+                cache.stageVerifySlot(5, padded)
+                cache.stageVerifySlot(6, tail)
+            } else {
+                cache[0] = tail
+            }
         }
 
         let convOutput = conv1d(padded)
@@ -481,8 +491,16 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
             NemotronHLayerProfiler.shared.record("mamba.split", seconds: CFAbsoluteTimeGetCurrent() - splitStart)
         }
 
+        // Staged native-MTP verify (`.inputCaptureStaged`): run the S verify
+        // rows from the committed state but leave cache[0]/cache[1]/offset
+        // untouched; the iterator commits the accepted prefix afterwards via
+        // ``commitVerifyStaged(cache:acceptedInputs:blockLength:)``. Without
+        // this a rejected draft costs a full backbone replay of the accepted
+        // rows. End-to-end MTP benefit must still be measured per bundle.
+        let stageVerify = cache != nil && hiddenStates.dim(1) > 1 && mask == nil
+            && NativeMTPVerifierStatePolicy.shouldStageVerifyInputs
         let convStart = profile ? CFAbsoluteTimeGetCurrent() : 0
-        let convOutput = applyConv(convInput, mask: mask, cache: cache)
+        let convOutput = applyConv(convInput, mask: mask, cache: cache, stageVerify: stageVerify)
         if profile {
             MLX.eval(convOutput)
             NemotronHLayerProfiler.shared.record("mamba.conv", seconds: CFAbsoluteTimeGetCurrent() - convStart)
@@ -530,8 +548,17 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         }
 
         if let cache {
-            cache[1] = nextState
-            cache.offset += y.dim(1)
+            if stageVerify {
+                cache.stageVerifySlot(0, hidden)
+                cache.stageVerifySlot(1, B)
+                cache.stageVerifySlot(2, C)
+                cache.stageVerifySlot(3, dtArray)
+                cache.stageVerifySlot(4, nextState)
+                cache.stageVerifySlot(7, MLXArray(Int32(hidden.dim(1))))
+            } else {
+                cache[1] = nextState
+                cache.offset += y.dim(1)
+            }
         }
 
         let flattenedY = y.flattened(start: 2)
@@ -549,6 +576,42 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
             NemotronHLayerProfiler.shared.record("mamba.out_proj", seconds: CFAbsoluteTimeGetCurrent() - outProjStart)
         }
         return output
+    }
+
+    /// Commit `acceptedInputs` rows of the last staged verify block. The
+    /// committed state is still the pre-verify state (the staged forward never
+    /// wrote it): a full accept adopts the staged final state, a partial
+    /// accept re-runs the scan over the accepted rows only — the in_proj and
+    /// conv outputs come from the staging slots, so no backbone replay.
+    func commitVerifyStaged(cache: MambaCache, acceptedInputs: Int, blockLength: Int) -> Bool {
+        guard cache.verifyStagingReady else { return false }
+        let n = acceptedInputs
+        let slots = cache.verifyStagingSlots
+        guard n > 0, n <= blockLength, let hidden = slots[0], hidden.dim(1) == blockLength
+        else { return false }
+        if n == blockLength {
+            cache[1] = slots[4]!
+            cache[0] = slots[6]!
+        } else {
+            let (_, prefixState) = ssmUpdate(
+                hiddenStates: hidden[0..., ..<n],
+                ALog: aLog,
+                B: slots[1]![0..., ..<n],
+                C: slots[2]![0..., ..<n],
+                D: D.asType(hidden.dtype),
+                dt: slots[3]![0..., ..<n],
+                dtBias: dtBias,
+                state: cache[1],
+                timeStepLimit: timeStepLimit,
+                mask: nil)
+            cache[1] = prefixState
+            let padded = slots[5]!
+            let convEnd = padded.dim(1) - blockLength + n
+            let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+            cache[0] = padded[0..., convStart ..< convEnd, 0...]
+        }
+        cache.offset += n
+        return true
     }
 
     // Protocol conformance
@@ -754,7 +817,12 @@ internal class NemotronHMoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = MLX.matmul(x, weight.transposed())
+        // Router logits in fp32 (HF `NemotronHTopkRouter`: `F.linear(x.float(),
+        // weight.float())`). A bf16 matmul rounds the logits before the sigmoid
+        // and reorders near-tied experts; with 512 experts / top-22 (Nemotron
+        // 3.5 Super) that changes the routed set on real tokens. Casting only
+        // the sigmoid input (groupExpertSelect) is too late.
+        let gates = MLX.matmul(x.asType(.float32), weight.asType(.float32).transposed())
         return groupExpertSelect(
             gates: gates,
             eSCB: eSCB,
@@ -919,7 +987,12 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = weighted
         } else {
             y = layer(expertInput, inds)
-            y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            // Router-weighted sum accumulated in fp32, then cast back — the
+            // reference (`(y * scores[..., None]).sum(-2).astype(y.dtype)` with
+            // fp32 scores) promotes before the reduction. Casting the scores to
+            // bf16 first summed up to 22 bf16 products in bf16.
+            y = (y.asType(.float32) * scores.asType(.float32)[.ellipsis, .newAxis])
+                .sum(axis: -2).asType(y.dtype)
         }
         if profile {
             MLX.eval(y)
@@ -1147,12 +1220,9 @@ internal class NemotronHMTP: Module {
         layers.map { _ in KVCacheSimple() as KVCache }
     }
 
-    /// Run the head and return the hidden state BEFORE `final_layernorm`.
-    ///
-    /// The MTP contract hands the iterator pre-final-norm hidden (so the next
-    /// recursive draft step fuses on the same footing the backbone provides)
-    /// and takes logits from the normed value. Applying the norm inside the
-    /// block would make the two indistinguishable and silently bias depth ≥2.
+    /// Run the head and return the hidden state BEFORE `final_layernorm`;
+    /// the model applies ``finalNorm(_:)`` and hands that normed value both to
+    /// `lm_head` and to the next recursive draft step (vLLM semantics).
     func preNormHidden(
         embeddings: MLXArray,
         hiddenStates: MLXArray,
@@ -1242,20 +1312,21 @@ internal class NemotronHBackbone: Module {
         normF(preNormFromEmbeddings(inputsEmbeds, cache: cache))
     }
 
-    /// The layer stack, stopping before `norm_f`.
-    ///
-    /// Native MTP fuses the PRE-final-norm hidden with the next-token
-    /// embedding; handing it the normed value instead makes depth >= 2 drift.
-    /// Both callers share this single copy of the loop.
+    /// The layer stack, stopping before `norm_f`. Both forwards share this
+    /// single copy of the loop.
     func preNormFromEmbeddings(_ inputsEmbeds: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var hidden = inputsEmbeds
 
         // Create attention mask using the first attention layer's cache
+        // A cache-less multi-token forward (teacher-forced scoring, a
+        // stateless re-encode) still needs the causal mask: returning `.none`
+        // there made every attention row see the future tokens.
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
+            guard firstAttentionCacheIndex != nil else { return .none }
             guard let cacheIdx = firstAttentionCacheIndex,
                 let cache = cache,
                 cacheIdx < cache.count
-            else { return .none }
+            else { return hidden.dim(1) > 1 ? .causal : .none }
             return createAttentionMask(h: hidden, cache: cache[cacheIdx])
         }()
 
@@ -1292,12 +1363,33 @@ internal class NemotronHBackbone: Module {
         preNormFromEmbeddings(embeddings(inputs), cache: cache)
     }
 
+    /// Commit a staged verify block on every Mamba layer. Cache slots follow
+    /// the forward's order (only Mamba and attention blocks own one);
+    /// attention caches are trimmed by the iterator.
+    func commitStagedVerifiedBlock(
+        cache: [KVCache], acceptedInputs: Int, blockLength: Int
+    ) -> Bool {
+        var cacheCounter = 0
+        for layer in layers {
+            guard layer.blockType == .mamba || layer.blockType == .attention else { continue }
+            defer { cacheCounter += 1 }
+            guard layer.blockType == .mamba else { continue }
+            guard cacheCounter < cache.count,
+                let mamba = cache[cacheCounter] as? MambaCache,
+                let mixer = layer.mixer as? NemotronHMamba2Mixer,
+                mixer.commitVerifyStaged(
+                    cache: mamba, acceptedInputs: acceptedInputs, blockLength: blockLength)
+            else { return false }
+        }
+        return true
+    }
+
 }
 
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
-    TokenEmbedderModel, NativeMTPModel
+    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -1436,13 +1528,20 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         return backbone.embeddings.asLinear(hidden)
     }
 
+    /// Nemotron-H's MTP head consumes the target's hidden state AFTER `norm_f`
+    /// (the same vector `lm_head` reads): vLLM `nemotron_h_mtp.py` receives the
+    /// model's normed output, and on Nemotron 3.5 Super the measured top-1 vs
+    /// token t+2 is 85.1 % with the post-norm input and far lower with the
+    /// pre-norm one (bundle `jang_config.mtp.heldout.h_input = "post"`). The
+    /// iterator treats `hiddenStates` as opaque, so this family returns the
+    /// normed value here and from ``nativeMTPForward(hiddenStates:nextTokenIds:cache:)``.
     public func nativeBackboneForward(
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let hidden = backbone.preNorm(inputs, cache: cache)
+        let hidden = backbone.normF(backbone.preNorm(inputs, cache: cache))
         return NativeMTPForwardResult(
-            logits: projectToLogits(backbone.normF(hidden)),
+            logits: projectToLogits(hidden),
             hiddenStates: hidden)
     }
 
@@ -1465,13 +1564,32 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         guard let mtp else {
             fatalError("NemotronH nativeMTPForward called without an MTP head")
         }
-        let hidden = mtp.preNormHidden(
-            embeddings: embedTokens(nextTokenIds),
-            hiddenStates: hiddenStates,
-            cache: cache)
+        // Recursive depth feeds the head's own output AFTER `final_layernorm`,
+        // as vLLM does (the MTP layer returns the end-normed state and
+        // `compute_logits` applies only `lm_head`).
+        let hidden = mtp.finalNorm(
+            mtp.preNormHidden(
+                embeddings: embedTokens(nextTokenIds),
+                hiddenStates: hiddenStates,
+                cache: cache))
         return NativeMTPForwardResult(
-            logits: projectToLogits(mtp.finalNorm(hidden)),
+            logits: projectToLogits(hidden),
             hiddenStates: hidden)
+    }
+
+    // MARK: - Staged verify rollback (native MTP on the hybrid stack)
+
+    /// Input-capture (unstaged) rollback is not implemented for this family;
+    /// the iterator selects the staged mode for it.
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        false
+    }
+
+    public func commitStagedVerifiedBlock(
+        cache: [KVCache], acceptedInputs: Int, blockLength: Int
+    ) -> Bool {
+        backbone.commitStagedVerifiedBlock(
+            cache: cache, acceptedInputs: acceptedInputs, blockLength: blockLength)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -1516,6 +1634,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 || key.hasPrefix("sound_encoder.")
                 || key.hasPrefix("sound_projection.")
                 || key.hasPrefix("mlp1.")
+                || key.hasPrefix("vision_projector.")
             {
                 continue
             }
@@ -1814,17 +1933,18 @@ public struct NemotronHConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .numHiddenLayers)
             ?? hybridOverridePattern.count
 
-        // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]`.
-        // A lower bound of 0.0 is normalized to 0.001 upstream before the
-        // selective-scan dt clamp. Keep Swift decode and update passes aligned.
+        // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]` and clips
+        // dt to exactly that range (`compute_dt`, mlx-lm 0.31: a missing limit
+        // defaults to (0, inf)). Raising a 0.0 floor to 0.001 here changed
+        // every small time step relative to the reference.
         if let limits = try? rawContainer.decode([Float].self, forKey: .timeStepLimit),
            let first = limits.first
         {
-            timeStepLimitMin = first <= 0 ? 0.001 : first
+            timeStepLimitMin = max(0, first)
             timeStepLimitMax = limits.count > 1 ? limits[1] : first
         } else {
-            let decodedMin = try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) ?? 0.001
-            timeStepLimitMin = decodedMin <= 0 ? 0.001 : decodedMin
+            let decodedMin = try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) ?? 0
+            timeStepLimitMin = max(0, decodedMin)
             timeStepLimitMax =
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
                 ?? Float.infinity
