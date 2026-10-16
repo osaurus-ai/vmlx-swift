@@ -184,6 +184,12 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
             parts.append("strength=\(normalized)")
         }
     }
+    // Nemotron 3.5's medium reasoning mode is `enable_thinking` +
+    // `medium_effort`; the template appends an effort line to the last user
+    // turn, so it scopes the key like `reasoning_strength` above.
+    if let medium = additionalContext["medium_effort"] as? Bool, medium {
+        parts.append("medium_effort=on")
+    }
     return parts.isEmpty ? nil : parts.joined(separator: "|")
 }
 
