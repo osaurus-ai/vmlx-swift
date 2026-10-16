@@ -12,6 +12,7 @@
 import Foundation
 import MLX
 import MLXHuggingFace
+import MLXLLM
 import MLXLMCommon
 import MLXVLM
 import VMLXTokenizers
@@ -64,6 +65,39 @@ func runRowExactBench(modelPath: String) async throws {
         arLogits.append(row)
         token = argMax(row, axis: -1).item(Int.self)
         stream.append(token)
+    }
+    if env["BENCH_ROWEXACT_NEMO_LAYERS"] == "1", let tappable = context.model as? NemotronHBlockOutputTappable {
+        // Nemotron-H layer bisect: every block output of the AR step on t0 vs row 0 of the staged
+        // verify [t0, t1] (both from the same prefilled state).
+        func capture(_ run: () -> Void) -> [Int: MLXArray] {
+            var outputs: [Int: MLXArray] = [:]
+            let previous = tappable.blockOutputTap
+            tappable.blockOutputTap = NemotronHBlockOutputTap(
+                layerIndices: Set(0 ..< 512), record: { outputs[$0] = $1 })
+            run()
+            tappable.blockOutputTap = previous
+            MLX.eval(Array(outputs.values))
+            return outputs
+        }
+        var (c1, t0) = prefill()
+        let arLayers = capture {
+            let a = model.nativeAutoregressiveBackboneForward(MLXArray([Int32(t0)]).reshaped(1, 1), cache: c1)
+            MLX.eval(a.logits)
+        }
+        (c1, _) = prefill()
+        let vLayers = capture {
+            let v = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                model.nativeBackboneMTPVerifyForward(
+                    MLXArray([Int32(t0), Int32(stream[1])]).reshaped(1, 2), cache: c1)
+            }
+            MLX.eval(v.logits)
+        }
+        for layer in arLayers.keys.sorted() {
+            guard let x = arLayers[layer], let y = vLayers[layer] else { continue }
+            let d = abs(x[0, 0].asType(.float32) - y[0, 0].asType(.float32))
+            print(String(format: "[ROWEXACT] nemo layer=%d maxdiff=%.4g nonzero=%d", layer,
+                d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+        }
     }
     if env["BENCH_ROWEXACT_LAYERS"] == "1" {
         // Layer bisect: AR step on t0 vs verify window [t0, t1], row 0, after every layer.

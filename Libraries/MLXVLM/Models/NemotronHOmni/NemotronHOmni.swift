@@ -1483,3 +1483,11 @@ extension NemotronHOmni: NativeMTPBlockDraftModel {
             nextToken: nextToken, depth: depth, targetCache: targetCache)
     }
 }
+
+extension NemotronHOmni: NativeMTPAutoregressiveBackboneModel {
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nemotronLanguageModel.nativeAutoregressiveBackboneForward(inputs, cache: cache)
+    }
+}

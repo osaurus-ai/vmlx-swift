@@ -43,7 +43,10 @@ public final class NemotronLiLiCorrLane: @unchecked Sendable {
         self.drafter = drafter
         self.attentionCacheIndex = attentionCacheIndex
         self.layerOrder = drafter.targetLayerIds
-        self.keep = drafter.window + drafter.blockSize * 2
+        // Saturating: a config without a sliding window reports 1 << 30, and a malformed one
+        // could report Int.max; neither may overflow the bound.
+        let (sum, overflow) = drafter.window.addingReportingOverflow(drafter.blockSize * 2)
+        self.keep = overflow ? Int.max / 2 : sum
     }
 
     /// The backbone tap that feeds the recorder. Cache-less forwards are not recorded.

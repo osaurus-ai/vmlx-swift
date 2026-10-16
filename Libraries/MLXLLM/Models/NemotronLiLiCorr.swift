@@ -649,6 +649,8 @@ public final class LiLiCorrHead: Module {
     let featureUp: Module
     let featureDown: Module
     let slotEmbedding: MLXArray
+    /// Draft slots the head was trained for (its slot embedding rows).
+    public var slotCapacity: Int { slotEmbedding.dim(2) }
     let rankEmbedding: MLXArray
     let contextProj: Module
     let layers: [LiLiCorrLatticeLayer]

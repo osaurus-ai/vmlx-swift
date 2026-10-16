@@ -8985,6 +8985,11 @@ private func runPerfBenchBody(
             }
             if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
                 params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+                // BENCH_PERF_MTP_ADAPTIVE_MAX=<n>: the app's On (Adaptive) policy — start at the
+                // requested depth, explore up to n (block drafters reach 7).
+                if let ceiling = env["BENCH_PERF_MTP_ADAPTIVE_MAX"].flatMap(Int.init) {
+                    params.nativeMTPDepthPolicy = .adaptive(maximumDepth: ceiling)
+                }
             }
             if let maxKVSize = env["BENCH_PERF_MAX_KV_SIZE"].flatMap(Int.init) {
                 params.maxKVSize = maxKVSize

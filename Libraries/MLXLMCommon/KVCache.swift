@@ -1780,7 +1780,14 @@ public class MambaCache: ArraysCache {
     /// Required whenever the verify block length changes.
     public func clearVerifyStaging() {
         verifyStagingSlots = Array(repeating: nil, count: verifyStagingSlots.count)
+        verifyStagedRowStates = nil
     }
+
+    /// Row-exact staged verify only: the recurrent state after each verify row, so a partial
+    /// accept commits the state the AR step would have produced instead of re-scanning the
+    /// accepted rows with the multi-row kernel. Nil whenever the last staged verify was not
+    /// row-exact; layer-private like the staging slots.
+    public var verifyStagedRowStates: [MLXArray]? = nil
 
     public override func innerState() -> [MLXArray] {
         super.innerState() + verifyStagingSlots.compactMap { $0 }

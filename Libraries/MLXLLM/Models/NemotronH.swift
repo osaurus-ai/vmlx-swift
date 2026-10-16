@@ -344,6 +344,38 @@ internal func nemotronHMambaDepthwiseDecodeConv(
 
 // MARK: - Mamba2Mixer
 
+/// Row-exact native-MTP verification. `FlashVerificationScope` admits 2...8 rows on the verify
+/// forward ONLY; inside it every op of a verify row must reproduce the single-row AR step bit for
+/// bit, or greedy MTP drifts from AR (vMLX Python C17: first divergence at layer 0, argmax flips
+/// within ~48 tokens). Measured on this MLX fork (M5 Max): affine 4-bit `quantizedMM` at M >= 2
+/// routes to `qmv_wide` and differs from M = 1 by up to 2.0; 8-bit differs at M = 3 and 8; fp32
+/// GEMM differs from GEMV. The `[rows, 1, K] x [1, N, K]` batched form runs the M = 1 `qmv` per
+/// row and is bitwise equal for 4/8-bit; dense matmuls run per row. DO NOT replace these with the
+/// plain multi-row calls without re-running BENCH_ROWEXACT (VMLX_FLASH_ROW_EXACT_OFF=<site>
+/// attributes the cost of each site).
+enum NemotronHRowExact {
+    static func active(_ x: MLXArray, site: String) -> Bool {
+        FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: site)
+    }
+
+    static func project(_ module: Linear, _ x: MLXArray, site: String) -> MLXArray {
+        guard active(x, site: site) else { return module(x) }
+        let rows = x.dim(1)
+        if type(of: module) == QuantizedLinear.self, let q = module as? QuantizedLinear {
+            var y = quantizedMM(
+                x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis],
+                scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
+                transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            if let bias = q.bias { y = y + bias }
+            if y.dtype != x.dtype, x.dtype == .bfloat16 || x.dtype == .float16 {
+                y = y.asType(x.dtype)
+            }
+            return y.reshaped(1, rows, -1)
+        }
+        return concatenated((0 ..< rows).map { module(x[0..., $0 ..< ($0 + 1)]) }, axis: 1)
+    }
+}
+
 internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
@@ -472,8 +504,14 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         cache: MambaCache?
     ) -> MLXArray {
         let profile = nemotronHLayerProfileEnabled()
+        if let cache, hiddenStates.dim(1) > 1, mask == nil,
+            NativeMTPVerifierStatePolicy.shouldStageVerifyInputs,
+            NemotronHRowExact.active(hiddenStates, site: "mamba")
+        {
+            return mambaVerifyRowExact(hiddenStates, cache: cache)
+        }
         let inProjStart = profile ? CFAbsoluteTimeGetCurrent() : 0
-        let projected = inProj(hiddenStates)
+        let projected = NemotronHRowExact.project(inProj, hiddenStates, site: "mamba_in")
         if profile {
             MLX.eval(projected)
             NemotronHLayerProfiler.shared.record("mamba.in_proj", seconds: CFAbsoluteTimeGetCurrent() - inProjStart)
@@ -560,6 +598,7 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
                 cache.stageVerifySlot(3, dtArray)
                 cache.stageVerifySlot(4, nextState)
                 cache.stageVerifySlot(7, MLXArray(Int32(hidden.dim(1))))
+                cache.verifyStagedRowStates = nil
             } else {
                 cache[1] = nextState
                 cache.offset += y.dim(1)
@@ -575,12 +614,95 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         }
 
         let outProjStart = profile ? CFAbsoluteTimeGetCurrent() : 0
-        let output = outProj(normalized)
+        let output = NemotronHRowExact.project(outProj, normalized, site: "mamba_out")
         if profile {
             MLX.eval(output)
             NemotronHLayerProfiler.shared.record("mamba.out_proj", seconds: CFAbsoluteTimeGetCurrent() - outProjStart)
         }
         return output
+    }
+
+    /// One AR-step convolution: exactly the S = 1 branch of ``applyConv`` (fused decode kernel
+    /// when it applies, else conv1d over [state, row] + SiLU).
+    private func convStep(_ row: MLXArray, state: MLXArray) -> (MLXArray, MLXArray) {
+        if let bias = conv1d.bias,
+            let (out, next) = nemotronHMambaDepthwiseDecodeConv(
+                input: row, state: state, weight: conv1d.weight, bias: bias,
+                channels: convDim, kernelSize: convKernelSize)
+        {
+            return (out, next)
+        }
+        let padded = concatenated([state, row], axis: 1)
+        let end = padded.dim(1)
+        let start = max(0, end - (convKernelSize - 1))
+        return (silu(conv1d(padded)), padded[0..., start ..< end, 0...])
+    }
+
+    /// Row-exact staged verify: conv and SSM advance one row at a time through the AR-step
+    /// kernels (projections stay batched through the row-exact M = 1 form), and the state after
+    /// every row is staged, so a partial accept commits exactly the AR state.
+    private func mambaVerifyRowExact(_ hiddenStates: MLXArray, cache: MambaCache) -> MLXArray {
+        let rows = hiddenStates.dim(1)
+        let projected = NemotronHRowExact.project(inProj, hiddenStates, site: "mamba_in")
+        let splits = split(
+            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        guard splits.count == 3 else { return hiddenStates }
+        let gate = splits[0]
+        let convInput = splits[1]
+        let dt = splits[2]
+
+        let batch = convInput.dim(0)
+        let committedConv = cache[0]
+            ?? MLXArray.zeros([batch, max(0, convKernelSize - 1), convDim], dtype: convInput.dtype)
+        var convState = committedConv
+        var convRows: [MLXArray] = []
+        convRows.reserveCapacity(rows)
+        for r in 0 ..< rows {
+            let (out, next) = convStep(convInput[0..., r ..< (r + 1)], state: convState)
+            convRows.append(out)
+            convState = next
+        }
+        let convOutput = concatenated(convRows, axis: 1)
+        let convSplits = split(
+            convOutput, indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
+            axis: -1)
+        guard convSplits.count == 3 else { return hiddenStates }
+        let hidden = convSplits[0].reshaped([batch, rows, numHeads, headDim])
+        let B = convSplits[1].reshaped([batch, rows, numGroups, ssmStateSize])
+        let C = convSplits[2].reshaped([batch, rows, numGroups, ssmStateSize])
+        let dtArray = dt.reshaped([batch, rows, numHeads])
+
+        var state = cache[1]
+        var ys: [MLXArray] = []
+        var states: [MLXArray] = []
+        ys.reserveCapacity(rows)
+        states.reserveCapacity(rows)
+        for r in 0 ..< rows {
+            let (y, next) = ssmUpdate(
+                hiddenStates: hidden[0..., r ..< (r + 1)], ALog: aLog,
+                B: B[0..., r ..< (r + 1)], C: C[0..., r ..< (r + 1)],
+                D: D.asType(hidden.dtype), dt: dtArray[0..., r ..< (r + 1)], dtBias: dtBias,
+                state: state, timeStepLimit: timeStepLimit, mask: nil)
+            ys.append(y)
+            states.append(next)
+            state = next
+        }
+        let padded = concatenated([committedConv, convInput], axis: 1)
+        let end = padded.dim(1)
+        let tail = padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        cache.stageVerifySlot(0, hidden)
+        cache.stageVerifySlot(1, B)
+        cache.stageVerifySlot(2, C)
+        cache.stageVerifySlot(3, dtArray)
+        cache.stageVerifySlot(4, states[rows - 1])
+        cache.stageVerifySlot(5, padded)
+        cache.stageVerifySlot(6, tail)
+        cache.stageVerifySlot(7, MLXArray(Int32(rows)))
+        cache.verifyStagedRowStates = states
+
+        let y = concatenated(ys, axis: 1)
+        let normalized = norm(y.flattened(start: 2), gate: gate)
+        return NemotronHRowExact.project(outProj, normalized, site: "mamba_out")
     }
 
     /// Commit `acceptedInputs` rows of the last staged verify block. The
@@ -597,6 +719,12 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if n == blockLength {
             cache[1] = slots[4]!
             cache[0] = slots[6]!
+        } else if let rowStates = cache.verifyStagedRowStates, rowStates.count == blockLength {
+            cache[1] = rowStates[n - 1]
+            let padded = slots[5]!
+            let convEnd = padded.dim(1) - blockLength + n
+            let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+            cache[0] = padded[0..., convStart ..< convEnd, 0...]
         } else {
             let (_, prefixState) = ssmUpdate(
                 hiddenStates: hidden[0..., ..<n],
@@ -674,11 +802,39 @@ internal class NemotronHAttention: Module, NemotronHMixer {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let queries = wq(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
-        let keys = wk(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
-        let values = wv(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+        let queries = NemotronHRowExact.project(wq, x, site: "attn_proj")
+            .reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        let keys = NemotronHRowExact.project(wk, x, site: "attn_proj")
+            .reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+        let values = NemotronHRowExact.project(wv, x, site: "attn_proj")
+            .reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
 
         // No RoPE applied - NemotronH attention uses direct attention without position embeddings
+
+        // Row-exact verify: the AR step's SDPA sees one query row; three or more query rows take
+        // a different kernel, so the verify attends in pairs over the updated cache (Qwen4Exp
+        // measured pairs bitwise equal to the single-row step).
+        if NemotronHRowExact.active(x, site: "attn"), (3 ... 8).contains(L), B == 1,
+            let simple = cache as? KVCacheSimple
+        {
+            let (cachedKeys, cachedValues) = simple.update(keys: keys, values: values)
+            let keyLength = cachedKeys.dim(2)
+            let past = keyLength - L
+            let keyPositions = MLXArray(Int32(0) ..< Int32(keyLength)).reshaped(1, keyLength)
+            var chunks: [MLXArray] = []
+            for start in stride(from: 0, to: L, by: 2) {
+                let end = min(start + 2, L)
+                let queryPositions = MLXArray(Int32(past + start) ..< Int32(past + end))
+                    .reshaped(end - start, 1)
+                let visible = (keyPositions .<= queryPositions).reshaped(1, 1, end - start, keyLength)
+                chunks.append(MLXFast.scaledDotProductAttention(
+                    queries: queries[0..., 0..., start ..< end, 0...],
+                    keys: cachedKeys, values: cachedValues, scale: scale,
+                    mask: .array(visible)))
+            }
+            let attended = concatenated(chunks, axis: 2).transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            return NemotronHRowExact.project(wo, attended, site: "attn_proj")
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -691,7 +847,7 @@ internal class NemotronHAttention: Module, NemotronHMixer {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return wo(output)
+        return NemotronHRowExact.project(wo, output, site: "attn_proj")
     }
 
     // Protocol conformance
@@ -719,7 +875,8 @@ internal class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        NemotronHRowExact.project(
+            downProj, relu2(NemotronHRowExact.project(upProj, x, site: "mlp")), site: "mlp")
     }
 
     // Protocol conformance
@@ -836,7 +993,17 @@ internal class NemotronHMoEGate: Module {
             MLX.eval(upcast)
             weight._updateInternal(upcast)
         }
-        let gates = MLX.matmul(x.asType(.float32), weight.transposed())
+        // Row-exact verify: the AR step's fp32 product is a GEMV; a multi-row GEMM reduces in a
+        // different order, so each verify row gets its own product.
+        let gates: MLXArray
+        if NemotronHRowExact.active(x, site: "router") {
+            let w = weight.transposed()
+            gates = concatenated(
+                (0 ..< x.dim(1)).map { MLX.matmul(x[0..., $0 ..< ($0 + 1)].asType(.float32), w) },
+                axis: 1)
+        } else {
+            gates = MLX.matmul(x.asType(.float32), weight.transposed())
+        }
         return groupExpertSelect(
             gates: gates,
             eSCB: eSCB,
@@ -873,9 +1040,9 @@ internal class NemotronHSwitchMLP: Module, NemotronHSwitchMLPLayer {
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        // Row-exact verify keeps the unsorted gather: per-row bitwise equal to the AR step.
+        let doSort = indices.size > 64 && !NemotronHRowExact.active(x, site: "moe")
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-
-        let doSort = indices.size > 64
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -995,7 +1162,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         }
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         let fc1Start = profile ? CFAbsoluteTimeGetCurrent() : 0
-        let expertInput = fc1LatentProj.map { $0(x) } ?? x
+        let expertInput = fc1LatentProj.map { NemotronHRowExact.project($0, x, site: "latent") } ?? x
         if profile {
             MLX.eval(expertInput)
             NemotronHLayerProfiler.shared.record("moe.fc1_latent", seconds: CFAbsoluteTimeGetCurrent() - fc1Start)
@@ -1009,7 +1176,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
                 MLX.eval(y)
                 NemotronHLayerProfiler.shared.record("moe.switch_mlp", seconds: CFAbsoluteTimeGetCurrent() - switchStart)
             }
-            if let fc2LatentProj { y = fc2LatentProj(y) }
+            if let fc2LatentProj { y = NemotronHRowExact.project(fc2LatentProj, y, site: "latent") }
             if let sharedExperts { y = y + sharedExperts(x) }
             return y
         }
@@ -1040,7 +1207,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         }
         if let fc2LatentProj {
             let fc2Start = profile ? CFAbsoluteTimeGetCurrent() : 0
-            y = fc2LatentProj(y)
+            y = NemotronHRowExact.project(fc2LatentProj, y, site: "latent")
             if profile {
                 MLX.eval(y)
                 NemotronHLayerProfiler.shared.record("moe.fc2_latent", seconds: CFAbsoluteTimeGetCurrent() - fc2Start)
@@ -1608,6 +1775,15 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             throw NemotronLiLiCorrError.malformedConfig(
                 "target_layer_ids \(drafter.targetLayerIds) / tap width \(drafter.tapDimension) do not fit a \(layerCount)-block target of hidden \(configuration.hiddenSize)")
         }
+        // The block is embedded with the TARGET table: the mask id must be a target token, and
+        // the block must fit the head's slot embedding (both read from the checkpoint).
+        guard drafter.maskTokenId >= 0, drafter.maskTokenId < configuration.vocabSize,
+            drafter.blockSize >= 2,
+            drafter.lilicorr.map({ drafter.blockSize - 1 <= $0.slotCapacity }) ?? true
+        else {
+            throw NemotronLiLiCorrError.malformedConfig(
+                "mask_token_id \(drafter.maskTokenId) / block_size \(drafter.blockSize) do not fit the target vocabulary \(configuration.vocabSize) or the head's slot embedding")
+        }
         let lane = NemotronLiLiCorrLane(drafter: drafter, attentionCacheIndex: attentionIndex)
         backbone.blockOutputTap = lane.makeTap()
         lilicorrLane = lane
@@ -1627,7 +1803,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     }
 
     public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
-        if let lmHead { return lmHead(hidden) }
+        if let lmHead { return NemotronHRowExact.project(lmHead, hidden, site: "lm_head") }
         return backbone.embeddings.asLinear(hidden)
     }
 
@@ -1656,7 +1832,12 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        nativeBackboneForward(inputs, cache: cache)
+        // The verify forward ONLY opens the row-exact scope (2...8 rows): every verify row then
+        // reproduces the AR step bit for bit (``NemotronHRowExact``), and small verify windows of
+        // mapped JANGH experts keep the decode kernels instead of the sorted prefill path.
+        FlashVerificationScope.withVerification(inputShape: inputs.shape) {
+            nativeBackboneForward(inputs, cache: cache)
+        }
     }
 
     public func nativeMTPForward(
@@ -2215,6 +2396,16 @@ public struct NemotronHBlockConfig: Codable, Sendable, Equatable {
     }
 }
 
+
+extension NemotronHModel: NativeMTPAutoregressiveBackboneModel {
+    /// The AR step is the ordinary single-row backbone forward; declaring it lets the
+    /// row-exactness bench (BENCH_ROWEXACT) compare verify rows with it.
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nativeBackboneForward(inputs, cache: cache)
+    }
+}
 
 extension NemotronHModel: NativeMTPBlockDraftModel {
     public var nativeMTPUsesBlockDrafts: Bool { mtp == nil && lilicorrLane != nil }
