@@ -2260,6 +2260,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount + (pendingTokens.count - pendingIndex) >= maxTokens {
             return
         }
+        // The prefetched graph is built HERE and evaluated on `prefetchQueue`.
+        // Any op that falls back to the C++ thread-local default stream gets
+        // this thread's private stream, which the prefetch thread cannot encode
+        // ("There is no Stream(gpu, N) in current thread"); Nemotron-H native
+        // MTP at depth >= 2 crashed on the first prefetch. Pin the C++ default
+        // of this thread to the cross-thread `.gpu` stream (the same stream
+        // Swift's StreamOrDevice.default already resolves to) before building.
+        Stream.setDefault(.gpu)
         let requested = [primary] + drafts
         let requestedInputIds = recordMaterializeSync {
             stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
