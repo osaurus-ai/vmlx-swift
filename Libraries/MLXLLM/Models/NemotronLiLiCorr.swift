@@ -169,7 +169,22 @@ public struct NemotronLiLiCorrConfiguration {
         numHiddenLayers = try int(root, "num_hidden_layers")
         numAttentionHeads = try int(root, "num_attention_heads")
         numKeyValueHeads = try int(root, "num_key_value_heads")
+        // A malformed config must fail as an error, never as a division by zero
+        // or a reshape trap deep inside the first forward.
+        for (key, value) in [
+            ("hidden_size", hiddenSize), ("num_hidden_layers", numHiddenLayers),
+            ("num_attention_heads", numAttentionHeads), ("num_key_value_heads", numKeyValueHeads),
+        ] where value <= 0 {
+            throw NemotronLiLiCorrError.malformedConfig("\(key) must be positive, got \(value)")
+        }
+        guard numAttentionHeads % numKeyValueHeads == 0 else {
+            throw NemotronLiLiCorrError.malformedConfig(
+                "num_attention_heads \(numAttentionHeads) is not a multiple of num_key_value_heads \(numKeyValueHeads)")
+        }
         headDim = optInt(root, "head_dim") ?? (hiddenSize / numAttentionHeads)
+        guard headDim > 0, blockSize > 1 else {
+            throw NemotronLiLiCorrError.malformedConfig("head_dim \(headDim) / block_size \(blockSize) out of range")
+        }
         intermediateSize = try int(root, "intermediate_size")
         rmsNormEps = try float(root, "rms_norm_eps", default: 1e-6)
         ropeTheta = try float(root, "rope_theta", default: 10000)
@@ -189,6 +204,12 @@ public struct NemotronLiLiCorrConfiguration {
         }
         convKernelSize = optInt(dc, "conv_kernel_size") ?? 0
         convGroupSize = optInt(dc, "conv_group_size") ?? 0
+        if convKernelSize > 0 {
+            guard convGroupSize > 0, hiddenSize % convGroupSize == 0, convKernelSize <= blockSize else {
+                throw NemotronLiLiCorrError.malformedConfig(
+                    "conv_group_size \(convGroupSize) must divide hidden_size \(hiddenSize) and conv_kernel_size \(convKernelSize) <= block_size")
+            }
+        }
         lilicorrEnabled = (dc["lilicorr_enabled"] as? Bool) ?? false
         if lilicorrEnabled {
             lilicorrCandidateTopK = try int(dc, "lilicorr_candidate_topk")
@@ -197,6 +218,12 @@ public struct NemotronLiLiCorrConfiguration {
             lilicorrNumHeads = try int(dc, "lilicorr_num_heads")
             lilicorrVectorEps = try float(dc, "lilicorr_vector_eps")
             lilicorrLogitScale = try float(dc, "lilicorr_logit_scale")
+            guard lilicorrCandidateTopK > 0, lilicorrNumHeads > 0, lilicorrHiddenSize > 0,
+                lilicorrHiddenSize % lilicorrNumHeads == 0
+            else {
+                throw NemotronLiLiCorrError.malformedConfig(
+                    "lilicorr topk \(lilicorrCandidateTopK) / heads \(lilicorrNumHeads) / hidden \(lilicorrHiddenSize) inconsistent")
+            }
         } else {
             lilicorrCandidateTopK = 0
             lilicorrHiddenSize = 0
