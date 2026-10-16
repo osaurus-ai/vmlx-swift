@@ -1,12 +1,35 @@
 import MLX
 @testable import MLXLLM
 import MLXLMCommon
+import MLXNN
 import XCTest
 
 final class NemotronStagedMambaTests: XCTestCase {
+    func testFusedDecodeConvolutionPreservesActivationRounding() throws {
+        let channels = 256
+        for dtype: DType in [.bfloat16, .float16, .float32] {
+            let input = sin(MLXArray(0 ..< 2 * channels).asType(.float32) * 0.193)
+                .asType(dtype).reshaped([2, 1, channels])
+            let state = cos(MLXArray(0 ..< 2 * 3 * channels).asType(.float32) * 0.071)
+                .asType(dtype).reshaped([2, 3, channels])
+            let weight = sin(MLXArray(0 ..< channels * 4).asType(.float32) * 0.137)
+                .asType(dtype).reshaped([channels, 4, 1])
+            let bias = (cos(MLXArray(0 ..< channels).asType(.float32)) * 0.7).asType(dtype)
+            let padded = concatenated([state, input], axis: 1)
+            let expected = silu(conv1d(padded, weight, groups: channels) + bias)
+            let (actual, next) = try XCTUnwrap(nemotronHMambaDepthwiseDecodeConv(
+                input: input, state: state, weight: weight, bias: bias,
+                channels: channels, kernelSize: 4))
+            XCTAssertEqual(abs(actual - expected).max().item(Float.self), 0, "\(dtype)")
+            XCTAssertEqual(abs(next - padded[0..., 1..., 0...]).max().item(Float.self), 0)
+        }
+    }
+
     func testGatedNormMatchesPythonFusedBFloat16Reference() {
         let norm = NemotronHRMSNormGated(dimensions: 32, eps: 1e-5, groupSize: 8)
-        norm.weight.update(MLXArray.ones([32], dtype: .bfloat16))
+        norm.update(parameters: ModuleParameters.unflattened([
+            "weight": MLXArray.ones([32], dtype: .bfloat16),
+        ]))
         let indices = MLXArray(0 ..< 32).asType(.float32)
         let x = (indices * 0.071 - 1).asType(.bfloat16).reshaped([1, 1, 32])
         let gate = (indices * 0.193 - 2).asType(.bfloat16).reshaped([1, 1, 32])
@@ -34,7 +57,9 @@ final class NemotronStagedMambaTests: XCTestCase {
         // TF32 GEMM versus float32 GEMV precision difference across row counts.
         let projection = (MLXArray(0 ..< mixer.inProj.weight.size) % 5 - 2)
             .asType(.float32) * 0.03125
-        mixer.inProj.weight.update(projection.reshaped(mixer.inProj.weight.shape))
+        mixer.inProj.update(parameters: ModuleParameters.unflattened([
+            "weight": projection.reshaped(mixer.inProj.weight.shape),
+        ]))
         let input = ((MLXArray(0 ..< 10 * 32) % 7 - 3).asType(.float32) * 0.125)
             .reshaped([1, 10, 32])
         func forward(_ x: MLXArray, _ cache: MambaCache) -> MLXArray {

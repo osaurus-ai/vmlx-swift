@@ -195,6 +195,15 @@ enum NemotronParityBench {
         {
             let embeds = omni.extractImageEmbeds(pixelValues: pixels, frames: prepared.image?.frames)
                 .asType(.float32)
+            if let referencePath = ProcessInfo.processInfo.environment["BENCH_PARITY_VISION_ARRAYS"] {
+                let reference = try loadArrays(url: URL(fileURLWithPath: referencePath))
+                if let refPixels = reference["pixels"], let refRows = reference["rows"] {
+                    print("PARITY vision arrays pixel_max=\(abs(pixels.asType(.float32) - refPixels).max().item(Float.self)) row_max=\(abs(embeds - refRows).max().item(Float.self))")
+                    try save(arrays: ["pixels": pixels, "rows": embeds],
+                        url: URL(fileURLWithPath: referencePath).deletingLastPathComponent()
+                            .appendingPathComponent("vision-swift.safetensors"))
+                }
+            }
             let first8 = embeds[0 ..< 8]
             let sums = first8.sum(axis: -1)
             let l2 = sqrt((first8 * first8).sum(axis: -1))

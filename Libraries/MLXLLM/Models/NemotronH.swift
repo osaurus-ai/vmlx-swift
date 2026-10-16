@@ -261,10 +261,15 @@ private func makeNemotronHMambaDepthwiseDecodeConvKernel() -> MLXFast.MLXFastKer
             }
             acc += static_cast<float>(input[b * C + c])
                 * static_cast<float>(weight[weight_base + K - 1]);
-            acc += static_cast<float>(bias[c]);
-
-            auto sigmoid = 1.0f / (1.0f + fast::exp(-acc));
-            out[b * C + c] = static_cast<T>(acc * sigmoid);
+            // Match conv1d -> bias -> SiLU, including each activation-dtype
+            // rounding boundary. Keeping everything in fp32 changes bf16
+            // Mamba state on every decode step despite an identical prefill.
+            T value = static_cast<T>(static_cast<T>(acc) + bias[c]);
+            // This is MLX's stable Sigmoid implementation. fast::exp(-x)
+            // also differs from the reference for bf16 negative activations.
+            auto tail = 1 / (1 + metal::precise::exp(metal::abs(value)));
+            T sigmoid = (value < 0) ? tail : 1 - tail;
+            out[b * C + c] = value * sigmoid;
 
             auto next_base = (b * (K - 1)) * C + c;
             for (int k = 0; k < K - 2; ++k) {
