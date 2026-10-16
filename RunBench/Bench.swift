@@ -722,6 +722,16 @@ struct Bench {
             return
         }
 
+        if (env["BENCH_LILICORR_ACCEPT"] ?? "0") == "1" {
+            do {
+                try await LiLiCorrAcceptBench.run(modelDir: modelDir)
+            } catch {
+                fputs("LILICORR FAILED: \(error)\n", stderr)
+                exit(benchFailureExitCode(for: error))
+            }
+            return
+        }
+
         if let fixture = env["BENCH_PARITY_FIXTURE"] {
             do {
                 try await NemotronParityBench.run(
