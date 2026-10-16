@@ -223,8 +223,10 @@ public class NemotronHViTPatchGenerator: Module {
         // Embed: video uses video_embedder (channel-stacked T frames), else embedder
         patches = video ? videoEmbedder(patches) : embedder(patches)
 
-        // Add bilinear-interpolated pos_embed
-        let pos = getPosEmbed(inputH: H, inputW: W)
+        // Source RADIO interpolates in FP32, then casts back to the patch
+        // activation dtype before addition. Leaving the result in FP32
+        // silently promotes every subsequent vision block.
+        let pos = getPosEmbed(inputH: H, inputW: W).asType(patches.dtype)
         patches = patches + pos
 
         // Concat cls/register tokens at front

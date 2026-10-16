@@ -31,7 +31,12 @@ public class NemotronHVisionMLPProjector: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var h = layerNorm(x)
+        // The bundle's NemotronH_Omni_RMSNorm applies the affine weight
+        // before restoring the activation dtype. The generic fused RMSNorm
+        // rounds the normalized value first, which changes bf16 image rows.
+        let xf = x.asType(.float32)
+        let normalized = xf * rsqrt((xf * xf).mean(axis: -1, keepDims: true) + layerNorm.eps)
+        var h = (layerNorm.weight.asType(.float32) * normalized).asType(x.dtype)
         h = fc1(h)
         let r = MLX.maximum(h, MLXArray(0, dtype: h.dtype))
         h = r * r

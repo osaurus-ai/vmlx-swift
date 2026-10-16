@@ -52,6 +52,26 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertEqual(output.item(Float.self), 2.0, accuracy: 1e-4)
     }
 
+    func testVisionProjectorRoundsAfterRMSAffineWeight() throws {
+        let projector = NemotronHVisionMLPProjector(inDim: 2, projectorDim: 2, llmDim: 1)
+        var parameters = ModuleParameters()
+        parameters["layer_norm"] = .dictionary([
+            "weight": .value(MLXArray([Float(1.5), 0.75]).asType(.bfloat16)),
+        ])
+        parameters["fc1"] = .dictionary([
+            "weight": .value(MLXArray([Float(1), 0, 0, 1], [2, 2]).asType(.bfloat16)),
+        ])
+        parameters["fc2"] = .dictionary([
+            "weight": .value(MLXArray([Float(0), 1], [1, 2]).asType(.bfloat16)),
+        ])
+        try projector.update(parameters: parameters, verify: .all)
+        let output = projector(MLXArray([Float(3), 4], [1, 2]).asType(.bfloat16))
+        // 0.75 * 4 / sqrt(12.5 + 1e-5) rounds to bf16 0.84765625.
+        // SquaredReLU then rounds to 0.71875. Rounding before the affine
+        // multiply instead produces 0.8515625, changing the projected row.
+        XCTAssertEqual(output.item(Float.self), 0.71875)
+    }
+
     func testRADIOForwardShape() throws {
         // Tiny ViT to keep test fast: 2 blocks, 64 hidden, 8 heads, 16 patch.
         // (The default V3 model is 1280-hidden 32-block; we only validate
@@ -116,6 +136,22 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertEqual(output.asArray(Float.self), reference.asArray(Float.self))
         // At target column 1, align-corners-false samples x=0.1.
         XCTAssertEqual(output[0, 0, 0, 1].item(Float.self), 1.8, accuracy: 1e-6)
+    }
+
+    func testPositionInterpolationDoesNotPromotePatchActivations() throws {
+        for dtype: DType in [.bfloat16, .float16, .float32] {
+            let generator = NemotronHViTPatchGenerator(
+                patchSize: 2, embedDim: 4, numClsTokens: 1,
+                maxGrid: 4, videoTemporalPatch: 2)
+            try generator.update(
+                parameters: generator.parameters().mapValues { $0.asType(dtype) },
+                verify: .all)
+            // A rectangular grid exercises interpolation and window selection.
+            let output = generator(MLXArray.ones([1, 3, 4, 6]))
+            MLX.eval(output)
+            XCTAssertEqual(output.dtype, dtype)
+            XCTAssertEqual(output.shape, [1, 7, 4])
+        }
     }
 
     func testPixelShufflePreservesRectangularPatchNeighborhoods() throws {
