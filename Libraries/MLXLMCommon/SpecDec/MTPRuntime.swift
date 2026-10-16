@@ -790,9 +790,10 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
 
 /// Fail-closed native-MTP activation policy.
 ///
-/// The runtime never enables native MTP from a path or marketing name. The first
-/// Swift implementation is deliberately Qwen3.6/Qwen3.5 only and requires an
-/// explicit per-load request, supported config model type, and real MTP tensor keys.
+/// The runtime never enables native MTP from a path or marketing name. Loading
+/// requires an explicit per-load request, a supported config model type, and
+/// complete physical MTP tensor evidence. Automatic depth selection also needs
+/// measured tuning or an explicitly validated family policy.
 public enum NativeMTPActivation {
     @TaskLocal public static var explicitRequestOverride: Bool?
 
@@ -976,12 +977,12 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
     }
 }
 
-/// Fail-closed native-MTP depth policy for tensor-proven Qwen3.5/Qwen3.6 artifacts.
+/// Native-MTP depth policy for tensor-proven, runtime-supported architectures.
 ///
 /// This policy never looks at the model path or marketing name. It uses config
 /// metadata, JANG quantization/profile metadata, and the MTP tensor census.
 /// Metadata-only bundles never receive a recommendation. Complete tensor-proven
-/// supported Qwen bundles resolve to a production launch recommendation only
+/// supported bundles resolve to a production launch recommendation only
 /// when their bundle-local `vmlx_mtp_tuning.json` row is usable.
 public enum NativeMTPAutoDecodePolicy {
     /// Architecture support for the server's Auto/manual-depth launch policy.
@@ -991,7 +992,7 @@ public enum NativeMTPAutoDecodePolicy {
         guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
         else { return false }
         return modelTypes(config: config, fallback: nil).contains(
-            where: isSupportedQwenMTPModelType)
+            where: NativeMTPActivation.isSupportedNativeMTPModelType)
     }
 
     /// Manual-depth recommendation: validates the same family/tensor evidence
@@ -1013,7 +1014,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else { return nil }
         let evidence = [
             "model_types=\(modelTypes.sorted().joined(separator: ","))",
             "mtp_tensors=\(status.tensorCount)",
@@ -1042,7 +1043,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else { return nil }
         let familyColdStartDepth = measuredFamilyColdStartDepth(
             config: config,
             fallback: jangConfig?.sourceModel.architecture)
@@ -1187,7 +1188,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
+        guard modelTypes.contains(where: NativeMTPActivation.isSupportedNativeMTPModelType) else {
             return "Bundle model type is not on the native-MTP allowlist."
         }
 
@@ -1331,20 +1332,6 @@ public enum NativeMTPAutoDecodePolicy {
             return false
         }
         return true
-    }
-
-    private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
-        switch value {
-        case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
-            return true
-        case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
-             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
-             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
-             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
-            return true
-        default:
-            return false
-        }
     }
 
     private static func normalize(_ value: String) -> String {
@@ -1747,6 +1734,14 @@ public struct MTPRecursiveDraftContract: Codable, Sendable, Equatable {
 /// No-load MTP/VL inspector. It reads JSON metadata and safetensors headers only;
 /// it never materializes tensors or changes the active generation path.
 public enum MTPBundleInspector {
+    /// Tensor names physically present in the same shard scope used by the
+    /// loader. Also used for optional media modules: an index entry alone is
+    /// not evidence that its tensor exists, and index-less bundles are valid.
+    /// Reads bounded headers only, without allocating model tensors.
+    public static func loadableTensorNames(from directory: URL) throws -> [String] {
+        try loadTensorNames(from: directory)
+    }
+
     public static func inspect(
         modelDirectory: URL,
         jangConfig suppliedJangConfig: JangConfig? = nil

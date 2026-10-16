@@ -1790,6 +1790,37 @@ private func readValidInDims(at modelDirectory: URL) -> Set<Int> {
             dims.insert(channels * temporal * patch * patch)
         }
     }
+    // Nemotron Omni / 3.5 VL bundles keep the vision geometry in a sibling
+    // `config_omni.json` (config.json is the LLM config). Same reason as the
+    // vision_config block above: without these widths the RADIO tower and the
+    // mlp1 projector (8-bit g64 on Nemotron 3.5) are ambiguous with 4-bit g128.
+    let omniURL = modelDirectory.appendingPathComponent("config_omni.json")
+    if let omniData = try? Data(contentsOf: omniURL),
+       let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any]
+    {
+        let vision = omni["vision_config"] as? [String: Any] ?? [:]
+        let vitHidden = (omni["vit_hidden_size"] as? Int) ?? (vision["hidden_size"] as? Int)
+        add(vitHidden)
+        if let hidden = vitHidden, let ratio = vision["mlp_ratio"] as? Double, ratio > 0 {
+            dims.insert(Int((Double(hidden) * ratio).rounded()))
+        }
+        if let hidden = vitHidden, let downsample = omni["downsample_ratio"] as? Double,
+           downsample > 0
+        {
+            let factor = Int((1 / downsample).rounded())
+            dims.insert(hidden * factor * factor)
+        }
+        add(omni["projector_hidden_size"])
+        if let patch = (vision["patch_size"] as? Int) ?? (omni["patch_size"] as? Int), patch > 0 {
+            let channels = (vision["num_channels"] as? Int) ?? 3
+            dims.insert(channels * patch * patch)
+            if let temporal = (omni["video_temporal_patch_size"] as? Int)
+                ?? (vision["video_temporal_patch_size"] as? Int), temporal > 1
+            {
+                dims.insert(temporal * channels * patch * patch)
+            }
+        }
+    }
     add(config["expert_intermediate_size"])
     add(config["shared_expert_intermediate_size"])
     add(config["hidden_size_per_layer_input"])

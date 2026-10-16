@@ -722,6 +722,17 @@ struct Bench {
             return
         }
 
+        if let fixture = env["BENCH_PARITY_FIXTURE"] {
+            do {
+                try await NemotronParityBench.run(
+                    modelDir: modelDir, fixturePath: fixture, imagePath: env["BENCH_PARITY_IMAGE"])
+            } catch {
+                fputs("PARITY FAILED: \(error)\n", stderr)
+                exit(1)
+            }
+            return
+        }
+
         if let nllFile = env["BENCH_NLL_FILE"] {
             try await NLLBench.run(
                 modelDir: modelDir, file: nllFile,

@@ -270,15 +270,17 @@ public func nemotronOmniPreprocessImages(
             downsampleFactor: downsampleFactor)
         let targetW = target.widthPatches * patchSize
         let targetH = target.heightPatches * patchSize
-        let resized = MediaProcessing.resampleBicubic(
-            MediaProcessing.inSRGBToneCurveSpace(img),
-            to: CGSize(width: targetW, height: targetH))
-        allImages.append(rasterizeImage(
-            resized,
-            width: targetW,
-            height: targetH,
-            mean: NEMOTRON_OMNI_CLIP_MEAN,
-            std: NEMOTRON_OMNI_CLIP_STD))
+        // The bundled processor resizes raw RGB bytes in float32 before
+        // normalization. CoreImage tone curves and bicubic filtering do not
+        // implement that contract, even when the target dimensions match.
+        let rgb = try MiniCPMV47ImageProcessing.rgb8(from: img)
+        let resized = NemotronImageResampling.resize(
+            rgb.data, width: rgb.width, height: rgb.height,
+            targetWidth: targetW, targetHeight: targetH)
+        let pixels = MLXArray(resized, [targetH, targetW, 3]) / Float(255)
+        let mean = MLXArray(NEMOTRON_OMNI_CLIP_MEAN).reshaped([1, 1, 3])
+        let std = MLXArray(NEMOTRON_OMNI_CLIP_STD).reshaped([1, 1, 3])
+        allImages.append(((pixels - mean) / std).transposed(2, 0, 1))
         tokenCounts.append(
             (target.widthPatches * target.heightPatches)
                 / (downsampleFactor * downsampleFactor))

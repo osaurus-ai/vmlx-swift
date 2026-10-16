@@ -5,7 +5,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
-import MLXVLM
+@testable import MLXVLM
 import XCTest
 
 /// Smoke tests for the Nemotron-3-Nano-Omni multimodal Swift wrapper.
@@ -50,6 +50,54 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         // positive components and summing produces 2.0. LayerNorm+GELU,
         // the broken implementation, produces approximately 0.68 instead.
         XCTAssertEqual(output.item(Float.self), 2.0, accuracy: 1e-4)
+    }
+
+    func testVisionProjectorRoundsAfterRMSAffineWeight() throws {
+        let projector = NemotronHVisionMLPProjector(inDim: 2, projectorDim: 2, llmDim: 1)
+        var parameters = ModuleParameters()
+        parameters["layer_norm"] = .dictionary([
+            "weight": .value(MLXArray([Float(1.5), 0.75]).asType(.bfloat16)),
+        ])
+        parameters["fc1"] = .dictionary([
+            "weight": .value(MLXArray([Float(1), 0, 0, 1], [2, 2]).asType(.bfloat16)),
+        ])
+        parameters["fc2"] = .dictionary([
+            "weight": .value(MLXArray([Float(0), 1], [1, 2]).asType(.bfloat16)),
+        ])
+        try projector.update(parameters: parameters, verify: .all)
+        let output = projector(MLXArray([Float(3), 4], [1, 2]).asType(.bfloat16))
+        // 0.75 * 4 / sqrt(12.5 + 1e-5) rounds to bf16 0.84765625.
+        // SquaredReLU then rounds to 0.71875. Rounding before the affine
+        // multiply instead produces 0.8515625, changing the projected row.
+        XCTAssertEqual(output.item(Float.self), 0.71875)
+    }
+
+    func testRADIONormalizationPreservesAffineRoundingAndStridedRows() throws {
+        // A non-contiguous transpose exercises the kernel input materialization;
+        // 33 features exercises the partially occupied SIMD group.
+        for dtype: DType in [.float32, .float16, .bfloat16] {
+            let norm = NemotronHVisionLayerNorm(dimensions: 33, eps: 1e-6)
+            let weights = (MLXArray(0 ..< 33).asType(.float32) / 32 + 0.75).asType(dtype)
+            let biases = (MLXArray(0 ..< 33).asType(.float32) / 64 - 0.25).asType(dtype)
+            try norm.update(parameters: ModuleParameters.unflattened([
+                "weight": weights, "bias": biases,
+            ]), verify: .all)
+            let input = (MLXArray(0 ..< 99).asType(.float32) / 16 - 3)
+                .reshaped([33, 3]).transposed().asType(dtype)
+            let xf = input.asType(.float32)
+            let centered = xf - MLX.mean(xf, axis: -1, keepDims: true)
+            let normalized = (centered * MLX.rsqrt(
+                MLX.mean(centered * centered, axis: -1, keepDims: true) + 1e-6))
+                .asType(dtype).asType(.float32)
+            let expected = (normalized * weights.asType(.float32) + biases.asType(.float32))
+                .asType(dtype)
+            let actual = norm(input)
+            XCTAssertEqual(actual.shape, input.shape)
+            XCTAssertEqual(actual.dtype, dtype)
+            XCTAssertLessThanOrEqual(
+                MLX.max(MLX.abs(actual.asType(.float32) - expected.asType(.float32)))
+                    .item(Float.self), dtype == .float32 ? 1e-6 : 0.002)
+        }
     }
 
     func testRADIOForwardShape() throws {
@@ -106,6 +154,62 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         let inX = MLXArray.zeros([1, 4, 4, 16])
         let outX = nemotronOmniPixelShuffle(inX, scaleFactor: 0.5)
         XCTAssertEqual(outX.shape, [1, 2, 2, 64])
+    }
+
+    func testPositionInterpolationKeepsFloat32FractionsForBFloat16Weights() {
+        let input = MLXArray([Float(1), 9, 3, 7]).reshaped([1, 1, 2, 2]).asType(.bfloat16)
+        let output = nemotronOmniBilinearResize2D(input, targetH: 3, targetW: 5)
+        let reference = nemotronOmniBilinearResize2D(input.asType(.float32), targetH: 3, targetW: 5)
+        XCTAssertEqual(output.dtype, .float32)
+        XCTAssertEqual(output.asArray(Float.self), reference.asArray(Float.self))
+        // At target column 1, align-corners-false samples x=0.1.
+        XCTAssertEqual(output[0, 0, 0, 1].item(Float.self), 1.8, accuracy: 1e-6)
+    }
+
+    func testPositionInterpolationDoesNotPromotePatchActivations() throws {
+        for dtype: DType in [.bfloat16, .float16, .float32] {
+            let generator = NemotronHViTPatchGenerator(
+                patchSize: 2, embedDim: 4, numClsTokens: 1,
+                maxGrid: 4, videoTemporalPatch: 2)
+            try generator.update(
+                parameters: generator.parameters().mapValues { $0.asType(dtype) },
+                verify: .all)
+            // A rectangular grid exercises interpolation and window selection.
+            let output = generator(MLXArray.ones([1, 3, 4, 6]))
+            MLX.eval(output)
+            XCTAssertEqual(output.dtype, dtype)
+            XCTAssertEqual(output.shape, [1, 7, 4])
+        }
+    }
+
+    func testPixelShufflePreservesRectangularPatchNeighborhoods() throws {
+        // A coordinate-coded image makes row/column swaps observable. Each
+        // output patch must contain its original 2x2 neighborhood in row order.
+        for (height, width) in [(4, 6), (6, 4), (4, 4)] {
+            let batches = 2
+            let channels = 3
+            let values = (0 ..< batches * height * width * channels).map { Float($0) }
+            let input = MLXArray(values).reshaped([batches, height, width, channels])
+            let output = nemotronOmniPixelShuffle(input, scaleFactor: 0.5)
+            var expected: [Float] = []
+            for batch in 0 ..< batches {
+                for row in stride(from: 0, to: height, by: 2) {
+                    for column in stride(from: 0, to: width, by: 2) {
+                        for dy in 0 ..< 2 {
+                            for dx in 0 ..< 2 {
+                                for channel in 0 ..< channels {
+                                    expected.append(values[
+                                        ((batch * height + row + dy) * width + column + dx)
+                                            * channels + channel])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            XCTAssertEqual(output.shape, [batches, height / 2, width / 2, channels * 4])
+            XCTAssertEqual(output.asArray(Float.self), expected)
+        }
     }
 
     func testVideoEVSMatchesSourceTokenCount() throws {

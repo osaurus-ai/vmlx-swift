@@ -67,9 +67,11 @@ public func nemotronOmniBilinearResize2D(
     let f10 = gather(x, y1, x0)
     let f11 = gather(x, y1, x1)
 
-    let wxB = wx.reshaped([1, 1, 1, targetW]).asType(x.dtype)
-    let wyB = wy.reshaped([1, 1, targetH, 1]).asType(x.dtype)
-    let one = MLXArray(1.0, dtype: x.dtype)
+    // CPE interpolation uses fp32 coordinates even for bf16 checkpoint
+    // positions. Rounding the fractions first changes every vision token.
+    let wxB = wx.reshaped([1, 1, 1, targetW])
+    let wyB = wy.reshaped([1, 1, targetH, 1])
+    let one = MLXArray(Float(1))
     return f00 * (one - wxB) * (one - wyB)
         + f01 * wxB * (one - wyB)
         + f10 * (one - wxB) * wyB
@@ -91,15 +93,86 @@ public func nemotronOmniPixelShuffle(
     let cMid = Int(Float(C) / s)
     let cOut = Int(Float(C) / (s * s))
 
-    // (B, H, W, C) → (B, W, H*s, C/s)
-    var out = x.reshaped([B, W, hOut, cMid])
-    out = out.transposed(0, 2, 1, 3) // (B, H*s, W, C/s)
-    out = out.reshaped([B, hOut, wOut, cOut]) // (B, H*s, W*s, C/s²)
+    // Group adjacent columns, then rows. The source names its spatial axes
+    // `w, h`; keep their positional order when using our `H, W` names.
+    // Swapping them in the first reshape silently scrambles rectangular grids.
+    var out = x.reshaped([B, H, wOut, cMid])
+    out = out.transposed(0, 2, 1, 3) // (B, W*s, H, C/s)
+    out = out.reshaped([B, wOut, hOut, cOut])
     out = out.transposed(0, 2, 1, 3)
     return out
 }
 
 // MARK: - ViT building blocks
+
+/// RADIO's bf16 LayerNorm needs stable reduction and affine rounding across
+/// Metal toolchains. Match the reference's fused variance accumulation explicitly,
+/// round the normalized activation once, then apply the affine weight in fp32.
+/// Keep this kernel scoped to RADIO; shared text normalization is unchanged.
+internal final class NemotronHVisionLayerNorm: LayerNorm {
+    #if canImport(Metal)
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_radio_layer_norm", inputNames: ["x", "w", "b", "epsilon"],
+        outputNames: ["out"], source: """
+            #pragma clang fp contract(off)
+            #pragma clang fp reassociate(off)
+            uint row = threadgroup_position_in_grid.x;
+            uint lid = thread_position_in_threadgroup.x;
+            uint lane = thread_index_in_simdgroup;
+            uint group = simdgroup_index_in_threadgroup;
+            threadgroup float sums[32];
+            if (group == 0) sums[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float values[8] = {0};
+            uint column = lid * 8;
+            for (uint i = 0; i < 8; ++i) {
+                if (column + i < WIDTH) values[i] = float(x[row * WIDTH + column + i]);
+            }
+            float mean = 0.0f;
+            for (uint i = 0; i < 8; ++i) mean += values[i];
+            mean = simd_sum(mean);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) sums[group] = mean;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mean = simd_sum(sums[lane]) / float(WIDTH);
+            float variance = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                values[i] = column + i < WIDTH ? values[i] - mean : 0.0f;
+                variance = fma(values[i], values[i], variance);
+            }
+            variance = simd_sum(variance);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) sums[group] = variance;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv = metal::precise::rsqrt(simd_sum(sums[lane]) / float(WIDTH) + epsilon[0]);
+            for (uint i = 0; i < 8; ++i) {
+                if (column + i < WIDTH) {
+                    T normalized = T(values[i] * inv);
+                    out[row * WIDTH + column + i] = T(float(w[column + i]) * float(normalized) + float(b[column + i]));
+                }
+            }
+            """)
+    #endif
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        #if canImport(Metal)
+        if let weight, let bias, dimensions > 0, dimensions <= 8192,
+            x.ndim > 0, x.dim(-1) == dimensions, x.size > 0,
+            weight.dtype == x.dtype, bias.dtype == x.dtype,
+            [.float32, .float16, .bfloat16].contains(x.dtype),
+            Device.defaultDevice().deviceType == .gpu
+        {
+            let threads = ((dimensions + 255) / 256) * 32
+            return Self.kernel(
+                [x, weight, bias, MLXArray([eps])],
+                template: [("T", x.dtype), ("WIDTH", dimensions)],
+                grid: (x.size / dimensions * threads, 1, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+        }
+        #endif
+        return super.callAsFunction(x)
+    }
+}
 
 public class NemotronHViTAttention: Module, UnaryLayer {
     let numHeads: Int
@@ -157,9 +230,9 @@ public class NemotronHViTBlock: Module, UnaryLayer {
         // timm's ViT blocks use LayerNorm(eps=1e-6). MLXNN defaults to
         // 1e-5, which compounds across RADIO's 32 blocks and materially
         // changes the vision embeddings.
-        self._norm1.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
+        self._norm1.wrappedValue = NemotronHVisionLayerNorm(dimensions: dim, eps: 1e-6)
         self._attn.wrappedValue = NemotronHViTAttention(dim: dim, numHeads: numHeads)
-        self._norm2.wrappedValue = LayerNorm(dimensions: dim, eps: 1e-6)
+        self._norm2.wrappedValue = NemotronHVisionLayerNorm(dimensions: dim, eps: 1e-6)
         self._mlp.wrappedValue = NemotronHViTMLP(dim: dim, hiddenDim: Int(Float(dim) * mlpRatio))
     }
 
@@ -199,6 +272,10 @@ public class NemotronHViTPatchGenerator: Module {
     }
 
     public func callAsFunction(_ x: MLXArray, video: Bool = false) -> MLXArray {
+        // The processor produces fp32 pixels; the source tower casts those to
+        // its loaded floating-point dtype before the quantized patch linear.
+        // clsToken remains floating point when embedder.weight is packed U32.
+        let x = x.asType(clsToken.dtype)
         let B = x.dim(0)
         let H = x.dim(2)
         let W = x.dim(3)
@@ -215,14 +292,15 @@ public class NemotronHViTPatchGenerator: Module {
         // Embed: video uses video_embedder (channel-stacked T frames), else embedder
         patches = video ? videoEmbedder(patches) : embedder(patches)
 
-        // Add bilinear-interpolated pos_embed
+        // Source RADIO interpolates in FP32, then casts back to the patch
+        // activation dtype before addition. Leaving the result in FP32
+        // silently promotes every subsequent vision block.
         let pos = getPosEmbed(inputH: H, inputW: W).asType(patches.dtype)
         patches = patches + pos
 
         // Concat cls/register tokens at front
         let clsExpanded = clsToken.expandedDimensions(axis: 0)
         let cls = MLX.broadcast(clsExpanded, to: [B, numClsTokens, embedDim])
-            .asType(patches.dtype)
         return MLX.concatenated([cls, patches], axis: 1)
     }
 
