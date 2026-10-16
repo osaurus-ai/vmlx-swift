@@ -91,10 +91,15 @@ public func nemotronOmniPixelShuffle(
     let cMid = Int(Float(C) / s)
     let cOut = Int(Float(C) / (s * s))
 
-    // (B, H, W, C) → (B, W, H*s, C/s)
-    var out = x.reshaped([B, W, hOut, cMid])
-    out = out.transposed(0, 2, 1, 3) // (B, H*s, W, C/s)
-    out = out.reshaped([B, hOut, wOut, cOut]) // (B, H*s, W*s, C/s²)
+    // ps_version v2 (HF `pixel_shuffle`, called with (n, w=H, h=W, c)):
+    // (B, H, W, C) → (B, H, W*s, C/s) → T → (B, W*s, H, C/s)
+    // → (B, W*s, H*s, C/s²) → T → (B, H*s, W*s, C/s²).
+    // The old order reshaped to (B, W, H*s, C/s) first — identical on the
+    // square 32x32 grids Nano-Omni used, scrambled on every non-square image
+    // (a 480x640 photo: 30x40 grid read as 40x30).
+    var out = x.reshaped([B, H, wOut, cMid])
+    out = out.transposed(0, 2, 1, 3)
+    out = out.reshaped([B, wOut, hOut, cOut])
     out = out.transposed(0, 2, 1, 3)
     return out
 }

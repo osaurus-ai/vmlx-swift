@@ -664,6 +664,44 @@ public final class VLMModelFactory: ModelFactory {
             }
         }
 
+        // Nemotron Omni bundle profile (config_omni.json + the shard index):
+        // which towers exist and whether the Super-VL vision final LayerNorm
+        // ships. Decoded by `NemotronHOmniConfiguration` from `_omni_*` keys.
+        if dispatchModelType == "NemotronH_Nano_Omni_Reasoning_V3",
+            let omniData = try? Data(contentsOf: configOmniURL),
+            let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any],
+            var configDict = try? JSONSerialization.jsonObject(with: mergedConfigData)
+                as? [String: Any]
+        {
+            let vision = omni["vision_config"] as? [String: Any] ?? [:]
+            configDict["_omni_has_sound"] = !(omni["sound_config"] is NSNull)
+                && omni["sound_config"] != nil
+            configDict["_omni_has_video"] = !(omni["video_context_token_id"] is NSNull)
+                && omni["video_context_token_id"] != nil
+            if let eps = vision["layer_norm_eps"] as? Double {
+                configDict["_omni_vision_layer_norm_eps"] = eps
+            }
+            if let token = omni["img_context_token_id"] as? Int {
+                configDict["_omni_img_context_token_id"] = token
+            }
+            if let cls = vision["num_cls_tokens"] as? Int {
+                configDict["_omni_vision_num_cls_tokens"] = cls + ((vision["num_registers"] as? Int) ?? 0)
+            }
+            let indexURL = modelDirectory.appending(component: "model.safetensors.index.json")
+            var hasFinalLN = false
+            if let indexData = try? Data(contentsOf: indexURL),
+                let index = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+                let weightMap = index["weight_map"] as? [String: Any]
+            {
+                hasFinalLN = weightMap["vision_projector.vision_final_layernorm.weight"] != nil
+                    && weightMap["vision_projector.vision_final_layernorm.bias"] != nil
+            }
+            configDict["_omni_vision_final_layernorm"] = hasFinalLN
+            if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
+                mergedConfigData = merged
+            }
+        }
+
         let earlyJangConfig: JangConfig?
         if JangLoader.isJangModel(at: modelDirectory) {
             earlyJangConfig = try JangLoader.loadConfig(at: modelDirectory)
@@ -961,6 +999,17 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
                     filename: videoPreprocessorConfigURL.lastPathComponent,
                     underlying: error)
             }
+        }
+        // Image-only Nemotron Omni bundles (3.5 Bolt / Super-VL: no sound
+        // tower) expand the chat template's own `<image>` markers.
+        let omniURL = modelDirectory.appending(component: "config_omni.json")
+        if let omniData = try? Data(contentsOf: omniURL),
+            let omni = try? JSONSerialization.jsonObject(with: omniData) as? [String: Any],
+            omni["sound_config"] == nil || omni["sound_config"] is NSNull,
+            var processorObject = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            processorObject["_omni_template_image_markers"] = true
+            data = try JSONSerialization.data(withJSONObject: processorObject)
         }
         let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)

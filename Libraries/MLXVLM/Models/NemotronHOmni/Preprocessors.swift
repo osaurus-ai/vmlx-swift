@@ -152,37 +152,6 @@ public func nemotronOmniDynamicPreprocess(
     return tiles
 }
 
-/// Render a CIImage into a planar (3, H, W) Float32 array, normalized by
-/// CLIP mean/std.
-private func rasterizeImage(
-    _ tile: CIImage,
-    width: Int,
-    height: Int,
-    mean: [Float], std: [Float]
-) -> MLXArray {
-    // Render to RGBA Float32 bitmap.
-    let bytesPerRow = width * 4 * MemoryLayout<Float>.size
-    var data = Data(count: width * height * 4 * MemoryLayout<Float>.size)
-    data.withUnsafeMutableBytes { ptr in
-        imagePreprocessContext.render(
-            tile,
-            toBitmap: ptr.baseAddress!,
-            rowBytes: bytesPerRow,
-            bounds: CGRect(x: 0, y: 0, width: width, height: height),
-            format: .RGBAf,
-            colorSpace: nil)
-    }
-
-    // Build (H, W, 4) array, drop alpha → (H, W, 3), normalize, transpose to (3, H, W)
-    var arr = MLXArray(data, [height, width, 4], type: Float32.self)
-    arr = arr[0..., 0..., ..<3] // (H, W, 3)
-    let meanT = MLXArray(mean).reshaped([1, 1, 3])
-    let stdT = MLXArray(std).reshaped([1, 1, 3])
-    arr = (arr - meanT) / stdT
-    // (H, W, 3) → (3, H, W)
-    return arr.transposed(2, 0, 1)
-}
-
 private func pythonRoundToInt(_ value: Double) -> Int {
     let floorValue = floor(value)
     let fraction = value - floorValue
@@ -270,15 +239,15 @@ public func nemotronOmniPreprocessImages(
             downsampleFactor: downsampleFactor)
         let targetW = target.widthPatches * patchSize
         let targetH = target.heightPatches * patchSize
-        let resized = MediaProcessing.resampleBicubic(
-            MediaProcessing.inSRGBToneCurveSpace(img),
-            to: CGSize(width: targetW, height: targetH))
-        allImages.append(rasterizeImage(
-            resized,
-            width: targetW,
-            height: targetH,
-            mean: NEMOTRON_OMNI_CLIP_MEAN,
-            std: NEMOTRON_OMNI_CLIP_STD))
+        // Same contract as the bundled `image_processing_nemotron_h_omni.py`:
+        // uint8 RGB → torch-style antialiased bicubic → `/255` → CLIP norm.
+        // The previous CoreImage path applied the sRGB tone curve inside a
+        // context whose working space is already sRGB (a double gamma: raw
+        // pixel mean 0.67 vs the processor's 0.43 on the parity photo) and
+        // used a non-antialiased kernel.
+        let chw = nemotronOmniResizeAndNormalize(
+            img, targetWidth: targetW, targetHeight: targetH)
+        allImages.append(MLXArray(chw, [3, targetH, targetW]))
         tokenCounts.append(
             (target.widthPatches * target.heightPatches)
                 / (downsampleFactor * downsampleFactor))
