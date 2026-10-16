@@ -823,7 +823,16 @@ internal class NemotronHMoEGate: Module {
         // and reorders near-tied experts; with 512 experts / top-22 (Nemotron
         // 3.5 Super) that changes the routed set on real tokens. Casting only
         // the sigmoid input (groupExpertSelect) is too late.
-        let gates = MLX.matmul(x.asType(.float32), weight.asType(.float32).transposed())
+        // SPEED: the upcast is exact, so the first forward REPLACES the bf16
+        // parameter with its fp32 copy (no second resident copy) instead of
+        // re-converting the whole [E, hidden] matrix on every token — that
+        // per-call cast moved ~10 B/param/token (Bolt: ~0.6 GB/token).
+        if weight.dtype != .float32 {
+            let upcast = weight.asType(.float32)
+            MLX.eval(upcast)
+            weight._updateInternal(upcast)
+        }
+        let gates = MLX.matmul(x.asType(.float32), weight.transposed())
         return groupExpertSelect(
             gates: gates,
             eSCB: eSCB,

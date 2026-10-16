@@ -51,6 +51,8 @@ public final class JANGHRelu2RoutedExpertLayer: Module, WeightedRoutedExpertLaye
         self.fc2 = fc2
         fc1Rotation = fc1Projection.rotation
         fc2Rotation = fc2Projection.rotation
+        // The float-register H32 variant measured slower here (Bolt greedy
+        // 50.8 vs 56.5 tok/s, same clock), so the activation-dtype rotation stays.
         fc1Decode = try JANGHProjectionKernel(contract: banks.contract, module: parentModule + ".fc1")
         fc2Decode = try JANGHWeightedDownKernel(contract: banks.contract, module: parentModule + ".fc2")
         fc1Prefill = try JANGHPrefillKernel(contract: banks.contract, module: parentModule + ".fc1")
