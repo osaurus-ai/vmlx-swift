@@ -161,7 +161,7 @@ struct VMLXServerRuntimeSettingsTests {
 
     @Test("selection capability shares the launch policy across architecture aliases")
     func selectionCapabilityMatchesLaunchPolicy() {
-        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35"] {
+        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35", "nemotron_h"] {
             for config in [
                 "{\"model_type\":\"\(type)\"}",
                 "{\"model_type\":\"vlm\",\"text_config\":{\"model_type\":\"\(type)\"}}",

@@ -1608,6 +1608,11 @@ public final class LLMModelFactory: ModelFactory {
         let lfmJANGHPreparation = try LFM2MoEJANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let lfmJANGHPreparation { configData = lfmJANGHPreparation.banks.ordinaryConfiguration }
+        let nemotronJANGHPreparation = try NemotronHJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let nemotronJANGHPreparation {
+            configData = nemotronJANGHPreparation.banks.ordinaryConfiguration
+        }
 
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
@@ -1616,7 +1621,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1816,7 +1821,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil {
+        if jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -1884,6 +1889,11 @@ public final class LLMModelFactory: ModelFactory {
                 model = try lfmJANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else if let k2JANGHPreparation {
                 model = try k2JANGHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let nemotronJANGHPreparation {
+                let languageModel = try nemotronJANGHPreparation.makeLanguageModel()
+                try NemotronLiLiCorrAttachment.attachIfRequested(
+                    to: languageModel, bundle: modelDirectory)
+                model = languageModel
             } else if let jangHPreparation {
                 model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
@@ -1893,7 +1903,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil { throw error }
+            if jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2073,14 +2083,14 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil
+            quantization: jangConfig != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil ? jangConfig : nil,
+            jangConfig: jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask

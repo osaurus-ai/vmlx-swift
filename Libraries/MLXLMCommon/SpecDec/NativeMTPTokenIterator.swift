@@ -652,7 +652,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // The environment bounds exploration but cannot raise a fixed request.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 5
+            .flatMap(Int.init).map { Swift.max($0, 1) }
+            ?? (model as? any NativeMTPBlockDraftModel).flatMap {
+                $0.nativeMTPUsesBlockDrafts ? $0.nativeMTPBlockDraftDepthLimit : nil
+            } ?? 5
         let resolvedDepth = try effectiveParameters.nativeMTPDepthPolicy.resolve(
             requestedDepth: requestedDepth, runtimeCap: depthCap)
         self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
@@ -956,6 +959,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: Self.lastHidden(bridge.hiddenStates),
             nextToken: secondToken,
             mtpCache: mtpCache,
+            targetCache: self.cache,
             depth: self.currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -2205,6 +2209,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
+            targetCache: cache,
             depth: copyWindow.isEmpty ? currentDepth : 1,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -2695,6 +2700,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: hidden,
             nextToken: nextToken,
             mtpCache: mtpCache,
+            targetCache: cache,
             depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -3314,6 +3320,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
+            targetCache: cache,
             depth: currentDepth,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -3595,11 +3602,37 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         hidden: MLXArray,
         nextToken: MLXArray,
         mtpCache: [KVCache],
+        targetCache: [KVCache],
         depth: Int,
         sampler: LogitSampler,
         speculativeSampler: SpeculativeSamplingController,
         processor: LogitProcessor?
     ) -> DraftBatch {
+        // Block drafters (LiLiCorr) propose the whole path in one call. The
+        // path is deterministic, so the verifier gets point masses: greedy
+        // needs only the ids; sampled acceptance takes q = one-hot, which makes
+        // accept = p(token) and the residual = p without that token (exact).
+        if let blockModel = model as? any NativeMTPBlockDraftModel, blockModel.nativeMTPUsesBlockDrafts {
+            let anchor = nextToken.reshaped(-1)[(-1)...]
+            let block = blockModel.nativeMTPBlockDraft(
+                nextToken: anchor, depth: depth, targetCache: targetCache
+            ).asType(nextToken.dtype)
+            let tokens = (0 ..< depth).map { block[$0 ..< ($0 + 1)] }
+            var probabilities: [MLXArray] = []
+            if !speculativeSampler.isGreedy {
+                let ids = NativeMTPPointMass.vocabularyIds(blockModel.nativeMTPBlockDraftVocabularySize)
+                probabilities = tokens.map {
+                    (ids .== $0.asType(.int32).reshaped(1, 1)).asType(.float32)
+                }
+            }
+            let syncStart = NativeMTPClock.now()
+            asyncEval(block)
+            return DraftBatch(
+                tokens: tokens,
+                probabilities: probabilities,
+                forwardCount: 1,
+                materializeSyncTime: NativeMTPClock.now() - syncStart)
+        }
         var tokens: [MLXArray] = []
         tokens.reserveCapacity(depth)
         var probabilities: [MLXArray] = []
@@ -3893,3 +3926,19 @@ extension NativeMTPTokenIterator {
     }
 }
 #endif
+
+/// `[1, V]` int32 vocabulary ids for point-mass rows, built once per width.
+enum NativeMTPPointMass {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cached: (width: Int, ids: MLXArray)?
+
+    static func vocabularyIds(_ width: Int) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached, cached.width == width { return cached.ids }
+        let ids = MLXArray(Int32(0) ..< Int32(width)).reshaped(1, width)
+        MLX.eval(ids)
+        cached = (width, ids)
+        return ids
+    }
+}

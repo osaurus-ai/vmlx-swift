@@ -289,9 +289,10 @@ public class NemotronHTests: XCTestCase {
         let config = try JSONDecoder().decode(
             NemotronHConfiguration.self, from: json.data(using: .utf8)!)
 
-        // 0.0 → 0.001 (selective-scan dt clamp normalization, see
-        // NemotronH.swift:1178-1184 for rationale + Python ref).
-        XCTAssertEqual(config.timeStepLimitMin, 0.001)
+        // Honoured as configured: mlx-lm 0.31 `compute_dt` clips dt to exactly
+        // `time_step_limit` (a 0.0 floor stays 0.0). Raising it to 0.001 moved
+        // every small time step away from the reference (Nemotron 3.5 parity).
+        XCTAssertEqual(config.timeStepLimitMin, 0.0)
         XCTAssertEqual(config.timeStepLimitMax, 1000.0)
     }
 

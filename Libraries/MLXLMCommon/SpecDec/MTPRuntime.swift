@@ -749,6 +749,31 @@ public extension NativeMTPModel {
     }
 }
 
+/// A native-MTP proposer that drafts a whole block from target-side context in
+/// one call instead of one recursive head step per depth (Nemotron-3.5 Bolt's
+/// LiLiCorr drafter). Its proposals are deterministic: the iterator gives the
+/// verifier point masses (q = 1 at the drafted token), which keeps exact
+/// rejection sampling exact, and — unlike copy windows — they feed the adaptive
+/// depth controller like head drafts do.
+public protocol NativeMTPBlockDraftModel: NativeMTPModel {
+    /// True only when this loaded instance actually drafts by blocks (a
+    /// drafter is attached and no recursive head is). A family type can carry
+    /// both capabilities; the iterator asks the instance.
+    var nativeMTPUsesBlockDrafts: Bool { get }
+
+    /// Deepest proposal one block draft can produce (block size - 1).
+    var nativeMTPBlockDraftDepthLimit: Int { get }
+
+    /// Vocabulary width of the target's logits (the point-mass row width).
+    var nativeMTPBlockDraftVocabularySize: Int { get }
+
+    /// Draft `depth` tokens that follow `nextToken`. `nextToken` sits at the
+    /// target cache's committed position (not yet fed to the target); every
+    /// earlier position has been through a target forward on `targetCache`.
+    /// Returns int32 `[depth]`, left on the graph.
+    func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray
+}
+
 /// Optional target scheduling specialization used only by the iterator's
 /// explicit AR-fallback step. Seed, draft, verification and re-entry must
 /// continue through their existing forwards. The result retains the same
@@ -1134,7 +1159,7 @@ public enum NativeMTPAutoDecodePolicy {
                 depth: familyColdStartDepth,
                 verifierMode: nil,
                 reason:
-                    "Qwen3.8 Flash-Next uses measured family cold-start depth 3; live acceptance may adapt downward.",
+                    "Measured family cold-start depth \(familyColdStartDepth) (Qwen3.8 Flash-Next); live acceptance may adapt downward.",
                 evidence: evidence + [
                     "activation=qwen4_exp_measured_family_cold_start",
                     "family_cold_start_depth=\(familyColdStartDepth)",
@@ -1232,8 +1257,13 @@ public enum NativeMTPAutoDecodePolicy {
         config: [String: Any]?,
         fallback: String?
     ) -> Int? {
-        modelTypes(config: config, fallback: fallback).contains(where: isQwen4ExpModelType)
-            ? 3 : nil
+        let types = modelTypes(config: config, fallback: fallback)
+        if types.contains(where: isQwen4ExpModelType) { return 3 }
+        // Nemotron's row-exact verifier and LiLiCorr proposer still need an
+        // in-app speedup measurement. Physical head presence establishes
+        // capability, not profitability. Keep Auto tuning-file driven;
+        // explicit manual depths remain available for measurement.
+        return nil
     }
 
     private static func isQwen4ExpModelType(_ value: String) -> Bool {
@@ -1748,7 +1778,7 @@ public enum MTPBundleInspector {
     ) throws -> MTPBundleStatus {
         let config = try loadJSONObjectIfExists(modelDirectory.appendingPathComponent("config.json"))
         let jangConfig = suppliedJangConfig ?? (try? JangLoader.loadConfig(at: modelDirectory))
-        let (configuredLayers, evidence, mtpLayerPrefixes) = configuredMTPLayers(
+        let (headLayers, evidence, mtpLayerPrefixes) = configuredMTPLayers(
             config: config,
             jangConfig: jangConfig)
         let tensorNames = try loadTensorNames(from: modelDirectory)
@@ -1764,11 +1794,20 @@ public enum MTPBundleInspector {
             fallback: jangConfig?.sourceModel.architecture)
         let quantizationFingerprint = MTPQuantizationTopology.fingerprint(config: config)
 
+        // A block drafter shipped beside the target (Nemotron-3.5 Bolt's `lilicorr/`) is the
+        // bundle's MTP artifact when it has no recursive head: its own config and shard headers
+        // are the physical evidence, read the same way as the target's.
+        let blockDrafter = inspectBlockDrafter(modelDirectory: modelDirectory, config: config)
+        let configuredLayers = Swift.max(headLayers, blockDrafter?.layers ?? 0)
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
         let metadataClaimsMTP = runtimeBundleHasMTP || runtimeMode != .none || configuredLayers > 0
-        let bundleHasMTP = !mtpNames.isEmpty
+        let bundleHasMTP = !mtpNames.isEmpty || blockDrafter != nil
         var statusEvidence = evidence
+        if let blockDrafter {
+            statusEvidence.append(
+                "block_drafter=lilicorr layers=\(blockDrafter.layers) tensors=\(blockDrafter.names.count)")
+        }
         if runtimeBundleHasMTP {
             statusEvidence.append("jang_config.runtime.bundle_has_mtp=true")
         }
@@ -1805,7 +1844,7 @@ public enum MTPBundleInspector {
             }
         }
 
-        let topologyGap = bundleHasMTP ? mtpTopologyGap(mtpNames) : nil
+        let topologyGap = !mtpNames.isEmpty ? mtpTopologyGap(mtpNames) : nil
         if let topologyGap {
             statusEvidence.append("mtp_topology_incomplete=\(topologyGap)")
         }
@@ -1824,16 +1863,37 @@ public enum MTPBundleInspector {
         return MTPBundleStatus(
             bundleHasMTP: bundleHasMTP,
             configuredLayers: configuredLayers,
-            tensorCount: mtpNames.count,
+            tensorCount: mtpNames.count + (blockDrafter?.names.count ?? 0),
             visionTensorCount: visionNames.count,
             mode: mode,
-            tensorSamples: Array(mtpNames.sorted().prefix(8)),
+            tensorSamples: Array(
+                (mtpNames.sorted() + (blockDrafter?.names.sorted().map { "lilicorr/" + $0 } ?? []))
+                    .prefix(8)),
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
             configEvidence: Array(Set(statusEvidence)).sorted(),
             nativeMTPTuning: nativeMTPTuning,
             quantizationFingerprint: quantizationFingerprint,
             measuredFamilyAutoDepth: measuredFamilyAutoDepth,
             incompleteTopologyReason: topologyGap)
+    }
+
+    /// `lilicorr/` beside a Nemotron-H target: its config must declare the LiLiCorr projector and
+    /// its shard headers must hold tensors.
+    private static func inspectBlockDrafter(
+        modelDirectory: URL, config: [String: Any]?
+    ) -> (layers: Int, names: [String])? {
+        let text = (config?["text_config"] as? [String: Any]) ?? config
+        let type = ((text?["model_type"] as? String) ?? (config?["model_type"] as? String) ?? "")
+            .lowercased().replacingOccurrences(of: "-", with: "_")
+        guard type == "nemotron_h" || type == "nemotron_h_text" else { return nil }
+        let dir = modelDirectory.appendingPathComponent("lilicorr")
+        guard let drafterConfig = try? loadJSONObjectIfExists(dir.appendingPathComponent("config.json")),
+            let dflash = drafterConfig["dflash_config"] as? [String: Any],
+            (dflash["projector_type"] as? String)?.lowercased() == "lilicorr",
+            let layers = drafterConfig["num_hidden_layers"] as? Int, layers > 0,
+            let names = try? loadTensorNames(from: dir), !names.isEmpty
+        else { return nil }
+        return (layers, names)
     }
 
     private static func configuredMTPLayers(

@@ -510,8 +510,19 @@ public final class VLMModelFactory: ModelFactory {
         if let qwen35JANGHPreparation {
             configData = qwen35JANGHPreparation.dense.ordinaryConfiguration
         }
-        let miniCPMJANGHPreparation =
+        // Nemotron-H relu2 JANGH banks (Nemotron 3.5 Bolt). Its bundle also
+        // ships config_omni.json, so it constructs through NemotronHOmni below.
+        let nemotronJANGHPreparation =
             (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil)
+            ? try NemotronHJANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let nemotronJANGHPreparation {
+            configData = nemotronJANGHPreparation.banks.ordinaryConfiguration
+        }
+        let miniCPMJANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil && qwen35JANGHPreparation == nil
+                && nemotronJANGHPreparation == nil)
             ? try MiniCPMV47JANGHPreparation.loadIfDeclared(
                 directory: modelDirectory, configurationData: configData)
             : nil
@@ -545,7 +556,8 @@ public final class VLMModelFactory: ModelFactory {
         // without `jang_config.json` skip this entirely.
         var mergedConfigData = configData
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if jangHPreparation == nil, FileManager.default.fileExists(atPath: jangConfigURL.path),
+        if jangHPreparation == nil, nemotronJANGHPreparation == nil,
+            FileManager.default.fileExists(atPath: jangConfigURL.path),
             let jangData = try? Data(contentsOf: jangConfigURL),
             let jangJSON = try? JSONSerialization.jsonObject(with: jangData)
                 as? [String: Any],
@@ -730,6 +742,17 @@ public final class VLMModelFactory: ModelFactory {
                 model = try miniCPMJANGHPreparation.construct(
                     configurationData: mergedConfigData,
                     requesting: configuration.requestedModalities)
+            } else if let nemotronJANGHPreparation {
+                let languageModel = try nemotronJANGHPreparation.makeLanguageModel()
+                if dispatchModelType == "NemotronH_Nano_Omni_Reasoning_V3" {
+                    let omniConfig = try JSONDecoder.json5().decode(
+                        NemotronHOmniConfiguration.self, from: mergedConfigData)
+                    model = NemotronHOmni(omniConfig, languageModel: languageModel)
+                } else {
+                    model = languageModel
+                }
+                try NemotronLiLiCorrAttachment.attachIfRequested(
+                    to: languageModel, bundle: modelDirectory)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: mergedConfigData, modelType: dispatchModelType,

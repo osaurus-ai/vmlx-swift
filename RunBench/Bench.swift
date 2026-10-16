@@ -722,6 +722,16 @@ struct Bench {
             return
         }
 
+        if (env["BENCH_LILICORR_ACCEPT"] ?? "0") == "1" {
+            do {
+                try await LiLiCorrAcceptBench.run(modelDir: modelDir)
+            } catch {
+                fputs("LILICORR FAILED: \(error)\n", stderr)
+                exit(benchFailureExitCode(for: error))
+            }
+            return
+        }
+
         if let fixture = env["BENCH_PARITY_FIXTURE"] {
             do {
                 try await NemotronParityBench.run(
@@ -8975,6 +8985,11 @@ private func runPerfBenchBody(
             }
             if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
                 params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+                // BENCH_PERF_MTP_ADAPTIVE_MAX=<n>: the app's On (Adaptive) policy — start at the
+                // requested depth, explore up to n (block drafters reach 7).
+                if let ceiling = env["BENCH_PERF_MTP_ADAPTIVE_MAX"].flatMap(Int.init) {
+                    params.nativeMTPDepthPolicy = .adaptive(maximumDepth: ceiling)
+                }
             }
             if let maxKVSize = env["BENCH_PERF_MAX_KV_SIZE"].flatMap(Int.init) {
                 params.maxKVSize = maxKVSize

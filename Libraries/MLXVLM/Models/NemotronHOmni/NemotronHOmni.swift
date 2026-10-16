@@ -171,10 +171,17 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
 // MARK: - Multimodal model
 
 public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAModel,
-    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel
+    TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    NemotronHBlockOutputTappable
 {
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
+
+    /// `NemotronHBlockOutputTappable`: forwarded to the language model's backbone.
+    public var blockOutputTap: NemotronHBlockOutputTap? {
+        get { languageModel.blockOutputTap }
+        set { languageModel.blockOutputTap = newValue }
+    }
 
     // Tower modules may contain affine-quantized linears alongside fp16/bf16
     // normalization tensors; sanitize() routes both through the remap helpers.
@@ -194,15 +201,21 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.loraLayers }
 
-    public init(_ config: NemotronHOmniConfiguration) {
-        self.config = config
-
+    public convenience init(_ config: NemotronHOmniConfiguration) {
+        let languageModel: NemotronHModel
         if let jangtq = config.jangtqContext {
-            self._languageModel.wrappedValue = NemotronHModel(
-                jangtqContext: jangtq, configuration: config.llmConfig)
+            languageModel = NemotronHModel(jangtqContext: jangtq, configuration: config.llmConfig)
         } else {
-            self._languageModel.wrappedValue = NemotronHModel(config.llmConfig)
+            languageModel = NemotronHModel(config.llmConfig)
         }
+        self.init(config, languageModel: languageModel)
+    }
+
+    /// Wrap an already-constructed language model (Nemotron 3.5 Bolt: routed
+    /// blocks bound to mapped JANGH banks by `NemotronHJANGHPreparation`).
+    public init(_ config: NemotronHOmniConfiguration, languageModel: NemotronHModel) {
+        self.config = config
+        self._languageModel.wrappedValue = languageModel
         self._radioModel.wrappedValue = NemotronHRADIOVisionModel(
             embedDim: config.vitHiddenSize,
             numBlocks: config.visionNumBlocks,
@@ -241,6 +254,9 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     // MARK: - Native MTP / staged verify (forwarded to the language model)
 
     public var nativeMTPAvailable: Bool { languageModel.nativeMTPAvailable }
+
+    /// The wrapped text model, for load-time attachments (the LiLiCorr drafter).
+    public var nemotronLanguageModel: NemotronHModel { languageModel }
 
     public func makeNativeMTPCache() -> [KVCache] { languageModel.makeNativeMTPCache() }
 
@@ -1446,4 +1462,32 @@ public enum NemotronHOmniMediaError: Error, LocalizedError, CustomStringConverti
     }
 
     public var errorDescription: String? { description }
+}
+
+extension NemotronHOmni: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        languageModel.excludeFromGenericSafetensorsLoad(key: key)
+    }
+
+    public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
+}
+
+extension NemotronHOmni: NativeMTPBlockDraftModel {
+    public var nativeMTPUsesBlockDrafts: Bool { nemotronLanguageModel.nativeMTPUsesBlockDrafts }
+    public var nativeMTPBlockDraftDepthLimit: Int { nemotronLanguageModel.nativeMTPBlockDraftDepthLimit }
+    public var nativeMTPBlockDraftVocabularySize: Int {
+        nemotronLanguageModel.nativeMTPBlockDraftVocabularySize
+    }
+    public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
+        nemotronLanguageModel.nativeMTPBlockDraft(
+            nextToken: nextToken, depth: depth, targetCache: targetCache)
+    }
+}
+
+extension NemotronHOmni: NativeMTPAutoregressiveBackboneModel {
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        nemotronLanguageModel.nativeAutoregressiveBackboneForward(inputs, cache: cache)
+    }
 }
