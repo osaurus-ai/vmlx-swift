@@ -18,7 +18,9 @@ final class JANGHWeightedDownKernel {
     private let kernel: MLXFast.MLXFastKernel
 
     init(contract: JANGHFormatContract, module: String) throws {
-        guard module.hasSuffix(".down_proj"), let projection = contract.projections[module],
+        // `.fc2` is the down projection of a gate-less relu2 stack (Nemotron-H).
+        guard module.hasSuffix(".down_proj") || module.hasSuffix(".fc2"),
+            let projection = contract.projections[module],
             let book = contract.codebooks[projection.bits]
         else { throw JANGHFormatContract.ValidationError.invalid("missing JANGH down projection") }
         bits = projection.bits

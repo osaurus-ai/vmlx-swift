@@ -40,6 +40,13 @@ struct JANGHFormatContract: Sendable {
     /// may mix the two formats per group (gate/up share one format and width; down may differ).
     let trellis: [String: Double]
     private static let supportedBits: Set<Int> = [2, 3, 4, 6, 8]
+    static let swigluRoles = ["gate_proj", "up_proj", "down_proj"]
+    static let relu2Roles = ["fc1", "fc2"]
+
+    /// Whether `parent` (a routed expert stack) is a gate-less relu2 pair.
+    func isRelu2Stack(_ parent: String) -> Bool {
+        projections[parent + ".fc1"] != nil && projections[parent + ".fc2"] != nil
+    }
 
     init(configuration data: Data) throws {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -81,7 +88,7 @@ struct JANGHFormatContract: Sendable {
                 Projection.self, from: JSONSerialization.data(withJSONObject: entry))
             guard name.contains("."), Self.supportedBits.contains(projection.bits),
                 books[projection.bits] != nil,
-                ["gate_proj", "up_proj", "down_proj"].contains(
+                (Self.swigluRoles + Self.relu2Roles).contains(
                     String(name.split(separator: ".").last ?? ""))
             else { throw ValidationError.invalid("unsupported JANGH projection \(name)") }
             modules[name] = projection
@@ -128,6 +135,20 @@ struct JANGHFormatContract: Sendable {
                 continue
             }
             let parent = String(name[..<name.lastIndex(of: ".")!])
+            let role = String(name[name.index(after: name.lastIndex(of: ".")!)...])
+            if Self.relu2Roles.contains(role) {
+                // Gate-less relu2 stack (Nemotron-H latent MoE): fc1 and fc2 are
+                // both required, carry independent widths and rotations, and a
+                // parent never mixes them with SwiGLU roles.
+                guard modules[parent + ".fc1"] != nil, modules[parent + ".fc2"] != nil,
+                    Self.swigluRoles.allSatisfy({
+                        modules[parent + "." + $0] == nil && trellisModules[parent + "." + $0] == nil
+                    })
+                else {
+                    throw ValidationError.invalid("incomplete or mixed JANGH relu2 expert \(parent)")
+                }
+                continue
+            }
             if trellisModules[parent + ".gate_proj"] != nil {
                 continue // gate/up are trellis; the JANGT loop above checked the whole triple.
             }

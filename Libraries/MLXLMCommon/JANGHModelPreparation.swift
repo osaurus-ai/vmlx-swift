@@ -29,6 +29,41 @@ public struct JANGHRoutedModelLayout: Sendable {
     }
 }
 
+/// Gate-less relu2 routed stacks (Nemotron-H latent MoE). Unlike the SwiGLU
+/// layout, every routed layer may have its own expert count, intermediate width
+/// and top-k (Nemotron 3.5 Bolt's `block_configs` puzzle blocks).
+public struct JANGHRelu2RoutedLayout: Sendable {
+    public struct Geometry: Sendable, Equatable {
+        public let experts: Int
+        public let intermediate: Int
+        public let routes: Int
+        public init(experts: Int, intermediate: Int, routes: Int) {
+            self.experts = experts
+            self.intermediate = intermediate
+            self.routes = routes
+        }
+    }
+
+    public let modelType: String
+    /// Width the experts read and write (the MoE latent size when present).
+    public let expertInputWidth: Int
+    public let layers: [Int: Geometry]
+    /// Checkpoint path of a layer's routed stack, `{L}` replaced by the layer.
+    public let parentTemplate: String
+
+    public init(modelType: String, expertInputWidth: Int, layers: [Int: Geometry],
+                parentTemplate: String) {
+        self.modelType = modelType
+        self.expertInputWidth = expertInputWidth
+        self.layers = layers
+        self.parentTemplate = parentTemplate
+    }
+
+    public func parent(_ layer: Int) -> String {
+        parentTemplate.replacingOccurrences(of: "{L}", with: String(layer))
+    }
+}
+
 /// Retains the admitted shard descriptors until explicit bank construction.
 /// The ordinary configuration must only be consumed together with all admitted
 /// custom banks; its false quantization overrides are not affine substitutes.
@@ -40,6 +75,7 @@ public final class JANGHModelPreparation {
     private let hiddenSize: Int
     private let intermediateSize: Int
     private let routesPerToken: Int
+    private let relu2Layout: JANGHRelu2RoutedLayout?
 
     /// Shared declaration gate for architecture factories. This only selects
     /// strict admission; it never establishes support from a label alone.
@@ -106,6 +142,7 @@ public final class JANGHModelPreparation {
         hiddenSize = layout.hiddenSize
         intermediateSize = layout.intermediateSize
         routesPerToken = layout.routesPerToken
+        relu2Layout = nil
         ordinaryConfiguration = partition.ordinaryConfiguration
         excludedTensorNames = Set(partition.customModules.flatMap { module in
             trellis[module] != nil
@@ -113,6 +150,70 @@ public final class JANGHModelPreparation {
                 : [module + ".tq2_packed", module + ".tq2_scales"]
         })
         moduleByLayer = modules
+    }
+
+    /// Relu2 admission: every listed layer must own exactly a codebook fc1/fc2
+    /// pair with its own geometry, and the bundle may declare nothing else.
+    public init(directory: URL, configuration: Data, sidecar: Data?,
+                relu2Layout layout: JANGHRelu2RoutedLayout) throws {
+        for legacyName in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
+            guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent(legacyName).path) else {
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "JANGH cannot coexist with legacy JANGTQ runtime or overlay files")
+            }
+        }
+        let partition = try JANGHConfigurationPartition(configuration: configuration, sidecar: sidecar)
+        guard partition.modelType == layout.modelType, layout.expertInputWidth > 0,
+            !layout.layers.isEmpty, layout.layers.keys.allSatisfy({ $0 >= 0 }),
+            layout.layers.values.allSatisfy({ $0.experts > 0 && $0.intermediate > 0 && $0.routes > 0 }),
+            partition.contract.trellis.isEmpty
+        else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "JANGH relu2 layout does not match configuration")
+        }
+        var dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
+        var modules: [Int: String] = [:]
+        for (layer, geometry) in layout.layers {
+            let parent = layout.parent(layer)
+            modules[layer] = parent
+            dimensions[parent + ".fc1"] = .init(
+                experts: geometry.experts, input: layout.expertInputWidth, output: geometry.intermediate)
+            dimensions[parent + ".fc2"] = .init(
+                experts: geometry.experts, input: geometry.intermediate, output: layout.expertInputWidth)
+        }
+        guard Set(dimensions.keys) == partition.customModules,
+            modules.values.allSatisfy({ partition.contract.isRelu2Stack($0) })
+        else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "JANGH relu2 banks do not cover the architecture routed layers")
+        }
+        let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: "model.safetensors.index.json")
+        source = try JANGHMappedBanks.SourceLease(
+            directory: directory, metadata: metadata, contract: partition.contract,
+            dimensions: dimensions, trellisDimensions: [:])
+        hiddenSize = layout.expertInputWidth
+        intermediateSize = layout.layers.values.map(\.intermediate).max() ?? 0
+        routesPerToken = layout.layers.values.map(\.routes).max() ?? 0
+        relu2Layout = layout
+        ordinaryConfiguration = partition.ordinaryConfiguration
+        excludedTensorNames = Set(partition.customModules.flatMap {
+            [$0 + ".tq2_packed", $0 + ".tq2_scales"]
+        })
+        moduleByLayer = modules
+    }
+
+    /// Relu2 counterpart of ``makeRoutedExperts(activationLimit:)``.
+    public func makeRelu2RoutedExperts() throws -> [Int: any WeightedRoutedExpertLayer] {
+        guard let layout = relu2Layout else {
+            throw JANGHFormatContract.ValidationError.invalid("not a relu2 JANGH preparation")
+        }
+        let banks = try mapBanks()
+        return try moduleByLayer.reduce(into: [:]) { result, entry in
+            let geometry = layout.layers[entry.key]!
+            result[entry.key] = try JANGHRelu2RoutedExpertLayer(
+                banks: banks, parentModule: entry.value, inputDimensions: layout.expertInputWidth,
+                intermediateSize: geometry.intermediate, experts: geometry.experts)
+        }
     }
 
     /// Architecture-side audit of the loader exclusions: every routed (layer, role) is excluded as exactly one whole
