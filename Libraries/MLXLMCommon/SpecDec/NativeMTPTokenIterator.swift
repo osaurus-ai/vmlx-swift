@@ -1513,6 +1513,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             input.text.tokenIds.map({ $0.count == size }) ?? true,
             input.text.mask.map({ $0.size == size }) ?? true
         else {
+            if ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_TRACE"] == "1" {
+                let offsets = Set(cache.map(\.offset)).sorted()
+                FileHandle.standardError.write(Data(
+                    "[vmlx][mtp-prefill-capture] skipped size=\(size) restored=\(restored) offsets=\(offsets)\n".utf8))
+            }
             return try model.prepare(input, cache: cache, windowSize: windowSize)
         }
 
