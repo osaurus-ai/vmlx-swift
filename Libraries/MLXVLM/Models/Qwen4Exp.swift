@@ -1856,29 +1856,28 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     /// What was actually built.
     public let plan: ResolvedConstructionPlan
 
-    /// JANGH construction: routed experts are pre-mapped custom banks (Qwen4ExpJANGHPreparation).
-    /// MTP experts stay ordinary affine. The exact tq2_* tensor names are excluded from the
-    /// generic (resident-copy) load; a mismatch between banks and names is an error.
+    /// JANGH / JANGHT construction: routed experts are pre-mapped custom banks (Qwen4ExpJANGHPreparation),
+    /// each (layer, role) either a JANGH codebook bank (`tq2_packed`, `tq2_scales`) or a JANGT trellis bank
+    /// (`jt_packed`, `jt_scale`, `jt_su`, `jt_ocol`, `jt_wout`, `jt_cs`; Qwen3.8-Flash-Next JANGHT, 2026-10-16).
+    /// MTP experts stay ordinary affine. The exact custom tensor names are excluded from the generic
+    /// (resident-copy) load; a mismatch between banks and names is an error.
     public convenience init(
         _ config: Qwen4ExpConfiguration,
         requesting: Set<ModelRuntimeRequestModality>?,
         routedExperts: [Int: any WeightedRoutedExpertLayer],
         customRoutedTensorNames: Set<String>
     ) throws {
-        let expected = Set(routedExperts.keys.flatMap { layer in
-            ["gate_proj", "up_proj", "down_proj"].flatMap { role in
-                ["tq2_packed", "tq2_scales"].map { "model.layers.\(layer).mlp.switch_mlp.\(role).\($0)" }
-            }
-        })
-        guard Set(routedExperts.keys) == Set(0 ..< config.base.textConfiguration.hiddenLayers),
-              customRoutedTensorNames == expected else {
+        let layers = Set(0 ..< config.base.textConfiguration.hiddenLayers)
+        guard Set(routedExperts.keys) == layers,
+              JANGHModelPreparation.isCanonicalRoutedExclusionSet(customRoutedTensorNames, routedLayers: layers)
+        else {
             throw Qwen4ExpJANGHError.invalidCustomTensorExclusions
         }
         self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting),
                   routedExperts: routedExperts, customRoutedTensorNames: customRoutedTensorNames)
     }
 
-    /// Exact tq2_* tensor names owned by the mapped JANGH banks (empty for affine bundles).
+    /// Exact custom tensor names (tq2_* / jt_*) owned by the mapped banks (empty for affine bundles).
     let customRoutedTensorNames: Set<String>
 
     /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.

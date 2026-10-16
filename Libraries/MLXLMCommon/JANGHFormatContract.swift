@@ -50,18 +50,29 @@ struct JANGHFormatContract: Sendable {
 
     init(configuration data: Data) throws {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let rawHeader = root["jangtq"] as? [String: Any],
             let quantization = root["quantization"] as? [String: Any]
         else { throw ValidationError.invalid("missing JANGH metadata") }
         let decoder = JSONDecoder()
-        let header = try decoder.decode(
-            Header.self, from: JSONSerialization.data(withJSONObject: rawHeader))
-        guard header.version == 2, header.packing == "lsb-bitstream",
-            header.scale_dtype == "float16", header.codebook_family == "odd-cubic"
-        else { throw ValidationError.invalid("unsupported JANGH format contract") }
+        // The codebook header (`jangtq`) is required by every `jangtq2` projection. A pure-JANGT bundle (Qwen3.8-Flash-
+        // Next JANGHT, 2026-10-16: every routed projection `mode: jangt`) needs no codebooks and may omit it; a
+        // `jangtq2` projection without the header is still refused below.
+        let header: Header?
+        if let rawHeader = root["jangtq"] {
+            guard let object = rawHeader as? [String: Any] else {
+                throw ValidationError.invalid("invalid JANGH header")
+            }
+            let decoded = try decoder.decode(Header.self, from: JSONSerialization.data(withJSONObject: object))
+            guard decoded.version == 2, decoded.packing == "lsb-bitstream",
+                decoded.scale_dtype == "float16", decoded.codebook_family == "odd-cubic"
+            else { throw ValidationError.invalid("unsupported JANGH format contract") }
+            header = decoded
+        } else {
+            guard root["jangt"] is [String: Any] else { throw ValidationError.invalid("missing JANGH metadata") }
+            header = nil
+        }
 
         var books: [Int: Codebook] = [:]
-        for (key, book) in header.codebooks {
+        for (key, book) in header?.codebooks ?? [:] {
             guard let bits = Int(key), String(bits) == key, Self.supportedBits.contains(bits),
                 book.alpha.isFinite, book.beta.isFinite, Float(book.alpha).isFinite,
                 Float(book.beta).isFinite, book.levels.count == 1 << bits
@@ -107,6 +118,7 @@ struct JANGHFormatContract: Sendable {
                 (jt["state_bits"] as? NSNumber)?.intValue == JANGTCode.stateBits,
                 jt["rotation"] as? String == "hadamard128-signs"
             else { throw ValidationError.invalid("unsupported JANGT header") }
+            if let mismatch = JANGTCode.validateDeclaredCode(jt) { throw ValidationError.invalid(mismatch) }
         }
         guard !modules.isEmpty || !trellisModules.isEmpty else {
             throw ValidationError.invalid("no JANGH projections")
