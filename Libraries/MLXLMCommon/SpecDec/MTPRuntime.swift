@@ -991,7 +991,7 @@ public enum NativeMTPAutoDecodePolicy {
         guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
         else { return false }
         return modelTypes(config: config, fallback: nil).contains(
-            where: isSupportedQwenMTPModelType)
+            where: isSupportedPolicyMTPModelType)
     }
 
     /// Manual-depth recommendation: validates the same family/tensor evidence
@@ -1013,7 +1013,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: isSupportedPolicyMTPModelType) else { return nil }
         let evidence = [
             "model_types=\(modelTypes.sorted().joined(separator: ","))",
             "mtp_tensors=\(status.tensorCount)",
@@ -1042,7 +1042,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        guard modelTypes.contains(where: isSupportedPolicyMTPModelType) else { return nil }
         let familyColdStartDepth = measuredFamilyColdStartDepth(
             config: config,
             fallback: jangConfig?.sourceModel.architecture)
@@ -1187,7 +1187,7 @@ public enum NativeMTPAutoDecodePolicy {
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
-        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
+        guard modelTypes.contains(where: isSupportedPolicyMTPModelType) else {
             return "Bundle model type is not on the native-MTP allowlist."
         }
 
@@ -1331,6 +1331,23 @@ public enum NativeMTPAutoDecodePolicy {
             return false
         }
         return true
+    }
+
+    /// Families the Auto / manual-depth policy may drive: the Qwen MTP
+    /// families plus Nemotron-H (its head runs through the same iterator with
+    /// a staged Mamba-2 verify rollback). Tensor evidence and tuning or a
+    /// measured family cold start are still required on top of this.
+    private static func isSupportedPolicyMTPModelType(_ value: String) -> Bool {
+        isSupportedQwenMTPModelType(value) || isNemotronHModelType(value)
+    }
+
+    private static func isNemotronHModelType(_ value: String) -> Bool {
+        switch normalize(value) {
+        case "nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text":
+            return true
+        default:
+            return false
+        }
     }
 
     private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
