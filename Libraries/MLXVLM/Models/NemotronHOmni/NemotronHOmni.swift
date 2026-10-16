@@ -296,6 +296,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        try Task.checkCancellation()
         let convertedCache = cache.compactMap { $0 as KVCache }
 
         if input.audio != nil, !config.hasSound {
@@ -345,14 +346,18 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                     + "got shape \(tokensShape).")
             }
             var flatTokens = input.text.tokens.reshaped([-1])
+            let promptSize = flatTokens.size
             while flatTokens.size > prefillStepSize {
+                try Task.checkCancellation()
                 let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
                 _ = languageModel.callAsFunction(
                     chunkTokens, cache: convertedCache)
                 MLX.eval(convertedCache)
                 flatTokens = flatTokens[prefillStepSize...]
+                PrefillProgressReporter.reportCompletedUnits(promptSize - flatTokens.size)
                 Memory.clearCache()
             }
+            try Task.checkCancellation()
             let lastChunk = flatTokens[.newAxis, 0...]
             let logits = languageModel.callAsFunction(
                 lastChunk, cache: convertedCache)
@@ -438,14 +443,17 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let sequenceLength = spliced.dim(1)
         var offset = 0
         while sequenceLength - offset > prefillStepSize {
+            try Task.checkCancellation()
             let end = offset + prefillStepSize
             let chunk = spliced[0..., offset..<end, 0...]
             _ = languageModel.callAsFunction(
                 inputsEmbeds: chunk, cache: convertedCache)
             MLX.eval(convertedCache)
             offset = end
+            PrefillProgressReporter.reportCompletedUnits(offset)
             Memory.clearCache()
         }
+        try Task.checkCancellation()
         let logits = languageModel.callAsFunction(
             inputsEmbeds: spliced[0..., offset..<sequenceLength, 0...],
             cache: convertedCache)
