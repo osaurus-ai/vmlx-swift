@@ -1394,7 +1394,10 @@ internal class NemotronHBackbone: Module {
 
         // Track which cache to use for each layer
         var cacheCounter = 0
-        let tap = blockOutputTap
+        let tap: NemotronHBlockOutputTap? = blockOutputTap.flatMap { tap in
+            (tap.begin?(cache, hidden.dim(1)) ?? true) ? tap : nil
+        }
+        defer { tap?.end?() }
         for (layerIndex, layer) in layers.enumerated() {
             let c: KVCache?
             if layer.blockType == .mamba || layer.blockType == .attention {
@@ -1586,7 +1589,29 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
     /// The head exists only when the bundle shipped one, so speculation can
     /// never engage on a Nemotron build without MTP weights.
-    public var nativeMTPAvailable: Bool { mtp != nil }
+    public var nativeMTPAvailable: Bool { mtp != nil || lilicorrLane != nil }
+
+    /// Bolt's LiLiCorr block drafter (`lilicorr/`), attached only for an explicit
+    /// native-MTP load of a bundle without a recursive head.
+    public private(set) var lilicorrLane: NemotronLiLiCorrLane?
+
+    public var hasRecursiveMTPHead: Bool { mtp != nil }
+
+    public func attachLiLiCorr(drafter: NemotronLiLiCorrDrafter) throws {
+        guard let attentionIndex = backbone.firstAttentionCacheIndex else {
+            throw NemotronLiLiCorrError.malformedConfig("target has no attention layer for positions")
+        }
+        let layerCount = backbone.layers.count
+        guard drafter.targetLayerIds.allSatisfy({ $0 >= 0 && $0 < layerCount }),
+            drafter.tapDimension == drafter.targetLayerIds.count * configuration.hiddenSize
+        else {
+            throw NemotronLiLiCorrError.malformedConfig(
+                "target_layer_ids \(drafter.targetLayerIds) / tap width \(drafter.tapDimension) do not fit a \(layerCount)-block target of hidden \(configuration.hiddenSize)")
+        }
+        let lane = NemotronLiLiCorrLane(drafter: drafter, attentionCacheIndex: attentionIndex)
+        backbone.blockOutputTap = lane.makeTap()
+        lilicorrLane = lane
+    }
 
     /// Per-request cache for the head alone. Never prefix, paged or L2 state —
     /// the draft must not be able to contaminate the base cache.
@@ -2190,6 +2215,25 @@ public struct NemotronHBlockConfig: Codable, Sendable, Equatable {
     }
 }
 
+
+extension NemotronHModel: NativeMTPBlockDraftModel {
+    public var nativeMTPUsesBlockDrafts: Bool { mtp == nil && lilicorrLane != nil }
+
+    public var nativeMTPBlockDraftDepthLimit: Int {
+        Swift.max(1, (lilicorrLane?.drafter.blockSize ?? 2) - 1)
+    }
+
+    public var nativeMTPBlockDraftVocabularySize: Int { configuration.vocabSize }
+
+    public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
+        guard let lane = lilicorrLane else {
+            fatalError("NemotronH block draft requested without an attached LiLiCorr drafter")
+        }
+        return lane.draft(
+            nextToken: nextToken, depth: depth, targetCache: targetCache,
+            embed: { self.embedTokens($0) }, lmHead: { self.projectToLogits($0) })
+    }
+}
 
 extension NemotronHModel: SafetensorsLoadKeyExcluding {
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {

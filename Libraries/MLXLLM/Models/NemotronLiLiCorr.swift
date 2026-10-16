@@ -1044,10 +1044,22 @@ public final class NemotronLiLiCorrDrafter: Module {
 public final class NemotronHBlockOutputTap {
     public let layerIndices: Set<Int>
     public let record: (_ layerIndex: Int, _ output: MLXArray) -> Void
+    /// Called once before the block loop with the forward's cache (nil for a cache-less forward)
+    /// and row count; returning false skips recording for this forward. Nil = always record.
+    public let begin: ((_ cache: [KVCache]?, _ rows: Int) -> Bool)?
+    /// Called once after the block loop of a forward that `begin` admitted.
+    public let end: (() -> Void)?
 
-    public init(layerIndices: Set<Int>, record: @escaping (_ layerIndex: Int, _ output: MLXArray) -> Void) {
+    public init(
+        layerIndices: Set<Int>,
+        record: @escaping (_ layerIndex: Int, _ output: MLXArray) -> Void,
+        begin: ((_ cache: [KVCache]?, _ rows: Int) -> Bool)? = nil,
+        end: (() -> Void)? = nil
+    ) {
         self.layerIndices = layerIndices
         self.record = record
+        self.begin = begin
+        self.end = end
     }
 }
 

@@ -751,6 +751,8 @@ public final class VLMModelFactory: ModelFactory {
                 } else {
                     model = languageModel
                 }
+                try NemotronLiLiCorrAttachment.attachIfRequested(
+                    to: languageModel, bundle: modelDirectory)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: mergedConfigData, modelType: dispatchModelType,

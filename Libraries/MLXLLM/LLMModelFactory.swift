@@ -1890,7 +1890,10 @@ public final class LLMModelFactory: ModelFactory {
             } else if let k2JANGHPreparation {
                 model = try k2JANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else if let nemotronJANGHPreparation {
-                model = try nemotronJANGHPreparation.makeLanguageModel()
+                let languageModel = try nemotronJANGHPreparation.makeLanguageModel()
+                try NemotronLiLiCorrAttachment.attachIfRequested(
+                    to: languageModel, bundle: modelDirectory)
+                model = languageModel
             } else if let jangHPreparation {
                 model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
             } else {

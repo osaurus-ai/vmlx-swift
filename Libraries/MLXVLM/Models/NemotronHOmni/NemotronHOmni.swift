@@ -255,6 +255,9 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
 
     public var nativeMTPAvailable: Bool { languageModel.nativeMTPAvailable }
 
+    /// The wrapped text model, for load-time attachments (the LiLiCorr drafter).
+    public var nemotronLanguageModel: NemotronHModel { languageModel }
+
     public func makeNativeMTPCache() -> [KVCache] { languageModel.makeNativeMTPCache() }
 
     public func embed(_ tokenIds: MLXArray) -> MLXArray { languageModel.embed(tokenIds) }
@@ -1467,4 +1470,16 @@ extension NemotronHOmni: SafetensorsLoadKeyExcluding {
     }
 
     public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
+}
+
+extension NemotronHOmni: NativeMTPBlockDraftModel {
+    public var nativeMTPUsesBlockDrafts: Bool { nemotronLanguageModel.nativeMTPUsesBlockDrafts }
+    public var nativeMTPBlockDraftDepthLimit: Int { nemotronLanguageModel.nativeMTPBlockDraftDepthLimit }
+    public var nativeMTPBlockDraftVocabularySize: Int {
+        nemotronLanguageModel.nativeMTPBlockDraftVocabularySize
+    }
+    public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
+        nemotronLanguageModel.nativeMTPBlockDraft(
+            nextToken: nextToken, depth: depth, targetCache: targetCache)
+    }
 }
