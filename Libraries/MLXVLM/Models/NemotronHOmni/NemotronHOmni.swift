@@ -1465,8 +1465,3 @@ extension NemotronHOmni: SafetensorsLoadKeyExcluding {
 
     public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
 }
-
-/// Nemotron-H has no positional encoding (NoPE attention, Mamba-2 state), so a
-/// native forward after the media prefill needs no position offset: image
-/// requests on Nemotron 3.5 Super-VL can speculate instead of decoding AR.
-extension NemotronHOmni: NativeMTPMediaCapable {}
