@@ -550,7 +550,21 @@ enum VLBench {
         print("image: \(imagePath) extent=\(Int(image.extent.width))x\(Int(image.extent.height))")
 
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let context = try await loadProductionContext(from: modelDir)
+        // BENCH_VL_NATIVE_MTP_DEPTH=<1-3>: the same image turn through native MTP.
+        let smokeMTPDepth = ProcessInfo.processInfo.environment["BENCH_VL_NATIVE_MTP_DEPTH"]
+            .flatMap(Int.init)
+        let context: ModelContext
+        if smokeMTPDepth != nil {
+            context = try await MLXLMCommon.loadModel(
+                from: modelDir,
+                using: #huggingFaceTokenizerLoader(),
+                loadConfiguration: LoadConfiguration(
+                    jangPress: .disabled, maxResidentBytes: .unlimited, memoryLimit: .unlimited,
+                    useMmapSafetensors: true, nativeMTP: true)
+            ).0
+        } else {
+            context = try await loadProductionContext(from: modelDir)
+        }
         print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
         print("Model: \(type(of: context.model))")
         print("Processor: \(type(of: context.processor))")
@@ -561,6 +575,10 @@ enum VLBench {
         let engine = BatchEngine(context: ctx, maxBatchSize: 1)
         var params = GenerateParameters(maxTokens: maxNewTokens, temperature: temperature, prefillStepSize: 512)
         params.maxTokens = maxNewTokens
+        if let smokeMTPDepth {
+            params.draftStrategy = .nativeMTP(depth: smokeMTPDepth)
+            print("Native MTP depth: \(smokeMTPDepth)")
+        }
         print("Sampling: temperature=\(params.temperature) maxTokens=\(maxNewTokens) thinking(T1)=\(thinking)")
 
         var history: [Chat.Message] = []
