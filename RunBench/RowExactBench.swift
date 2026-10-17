@@ -49,6 +49,41 @@ func runRowExactBench(modelPath: String) async throws {
         return (cache, first)
     }
 
+    if env["BENCH_ROWEXACT_TIME"] == "1" {
+        // Verify cost: median wall time of one AR step vs one staged verify forward of W rows, each
+        // from a fresh copy of the same prefilled cache (copy evaluated before the clock starts).
+        let reps = Int(env["BENCH_ROWEXACT_TIME_REPS"] ?? "9") ?? 9
+        let (base, first) = prefill()
+        func timed(_ ids: [Int32], verify: Bool) -> Double {
+            var samples: [Double] = []
+            for _ in 0 ..< reps {
+                let c = base.map { $0.copy() }
+                MLX.eval(c)
+                let input = MLXArray(ids).reshaped(1, ids.count)
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let out =
+                    verify
+                    ? NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                        model.nativeBackboneMTPVerifyForward(input, cache: c)
+                    }
+                    : model.nativeAutoregressiveBackboneForward(input, cache: c)
+                MLX.eval(out.logits)
+                samples.append(CFAbsoluteTimeGetCurrent() - t0)
+            }
+            samples.sort()
+            return samples[samples.count / 2] * 1000
+        }
+        let ids = (0 ..< 8).map { Int32(first + $0 * 7) }
+        _ = timed([ids[0]], verify: false)
+        let ar = timed([ids[0]], verify: false)
+        print(String(format: "[ROWEXACT-TIME] AR step %.2f ms", ar))
+        for w in widths {
+            let v = timed(Array(ids.prefix(w)), verify: true)
+            print(String(format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR)", w, v, v / ar))
+        }
+        if env["BENCH_ROWEXACT_TIME_ONLY"] == "1" { return }
+    }
+
     // 1. AR reference.
     var (cache, token) = prefill()
     var stream: [Int] = [token]

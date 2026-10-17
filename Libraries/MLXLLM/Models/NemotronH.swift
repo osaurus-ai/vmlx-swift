@@ -362,10 +362,23 @@ enum NemotronHRowExact {
         guard active(x, site: site) else { return module(x) }
         let rows = x.dim(1)
         if type(of: module) == QuantizedLinear.self, let q = module as? QuantizedLinear {
-            var y = quantizedMM(
-                x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis],
-                scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
-                transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            // Batched M = 1 per row: exact, but streams the weight once PER ROW.
+            func batched(_ input: MLXArray) -> MLXArray {
+                quantizedMM(
+                    input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis],
+                    scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
+                    transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode
+                ).reshaped(input.dim(0), -1)
+            }
+            let flat = x.reshaped(rows, x.dim(-1))
+            // Same per-row arithmetic with the weight streamed once for all rows (admitted
+            // bitwise against `batched` per shape; see RowExactAffineQMV).
+            var y =
+                (q.mode == .affine
+                    ? RowExactAffineQMV.project(
+                        flat, weight: q.weight, scales: q.scales, biases: q.biases,
+                        groupSize: q.groupSize, bits: q.bits, reference: batched)
+                    : nil) ?? batched(flat)
             if let bias = q.bias { y = y + bias }
             if y.dtype != x.dtype, x.dtype == .bfloat16 || x.dtype == .float16 {
                 y = y.asType(x.dtype)
