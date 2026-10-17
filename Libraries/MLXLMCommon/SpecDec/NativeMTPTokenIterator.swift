@@ -1201,6 +1201,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    // Same canonical-boundary policy as the solo TokenIterator
+                    // loop: with a proven cross-turn strip boundary, the
+                    // non-stable message boundaries are either unproducible
+                    // for a path-dependent hybrid (no re-derive is allowed
+                    // for them, so `cacheSnapshotForBoundary` returns nil) or
+                    // the canonical boundary itself, which the stripped store
+                    // below persists. Storing it here as well copied and
+                    // evaluated the whole prompt cache a second time and ran
+                    // the full disk-store transaction again for an entry the
+                    // writer then deduplicated (one extra store + one skip
+                    // per turn in the app trace).
+                    if usesCanonicalHybridBoundary, !isStableBoundary {
+                        continue
+                    }
                     let storeBoundary = isStableBoundary
                         && coordinator.requiresRecurrentSSMCompanion && boundary > 1
                         ? boundary - 1

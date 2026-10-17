@@ -146,6 +146,11 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
                           "the stable N-1 seed must reach disk from the captured snapshot")
             XCTAssertTrue(disk.hasDurableDiskEntry(tokens: stable + user, mediaSalt: salt),
                           "the canonical boundary must reach disk from the captured snapshot")
+            // Exactly one disk store per boundary: the seed from the history
+            // loop and the canonical boundary from the stripped store. The
+            // history loop must not store the canonical boundary as well.
+            XCTAssertEqual(disk.snapshotStats().diskStats?.stores, 2)
+            XCTAssertEqual(disk.snapshotStats().diskStats?.storeSkips, 0)
         }
     }
 
