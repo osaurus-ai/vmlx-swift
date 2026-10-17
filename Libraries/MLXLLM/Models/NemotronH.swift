@@ -1207,6 +1207,22 @@ internal class NemotronHSwitchMLP: Module, NemotronHSwitchMLPLayer {
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        // Row-exact verify: each expert's weights once for every verify row that selected it,
+        // per-pair arithmetic equal to the unsorted gather (RowExactGatherQMV).
+        if NemotronHRowExact.active(x, site: "moe"), indices.ndim == 3,
+            let q1 = fc1 as? QuantizedSwitchLinear, let q2 = fc2 as? QuantizedSwitchLinear
+        {
+            let rows = x.dim(1)
+            let topK = indices.dim(-1)
+            let flatIndices = indices.reshaped(-1)
+            if let h = q1.rowExactDedupGather(
+                x.reshaped(rows, x.dim(-1)), indices: flatIndices, xDivisor: topK, maxRun: rows),
+                let y = q2.rowExactDedupGather(
+                    relu2(h), indices: flatIndices, xDivisor: 1, maxRun: rows)
+            {
+                return y.reshaped(1, rows, topK, -1)
+            }
+        }
         // Row-exact verify keeps the unsorted gather: per-row bitwise equal to the AR step.
         let doSort = indices.size > 64 && !NemotronHRowExact.active(x, site: "moe")
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
