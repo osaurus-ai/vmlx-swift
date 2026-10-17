@@ -828,8 +828,21 @@ public final class CacheCoordinator: @unchecked Sendable {
         mediaSalt: String? = nil,
         skipExactDiskBoundary: Bool = false,
         preferredDiskBoundaries: [Int] = [],
-        chainId: String? = nil
+        chainId: String? = nil,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) -> CacheFetchResult {
+        /// The salts a boundary may be stored under, in probe order. A boundary
+        /// at or before the first media token of a request whose model declares
+        /// the pre-media state media-independent (``MediaIndependentPrefix``)
+        /// is keyed under the text-only salt — the rows an earlier text turn of
+        /// the chat wrote — and is probed there first; the request salt is still
+        /// tried after it for rows this build or an older one wrote under it.
+        func saltsToProbe(boundary: Int) -> [String?] {
+            guard let prefix = mediaIndependentPrefix, boundary <= prefix.tokenCount,
+                  prefix.salt != mediaSalt
+            else { return [mediaSalt] }
+            return [prefix.salt, mediaSalt]
+        }
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 FileHandle.standardError.write(Data(
@@ -869,14 +882,24 @@ public final class CacheCoordinator: @unchecked Sendable {
         // DSV4 via `LayerKind.deepseekV4` — would never get consulted.
         let skipPaged = isPagedIncompatible
 
-        // Tier 1: Paged cache (in-memory)
+        // Tier 1: Paged cache (in-memory). The request salt is probed over
+        // the whole prompt; a media-independent prefix is then probed under
+        // its own salt over just that prefix (its rows carry the text salt).
+        var pagedProbes: [(tokens: [Int], salt: String?)] = [(tokens, mediaSalt)]
+        if let prefix = mediaIndependentPrefix, prefix.salt != mediaSalt,
+           prefix.tokenCount > 0, prefix.tokenCount <= tokens.count
+        {
+            pagedProbes.append((Array(tokens.prefix(prefix.tokenCount)), prefix.salt))
+        }
+        for probe in pagedProbes {
         if !skipPaged,
            let pagedCache,
-           let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
+           let result = pagedCache.fetchPrefix(tokens: probe.tokens, mediaSalt: probe.salt)
         {
+            let probeSalt = probe.salt
             var matchedBlocks = result.blocks
             var matchedTokens = result.matchedTokens
-            var remainingTokens = result.remainingTokens
+            var remainingTokens = Array(tokens.dropFirst(matchedTokens))
             var ssmStates: [MLXArray]? = nil
             var canUsePagedHit = true
 
@@ -902,7 +925,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 ssmStates = fetchCompleteSSMStates(
                     tokens: tokens,
                     boundary: matchedTokens,
-                    mediaSalt: mediaSalt
+                    mediaSalt: probeSalt
                 )
                 if ssmStates?.isEmpty ?? true {
                     release(blocks: matchedBlocks)
@@ -921,6 +944,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 )
             }
         }
+        }
 
         // Tier 2: Disk cache.
         //
@@ -936,12 +960,21 @@ public final class CacheCoordinator: @unchecked Sendable {
             func diskHit(boundary: Int) -> CacheFetchResult? {
                 guard boundary > 0, boundary <= tokens.count else { return nil }
                 let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
+                for probeSalt in saltsToProbe(boundary: boundary) {
+                    if let hit = diskHit(boundary: boundary, prefix: prefix, probeSalt: probeSalt) {
+                        return hit
+                    }
+                }
+                return nil
+            }
+            func diskHit(boundary: Int, prefix: [Int], probeSalt: String?) -> CacheFetchResult? {
+                let saltTag = probeSalt == mediaSalt ? "" : " salt=text-only"
                 // A deserializable KV payload is only a candidate until
                 // architecture-specific companion state is validated below.
                 // Do not make rejected hybrid candidates hot: no recency
                 // touch and no hit until one is accepted.
                 let arrays: [String: MLXArray]
-                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: mediaSalt) {
+                switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: probeSalt) {
                 case .arrays(let found):
                     arrays = found
                 case .miss:
@@ -951,28 +984,28 @@ public final class CacheCoordinator: @unchecked Sendable {
                     // aggregate "MISS all tiers" was ever traced, which cannot
                     // tell those apart — and a silent companion veto has
                     // already cost a whole family (LFM2.5) its cache once.
-                    ftrace("probe boundary=\(boundary) noRow")
+                    ftrace("probe boundary=\(boundary) noRow\(saltTag)")
                     return nil
                 case .restoreRejectedEarlier:
                     // See `reportDiskRestoreRejected`: serving it again would
                     // end in the same full prefill, with a shorter entry that
                     // does restore still waiting behind it.
-                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier")
+                    ftrace("probe boundary=\(boundary) skipped: restore was rejected earlier\(saltTag)")
                     return nil
                 }
                 let ssmStates = resolveSSMStates(
                     forTokens: prefix,
                     boundary: boundary,
                     diskArrays: arrays,
-                    mediaSalt: mediaSalt,
+                    mediaSalt: probeSalt,
                     chainId: chainId)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     touchSuccessfulDiskRestore(
                         matchedTokens: prefix,
                         matchedBoundary: boundary,
-                        mediaSalt: mediaSalt,
+                        mediaSalt: probeSalt,
                         chainId: chainId)
-                    ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
+                    ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
                     return .hit(
                         matchedTokens: boundary,
                         remainingTokens: Array(tokens.dropFirst(boundary)),
@@ -984,7 +1017,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
                 ftrace(
                     "probe boundary=\(boundary) rowFound but companion REJECTED "
-                        + "ssm=\(ssmStates?.count ?? -1)")
+                        + "ssm=\(ssmStates?.count ?? -1)\(saltTag)")
                 return nil
             }
 
@@ -1119,11 +1152,23 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         boundary: Int,
         mediaSalt: String?,
-        reason: String
+        reason: String,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) {
         guard let diskCache, boundary > 0, boundary <= tokens.count else { return }
         let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
-        let marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: mediaSalt)
+        // The served row sits under whichever salt `fetch` probed for this
+        // boundary; marking a key with no served payload changes nothing.
+        var salts: [String?] = [mediaSalt]
+        if let textPrefix = mediaIndependentPrefix, boundary <= textPrefix.tokenCount,
+           textPrefix.salt != mediaSalt
+        {
+            salts.insert(textPrefix.salt, at: 0)
+        }
+        var marked = false
+        for salt in salts where !marked {
+            marked = diskCache.markRestoreRejected(tokens: prefix, mediaSalt: salt)
+        }
         if marked || ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             // Said once per payload: it explains a full prefill after a hit.
             FileHandle.standardError.write(Data(
@@ -1293,7 +1338,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         matchedTokenCount: Int,
         preferredDiskBoundaries: [Int],
         skipExactDiskBoundary: Bool,
-        mediaSalt: String?
+        mediaSalt: String?,
+        mediaIndependentPrefix: MediaIndependentPrefix? = nil
     ) {
         guard let diskCache,
               matchedTokenCount > 0,
@@ -1313,15 +1359,18 @@ public final class CacheCoordinator: @unchecked Sendable {
             let tokens = boundary == requestTokens.count
                 ? requestTokens
                 : Array(requestTokens.prefix(boundary))
+            let boundarySalt = mediaIndependentPrefix.flatMap { prefix in
+                boundary <= prefix.tokenCount ? prefix.salt : nil
+            } ?? mediaSalt
             let touchedKV = diskCache.touchRecency(
                 tokens: tokens,
-                mediaSalt: mediaSalt,
+                mediaSalt: boundarySalt,
                 at: recency)
             if touchedKV, isHybrid {
                 _ = ssmStateCache.diskStore?.touchRecency(
                     tokens: tokens,
                     boundary: boundary,
-                    mediaSalt: mediaSalt,
+                    mediaSalt: boundarySalt,
                     at: recency)
             }
         }

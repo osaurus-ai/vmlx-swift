@@ -158,6 +158,16 @@ struct BatchSlot {
     /// traffic can cache-hit without colliding with other modes/media.
     let mediaSalt: String?
 
+    /// Per-boundary salts (``CacheBoundarySaltPlan``), set once the prefill
+    /// lookup token space is known. Nil until then: every boundary uses
+    /// `mediaSalt`.
+    var cacheSaltPlan: CacheBoundarySaltPlan? = nil
+
+    /// The salt a prompt boundary of `tokenCount` tokens is keyed under.
+    func cacheSalt(forBoundary tokenCount: Int) -> String? {
+        cacheSaltPlan?.salt(forBoundary: tokenCount) ?? mediaSalt
+    }
+
     /// Compiled forward closure captured when this slot's cache is promoted
     /// to `CompilableKVCache` layers. Stage 1B.3 sets this for the solo
     /// slot in a `maxBatchSize == 1` engine when

@@ -207,7 +207,17 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
 /// - identical scope + different media → different salt (false-positive
 ///   protection that already existed via `computeMediaSalt`).
 public func computeCacheSalt(for input: LMInput) -> String? {
-    let media = computeMediaSalt(for: input)
+    computeCacheSalt(for: input, includingMedia: true)
+}
+
+/// `includingMedia: false` is the salt the same request would carry with no
+/// image/video/audio attached — scope only — which is what the media-
+/// independent prefix of a media request is keyed under (see
+/// ``CacheBoundarySaltPlan``). It is byte-identical to the salt a text-only
+/// turn with the same scope computes, by construction: the same function
+/// with the media component absent.
+public func computeCacheSalt(for input: LMInput, includingMedia: Bool) -> String? {
+    let media = includingMedia ? computeMediaSalt(for: input) : nil
     let scope = input.cacheScopeSalt
     if media == nil && scope == nil { return nil }
 
@@ -232,7 +242,15 @@ public func computeCacheSalt(for input: LMInput) -> String? {
 /// caps, or a previous serializer contract must not be restored into a request
 /// using different cache semantics.
 public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters) -> String? {
-    let base = computeCacheSalt(for: input)
+    computeCacheSalt(for: input, parameters: parameters, includingMedia: true)
+}
+
+/// See `computeCacheSalt(for:includingMedia:)`: with `includingMedia: false`
+/// the result equals the salt of the same request without its media.
+public func computeCacheSalt(
+    for input: LMInput, parameters: GenerateParameters, includingMedia: Bool
+) -> String? {
+    let base = computeCacheSalt(for: input, includingMedia: includingMedia)
     let policy = cachePolicySalt(for: parameters)
 
     var hasher = SHA256()
@@ -252,7 +270,9 @@ public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters)
         // names the differing field directly instead of leaving two opaque
         // digests to stare at.
         let scopeDesc = input.cacheScopeSalt ?? "nil"
-        let mediaDesc = computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil"
+        let mediaDesc = includingMedia
+            ? (computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil")
+            : "excluded"
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
                 + "scope=\(scopeDesc) media=\(mediaDesc)\n").utf8))

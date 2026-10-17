@@ -1795,6 +1795,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// colliding with other modes/media.
     let mediaSalt: String?
 
+    /// The salt each prompt boundary is keyed under (``CacheBoundarySaltPlan``).
+    /// Every boundary uses `mediaSalt` unless the model declares the state
+    /// before the first media token media-independent, in which case the
+    /// boundaries at or before that token use the text-only salt.
+    let cacheSaltPlan: CacheBoundarySaltPlan
+
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
 
@@ -1840,6 +1846,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheInitParameters = parameters
         self.promptCacheSnapshot = nil
         self.mediaSalt = nil
+        self.cacheSaltPlan = CacheBoundarySaltPlan(requestSalt: nil)
 
         self.promptPrefillTime = try measure {
             let promptInput = LMInput(text: y)
@@ -1975,6 +1982,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                 "TokenIterator: resolved post-prepare cache-key alias for \(rawCount) raw tokens -> \(effectiveCount) effective tokens"
             )
         }
+        // Per-boundary salts, computed in the token space the probe uses.
+        self.cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
+            model: model, parameters: effectiveParameters)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1",
+           let prefix = cacheSaltPlan.mediaIndependentPrefix
+        {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/salt] media-independent prefix tokens=\(prefix.tokenCount)"
+                    + " salt=\(prefix.salt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
+        }
 
         if let coordinator = cacheCoordinator,
            !cacheLookupTokenIds.isEmpty,
@@ -2014,8 +2032,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            // A model that declares its exact-prefix restore suffix-independent
+            // keeps the ordinary longest-prefix fetch under a forced tool
+            // selection; the skip below was the whole-prompt re-prefill of
+            // every tool_choice=required turn on Nemotron 3.5 (19,373 tokens,
+            // 33.9 s, with the previous turn's boundary on disk).
+            let suffixIndependentRestore = (model as? PrefixCacheInvariantModel)?
+                .exactPrefixRestoreIsSuffixIndependent == true
             if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore
-                && !cacheRestoreIsExactPrefix(self.cache)
+                && !cacheRestoreIsExactPrefix(self.cache) && !suffixIndependentRestore
             {
                 let structuralBoundary = input.cachePrefixTokenCounts
                     .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()
@@ -2049,7 +2074,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput
                         .cacheStablePrefixTokenCounts,
-                    chainId: parameters.cacheChainId)
+                    chainId: parameters.cacheChainId,
+                    mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                 switch result {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
@@ -2143,7 +2169,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "payload does not fit the runtime cache")
+                            reason: "payload does not fit the runtime cache",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
 
@@ -2159,7 +2186,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "restored offsets do not match the boundary")
+                            reason: "restored offsets do not match the boundary",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                     restored = false
                     retainedDiskRestore = false
@@ -2170,8 +2198,19 @@ public struct TokenIterator: TokenIteratorProtocol {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let unsafePartial =
+                    // A hit at or before the first media token of a model that
+                    // declares its pre-media state media-independent resumes
+                    // with the media carried into the suffix; every other hit
+                    // whose suffix still holds a placeholder rolls back. Live
+                    // on Nemotron 3.5 Bolt the roll-back followed EVERY image
+                    // turn's restore (the 4,315-token seed was restored, then
+                    // all 17,829 tokens were prefilled, 31.5 s), so the salt
+                    // fix alone would not have reused anything.
+                    let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                        input: input, remainingTokens: remainingTokens,
+                        matchedTokens: matchedTokens, plan: cacheSaltPlan)
                     // Only standalone rotating / sliding-window caches (Gemma,
                     // Mistral SWA) are PROVEN to restore exactly and take the
                     // standard trim-last-token + re-feed fast path on a full hit
@@ -2198,7 +2237,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                            let seedSSM = coordinator.ssmStateCache.fetchEntry(
                                 tokens: cacheLookupTokenIds,
                                 boundary: seedBoundary,
-                                mediaSalt: mediaSalt,
+                                mediaSalt: cacheSaltPlan.salt(forBoundary: seedBoundary),
                                 requireComplete: true)?.states
                         {
                             let cacheOffset = self.cache.first?.offset ?? promptLen
@@ -2256,6 +2295,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: lastToken),
                                 image: nil, video: nil)
+                        } else if suffixHoldsMedia {
+                            inputForPrepare = mediaCarryingSuffixInput(
+                                from: input, remainingTokens: remainingTokens,
+                                matchedTokens: matchedTokens)
                         } else {
                             let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                                 .expandedDimensions(axis: 0)
@@ -2273,7 +2316,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
                             skipExactDiskBoundary: requiresDiskBackedRestore,
-                            mediaSalt: mediaSalt)
+                            mediaSalt: mediaSalt,
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
                 case .miss:
@@ -2380,7 +2424,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 .filter { $0 > 1 && $0 < strip }
                 .map { $0 - 1 }
                 .filter { !coordinator.hasDurableDiskEntry(
-                    tokens: Array(self.promptTokenIds.prefix($0)), mediaSalt: self.mediaSalt) }
+                    tokens: Array(self.promptTokenIds.prefix($0)),
+                    mediaSalt: self.cacheSaltPlan.salt(forBoundary: $0)) }
         } else { canonicalTargets = [] }
         let canonicalCapture = CanonicalStablePrefillCapture(
             input: input, promptTokens: self.promptTokenIds, cache: self.cache,
@@ -2608,6 +2653,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheInitParameters = nil
         self.promptCacheSnapshot = nil
         self.mediaSalt = nil
+        self.cacheSaltPlan = CacheBoundarySaltPlan(requestSalt: nil)
 
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
@@ -2956,7 +3002,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 .filter { boundary in
                     boundary > alreadyConsumed && boundary < segmentEnd
                         && !(cacheCoordinator?.hasDurableDiskEntry(
-                            tokens: Array(promptTokenIds.prefix(boundary)), mediaSalt: mediaSalt) ?? false)
+                            tokens: Array(promptTokenIds.prefix(boundary)),
+                            mediaSalt: cacheSaltPlan.salt(forBoundary: boundary)) ?? false)
                 }.sorted()
         } else {
             // Preserve the pre-existing final-suffix partition exactly.
@@ -3493,7 +3540,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 perLayerData: perLayerData,
                 ssmStates: ssmCapture,
                 cache: diskStoreCache,
-                mediaSalt: mediaSalt,
+                // A boundary at or before the first media token is keyed under
+                // the text-only salt so later text turns and other-image turns
+                // of this chat reuse it; later boundaries keep the media salt.
+                mediaSalt: cacheSaltPlan.salt(forBoundary: tokens.count),
                 chainId: cacheInitParameters?.cacheChainId,
                 isStableRoot: isStableBoundary,
                 isResumeBoundary: isResumeBoundary,
@@ -3665,7 +3715,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // `rederive-failed ... CancellationError()`.
                     if coordinator.hasDurableDiskEntry(
                         tokens: boundaryTokens,
-                        mediaSalt: mediaSalt)
+                        mediaSalt: cacheSaltPlan.salt(forBoundary: boundaryTokens.count))
                     {
                         Self.logger.debug(
                             "TokenIterator: skipped already-durable cache boundary at \(boundary, privacy: .public) tokens (stable=\(isStableBoundary, privacy: .public))"
