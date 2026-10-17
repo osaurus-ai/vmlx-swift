@@ -1256,8 +1256,11 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(batchSource.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
         #expect(!batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
         #expect(batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
-        #expect(batchSource.contains(
-            "slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection"))
+        // The policy is consulted through `requiredToolSelectionSkipsDiskBackedRestore`
+        // (PrefixCacheInvariants.swift), which keeps the skip for every model that
+        // does not declare `exactPrefixRestoreIsSuffixIndependent`.
+        #expect(batchSource.contains("requiredToolSelectionSkipsDiskBackedRestore("))
+        #expect(batchSource.contains("restorePolicy: slot.originalInput.cacheRestorePolicy)"))
         #expect(batchSource.contains(
             "skipped disk-backed required-tool cache restore; caller requested fresh tool selection"))
         #expect(batchSource.contains("Skipped disk-backed tool prompt seed boundary"))
@@ -1267,6 +1270,7 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(evaluateSource.contains("TokenIterator: skipped disk-backed required-tool cache restore"))
         #expect(evaluateSource.contains(
             "requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore"))
+        #expect(evaluateSource.contains("&& !suffixIndependentRestore"))
     }
 
     @Test("KV policy changes dynamic cache salt")

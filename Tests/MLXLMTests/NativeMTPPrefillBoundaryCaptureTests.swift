@@ -117,26 +117,104 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
                        [Float(NativeBoundaryRecordingModel.state(after: prefix)), Float(prefix.count)], file: file, line: line)
     }
 
-    func testCanonicalCapturePrecedesEarlierStableBoundaryAndOnlyStableReplaysAtStore() throws {
+    func testStableSeedAndCanonicalBoundaryAreCapturedInsideThePrefillHeadWithoutReplayAtStore() throws {
         let lock = lockSerializedMLXTest(); defer { lock.unlock() }
         for step in [3, 512] {
             let model = NativeBoundaryRecordingModel()
             let prompt = stable + user + suffix
+            let disk = coordinator()
             var iterator = try NativeMTPTokenIterator(input: input(prompt), model: model,
-                parameters: parameters(step: step), depth: 1, cacheCoordinator: coordinator())
+                parameters: parameters(step: step), depth: 1, cacheCoordinator: disk)
             XCTAssertEqual(Array(model.forwarded.prefix(prompt.count)), prompt)
             XCTAssertEqual(model.forwarded.count, prompt.count + 1)
-            // AR captures the canonical strip first, without introducing a
-            // single-row forward at the earlier stable N-1 checkpoint.
-            XCTAssertEqual(model.forwardLengths, step == 3 ? [3, 3, 3, 3, 3, 1] : [12, 3, 1])
-            XCTAssertNil(iterator.prefillBoundarySnapshots[stable.count - 1])
+            // Same segmentation as the AR iterator's stable-head capture: the
+            // head splits once at the stable N-1 seed (4) and once at the
+            // canonical boundary (12). No single-row forward is introduced —
+            // N itself (5) is not captured — and every token is still
+            // forwarded exactly once, in order.
+            XCTAssertEqual(model.forwardLengths, step == 3 ? [3, 1, 3, 3, 2, 3, 1] : [4, 8, 3, 1])
+            XCTAssertEqual(Set(iterator.prefillBoundarySnapshots.keys), Set([stable.count - 1, stable.count + user.count]))
+            assertSnapshot(iterator.prefillBoundarySnapshots[stable.count - 1], prefix: Array(stable.dropLast()))
             assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
             let before = model.forwarded.count
             iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
-            // The earlier stable seed retains its old replay path. Canonical
-            // persistence must reuse the checkpoint, never replay its 12 tokens.
-            XCTAssertEqual(Array(model.forwarded.dropFirst(before)), Array(stable.dropLast()))
+            // The terminal store consumes both captured snapshots; nothing is
+            // replayed through the model after generation.
+            XCTAssertEqual(Array(model.forwarded.dropFirst(before)), [])
+            let salt = computeCacheSalt(for: input(prompt), parameters: parameters(step: step))
+            XCTAssertTrue(disk.hasDurableDiskEntry(tokens: Array(stable.dropLast()), mediaSalt: salt),
+                          "the stable N-1 seed must reach disk from the captured snapshot")
+            XCTAssertTrue(disk.hasDurableDiskEntry(tokens: stable + user, mediaSalt: salt),
+                          "the canonical boundary must reach disk from the captured snapshot")
+            // Exactly one disk store per boundary: the seed from the history
+            // loop and the canonical boundary from the stripped store. The
+            // history loop must not store the canonical boundary as well.
+            XCTAssertEqual(disk.snapshotStats().diskStats?.stores, 2)
+            XCTAssertEqual(disk.snapshotStats().diskStats?.storeSkips, 0)
         }
+    }
+
+    func testAlreadyDurableStableSeedIsNotCapturedAndNotReplayed() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let prompt = stable + user + suffix
+        let disk = coordinator()
+        disk.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+        let salt = computeCacheSalt(for: input(prompt), parameters: parameters(step: 512))
+        let seedTokens = Array(stable.dropLast())
+        let seedModel = NativeBoundaryRecordingModel()
+        let seedCache = seedModel.newCache(parameters: parameters())
+        _ = seedModel.nativeBackboneForward(
+            MLXArray(seedTokens.map(Int32.init)).reshaped(1, seedTokens.count), cache: seedCache)
+        MLX.eval(seedCache)
+        disk.storeAfterGeneration(promptTokens: seedTokens, perLayerData: [nil],
+            ssmStates: extractSSMStates(from: seedCache), cache: seedCache, mediaSalt: salt, isStableRoot: true)
+        XCTAssertTrue(disk.hasDurableDiskEntry(tokens: seedTokens, mediaSalt: salt))
+
+        // The forced-fresh policy keeps the durable seed from being restored,
+        // so the cold head still crosses it and the capture decision is the
+        // only thing under test.
+        let fresh = LMInput(tokens: MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count),
+            tokenIds: prompt, cachePrefixTokenCounts: [stable.count, prompt.count - suffix.count],
+            cacheStablePrefixTokenCounts: [stable.count], cacheRestorePolicy: .freshRequiredToolSelection)
+        let model = NativeBoundaryRecordingModel()
+        var iterator = try NativeMTPTokenIterator(input: fresh, model: model,
+            parameters: parameters(step: 512), depth: 1, cacheCoordinator: disk)
+        // A durable seed is not worth a retained copy: the head stays one
+        // segment up to the canonical boundary, exactly as before.
+        XCTAssertEqual(model.forwardLengths, [12, 3, 1])
+        XCTAssertNil(iterator.prefillBoundarySnapshots[stable.count - 1])
+        assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
+        let before = model.forwarded.count
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(Array(model.forwarded.dropFirst(before)), [],
+                       "a validated durable seed is skipped by the store loop, never replayed")
+    }
+
+    func testStoreSeedsInsidePrefillHeadRule() {
+        // Recurrent topology: the seed is N-1; seeds at/below the restored
+        // prefix and at/above the head end are left to their own paths
+        // (5770 is the whole prompt; 5000's seed 4999 is still inside the
+        // head that ends at 5000).
+        let seeds = NativeMTPTokenIterator.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: [1, 5, 2229, 4316, 5000, 5770],
+            promptTokenCount: 5770, restored: 0, headEnd: 5000,
+            requiresRecurrentSSMCompanion: true, isDurable: { _ in false })
+        XCTAssertEqual(seeds, Set([1, 4, 2228, 4315, 4999]))
+        // Durable seeds are excluded individually.
+        let partiallyDurable = NativeMTPTokenIterator.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: [2229, 4316], promptTokenCount: 5770, restored: 0,
+            headEnd: 5769, requiresRecurrentSSMCompanion: true, isDurable: { $0 == 2228 })
+        XCTAssertEqual(partiallyDurable, Set([4315]))
+        // A warm turn restored past the seeds captures nothing for them.
+        let warm = NativeMTPTokenIterator.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: [2229, 4316], promptTokenCount: 5770, restored: 4792,
+            headEnd: 5769, requiresRecurrentSSMCompanion: true, isDurable: { _ in false })
+        XCTAssertEqual(warm, [])
+        // Non-recurrent topologies store the exact boundary N.
+        let exact = NativeMTPTokenIterator.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: [2229, 4316], promptTokenCount: 5770, restored: 0,
+            headEnd: 5769, requiresRecurrentSSMCompanion: false, isDurable: { _ in false })
+        XCTAssertEqual(exact, Set([2229, 4316]))
     }
 
     func testLaterStableBoundariesCaptureNMinusOneAndNRegardlessOfValidatedDiskEntry() throws {
@@ -181,7 +259,7 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
             model: NativeBoundaryRecordingModel(), parameters: parameters(), depth: 1,
             cacheCoordinator: coordinator())
         while iterator.next() != nil {}
-        XCTAssertNil(iterator.prefillBoundarySnapshots[stable.count - 1])
+        assertSnapshot(iterator.prefillBoundarySnapshots[stable.count - 1], prefix: Array(stable.dropLast()))
         assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
     }
 

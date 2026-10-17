@@ -653,6 +653,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
             .flatMap(Int.init).map { Swift.max($0, 1) }
+            ?? (model as? any NativeMTPAdaptiveCeilingModel)?.nativeMTPAdaptiveDepthCeiling
             ?? (model as? any NativeMTPBlockDraftModel).flatMap {
                 $0.nativeMTPUsesBlockDrafts ? $0.nativeMTPBlockDraftDepthLimit : nil
             } ?? 5
@@ -731,9 +732,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             let result: CacheFetchResult
-            if requiresDiskBackedRestore,
-               input.cacheRestorePolicy == .freshRequiredToolSelection,
-               !cacheRestoreIsExactPrefix(self.cache)
+            if requiredToolSelectionSkipsDiskBackedRestore(
+                model: model, cache: self.cache, restorePolicy: input.cacheRestorePolicy)
             {
                 result = .miss
             } else {
@@ -1201,6 +1201,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 where boundary > 0 && boundary < promptTokenIds.count {
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    // Same canonical-boundary policy as the solo TokenIterator
+                    // loop: with a proven cross-turn strip boundary, the
+                    // non-stable message boundaries are either unproducible
+                    // for a path-dependent hybrid (no re-derive is allowed
+                    // for them, so `cacheSnapshotForBoundary` returns nil) or
+                    // the canonical boundary itself, which the stripped store
+                    // below persists. Storing it here as well copied and
+                    // evaluated the whole prompt cache a second time and ran
+                    // the full disk-store transaction again for an entry the
+                    // writer then deduplicated (one extra store + one skip
+                    // per turn in the app trace).
+                    if usesCanonicalHybridBoundary, !isStableBoundary {
+                        continue
+                    }
                     let storeBoundary = isStableBoundary
                         && coordinator.requiresRecurrentSSMCompanion && boundary > 1
                         ? boundary - 1
@@ -1521,10 +1535,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         // Match TokenIterator.prepare's segmentation: the canonical chat
-        // boundary comes first. Capturing an earlier stable N-1 first would
-        // introduce an extra single-row forward and change floating-point
-        // results relative to AR. Earlier stable snapshots keep their existing
-        // reconstruction path until both iterators share a capture policy.
+        // boundary is captured while the head prefill crosses it, and so are
+        // the stable system/tool seeds that sit INSIDE that head (the AR
+        // iterator's `prepareStableBoundarySegments(captureStoreSeedsOnly:)`).
+        // Only the seed the terminal store actually consumes is captured —
+        // N-1 for recurrent topologies, exactly as `storeCacheAfterGeneration`
+        // computes `storeBoundary` — so no single-row forward is introduced.
+        // Stable boundaries AFTER the canonical one keep their [N-1, N] tail
+        // capture. Before this the earlier seeds were left to the
+        // post-generation reconstruction, which replays each prefix through
+        // the model from token zero: measured in the app on Nemotron 3.5
+        // Super-VL (MTP lane) as 2.9 s for the 2,228-token system seed plus
+        // 5.7 s for the 4,315-token tool seed — an 8.6 s stall between the
+        // last streamed token and the end of the first turn of every chat,
+        // which the AR lane had already stopped paying on 2026-10-13.
         let stripAt = TokenIterator.hybridStripBoundaryIndex(
             coordinator: coordinator, promptTokenIds: promptTokenIds,
             input: originalInput, cache: cache)
@@ -1535,6 +1559,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 .filter { $0 > stableStart && $0 < promptTokenIds.count }
                 .flatMap { [$0 - 1, $0] }
         ).filter { $0 > stableStart }
+        // Seeds inside the head, before the canonical boundary. A seed that
+        // is already durable on disk is not captured: the store loop skips
+        // it, so a retained copy would only hold KV bytes through decode.
+        wanted.formUnion(Self.storeSeedsInsidePrefillHead(
+            stablePrefixTokenCounts: originalInput.cacheStablePrefixTokenCounts,
+            promptTokenCount: promptTokenIds.count,
+            restored: restored,
+            headEnd: stableStart,
+            requiresRecurrentSSMCompanion: coordinator.requiresRecurrentSSMCompanion,
+            isDurable: { count in
+                coordinator.hasDurableDiskEntry(
+                    tokens: Array(promptTokenIds.prefix(count)), mediaSalt: mediaSalt)
+            }))
         // Keep segmentation independent of whether an SSD entry already
         // exists, just as the AR iterator does.
         if let canonical { wanted.insert(canonical) }
@@ -1590,6 +1627,34 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         try Task.checkCancellation()
         return try model.prepare(segment(consumed, size), cache: cache, windowSize: windowSize)
+    }
+
+    /// The stable-boundary seeds the terminal store will ask for that lie
+    /// strictly inside the prefill head `(restored, headEnd)`, so that the
+    /// head prefill can snapshot them in passing instead of replaying each
+    /// prefix after generation.
+    ///
+    /// One seed per stable boundary: N-1 when the topology needs a recurrent
+    /// seed (the same `storeBoundary` rule as `storeCacheAfterGeneration`),
+    /// otherwise N. Seeds at or before `restored` cannot be captured (prefill
+    /// never crosses them again); seeds at or after `headEnd` belong to the
+    /// canonical/tail capture. A seed already durable on disk is excluded —
+    /// the store loop skips it.
+    static func storeSeedsInsidePrefillHead(
+        stablePrefixTokenCounts: [Int],
+        promptTokenCount: Int,
+        restored: Int,
+        headEnd: Int,
+        requiresRecurrentSSMCompanion: Bool,
+        isDurable: (Int) -> Bool
+    ) -> Set<Int> {
+        Set(
+            stablePrefixTokenCounts
+                .filter { $0 > 0 && $0 < promptTokenCount }
+                .map { requiresRecurrentSSMCompanion && $0 > 1 ? $0 - 1 : $0 }
+        ).filter { seed in
+            seed > restored && seed < headEnd && !isDurable(seed)
+        }
     }
 
     /// Reloading a model drops the disk cache's in-process validation records.

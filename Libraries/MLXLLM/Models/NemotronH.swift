@@ -342,6 +342,141 @@ internal func nemotronHMambaDepthwiseDecodeConv(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Row-exact multi-row Mamba verify kernels
+
+/// Native-MTP verify rows through the Mamba conv and SSM step in ONE launch each, with every row
+/// running exactly the single-row decode statements of `nemotron_h_mamba_depthwise_decode_conv` /
+/// `ssm_kernel` (SSM.swift). The per-row path ran R conv + R SSM launches per layer and read and wrote
+/// the full recurrent state (128 x 64 x 128 fp32 = 4 MB on Super-VL) once per row; here the window
+/// and the state stay in registers between rows (the state is re-read as its stored dtype, as the next
+/// single-row step would), and only each row's state is written for staged partial accepts.
+/// Batch 1 only (verify). `VMLX_NEMOTRON_FUSED_VERIFY_MAMBA=0` keeps the per-row launches.
+enum NemotronHMambaRowsKernels {
+    static let enabled =
+        ProcessInfo.processInfo.environment["VMLX_NEMOTRON_FUSED_VERIFY_MAMBA"] != "0"
+
+    static let conv: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "nemotron_h_mamba_depthwise_conv_rows",
+        inputNames: ["input", "state", "weight", "bias"],
+        outputNames: ["out"],
+        source: """
+            auto c = thread_position_in_grid.x;
+            if (c >= C) {
+                return;
+            }
+            auto weight_base = c * K;
+            T window[K > 1 ? K - 1 : 1];
+            for (int k = 0; k < K - 1; ++k) {
+                window[k] = state[k * C + c];
+            }
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0;
+                for (int k = 0; k < K - 1; ++k) {
+                    acc += static_cast<float>(window[k])
+                        * static_cast<float>(weight[weight_base + k]);
+                }
+                T in_v = input[r * C + c];
+                acc += static_cast<float>(in_v)
+                    * static_cast<float>(weight[weight_base + K - 1]);
+                T value = static_cast<T>(static_cast<T>(acc) + bias[c]);
+                auto tail = 1 / (1 + metal::precise::exp(metal::abs(value)));
+                T sigmoid = (value < 0) ? tail : 1 - tail;
+                out[r * C + c] = value * sigmoid;
+                for (int k = 0; k < K - 2; ++k) {
+                    window[k] = window[k + 1];
+                }
+                if (K > 1) {
+                    window[K - 2] = in_v;
+                }
+            }
+            """)
+
+    static let ssm: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "nemotron_h_ssm_rows",
+        inputNames: ["X", "A_log", "B", "C", "D", "dt", "state_in"],
+        outputNames: ["out", "states_out"],
+        source: """
+            auto n = thread_position_in_grid.z;
+            auto h_idx = n % H;
+            auto g_idx = n / G;
+            constexpr int n_per_t = Ds / 32;
+            auto ds_idx = thread_position_in_threadgroup.x;
+            auto d_idx = thread_position_in_grid.y;
+            auto i_state = state_in + n * Dh * Ds;
+            auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+            float st[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+                st[i] = i_state[d_idx * Ds + n_per_t * ds_idx + i];
+            }
+            for (int r = 0; r < R; ++r) {
+                auto x = X + (r * H + n) * Dh;
+                auto C_ = C + (r * HB + g_idx) * Ds;
+                auto B_ = B + (r * HB + g_idx) * Ds;
+                auto o_state = states_out + (r * H + n) * Dh * Ds;
+                auto dt_ = static_cast<float>(dt[r * H + n]);
+                auto dA = fast::exp(A * dt_);
+                float acc = 0.0;
+                auto x_ = static_cast<float>(x[d_idx]);
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    auto idx = d_idx * Ds + s_idx;
+                    auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    auto state = dA * st[i] + dB_by_x;
+                    U stored = static_cast<U>(state);
+                    o_state[idx] = stored;
+                    st[i] = stored;
+                    acc += state * C_[s_idx];
+                }
+                acc = simd_sum(acc);
+                if (thread_index_in_simdgroup == 0) {
+                    out[(r * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+                }
+            }
+            """)
+
+    /// conv rows: `input` [1, R, C], `state` [1, K-1, C] -> [1, R, C] (SiLU applied).
+    static func convRows(
+        input: MLXArray, state: MLXArray, weight: MLXArray, bias: MLXArray, channels: Int,
+        kernelSize: Int
+    ) -> MLXArray? {
+        guard enabled, !nemotronHMambaConvFastPathDisabled(), input.dim(0) == 1,
+            state.dim(0) == 1, state.dim(1) == kernelSize - 1, state.dim(2) == channels,
+            weight.dim(0) == channels, weight.dim(1) == kernelSize, bias.dim(0) == channels,
+            state.dtype == input.dtype
+        else { return nil }
+        let rows = input.dim(1)
+        return conv(
+            [input, state, weight, bias],
+            template: [("T", input.dtype), ("C", channels), ("K", kernelSize), ("R", rows)],
+            grid: (channels, 1, 1), threadGroup: (min(256, channels), 1, 1),
+            outputShapes: [[1, rows, channels]], outputDTypes: [input.dtype])[0]
+    }
+
+    /// SSM rows: hidden [1, R, H, Dh], B/C [1, R, G, Ds], dt [1, R, H] (raw) -> (y [1, R, H, Dh],
+    /// per-row states [R, 1, H, Dh, Ds]).
+    static func ssmRows(
+        hidden: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray, dt: MLXArray,
+        dtBias: MLXArray, state: MLXArray, timeStepLimit: (Float, Float)
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, hidden.ndim == 4, hidden.dim(0) == 1, state.ndim == 4, state.dim(0) == 1,
+            B.dim(-1) % 32 == 0
+        else { return nil }
+        let (_, rows, h, d) = hidden.shape4
+        let (hb, ds) = (B.dim(-2), B.dim(-1))
+        let dt = computeDt(dt, dtBias, timeStepLimit)
+        let outputs = ssm(
+            [hidden, ALog, B, C, D, dt, state],
+            template: [
+                ("T", hidden.dtype), ("U", state.dtype), ("Dh", d), ("Ds", ds), ("H", h),
+                ("G", h / hb), ("HB", hb), ("R", rows),
+            ],
+            grid: (32, d, h), threadGroup: (32, 8, 1),
+            outputShapes: [[1, rows, h, d], [rows] + state.shape],
+            outputDTypes: [hidden.dtype, state.dtype])
+        return (outputs[0], outputs[1])
+    }
+}
+
 // MARK: - Mamba2Mixer
 
 /// Row-exact native-MTP verification. `FlashVerificationScope` admits 2...8 rows on the verify
@@ -362,10 +497,23 @@ enum NemotronHRowExact {
         guard active(x, site: site) else { return module(x) }
         let rows = x.dim(1)
         if type(of: module) == QuantizedLinear.self, let q = module as? QuantizedLinear {
-            var y = quantizedMM(
-                x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis],
-                scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
-                transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            // Batched M = 1 per row: exact, but streams the weight once PER ROW.
+            func batched(_ input: MLXArray) -> MLXArray {
+                quantizedMM(
+                    input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis],
+                    scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
+                    transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode
+                ).reshaped(input.dim(0), -1)
+            }
+            let flat = x.reshaped(rows, x.dim(-1))
+            // Same per-row arithmetic with the weight streamed once for all rows (admitted
+            // bitwise against `batched` per shape; see RowExactAffineQMV).
+            var y =
+                (q.mode == .affine
+                    ? RowExactAffineQMV.project(
+                        flat, weight: q.weight, scales: q.scales, biases: q.biases,
+                        groupSize: q.groupSize, bits: q.bits, reference: batched)
+                    : nil) ?? batched(flat)
             if let bias = q.bias { y = y + bias }
             if y.dtype != x.dtype, x.dtype == .bfloat16 || x.dtype == .float16 {
                 y = y.asType(x.dtype)
@@ -654,15 +802,24 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let batch = convInput.dim(0)
         let committedConv = cache[0]
             ?? MLXArray.zeros([batch, max(0, convKernelSize - 1), convDim], dtype: convInput.dtype)
-        var convState = committedConv
-        var convRows: [MLXArray] = []
-        convRows.reserveCapacity(rows)
-        for r in 0 ..< rows {
-            let (out, next) = convStep(convInput[0..., r ..< (r + 1)], state: convState)
-            convRows.append(out)
-            convState = next
+        let convOutput: MLXArray
+        if let bias = conv1d.bias,
+            let fused = NemotronHMambaRowsKernels.convRows(
+                input: convInput, state: committedConv, weight: conv1d.weight, bias: bias,
+                channels: convDim, kernelSize: convKernelSize)
+        {
+            convOutput = fused
+        } else {
+            var convState = committedConv
+            var convRows: [MLXArray] = []
+            convRows.reserveCapacity(rows)
+            for r in 0 ..< rows {
+                let (out, next) = convStep(convInput[0..., r ..< (r + 1)], state: convState)
+                convRows.append(out)
+                convState = next
+            }
+            convOutput = concatenated(convRows, axis: 1)
         }
-        let convOutput = concatenated(convRows, axis: 1)
         let convSplits = split(
             convOutput, indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
             axis: -1)
@@ -677,7 +834,15 @@ internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
         var states: [MLXArray] = []
         ys.reserveCapacity(rows)
         states.reserveCapacity(rows)
-        for r in 0 ..< rows {
+        if let committed = state,
+            let (y, rowStates) = NemotronHMambaRowsKernels.ssmRows(
+                hidden: hidden, ALog: aLog, B: B, C: C, D: D.asType(hidden.dtype), dt: dtArray,
+                dtBias: dtBias, state: committed, timeStepLimit: timeStepLimit)
+        {
+            ys = [y]
+            states = (0 ..< rows).map { rowStates[$0] }
+        }
+        for r in 0 ..< (ys.isEmpty ? rows : 0) {
             let (y, next) = ssmUpdate(
                 hiddenStates: hidden[0..., r ..< (r + 1)], ALog: aLog,
                 B: B[0..., r ..< (r + 1)], C: C[0..., r ..< (r + 1)],
@@ -994,7 +1159,9 @@ internal class NemotronHMoEGate: Module {
             weight._updateInternal(upcast)
         }
         // Row-exact verify: the AR step's fp32 product is a GEMV; a multi-row GEMM reduces in a
-        // different order, so each verify row gets its own product.
+        // different order, so each verify row gets its own product. (A multi-row transcription of
+        // MLX's GEMVKernel streaming the weight once measured NO gain on Super-VL, 2026-10-17: the
+        // 8 MB [512, 4096] fp32 router stays cache-resident across the consecutive per-row GEMVs.)
         let gates: MLXArray
         if NemotronHRowExact.active(x, site: "router") {
             let w = weight.transposed()
@@ -1040,6 +1207,22 @@ internal class NemotronHSwitchMLP: Module, NemotronHSwitchMLPLayer {
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        // Row-exact verify: each expert's weights once for every verify row that selected it,
+        // per-pair arithmetic equal to the unsorted gather (RowExactGatherQMV).
+        if NemotronHRowExact.active(x, site: "moe"), indices.ndim == 3,
+            let q1 = fc1 as? QuantizedSwitchLinear, let q2 = fc2 as? QuantizedSwitchLinear
+        {
+            let rows = x.dim(1)
+            let topK = indices.dim(-1)
+            let flatIndices = indices.reshaped(-1)
+            if let h = q1.rowExactDedupGather(
+                x.reshaped(rows, x.dim(-1)), indices: flatIndices, xDivisor: topK, maxRun: rows),
+                let y = q2.rowExactDedupGather(
+                    relu2(h), indices: flatIndices, xDivisor: 1, maxRun: rows)
+            {
+                return y.reshaped(1, rows, topK, -1)
+            }
+        }
         // Row-exact verify keeps the unsorted gather: per-row bitwise equal to the AR step.
         let doSort = indices.size > 64 && !NemotronHRowExact.active(x, site: "moe")
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -2405,6 +2588,14 @@ extension NemotronHModel: NativeMTPAutoregressiveBackboneModel {
     ) -> NativeMTPForwardResult {
         nativeBackboneForward(inputs, cache: cache)
     }
+}
+
+/// Nemotron-H's exact verify costs 1.26x / 1.46x / 1.77x / 3.08x one AR step at 2 / 3 / 4 / 8 rows
+/// (Super-VL, 2026-10-17), and adaptive exploration past depth 3 measured slower than a fixed depth
+/// on both Super-VL (recursive head) and Bolt (LiLiCorr block drafts, adaptive-to-7 0.87-1.37x vs
+/// fixed d3 0.96-1.45x of AR, paired within rounds). Adaptive requests stay within depth 3.
+extension NemotronHModel: NativeMTPAdaptiveCeilingModel {
+    public var nativeMTPAdaptiveDepthCeiling: Int { 3 }
 }
 
 extension NemotronHModel: NativeMTPBlockDraftModel {
