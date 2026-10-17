@@ -27,6 +27,10 @@ public final class JANGHRelu2RoutedExpertLayer: Module, WeightedRoutedExpertLaye
     private let fc1Rotation: JANGHFormatContract.Rotation
     private let fc2Rotation: JANGHFormatContract.Rotation
     private let rowRotation = JANGHRowRotation()
+    /// Bitwise twins of fc1Decode / fc2Decode (JANGHRoutedFastDecode), used only once admitted.
+    private let fc1Fast: JANGHRoutedFastQMV?
+    private let fc2Fast: JANGHRoutedFastWeightedDown?
+    private let fastAdmission = JANGHDenseFastAdmission(enabled: JANGHRoutedFastDecode.enabled)
     private let inputDimensions: Int
     private let intermediateSize: Int
     public let supplementalWeightBytes: Int
@@ -55,6 +59,14 @@ public final class JANGHRelu2RoutedExpertLayer: Module, WeightedRoutedExpertLaye
         // 50.8 vs 56.5 tok/s, same clock), so the activation-dtype rotation stays.
         fc1Decode = try JANGHProjectionKernel(contract: banks.contract, module: parentModule + ".fc1")
         fc2Decode = try JANGHWeightedDownKernel(contract: banks.contract, module: parentModule + ".fc2")
+        fc1Fast = banks.contract.codebooks[fc1Projection.bits].flatMap {
+            JANGHRoutedFastDecode.eligible(k: inputDimensions, n: intermediateSize, bits: fc1Projection.bits)
+                ? JANGHRoutedFastQMV(bits: fc1Projection.bits, alpha: $0.alpha, beta: $0.beta) : nil
+        }
+        fc2Fast = banks.contract.codebooks[fc2Projection.bits].flatMap {
+            JANGHRoutedFastDecode.eligible(k: intermediateSize, n: inputDimensions, bits: fc2Projection.bits)
+                ? JANGHRoutedFastWeightedDown(bits: fc2Projection.bits, alpha: $0.alpha, beta: $0.beta) : nil
+        }
         fc1Prefill = try JANGHPrefillKernel(contract: banks.contract, module: parentModule + ".fc1")
         fc2Prefill = try JANGHPrefillKernel(contract: banks.contract, module: parentModule + ".fc2")
         self.inputDimensions = inputDimensions
@@ -97,11 +109,45 @@ public final class JANGHRelu2RoutedExpertLayer: Module, WeightedRoutedExpertLaye
     ) throws -> MLXArray {
         let routes = indices.dim(-1)
         if indices.size < 64 || forceDecode {
-            var hidden = try fc1Decode.project(
-                input, packed: fc1.packed, scales: fc1.scales, indices: indices)
+            var hidden: MLXArray
+            let fc1Key = "fc1|\(input.dtype)|\(input.dim(0))x\(routes)"
+            if let fc1Fast,
+                fastAdmission.admits(key: fc1Key, compare: {
+                    let x = fc1Rotation == .hadamard32 ? try fc1Decode.hadamard32(input) : input
+                    return (
+                        fc1Fast.project(x, packed: fc1.packed, scales: fc1.scales, indices: indices),
+                        try fc1Decode.project(
+                            input, packed: fc1.packed, scales: fc1.scales, indices: indices))
+                })
+            {
+                let x = fc1Rotation == .hadamard32 ? try fc1Decode.hadamard32(input) : input
+                hidden = fc1Fast.project(x, packed: fc1.packed, scales: fc1.scales, indices: indices)
+            } else {
+                hidden = try fc1Decode.project(
+                    input, packed: fc1.packed, scales: fc1.scales, indices: indices)
+            }
             hidden = relu2F32(hidden)
             if fc2Rotation == .hadamard32 {
                 hidden = try rowRotation(hidden, outputDType: .float32)
+            }
+            let prepared = hidden
+            let fc2Key = "fc2|\(outputDType)|\(input.dim(0))x\(routes)"
+            if let fc2Fast,
+                fastAdmission.admits(key: fc2Key, compare: {
+                    (
+                        fc2Fast.project(
+                            prepared, packed: fc2.packed, scales: fc2.scales, indices: indices,
+                            scores: scores, outputDType: outputDType),
+                        try fc2Decode.projectPreparedHidden(
+                            prepared, preparedBasis: fc2Rotation, packed: fc2.packed,
+                            scales: fc2.scales, indices: indices, scores: scores,
+                            outputDType: outputDType)
+                    )
+                })
+            {
+                return fc2Fast.project(
+                    prepared, packed: fc2.packed, scales: fc2.scales, indices: indices,
+                    scores: scores, outputDType: outputDType)
             }
             return try fc2Decode.projectPreparedHidden(
                 hidden, preparedBasis: fc2Rotation, packed: fc2.packed, scales: fc2.scales,
