@@ -172,8 +172,18 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
 
 public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAModel,
     TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
-    NemotronHBlockOutputTappable
+    NemotronHBlockOutputTappable, PrefixCacheInvariantModel
 {
+    // MARK: - PrefixCacheInvariantModel
+
+    /// Nemotron-H is Mamba2 + full attention without rotary positions + MoE,
+    /// all causal; image embeddings are spliced only at the `<image>`
+    /// placeholder positions (`spliceMultimodal`), and nothing before the
+    /// first placeholder reads the media. Every KV/SSM state strictly before
+    /// that token is therefore the text-only prompt's state, so the text
+    /// turns' prefix rows are reused by image turns and vice versa.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
 
