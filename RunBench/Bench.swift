@@ -612,6 +612,13 @@ struct Bench {
             try await runPrefillSweepBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_JANGH_ROUTED_MICRO"] ?? "0") == "1" {
+            for bits in [2, 3] {
+                for line in JANGHRoutedFastBench.run(bits: bits) { print(line) }
+                for line in JANGHRoutedFastBench.run(k: 2048, n: 1024, bits: bits) { print(line) }
+            }
+            return
+        }
         if (env["BENCH_KERNEL_MICRO"] ?? "0") == "1" {
             runKernelMicroBench()
             return
