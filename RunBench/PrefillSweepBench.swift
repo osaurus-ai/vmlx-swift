@@ -18,7 +18,9 @@ func runPrefillSweepBench(modelPath: String) async throws {
     let reps = Int(env["BENCH_PREFILL_REPS"] ?? "3") ?? 3
     let text = try String(contentsOfFile: env["BENCH_PREFILL_FILE"] ?? "", encoding: .utf8)
     let context = try await MLXLMCommon.loadModel(
-        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader())
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .osaurusProduction
+    ).0
     var input = UserInput(prompt: text)
     input.additionalContext = ["enable_thinking": false]
     let prepared = try await context.processor.prepare(input: input)
@@ -40,7 +42,10 @@ func runPrefillSweepBench(modelPath: String) async throws {
             logits = out.logits
         }
         MLX.eval(logits)
-        return CFAbsoluteTimeGetCurrent() - t0
+        let seconds = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "[PREFILL] run step=%d %.2f s", step, seconds))
+        fflush(stdout)
+        return seconds
     }
     _ = try prefill(steps.first ?? 512)
     var samples = [Int: [Double]]()

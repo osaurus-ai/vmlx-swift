@@ -305,6 +305,22 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         languageModel.callAsFunction(inputs, cache: cache)
     }
 
+    /// Text prefill chunk: the caller's value, except the library default
+    /// (`GenerateParameters.prefillStepSize` = 512, indistinguishable from "unset"), which becomes 2,048.
+    /// Measured on M5 Max, 5,506-token prompt, cold cache, interleaved x3 (RunBench BENCH_PREFILL_SWEEP):
+    /// Super-VL 451 / 508 / 550 / 577 tok/s and Bolt 568 / 625 / 656 / 670 tok/s at 512 / 1,024 / 2,048 /
+    /// 4,096. 2,048 keeps most of the gain (+22 % / +15 %) at half the transient chunk activations of 4,096
+    /// (Bolt targets 32-48 GB Macs) and matches the vMLX Python app's step. The SSM scan chunks itself, so
+    /// the O(L^2) segsum the chunking guards against stays bounded. `VMLX_NEMOTRON_PREFILL_STEP=<n>`
+    /// overrides both.
+    static func prefillStep(requested: Int?) -> Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_NEMOTRON_PREFILL_STEP"], let n = Int(raw), n > 0 {
+            return n
+        }
+        guard let requested, requested != 512 else { return 2048 }
+        return requested
+    }
+
     /// VLM prepare — accepts LMInput with text + optional image / video /
     /// audio. Each non-text modality gets encoded by its tower and
     /// spliced into the token-embedding sequence at its placeholder
@@ -354,7 +370,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             // instead of O(prompt_length²). We always return `.logits` so
             // the BatchEngine never re-axises this output and the .newAxis
             // trap stays dodged.
-            let prefillStepSize = windowSize ?? 512
+            let prefillStepSize = Self.prefillStep(requested: windowSize)
             let tokensShape = input.text.tokens.shape
             if tokensShape.count >= 2 && tokensShape[0] != 1 {
                 fatalError(
