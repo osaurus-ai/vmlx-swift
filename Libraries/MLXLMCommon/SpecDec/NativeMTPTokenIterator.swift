@@ -732,9 +732,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             let result: CacheFetchResult
-            if requiresDiskBackedRestore,
-               input.cacheRestorePolicy == .freshRequiredToolSelection,
-               !cacheRestoreIsExactPrefix(self.cache)
+            if requiredToolSelectionSkipsDiskBackedRestore(
+                model: model, cache: self.cache, restorePolicy: input.cacheRestorePolicy)
             {
                 result = .miss
             } else {

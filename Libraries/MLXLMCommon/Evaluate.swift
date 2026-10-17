@@ -2032,8 +2032,15 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            // A model that declares its exact-prefix restore suffix-independent
+            // keeps the ordinary longest-prefix fetch under a forced tool
+            // selection; the skip below was the whole-prompt re-prefill of
+            // every tool_choice=required turn on Nemotron 3.5 (19,373 tokens,
+            // 33.9 s, with the previous turn's boundary on disk).
+            let suffixIndependentRestore = (model as? PrefixCacheInvariantModel)?
+                .exactPrefixRestoreIsSuffixIndependent == true
             if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore
-                && !cacheRestoreIsExactPrefix(self.cache)
+                && !cacheRestoreIsExactPrefix(self.cache) && !suffixIndependentRestore
             {
                 let structuralBoundary = input.cachePrefixTokenCounts
                     .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()

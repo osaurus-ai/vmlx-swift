@@ -29,6 +29,17 @@ public protocol PrefixCacheInvariantModel: AnyObject {
     /// Must be false for M-RoPE families (Qwen-VL class) and for any model
     /// whose pre-media positions or states depend on the media.
     var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { get }
+
+    /// The cache state restored from an exact token-prefix row is the state a
+    /// cold prefill of those tokens produces, whatever the request appends
+    /// after the prefix: recurrent state included, and independent of the
+    /// suffix the request will prefill next (a forced tool-selection tail is
+    /// just another suffix).
+    ///
+    /// When true, `CacheRestorePolicy.freshRequiredToolSelection` keeps the
+    /// ordinary longest-prefix restore for this model's disk-backed topology
+    /// instead of skipping the cache fetch and prefilling the whole prompt.
+    var exactPrefixRestoreIsSuffixIndependent: Bool { get }
 }
 
 /// A prefix of the lookup token list whose rows may be keyed under a salt
@@ -165,4 +176,22 @@ public func mediaCarryingSuffixInput(
         cachePromptIntent: input.cachePromptIntent, cacheRestorePolicy: input.cacheRestorePolicy,
         toolSchemas: input.toolSchemas,
         canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+}
+
+/// Whether `CacheRestorePolicy.freshRequiredToolSelection` must skip the
+/// disk-backed restore for this model and cache, or may keep the ordinary
+/// longest-prefix fetch. The skip was introduced for topologies whose
+/// path-dependent restore had no proof; a model that declares
+/// ``PrefixCacheInvariantModel/exactPrefixRestoreIsSuffixIndependent`` carries
+/// that proof and keeps reuse. Exact-prefix caches never skipped.
+public func requiredToolSelectionSkipsDiskBackedRestore(
+    model: any LanguageModel,
+    cache: [any KVCache],
+    restorePolicy: LMInput.CacheRestorePolicy
+) -> Bool {
+    guard restorePolicy == .freshRequiredToolSelection,
+          cacheRequiresDiskBackedCoordinatorRestore(cache),
+          !cacheRestoreIsExactPrefix(cache)
+    else { return false }
+    return (model as? PrefixCacheInvariantModel)?.exactPrefixRestoreIsSuffixIndependent != true
 }

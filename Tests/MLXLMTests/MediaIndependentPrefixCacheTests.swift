@@ -43,6 +43,7 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
 /// Declares both invariants, as NemotronHOmni does.
 private final class InvariantHybridModel: RecordingHybridModel, PrefixCacheInvariantModel, @unchecked Sendable {
     var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+    var exactPrefixRestoreIsSuffixIndependent: Bool { true }
 }
 
 final class MediaIndependentPrefixCacheTests: XCTestCase {
@@ -235,6 +236,60 @@ final class MediaIndependentPrefixCacheTests: XCTestCase {
                        "without the invariant the seed is only ever keyed under the image salt")
     }
 
+    // MARK: - Forced tool selection
+
+    func testRequiredToolSelectionRestoresTheLongestMessageBoundaryWhenDeclaredSuffixIndependent() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        for (declares, expectReuse) in [(true, true), (false, false)] {
+            let disk = coordinator()
+            let model: RecordingHybridModel = declares ? InvariantHybridModel() : RecordingHybridModel()
+            var first = try TokenIterator(input: textInput(), model: model, parameters: parameters(),
+                cacheCoordinator: disk)
+            first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            // The next prompt does NOT extend the previous raw prompt (its
+            // generation header is replaced by the rendered assistant turn),
+            // but shares the 12-token message boundary. tool_choice=required.
+            let ids = system + user1 + assistant1 + user2 + suffix
+            let next = LMInput(tokens: MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), tokenIds: ids,
+                cachePrefixTokenCounts: [system.count, system.count + user1.count, ids.count - suffix.count],
+                cacheStablePrefixTokenCounts: [system.count],
+                cacheRestorePolicy: .freshRequiredToolSelection)
+            let warmModel: RecordingHybridModel = declares ? InvariantHybridModel() : RecordingHybridModel()
+            _ = try TokenIterator(input: next, model: warmModel, parameters: parameters(), cacheCoordinator: disk)
+            if expectReuse {
+                XCTAssertEqual(warmModel.forwarded, Array(ids.dropFirst(12)),
+                               "a forced tool selection must resume from the shared message boundary")
+            } else {
+                XCTAssertEqual(warmModel.forwarded, ids, "today's behaviour without the declaration")
+            }
+        }
+    }
+
+    func testRequiredToolSelectionWithAnImageRestoresThePreMediaBoundary() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let disk = coordinator()
+        var first = try TokenIterator(input: textInput(), model: InvariantHybridModel(),
+            parameters: parameters(), cacheCoordinator: disk)
+        first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        let warmModel = InvariantHybridModel()
+        _ = try TokenIterator(input: mediaInput(pixelSeed: 1, policy: .freshRequiredToolSelection),
+            model: warmModel, parameters: parameters(), cacheCoordinator: disk)
+        XCTAssertEqual(warmModel.forwarded, Array(mediaPrompt.dropFirst(12)))
+    }
+
+    func testRequiredToolSelectionSkipRule() {
+        let mamba: [KVCache] = [MambaCache()]
+        let dense: [KVCache] = [KVCacheSimple()]
+        XCTAssertTrue(requiredToolSelectionSkipsDiskBackedRestore(
+            model: RecordingHybridModel(), cache: mamba, restorePolicy: .freshRequiredToolSelection))
+        XCTAssertFalse(requiredToolSelectionSkipsDiskBackedRestore(
+            model: InvariantHybridModel(), cache: mamba, restorePolicy: .freshRequiredToolSelection))
+        XCTAssertFalse(requiredToolSelectionSkipsDiskBackedRestore(
+            model: RecordingHybridModel(), cache: mamba, restorePolicy: .standard))
+        XCTAssertFalse(requiredToolSelectionSkipsDiskBackedRestore(
+            model: RecordingHybridModel(), cache: dense, restorePolicy: .freshRequiredToolSelection))
+    }
+
     /// The batched lane routes every boundary through the slot's plan and
     /// hands the media-independent prefix to the coordinator's fetch.
     func testBatchEngineRoutesSaltsThroughTheSlotPlan() throws {
@@ -244,6 +299,7 @@ final class MediaIndependentPrefixCacheTests: XCTestCase {
             "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)"))
         XCTAssertTrue(source.contains("slot.cacheSaltPlan = saltPlan"))
+        XCTAssertTrue(source.contains("requiredToolSelectionSkipsDiskBackedRestore("))
         // Every disk/SSM store of a prompt boundary keys by the boundary's salt.
         for pattern in [
             "mediaSalt: slot.cacheSalt(forBoundary: tokens.count),",

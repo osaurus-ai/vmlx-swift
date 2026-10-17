@@ -184,6 +184,15 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     /// turns' prefix rows are reused by image turns and vice versa.
     public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
 
+    /// An exact token-prefix row of this model is the state a cold prefill of
+    /// those tokens produces (proven live: every ordinary turn restores the
+    /// stable seeds and the previous turn's stripped boundary, and the native
+    /// MTP capture test shows warm continuation equals cold). The suffix a
+    /// request appends — a forced tool-selection tail included — cannot
+    /// change it, so `freshRequiredToolSelection` keeps the longest-prefix
+    /// restore instead of re-prefilling the whole prompt.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+
 
     @ModuleInfo(key: "language_model") private var languageModel: NemotronHModel
 
