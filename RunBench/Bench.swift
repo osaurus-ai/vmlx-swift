@@ -608,6 +608,10 @@ struct Bench {
             try await runRowExactBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_PREFILL_SWEEP"] ?? "0") == "1" {
+            try await runPrefillSweepBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_KERNEL_MICRO"] ?? "0") == "1" {
             runKernelMicroBench()
             return
