@@ -653,6 +653,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
             .flatMap(Int.init).map { Swift.max($0, 1) }
+            ?? (model as? any NativeMTPAdaptiveCeilingModel)?.nativeMTPAdaptiveDepthCeiling
             ?? (model as? any NativeMTPBlockDraftModel).flatMap {
                 $0.nativeMTPUsesBlockDrafts ? $0.nativeMTPBlockDraftDepthLimit : nil
             } ?? 5

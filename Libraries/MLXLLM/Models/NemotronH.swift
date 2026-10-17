@@ -2590,6 +2590,14 @@ extension NemotronHModel: NativeMTPAutoregressiveBackboneModel {
     }
 }
 
+/// Nemotron-H's exact verify costs 1.26x / 1.46x / 1.77x / 3.08x one AR step at 2 / 3 / 4 / 8 rows
+/// (Super-VL, 2026-10-17), and adaptive exploration past depth 3 measured slower than a fixed depth
+/// on both Super-VL (recursive head) and Bolt (LiLiCorr block drafts, adaptive-to-7 0.87-1.37x vs
+/// fixed d3 0.96-1.45x of AR, paired within rounds). Adaptive requests stay within depth 3.
+extension NemotronHModel: NativeMTPAdaptiveCeilingModel {
+    public var nativeMTPAdaptiveDepthCeiling: Int { 3 }
+}
+
 extension NemotronHModel: NativeMTPBlockDraftModel {
     public var nativeMTPUsesBlockDrafts: Bool { mtp == nil && lilicorrLane != nil }
 
