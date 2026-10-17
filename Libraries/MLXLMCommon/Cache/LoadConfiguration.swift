@@ -163,6 +163,10 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// loading the sidecar does not force speculative decode for every request.
     public var nativeMTP: Bool
 
+    /// Request GPU residency while loaded, subject to the device ceiling and
+    /// physical-memory reserve. Separate from the host's idle-unload timer.
+    public var keepModelInMemory: Bool = true
+
     /// Explicit user-selected MTP depth (1–3) carried into the load so the
     /// activation gate can accept a tensor-complete head without a measured
     /// tuning artifact. Nil for Auto/Off — Auto stays tuning-gated.
@@ -258,10 +262,17 @@ public struct LoadConfiguration: Sendable, Equatable {
         let physical85 = (facts.physicalMemory / 20) * 17
             + ((facts.physicalMemory % 20) * 17) / 20
         let ceiling = min(physical85, UInt64(recommendedWorkingSetBytes))
-        guard !desired.overflow, desired.partialValue <= ceiling,
-            desired.partialValue > base
-        else { return ordinary }
-        return .absolute(desired.partialValue)
+        // A model that fits the ceiling must not fall back below its own
+        // weight size merely because the preferred 4 GiB scratch allowance
+        // does not fit. That fallback drains the allocator's reusable buffers
+        // on every step (Allosaurus on 48 GiB). A ceiling below the weights
+        // remains an admission concern; do not silently exceed it here.
+        guard !desired.overflow, facts.gpuResidentWeightBytes < ceiling else {
+            return ordinary
+        }
+        let target = min(desired.partialValue, ceiling)
+        guard target > base else { return ordinary }
+        return .absolute(target)
     }
 }
 

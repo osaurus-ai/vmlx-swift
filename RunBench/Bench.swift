@@ -8809,6 +8809,7 @@ private func runPerfBenchBody(
             var reasoning = ""
             var toolCalls = 0
             var stopReason = "unknown"
+            var generationFailure: GenerationFailure?
             var unclosedReasoning = false
             var rssMiB = 0.0
             var footprintMiB = 0.0
@@ -8821,8 +8822,7 @@ private func runPerfBenchBody(
             var lastTokenDelivery: TimeInterval?
 
             mutating func recordPrefill(_ progress: PrefillProgress) {
-                if prefillStart == nil, progress.stage == .prefill,
-                    progress.detail == "running"
+                if prefillStart == nil, progress.stage == .prefill
                 {
                     prefillStart = progress
                 }
@@ -9048,6 +9048,7 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -9070,6 +9071,7 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -9103,9 +9105,16 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
+            }
+            if let failure = result.generationFailure,
+               let encoded = try? JSONSerialization.data(withJSONObject: [
+                    "stage": failure.stage.rawValue, "cause": failure.cause]),
+               let json = String(data: encoded, encoding: .utf8) {
+                print("  PERF_FAILURE label=\(label) failure=\(json)")
             }
             result.rssMiB = currentRSSMiB()
             result.footprintMiB = currentPhysFootprintMiB()

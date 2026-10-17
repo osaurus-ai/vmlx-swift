@@ -596,7 +596,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         depth requestedDepth: Int,
-        cacheCoordinator: CacheCoordinator? = nil
+        cacheCoordinator: CacheCoordinator? = nil,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws {
         guard model.nativeMTPAvailable else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -695,6 +696,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
+        prefillProgressHandler?(PrefillProgress(
+            stage: .cacheLookup, completedUnitCount: 0,
+            totalUnitCount: promptTokenIds.count, detail: "native-mtp"))
         var inputForPrepare = input
         var cacheLookupTokenIds = promptTokenIds
         var cacheLookupUsesPostPrepareAlias = false
@@ -875,8 +879,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let start = NativeMTPClock.now()
         try Task.checkCancellation()
+        let totalPromptCount = self.promptTokenIds.count
+        let restoredCount = Swift.max(0, totalPromptCount - inputForPrepare.text.tokens.size)
+        if restoredCount > 0 {
+            prefillProgressHandler?(PrefillProgress(
+                stage: .cacheRestore, completedUnitCount: restoredCount,
+                totalUnitCount: totalPromptCount, detail: "native-mtp"))
+        }
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: restoredCount,
+            totalUnitCount: totalPromptCount, detail: "native-mtp"))
         let prepared = try prepareCapturingCacheBoundaries(
-            inputForPrepare, windowSize: effectiveParameters.prefillStepSize)
+            inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
+            prefillProgressHandler: prefillProgressHandler)
         self.promptPrefillTime = NativeMTPClock.now() - start
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
@@ -929,6 +944,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             self.materializeSyncTime += NativeMTPClock.now() - syncStart
         }
 
+        // The final prompt row is lazy until the first token is evaluated.
+        // Report completion here, not when prepare merely returns its graph.
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-complete"))
         let firstID = recordMaterializeSync {
             firstToken.item(Int.self)
         }
@@ -1495,8 +1515,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// tool call even when writing the resulting SSD record took milliseconds.
     /// Media and opaque post-prepare token layouts retain their existing path.
     private mutating func prepareCapturingCacheBoundaries(
-        _ input: LMInput, windowSize: Int
+        _ input: LMInput, windowSize: Int,
+        prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil
     ) throws -> PrepareResult {
+        // Observe the existing prepare calls without changing their segmentation
+        // or adding evaluations. Each segment reports local counts; translate
+        // those to the request's absolute prompt position after cache restore.
+        let total = promptTokenIds.count
+        let initialOffset = Swift.max(0, total - input.text.tokens.size)
+        func prepareReporting(_ part: LMInput, offset: Int) throws -> PrepareResult {
+            let report: PrefillProgressReporter.Handler?
+            if let prefillProgressHandler {
+                let accumulator = SoloPrefillProgressAccumulator(
+                    handler: prefillProgressHandler,
+                    completedBeforePrefill: offset, totalPromptUnits: total)
+                report = { accumulator.report(completedInPrepare: $0) }
+            } else {
+                report = nil
+            }
+            return try PrefillProgressReporter.withHandler(report) {
+                try model.prepare(part, cache: cache, windowSize: windowSize)
+            }
+        }
         guard let coordinator = cacheCoordinator,
             coordinator.canPersistBoundaries,
             originalInput.cachePromptIntent != .auxiliary,
@@ -1507,7 +1547,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             usesHybridMambaCache,
             !cache.contains(where: { $0 is HybridPoolCache })
         else {
-            return try model.prepare(input, cache: cache, windowSize: windowSize)
+            return try prepareReporting(input, offset: initialOffset)
         }
 
         let size = input.text.tokens.size
@@ -1517,7 +1557,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             input.text.tokenIds.map({ $0.count == size }) ?? true,
             input.text.mask.map({ $0.size == size }) ?? true
         else {
-            return try model.prepare(input, cache: cache, windowSize: windowSize)
+            return try prepareReporting(input, offset: initialOffset)
         }
 
         // Match TokenIterator.prepare's segmentation: the canonical chat
@@ -1539,7 +1579,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // exists, just as the AR iterator does.
         if let canonical { wanted.insert(canonical) }
         guard !wanted.isEmpty else {
-            return try model.prepare(input, cache: cache, windowSize: windowSize)
+            return try prepareReporting(input, offset: initialOffset)
         }
 
         let flat = input.text.tokens.reshaped([-1])
@@ -1570,7 +1610,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if end > consumed {
                 let head = segment(consumed, end)
                 try withError { error in
-                    let result = try model.prepare(head, cache: cache, windowSize: windowSize)
+                    let result = try prepareReporting(head, offset: restored + consumed)
                     try error.check()
                     if case .tokens(let remaining) = result, remaining.tokens.size > 0 {
                         _ = model.nativeBackboneForward(
@@ -1581,6 +1621,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     try error.check()
                 }
                 consumed = end
+                prefillProgressHandler?(PrefillProgress(
+                    stage: .prefill, completedUnitCount: boundary,
+                    totalUnitCount: total, detail: "native-mtp-boundary"))
             }
             if cache.allSatisfy({ $0.offset == boundary }) {
                 // Materialize OWNED copies before subsequent prefill/decode
@@ -1589,7 +1632,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
         }
         try Task.checkCancellation()
-        return try model.prepare(segment(consumed, size), cache: cache, windowSize: windowSize)
+        return try prepareReporting(segment(consumed, size), offset: restored + consumed)
     }
 
     /// Reloading a model drops the disk cache's in-process validation records.
