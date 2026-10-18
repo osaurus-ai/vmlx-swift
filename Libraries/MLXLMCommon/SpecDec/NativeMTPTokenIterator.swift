@@ -308,6 +308,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let prefetchQueue = DispatchQueue(
         label: "vmlx.mtp.verify-prefetch", qos: .userInitiated)
     private var pendingVerify: PendingVerify?
+    /// The next paused-AR step, built and submitted before the current token was read back.
+    private var arLookahead: (output: NativeMTPForwardResult, token: MLXArray)?
+    private(set) var arLookaheadCount = 0
+    /// `true` while the next AR step is already in the cache (one row past the last emitted token).
+    var hasPendingARLookahead: Bool { arLookahead != nil }
     private(set) var verifyPrefetchSubmitCount = 0
     private(set) var verifyPrefetchConsumedCount = 0
     private(set) var verifyPrefetchAbandonedCount = 0
@@ -1090,6 +1095,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        // A paused-AR lookahead past the last emitted token wrote one extra row; finish it so no snapshot races
+        // its pending graph. The post-answer store below trims that row or skips (offset != tokens).
+        if let lookahead = arLookahead {
+            MLX.eval(lookahead.token)
+            arLookahead = nil
+        }
         // A prefetched verify that was never consumed left speculative rows
         // in the attention lanes; roll it back before any boundary snapshot
         // can capture them.
@@ -1437,7 +1448,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyResumes: arSafetyResumes)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d]\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d] arLookahead=%d\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1486,7 +1497,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             arSafetyPaused ? 1 : 0,
             adaptiveDepthPromotionCount,
             adaptiveWallClockDemotes,
-            adaptiveAcceptanceDemotes)
+            adaptiveAcceptanceDemotes,
+            arLookaheadCount)
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -3197,46 +3209,84 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpCacheRefreshCount += 1
     }
 
+    /// `VMLX_NATIVE_MTP_AR_LOOKAHEAD=0` restores the synchronous paused-AR step (A/B and diagnosis).
+    static let arLookaheadEnabled: Bool = {
+        let raw = RuntimeEnvironment.value("VMLX_NATIVE_MTP_AR_LOOKAHEAD")?.lowercased()
+        return !["0", "false", "no", "off"].contains(raw ?? "")
+    }()
+
+    /// One AR step: forward + lazily sampled token, submitted (not waited on).
+    private mutating func buildAutoregressiveStep(
+        _ input: MLXArray
+    ) -> (output: NativeMTPForwardResult, token: MLXArray) {
+        let output: NativeMTPForwardResult
+        if let arModel = model as? any NativeMTPAutoregressiveBackboneModel {
+            output = arModel.nativeAutoregressiveBackboneForward(Self.tokenInput(input), cache: cache)
+        } else {
+            output = model.nativeBackboneForward(Self.tokenInput(input), cache: cache)
+        }
+        let sample = Self.sampleLast(
+            logits: output.logits,
+            sampler: sampler,
+            speculativeSampler: speculativeSampler,
+            processor: &processor)
+        asyncEval(sample.token, output.hiddenStates)
+        targetForwardCount += 1
+        verifyMainForwardCount += 1
+        verifyInputTokenCount += 1
+        return (output, sample.token)
+    }
+
+    /// Whether the AR step about to complete is certainly followed by another AR step, so the next one may be
+    /// built before this token is read back. Mirrors `arSafetyAfterARStep`'s resume rule exactly: a step that
+    /// may hand over to speculation (resume probe, end of a calibration, the seed steps) never has a lookahead,
+    /// because speculation starts from that step's own hidden state and an already-built AR step cannot be taken
+    /// back. Logit processors keep the synchronous step (they may need the concrete token).
+    private func nextStepStaysAutoregressive() -> Bool {
+        guard Self.arLookaheadEnabled, processor == nil, nanTrace == nil else { return false }
+        // This step emits token `tokenCount + 1`; a lookahead would compute `tokenCount + 2`.
+        if let maxTokens, tokenCount + 2 > maxTokens { return false }
+        if forceAutoregressiveFallback { return true }
+        guard !Self.arSafetyDisabled, arSafetyPaused, arSafetySeedStepSec != nil else { return false }
+        if arSafetyCalibrationRemaining > 0 { return arSafetyCalibrationRemaining > 1 }
+        return arSafetyTokensSincePause + 1 < arSafetyResumeInterval
+    }
+
     private mutating func generateAutoregressiveToken() throws {
         abandonPendingVerify()
         guard let primary = nextMain else {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        // SPEED-CRITICAL (Allosaurus 0.2, 2026-10-18): one-token lookahead while the governor holds AR, as the
+        // plain AR iterator does. A decode step is host-bound (15.8 of 17.8 ms build + encode); the synchronous
+        // step then idled the host through the GPU tail (last layers, LM head, sampling) on every token. Paused
+        // stretches ran ~10 % slower per token than MTP Off (in-app 48 GB essay: 23.3 vs 21.2 ms/token), so a
+        // reply the governor correctly kept on AR still lost to Off. With the lookahead, the next forward is built
+        // on the lazily sampled token while the GPU finishes this one. If the reply stops during a lookahead the
+        // cache holds that one extra row; the post-answer store trims it or skips (offset check) — never stores it.
         let verifyStart = NativeMTPClock.now()
-        let output: NativeMTPForwardResult
-        if let arModel = model as? any NativeMTPAutoregressiveBackboneModel {
-            output = arModel.nativeAutoregressiveBackboneForward(
-                Self.tokenInput(primary), cache: cache)
-        } else {
-            output = model.nativeBackboneForward(Self.tokenInput(primary), cache: cache)
-        }
-        MLX.eval(output.logits, output.hiddenStates)
+        let current = arLookahead ?? buildAutoregressiveStep(primary)
+        arLookahead = nil
+        let output = current.output
         let elapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += elapsed
         verifyMainForwardTime += elapsed
-        targetForwardCount += 1
-        verifyMainForwardCount += 1
-        verifyInputTokenCount += 1
+        if nextStepStaysAutoregressive() {
+            arLookahead = buildAutoregressiveStep(current.token)
+            arLookaheadCount += 1
+        }
 
         let sampleStart = NativeMTPClock.now()
-        let sample = Self.sampleLast(
-            logits: output.logits,
-            sampler: sampler,
-            speculativeSampler: speculativeSampler,
-            processor: &processor)
-        recordMaterializeSync {
-            MLX.eval(sample.token)
-        }
+        let token = current.token
+        let tokenID = recordMaterializeSync { token.item(Int.self) }
         samplingTime += NativeMTPClock.now() - sampleStart
-
-        let tokenID = recordMaterializeSync { sample.token.item(Int.self) }
         nanTrace?.observe(
             output.logits[0..., -1, 0...], site: "mtp", step: tokenCount, role: "ar",
             sampled: { tokenID })
         pendingTokens.append(tokenID)
         autoregressiveFallbackTokenCount += 1
-        nextMain = sample.token
+        nextMain = token
         // Any drafts made before this AR step were built for the previous
         // position; they are stale now.
         drafts.removeAll(keepingCapacity: true)
@@ -3245,7 +3295,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         arSafetyAfterARStep(
             stepSec: NativeMTPClock.now() - verifyStart,
             hidden: Self.lastHidden(output.hiddenStates),
-            nextToken: sample.token)
+            nextToken: token)
     }
 
     private mutating func verifyCycleSequential(primary: MLXArray) throws {

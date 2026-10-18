@@ -415,7 +415,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// failures degrade silently to safe defaults (zero bytes, dense).
     public static func inspect(bundleURL url: URL) -> LoadBundleFacts {
         let fm = FileManager.default
-        let physical = ProcessInfo.processInfo.physicalMemory
+        let physical = HostPhysicalMemory.bytes
 
         // Walk top-level for *.safetensors. Don't recurse — MLXPress
         // bundles never nest weights under subdirs.
@@ -1020,7 +1020,7 @@ public struct MemoryStatus: Sendable, Equatable {
             memoryLimit: MLX.Memory.memoryLimit,
             cacheLimit: MLX.Memory.cacheLimit,
             recommendedWorkingSetBytes: MLX.GPU.maxRecommendedWorkingSetBytes(),
-            physicalMemory: ProcessInfo.processInfo.physicalMemory,
+            physicalMemory: HostPhysicalMemory.bytes,
             currentRSS: residentSetSizeBytes())
     }
 }

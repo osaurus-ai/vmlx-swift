@@ -476,6 +476,41 @@ enum Qwen4ExpCompiledMoE {
         return (outputs[0], outputs[1])
     }
 
+    static let denseRouterRowsEnabled: Bool = {
+        let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_ROUTER_ROWS") ?? "1"
+        return value != "0" && value.lowercased() != "false"
+    }()
+
+    /// The dense router for a verify window ([1, rows, K]) in ONE region call, row-for-row bitwise equal to the 1-row AR
+    /// step (`denseRouter` on [1, 1, K]). SPEED-CRITICAL + EXACTNESS-CRITICAL (2026-10-18):
+    /// - A contiguous [rows, 1, K] input does NOT work: MLX folds a batch of M = 1 rows into one M = rows product when
+    ///   the weight is unbatched (`matmul.cpp` "Collapse batches into M"), and on M5 an M = 2...15 product runs the
+    ///   `gemv_wide` kernel, whose reduction differs from the 1-row `gemv` (BENCH_ROWEXACT first mismatch at position
+    ///   21 on Allosaurus 0.2). That is why verify used to run this router once per row.
+    /// - The view below has the same values but strides [K, 1, 1]: MLX reads it as a "transposed" vector
+    ///   (`check_transpose`), which disables the fold, so every row runs the same `gemv` kernel as the AR step (kernel
+    ///   choice depends on the weight's layout and M / N / K only; the batch is the grid's z axis). softmax,
+    ///   argPartition and the elementwise tail are per row.
+    /// One router launch set per MoE layer instead of one per row: 48 layers x (rows - 1) fewer region calls per verify.
+    static func denseRouterRows(
+        _ window: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
+    ) -> (indices: MLXArray, scores: MLXArray)? {
+        // BF16 router weights only (Allosaurus 0.2, Flash-Next): with F32 weights (some JANG loaders) the F32 product
+        // of the view did not reproduce the 1-row product (unit test, 15/15 cases), so those keep the per-row router.
+        guard denseRouterRowsEnabled, window.ndim == 3, window.dim(0) == 1, window.dim(1) > 1,
+            window.dtype == .bfloat16, weight.dtype == .bfloat16
+        else {
+            return nil
+        }
+        let rows = window.dim(1)
+        let hidden = window.dim(2)
+        let view = asStrided(window, [rows, 1, hidden], strides: [hidden, 1, 1])
+        guard let routed = denseRouter(view, weight: weight, topK: topK, normTopK: normTopK) else {
+            return nil
+        }
+        return (routed.indices.reshaped(1, rows, topK), routed.scores.reshaped(1, rows, topK))
+    }
+
     /// Shared expert with f16 affine metadata against bf16 activations (Allosaurus 0.2: 4-bit, f16 scales). `sharedExpert`
     /// admits bf16 metadata only, so this expert ran as separate uncompiled launches in every decode step. The 1-row
     /// step uses plain 2-D products (MLX's 1-row kernels); a verify window ([1, rows, K], rows 2...8) uses one M = 1
@@ -2749,6 +2784,7 @@ enum Qwen35Language {
                 !CompiledDecodeTrace.isActive, x.dtype == .bfloat16,
                 !(gate is QuantizedLinear), gate.bias == nil
             {
+                if let batched = denseRouterRows(x) { return batched }
                 var indices: [MLXArray] = []
                 var scores: [MLXArray] = []
                 for row in MLX.split(x, parts: x.dim(1), axis: 1) {
@@ -2842,6 +2878,15 @@ enum Qwen35Language {
                         .utf8))
         }
 
+        /// Every verify row's router in one call, bitwise equal to the 1-row AR router (see
+        /// `Qwen4ExpCompiledMoE.denseRouterRows`). `nil` when the router is not the compiled dense one.
+        private func denseRouterRows(_ window: MLXArray) -> (indices: MLXArray, scores: MLXArray)? {
+            guard compileDecodeRegions, window.dtype == .bfloat16, !(gate is QuantizedLinear), gate.bias == nil
+            else { return nil }
+            return Qwen4ExpCompiledMoE.denseRouterRows(
+                window, weight: gate.weight, topK: topK, normTopK: normTopkProb)
+        }
+
         /// Top-k expert indices and routing weights (the compiled router when it applies).
         private func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
             if let compiled = compiledRouter(x) { return compiled }
@@ -2869,9 +2914,14 @@ enum Qwen35Language {
                 // Router per row: its dense product as an M = 1 batch did not reproduce the 1-row product bit
                 // for bit (Allosaurus 0.2, BENCH_ROWEXACT position 21); the shared expert's quantized products do.
                 if let sharedRows = compiledSharedExpert(window) {
-                    let parts = MLX.split(window, parts: rows, axis: 1).map { routerSelection($0) }
-                    let routing = (indices: MLX.concatenated(parts.map(\.0), axis: 1),
+                    let routing: (indices: MLXArray, scores: MLXArray)
+                    if let batched = denseRouterRows(window) {
+                        routing = batched
+                    } else {
+                        let parts = MLX.split(window, parts: rows, axis: 1).map { routerSelection($0) }
+                        routing = (indices: MLX.concatenated(parts.map(\.0), axis: 1),
                                    scores: MLX.concatenated(parts.map(\.1), axis: 1))
+                    }
                     let routed = weighted.callRouted(window, indices: routing.indices, scores: routing.scores)
                     reportDecodeEquivalentRows()
                     return (routed + sharedRows).reshaped(x.shape)

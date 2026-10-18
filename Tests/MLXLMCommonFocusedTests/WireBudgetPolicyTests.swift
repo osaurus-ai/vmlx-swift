@@ -8,6 +8,14 @@ import XCTest
 /// SYSTEM WIRE BUDGET (`vm.global_user_wire_limit` − already wired), not only RAM / Metal working set.
 /// Measured: ~33.5 GiB of wire headroom → 22-28 tok/s with kernel wire rejections; ~37.5 GiB → 46-48 tok/s.
 final class WireBudgetPolicyTests: XCTestCase {
+    func testDiagnosticMemorySizeRejectsUnrepresentableValues() {
+        for value in [nil, "", "nan", "inf", "-inf", "1e300", "8589934592", "0", "-48", "1e-30"] as [String?] {
+            XCTAssertNil(HostPhysicalMemory.emulatedBytes(value), "invalid diagnostic value: \(value ?? "nil")")
+        }
+        XCTAssertEqual(HostPhysicalMemory.emulatedBytes(" 48\n"), 48 * 1_073_741_824)
+        XCTAssertEqual(HostPhysicalMemory.emulatedBytes("48.5"), 52_076_478_464)
+    }
+
     private let gib = 1024 * 1024 * 1024
     private let allosaurusBytes = 36_972_157_624  // gpuResidentWeightBytes from the bundle headers
 
