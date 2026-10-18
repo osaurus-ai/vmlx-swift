@@ -9217,6 +9217,7 @@ private func runPerfBenchBody(
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
                 print("    TEXT_PREVIEW \"\(compactPreview(result.text.isEmpty ? result.reasoning : result.text))\"")
+                print("    PERF_MLX_MEMORY label=\(label) active_bytes=\(MLX.Memory.activeMemory) cache_bytes=\(MLX.Memory.cacheMemory) peak_bytes=\(MLX.Memory.peakMemory)")
                 if env["BENCH_PERF_FULL_TEXT"] == "1" {
                     printDecodedOutput(
                         label: label,

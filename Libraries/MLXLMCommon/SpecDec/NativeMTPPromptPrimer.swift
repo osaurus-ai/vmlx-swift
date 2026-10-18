@@ -41,7 +41,7 @@ public final class NativeMTPPromptPrimer: @unchecked Sendable {
     }
 
     /// `hidden` [1, S, H] is the head input of the chunk's `tokens` [1, S] (in prompt order, chunks contiguous).
-    /// Lazy: the rows are evaluated with the caller's next cache evaluation (or by `finish`).
+    /// The head rows are evaluated before returning, so a long prompt never holds more than one chunk's graph.
     public func fold(hidden: MLXArray, tokens: MLXArray) {
         let count = tokens.dim(-1)
         guard count > 0, hidden.ndim == 3, hidden.dim(1) == count else { return }
@@ -63,6 +63,10 @@ public final class NativeMTPPromptPrimer: @unchecked Sendable {
         model.nativeMTPPrime(hiddenStates: rowHidden, nextTokenIds: rowTokens, cache: cache)
         foldedRows += rowTokens.dim(1)
         pending = hidden[0..., (count - 1)...]
+        // Materialize per chunk, as the prefill materializes the trunk cache. Left lazy, every chunk's head
+        // forward stayed in one graph until `finish`: 52 GB peak footprint at a 32k-token prompt on Allosaurus
+        // 0.2 (10.9 GB without the head) — fatal on a 48 GB Mac.
+        MLX.eval(cache, pending!)
     }
 
     /// Pair the last prompt position with the first sampled token and materialize the head cache.
