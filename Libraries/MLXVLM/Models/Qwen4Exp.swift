@@ -1653,10 +1653,13 @@ private final class Qwen4ExpMTPZeroCenteredRMSNorm: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
 
     private let eps: Float
+    /// Per-group normalization width (the four-stream hidden normalizes each stream separately).
+    private let groupSize: Int?
 
-    init(dimensions: Int, eps: Float) {
+    init(dimensions: Int, eps: Float, groupSize: Int? = nil) {
         self._weight.wrappedValue = MLXArray.zeros([dimensions])
         self.eps = eps
+        self.groupSize = groupSize
         super.init()
     }
 
@@ -1664,10 +1667,13 @@ private final class Qwen4ExpMTPZeroCenteredRMSNorm: Module {
         // Qwen4Exp stores only the two MTP fusion-norm tensors around zero.
         // Keep the reduction in F32, apply the checkpoint as `1 + weight`,
         // and return to the bundle-owned compute dtype before either affine.
-        let inputF32 = input.asType(.float32)
+        var inputF32 = input.asType(.float32)
+        if let groupSize {
+            inputF32 = inputF32.reshaped(Array(input.shape.dropLast()) + [-1, groupSize])
+        }
         let variance = (inputF32 * inputF32).mean(axis: -1, keepDims: true)
-        return (inputF32 * rsqrt(variance + eps)
-            * (1 + weight.asType(.float32))).asType(input.dtype)
+        let normalized = (inputF32 * rsqrt(variance + eps)).reshaped(input.shape)
+        return (normalized * (1 + weight.asType(.float32))).asType(input.dtype)
     }
 }
 
@@ -1688,8 +1694,16 @@ private final class Qwen4ExpMTPModule: Module {
         let text = config.base.textConfiguration
         hiddenSize = text.hiddenSize
         hcCount = config.extras.hcCount
+        // The hidden pre-norm normalizes each of the hc streams on its own, like every other hc-wide norm of
+        // this model (the bf16 reference head groups it by hidden_size). One norm over all hc x D values let a
+        // large stream set the scale of the others: measured on Allosaurus 0.2 (teacher-forced, 48 sequences,
+        // 23,580 positions) next-token acceptance 65.5 -> 66.8 %, agreement with the bf16 head 73.3 -> 75.9 %,
+        // and 55.3 -> 60.8 % on a live code answer. `VMLX_QWEN4_MTP_HIDDEN_NORM_GROUP=0` restores the
+        // single norm (A/B).
+        let groupOverride = RuntimeEnvironment.value("VMLX_QWEN4_MTP_HIDDEN_NORM_GROUP").flatMap(Int.init)
         _preFCNormHidden.wrappedValue = Qwen4ExpMTPZeroCenteredRMSNorm(
-            dimensions: hiddenSize * hcCount, eps: text.rmsNormEps)
+            dimensions: hiddenSize * hcCount, eps: text.rmsNormEps,
+            groupSize: groupOverride.map { $0 > 0 ? $0 : nil } ?? (hcCount > 1 ? hiddenSize : nil))
         _preFCNormEmbedding.wrappedValue = Qwen4ExpMTPZeroCenteredRMSNorm(
             dimensions: hiddenSize, eps: text.rmsNormEps)
         _fcEmbedding.wrappedValue = Linear(hiddenSize, hiddenSize, bias: false)
