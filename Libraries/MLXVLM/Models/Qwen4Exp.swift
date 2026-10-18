@@ -1971,7 +1971,7 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
     SafetensorsLoadKeyExcluding, NativeMTPModel, NativeMTPAutoregressiveBackboneModel,
-    NativeMTPPromptPrimingModel, DFlash2StagedVerifyRollbackModel,
+    NativeMTPPromptPrimingModel, PrefixCacheInvariantModel, DFlash2StagedVerifyRollbackModel,
     CompiledDecodeExternalInputModel, ModalityBearing, ModelComponentMapping
 {
     /// QSA index selection and its path-dependent cache currently require a
@@ -2092,6 +2092,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     private let jangtCacheComputationIdentity: String?
 
     public var cacheComputationIdentity: String? { jangtCacheComputationIdentity }
+
+    // QSA's raw indexer keys, GDN/PLE recurrent state and media RoPE delta are
+    // persisted with the prefix. A forced tool-selection suffix does not alter
+    // those earlier states. Keep the same validated disk restore as ordinary
+    // chat instead of re-prefilling the entire history for tool_choice=required.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+    // This does not permit cross-media key reuse: Qwen's M-RoPE still requires
+    // the full media salt, including when a tool-selection suffix is appended.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { false }
 
     /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.
     private init(

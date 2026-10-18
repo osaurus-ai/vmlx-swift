@@ -78,6 +78,54 @@ final class NativeMTPPromptPrimingTests: XCTestCase {
         }
     }
 
+    func testRequiredToolSelectionRestoresQwenHybridPrefixAndMatchesCold() throws {
+        try MLXMetalTestLock.withLock {
+            let real = try model(seed: 7103)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let suffix = [120, 121]
+            func coordinator() -> CacheCoordinator {
+                let result = CacheCoordinator(config: .init(
+                    usePagedCache: false, enableDiskCache: true, diskCacheDir: root,
+                    modelKey: "qwen-required-tool-priming"))
+                result.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+                result.setGenPromptSuffixTokens(suffix)
+                return result
+            }
+            func input(_ body: [Int], required: Bool) -> LMInput {
+                let ids = body + suffix
+                return LMInput(tokens: MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), tokenIds: ids,
+                    cachePrefixTokenCounts: [3, body.count], cacheStablePrefixTokenCounts: [3],
+                    cacheRestorePolicy: required ? .freshRequiredToolSelection : .standard)
+            }
+            var parameters = GenerateParameters(maxTokens: 12, temperature: 0, prefillStepSize: 3)
+            parameters.draftStrategy = .nativeMTP(depth: 1)
+            parameters.nativeMTPDepthPolicy = .fixed
+            let body = [3, 7, 11, 5, 19, 2, 23, 13, 29]
+            let writer = coordinator()
+            var initial = try NativeMTPTokenIterator(
+                input: input(body, required: false), model: real, parameters: parameters,
+                depth: 1, cacheCoordinator: writer)
+            initial.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+
+            let next = input(body + [17, 31, 43], required: true)
+            var warm = try NativeMTPTokenIterator(input: next, model: real, parameters: parameters,
+                depth: 1, cacheCoordinator: coordinator())
+            // Full prompt = 14; restored boundary = 9. Priming only five suffix
+            // positions proves that the forced-tool path actually reused disk.
+            XCTAssertEqual(warm.promptPrimedRows, 5)
+            var cold = try NativeMTPTokenIterator(input: next, model: real, parameters: parameters, depth: 1)
+            XCTAssertEqual(cold.promptPrimedRows, 14)
+            var warmTokens: [Int] = []; var coldTokens: [Int] = []
+            while let token = warm.next() { warmTokens.append(token) }
+            while let token = cold.next() { coldTokens.append(token) }
+            XCTAssertEqual(warmTokens.count, 12)
+            XCTAssertEqual(warmTokens, coldTokens)
+            XCTAssertFalse(real.statesBeforeFirstMediaTokenAreMediaIndependent,
+                           "Required-tool reuse must not enable cross-media prefix reuse")
+        }
+    }
+
     private static let config = #"""
     {"model_type":"qwen4_exp","text_config":{
       "model_type":"qwen4_exp_text","dtype":"float32","mamba_ssm_dtype":"float32",
