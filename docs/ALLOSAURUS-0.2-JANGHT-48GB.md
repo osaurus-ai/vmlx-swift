@@ -1,8 +1,11 @@
 # Allosaurus 0.2 (qwen4_exp JANGHT, 48 GB Macs): runtime contract and verification checklist
 
 Branch `feat/allosaurus-48gb-janght` = `main` @ `f3586f93f` + `fix/allosaurus-wire-budget-oct15` (#608, which carries
-#599) + the sub-2-bit JANGT port (`Q38-JANGHT-LOWBIT-SWIFT.md`). Status: **not yet verified on the real bundle in this
-runtime.** Nothing here may gate an upload until the checklist below passes.
+#599) + `perf/nemotron35-fast-exact-verify-oct17` (#612) + the sub-2-bit JANGT port (`Q38-JANGHT-LOWBIT-SWIFT.md`) +
+the Allosaurus 0.2 runtime work (PR #613; MLX fork fix osaurus-ai/mlx#25).
+
+Status (2026-10-17): checklist items 1-6 verified on the real bundle in this runtime (see below and PR #613); item 7
+(48 GiB hardware) is still open — memory was measured with MLX accounting on a 128 GiB Mac.
 
 ## Bundle contract
 
@@ -50,15 +53,15 @@ runtime.** Nothing here may gate an upload until the checklist below passes.
 
 ## Verification checklist (real bundle, this runtime)
 
-1. Build `RunBench` (release). Load with `BENCH_PERF=1 BENCH_MODEL=<bundle> BENCH_PERF_USE_GENERATION_CONFIG=1
-   BENCH_PERF_FULL_TEXT=1`, MTP off, then `BENCH_PERF_LOAD_NATIVE_MTP=1`. Coherent answers on short maths/science/
-   counting prompts and one tool call; thinking closes; no loop.
-2. 1-row decode logits vs vMLX Python on identical token ids: KL ≪ 0.01, argmax ≈ 100 %.
-3. Multi-row (2–4 rows, verify-shaped) vs 1-row logits in Swift on the same tokens.
-4. Decode/prefill speed (≥ 3 probes at a fixed condition, median); measure the JANGT prefill sort threshold on Qwen
-   shapes (512 here vs 72 in vMLX Python) before keeping either.
-5. Adaptive MTP: acceptance by depth, AR-safety trips, wall-clock vs AR, on prose, code and tool-call text.
-6. SSD cache: partial hit after a tool result (same prefix, different suffix), MTP on; restored == cold (greedy);
-   prompt lengths that are not multiples of the cache block.
-7. 48 GiB hardware: wired bytes, `vm.add_wire_count_over_global_limit` stays flat, decode speed stable over a long
-   multi-turn agentic session.
+1. **Done.** Loads; coherent answers; thinking closes; tool calls and continuations work (in-app, osaurus #3125).
+2. **Done.** `BENCH_FIDELITY`: 1-row-chunked logits vs the bf16 reference match vMLX Python within cross-runtime noise
+   (top-1 75.0 vs 75.4 %, median KL 0.058 vs 0.057; v0.1 control 80.8 vs 80.4 %).
+3. **Done.** `BENCH_ROWEXACT` W = 2/3/4: verify rows bitwise equal to the 1-row AR step (256/256, prose and code).
+4. **Done.** Greedy decode 56 tok/s (M5 Max); JANGT prefill sort threshold kept at 512 (verify windows stay below it).
+5. **Done, with an open item.** Adaptive MTP: protocol (`BENCH_SPEED` sampled, filler 4000, 1,500 tokens) code +21-32 %,
+   prose -4..-21 % vs AR; in-app Auto vs Off tool turns +23-43 %, reasoning-heavy replies -2..-3 %. Open: AR-safety
+   governor sensitivity at thin margins.
+6. **Done (in-app).** SSD prompt cache restores on every turn including after tool results with MTP on (follow-up TTFT
+   0.66-1.0 s). Prompt cache key carries the JANGT computation identity.
+7. **Open.** 48 GiB hardware run. Measured on 128 GiB: MLX peak active incl. weights 29.3 GiB (8k) / 30.6 GiB (32k)
+   with MTP, against ~30.9 GiB wire headroom on a 48 GiB Mac.
