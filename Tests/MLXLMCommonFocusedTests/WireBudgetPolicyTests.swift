@@ -116,6 +116,43 @@ final class WireBudgetPolicyTests: XCTestCase {
             modelBytes: allosaurusBytes, budget: unknown, residencyTargetBytes: nil).advisory)
     }
 
+    /// Allosaurus 0.2 on 48 GB Macs (2026-10-18): the MLX freed-buffer pool is wired too. Sized from RAM it was
+    /// ~6 GB, and weights + KV + scratch + pool overran the wire budget (decode 46-64 -> 23-34 tok/s). The ceiling
+    /// keeps the pool inside what the generation leaves; it never applies on 64 GiB+ Macs or an unknown budget.
+    func testAllocatorCacheCeilingFitsTheWireBudgetLeftByTheGeneration() {
+        let v02Bytes = 28_838_118_008  // Allosaurus 0.2 candidate v3 GPU-resident weights (n-gram table on SSD)
+        let mac48 = SystemWireBudget(
+            userWireLimitBytes: 40_716_289_966, gpuWiredLimitBytes: nil,
+            wiredBytes: Int(7.06 * Double(gib)), wireLimitRejections: 0)
+        let target = modelResidencyWiredTarget(
+            modelBytes: v02Bytes, workingSet: 40_200_896_512, physicalMemory: 48 * gib,
+            wireHeadroom: mac48.headroomBytes, systemWireLimit: mac48.userWireLimitBytes)
+        let report = ModelWireBudgetReport(
+            modelBytes: v02Bytes, budget: mac48, residencyTargetBytes: target, physicalMemoryBytes: 48 * gib)
+        let ceiling = try! XCTUnwrap(report.allocatorCacheCeilingBytes)
+        let wireable = min(mac48.headroomBytes!, target!)
+        XCTAssertLessThanOrEqual(report.estimatedGenerationBytes + ceiling, wireable)
+        XCTAssertGreaterThanOrEqual(ceiling, ModelWireBudgetReport.minimumAllocatorCacheCeilingBytes)
+        XCTAssertLessThan(ceiling, 2 * gib, "the RAM-sized 6 GB pool is what overran the budget")
+
+        // A model that leaves no room still gets the minimum pool (a 0-byte pool re-allocates every step).
+        let tight = ModelWireBudgetReport(
+            modelBytes: allosaurusBytes, budget: mac48, residencyTargetBytes: nil, physicalMemoryBytes: 48 * gib)
+        XCTAssertEqual(tight.allocatorCacheCeilingBytes, ModelWireBudgetReport.minimumAllocatorCacheCeilingBytes)
+
+        let mac128 = SystemWireBudget(
+            userWireLimitBytes: 116_823_110_451, gpuWiredLimitBytes: nil, wiredBytes: 7 * gib,
+            wireLimitRejections: 0)
+        XCTAssertNil(ModelWireBudgetReport(
+            modelBytes: v02Bytes, budget: mac128, residencyTargetBytes: 46_017_987_192,
+            physicalMemoryBytes: 128 * gib).allocatorCacheCeilingBytes, "no change on 64 GiB+ Macs")
+        let unknown = SystemWireBudget(
+            userWireLimitBytes: nil, gpuWiredLimitBytes: nil, wiredBytes: nil, wireLimitRejections: nil)
+        XCTAssertNil(ModelWireBudgetReport(
+            modelBytes: v02Bytes, budget: unknown, residencyTargetBytes: nil,
+            physicalMemoryBytes: 48 * gib).allocatorCacheCeilingBytes, "an unknown budget is never a limit")
+    }
+
     func testLiveSnapshotReadsTheBudgetWithoutPrivileges() {
         let budget = SystemWireBudget.snapshot()
         #if os(macOS)

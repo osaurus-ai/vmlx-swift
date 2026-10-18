@@ -709,7 +709,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let profile = memorySafety.profile
         let physicalMemory = host?.physicalMemory
             ?? bundleFacts?.physicalMemory
-            ?? ProcessInfo.processInfo.physicalMemory
+            ?? HostPhysicalMemory.bytes
         let requestedFraction = memorySafety.customPhysicalMemoryFraction
             ?? profile.loadFraction
         let loadCap = ResidentCap.fraction(requestedFraction)

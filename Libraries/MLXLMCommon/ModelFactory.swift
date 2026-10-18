@@ -690,7 +690,8 @@ public func loadModel(
     // and otherwise retains the previous model's wiring limit after unloading.
     let residencyApplied = setModelResidencyWiredLimit(residencyTarget ?? 0)
     let wireReport = ModelWireBudgetReport(
-        modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
+        modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget,
+        physicalMemoryBytes: physical)
     ModelWireBudgetReport.recordLastLoad(wireReport)
     FileHandle.standardError.write(Data(
         "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
