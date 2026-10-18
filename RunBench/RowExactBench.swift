@@ -54,6 +54,7 @@ func runRowExactBench(modelPath: String) async throws {
         // from a fresh copy of the same prefilled cache (copy evaluated before the clock starts).
         let reps = Int(env["BENCH_ROWEXACT_TIME_REPS"] ?? "15") ?? 15
         let (base, first) = prefill()
+        var buildSamples = [Int: [Double]]()
         func once(_ ids: [Int32], verify: Bool) -> Double {
             let c = base.map { $0.copy() }
             MLX.eval(c)
@@ -65,6 +66,8 @@ func runRowExactBench(modelPath: String) async throws {
                     model.nativeBackboneMTPVerifyForward(input, cache: c)
                 }
                 : model.nativeAutoregressiveBackboneForward(input, cache: c)
+            // Graph construction ends here (early-submit layers may already be running on the GPU).
+            buildSamples[verify ? ids.count : 0, default: []].append(CFAbsoluteTimeGetCurrent() - t0)
             MLX.eval(out.logits)
             return CFAbsoluteTimeGetCurrent() - t0
         }
@@ -81,10 +84,11 @@ func runRowExactBench(modelPath: String) async throws {
         }
         func median(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] * 1000 }
         let ar = median(arSamples)
-        print(String(format: "[ROWEXACT-TIME] AR step %.2f ms", ar))
+        print(String(format: "[ROWEXACT-TIME] AR step %.2f ms (graph build %.2f ms)", ar, median(buildSamples[0] ?? [0])))
         for w in widths {
             let v = median(verifySamples[w] ?? [0])
-            print(String(format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR)", w, v, v / ar))
+            print(String(format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR) (graph build %.2f ms)", w, v, v / ar,
+                         median(buildSamples[w] ?? [0])))
         }
         if env["BENCH_ROWEXACT_TIME_ONLY"] == "1" { return }
     }
