@@ -761,6 +761,22 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && (numRoutedExperts ?? 0) >= 128
     }
 
+    /// MiniCPM-V 4.7 (`minicpmv4_7`) declares JANGH2 routed banks as per-expert
+    /// tensors, and sanitize replaces them with full per-layer stacked banks, so
+    /// an mmap-backed load holds every routed byte twice (mapped originals plus
+    /// the stacked banks) when the first eval touches the graph. On a 24 GB Mac
+    /// that exceeds the wired budget before the first token: the residency
+    /// target lands at `min(modelBytes + 16 GB headroom, workingSet,
+    /// physical - osReserve)` = ~15.6 GB while the double-resident demand is
+    /// ~22 GB. Same situation and same remedy as unstacked plain DSV4: read the
+    /// bundle resident instead of mapping it.
+    public var isMiniCPMV47UnstackedJANGH: Bool {
+        let type = modelType?.lowercased() ?? ""
+        return type == "minicpmv4_7"
+            && customRoutedFormat == .janghV2
+            && isRouted
+    }
+
     /// Plain split-expert DSV4 currently requires a resident compute bank.
     /// Qwen4Exp must retain the caller's mmap choice: its 61+ GiB packed bank
     /// is valid mixed-dtype MLX input, while its PLE/ngram tensors already stay
@@ -769,6 +785,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         (isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts)
             || isGlm5NextAffineJANG
             || isMiMoV26MixedQuantized
+            || isMiniCPMV47UnstackedJANGH
     }
 
     public func resolveMmapSafetensors(requested: Bool) -> Bool {

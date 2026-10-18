@@ -43,6 +43,39 @@ final class JANGHLoadPolicyTests: XCTestCase {
         }
     }
 
+    func testMiniCPMV47JANGH2ShipsUnstackedRoutedBanksAndLoadsResident() throws {
+        let root = config(modelType: "minicpmv4_7")
+        let facts = try inspect(root, sidecar: ["format": "jangtq2", "format_version": 2, "jangtq": root["jangtq"]!])
+        XCTAssertEqual(facts.customRoutedFormat, .janghV2)
+        XCTAssertTrue(facts.isMiniCPMV47UnstackedJANGH)
+        XCTAssertTrue(facts.requiresResidentSafetensors)
+        XCTAssertFalse(facts.resolveMmapSafetensors(requested: true))
+        // The measured 24 GB row does not need the uncapped-pool policy the big
+        // affine families require; keep the opt-in narrow.
+        XCTAssertFalse(facts.requiresUncappedResidentPools)
+        for cap in [ResidentCap.fraction(0.7), .absolute(12345678), .unlimited] {
+            XCTAssertEqual(facts.resolveMLXMemoryLimit(requested: cap), cap)
+            XCTAssertEqual(facts.resolveMLXAllocatorCacheLimit(requested: cap), cap)
+        }
+
+        // Other JANGH2 families keep the caller's mmap choice.
+        for type in ["glm5_next", "naive_n05_flash"] {
+            let otherRoot = config(modelType: type)
+            let other = try inspect(otherRoot, sidecar: ["format": "jangtq2", "format_version": 2, "jangtq": otherRoot["jangtq"]!])
+            XCTAssertFalse(other.isMiniCPMV47UnstackedJANGH)
+            XCTAssertTrue(other.resolveMmapSafetensors(requested: true))
+        }
+
+        // A label-only minicpmv4_7 bundle without a validated custom bank must
+        // not masquerade into the resident policy.
+        let labelOnly = LoadBundleFacts(totalSafetensorsBytes: 12 << 30, isRouted: true,
+            physicalMemory: 24 << 30, modelType: "minicpmv4_7", jangFormat: "jangtq2",
+            hasJangConfig: true, numRoutedExperts: 64)
+        XCTAssertEqual(labelOnly.customRoutedFormat, .none)
+        XCTAssertFalse(labelOnly.isMiniCPMV47UnstackedJANGH)
+        XCTAssertFalse(labelOnly.requiresResidentSafetensors)
+    }
+
     func testMalformedCustomAndLabelOnlyCannotMasqueradeAsAffine() throws {
         var malformed = config()
         malformed.removeValue(forKey: "jangtq")
