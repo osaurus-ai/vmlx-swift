@@ -133,7 +133,10 @@ public func modelResidencyWiredTarget(
         // Never ask beyond the kernel's own wire cap (the live sysctl when the loader read it, else XNU's
         // default for this RAM size): anything above it could not be wired.
         let kernelWireCap = systemWireLimit ?? xnuDefaultUserWireLimit(physicalMemory: physicalMemory)
-        target = max(target, min(wanted.partialValue, workingSet, kernelWireCap))
+        // Clamp the existing target too: safeCeiling can exceed the kernel cap
+        // (38 GiB versus 37.92 GiB on a 48 GiB Mac). Clamping only `wanted`
+        // lets max() retain that larger request, especially with a custom cap.
+        target = min(max(target, wanted.partialValue), workingSet, max(0, kernelWireCap))
         // A partial set still beats none (measured above): return it even when Metal's working set is
         // below the model, and let the advisory explain the shortfall.
         return target > 0 ? target : nil

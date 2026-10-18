@@ -63,6 +63,16 @@ final class WireBudgetPolicyTests: XCTestCase {
         XCTAssertEqual(target, 40_200_896_512, "the whole working set, bounded by Metal's ceiling — never nil")
     }
 
+    func testKernelCapBoundsExistingTargetWhenMetalCeilingIsHigher() {
+        let defaultCap = xnuDefaultUserWireLimit(physicalMemory: 48 * gib)
+        for cap in [defaultCap, 30 * gib, 0] {
+            let target = modelResidencyWiredTarget(
+                modelBytes: 29 * gib, workingSet: 40 * gib, physicalMemory: 48 * gib,
+                systemWireLimit: cap)
+            XCTAssertEqual(target, cap > 0 ? cap : nil)
+        }
+    }
+
     func testSmallMacKeepsTheFreezeGuard() {
         // osaurus#2612: 16 GB Macs keep the conservative reserve.
         XCTAssertNil(modelResidencyWiredTarget(
