@@ -623,6 +623,26 @@ struct Bench {
             runKernelMicroBench()
             return
         }
+        if (env["BENCH_MIXED_QMV_PROBE"] ?? "0") == "1" {
+            runMixedQMVProbe()
+            return
+        }
+        if (env["BENCH_MIXER_MICRO"] ?? "0") == "1" {
+            runMixerMicroBench()
+            return
+        }
+        if (env["BENCH_ROUTED_LAYER_MICRO"] ?? "0") == "1" {
+            try await runRoutedLayerMicroBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_MTP_PROXY"] ?? "0") == "1" {
+            try await runMTPProxyBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_FIDELITY"] ?? "0") == "1" {
+            try await runFidelityBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
