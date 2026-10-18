@@ -116,6 +116,8 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 }
             }
             XCTAssertEqual(tokens, (0..<240).map { (2 + $0) % 32 })
+            XCTAssertNil(iterator.next(), "the token budget must terminate the iterator")
+            XCTAssertFalse(iterator.hasPendingARLookahead, "never compute beyond the token budget")
             XCTAssertEqual(model.autoregressiveBackboneCalls,
                            iterator.autoregressiveFallbackTokenCount + (iterator.hasPendingARLookahead ? 1 : 0),
                            "only explicit AR steps (and one pending lookahead) may use the specialization")

@@ -12,13 +12,23 @@ import Foundation
 public enum HostPhysicalMemory {
     public static let bytes: UInt64 = {
         let actual = ProcessInfo.processInfo.physicalMemory
-        guard let raw = RuntimeEnvironment.value("VMLX_EMULATE_PHYSICAL_MEMORY_GIB"),
-            let gib = Double(raw.trimmingCharacters(in: .whitespaces)), gib > 0
+        guard let emulated = emulatedBytes(
+            RuntimeEnvironment.value("VMLX_EMULATE_PHYSICAL_MEMORY_GIB"))
         else { return actual }
-        let emulated = UInt64(gib * 1_073_741_824)
         FileHandle.standardError.write(Data(
             "[Memory] emulated_physical_memory=\(emulated) actual=\(actual) (VMLX_EMULATE_PHYSICAL_MEMORY_GIB, diagnostics only)\n"
                 .utf8))
         return emulated
     }()
+
+    /// Reject values that would trap during conversion or overflow downstream Int byte budgets.
+    /// Invalid diagnostic input leaves the real physical-memory policy in effect.
+    static func emulatedBytes(_ raw: String?) -> UInt64? {
+        guard let raw,
+            let gib = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        let bytes = gib * 1_073_741_824
+        guard bytes.isFinite, bytes >= 1, bytes < Double(Int.max) else { return nil }
+        return UInt64(bytes)
+    }
 }
