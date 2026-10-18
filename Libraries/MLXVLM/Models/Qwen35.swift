@@ -476,6 +476,64 @@ enum Qwen4ExpCompiledMoE {
         return (outputs[0], outputs[1])
     }
 
+    /// Shared expert with f16 affine metadata against bf16 activations (Allosaurus 0.2: 4-bit, f16 scales). `sharedExpert`
+    /// admits bf16 metadata only, so this expert ran as separate uncompiled launches in every decode step. The 1-row
+    /// step uses plain 2-D products (MLX's 1-row kernels); a verify window ([1, rows, K], rows 2...8) uses one M = 1
+    /// product per row, the same per-row arithmetic, in one region.
+    static func sharedExpertRowsF16Metadata(
+        _ x: MLXArray, gate: QuantizedLinear, up: QuantizedLinear, down: QuantizedLinear,
+        gateBiases: MLXArray, upBiases: MLXArray, downBiases: MLXArray, sharedGateWeight: MLXArray
+    ) -> MLXArray? {
+        let rows = x.ndim == 3 && x.dim(0) == 1 ? x.dim(1) : 0
+        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows), x.dtype == .bfloat16 else {
+            return nil
+        }
+        if rows > 1, !FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "moe") {
+            return nil
+        }
+        for q in [gate, up, down] {
+            guard q.mode == .affine, q.bias == nil, q.scales.dtype == .float16,
+                q.groupSize == gate.groupSize, q.bits == gate.bits
+            else { return nil }
+        }
+        for b in [gateBiases, upBiases, downBiases] where b.dtype != .float16 { return nil }
+        guard sharedGateWeight.ndim == 2, sharedGateWeight.dim(1) == x.dim(2),
+            sharedGateWeight.dtype == .bfloat16 || sharedGateWeight.dtype == .float32
+        else { return nil }
+        let groupSize = gate.groupSize, bits = gate.bits
+        let key = "sharedF16|rows\(rows)|\(x.dim(-1))|\(gate.weight.dim(0))|\(groupSize)|\(bits)|\(sharedGateWeight.dtype)"
+        lock.lock()
+        var region = sharedRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                func project(_ v: MLXArray, _ w: Int) -> MLXArray {
+                    let k = v.dim(-1)
+                    let product = rows == 1
+                        ? quantizedMM(v.reshaped(1, k), args[w], scales: args[w + 1], biases: args[w + 2],
+                                      transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
+                        : quantizedMM(v.reshaped(rows, 1, k), args[w][.newAxis], scales: args[w + 1][.newAxis],
+                                      biases: args[w + 2][.newAxis], transpose: true, groupSize: groupSize,
+                                      bits: bits, mode: .affine)
+                    return product.reshaped(1, rows, -1).asType(.bfloat16)
+                }
+                let activated = silu(project(args[0], 1)) * project(args[0], 4)
+                let shared = project(activated, 7)
+                let k = args[0].dim(-1)
+                let gateOutput = (rows == 1
+                    ? matmul(args[0].reshaped(1, k), args[10].transposed())
+                    : matmul(args[0].reshaped(rows, 1, k), args[10].transposed())).reshaped(1, rows, -1)
+                return [sigmoid(gateOutput) * shared]
+            }
+            sharedRegions[key] = region
+        }
+        lock.unlock()
+        let outputs = region!([
+            x, gate.weight, gate.scales, gateBiases, up.weight, up.scales, upBiases,
+            down.weight, down.scales, downBiases, sharedGateWeight,
+        ])
+        return outputs.first
+    }
+
     static func sharedExpert(
         _ x: MLXArray,
         gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
@@ -2715,6 +2773,19 @@ enum Qwen35Language {
         }
 
         private func compiledSharedExpert(_ x: MLXArray) -> MLXArray? {
+            if compileDecodeRegions,
+                let gate = sharedExpert.gateProj as? QuantizedLinear, type(of: gate) == QuantizedLinear.self,
+                let up = sharedExpert.upProj as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+                let down = sharedExpert.downProj as? QuantizedLinear, type(of: down) == QuantizedLinear.self,
+                gate.scales.dtype == .float16,
+                let gateBiases = gate.biases, let upBiases = up.biases, let downBiases = down.biases,
+                sharedExpertGate.bias == nil, !(sharedExpertGate is QuantizedLinear),
+                let shared = Qwen4ExpCompiledMoE.sharedExpertRowsF16Metadata(
+                    x, gate: gate, up: up, down: down, gateBiases: gateBiases, upBiases: upBiases,
+                    downBiases: downBiases, sharedGateWeight: sharedExpertGate.weight)
+            {
+                return shared
+            }
             guard compileDecodeRegions,
                 let gate = sharedExpert.gateProj as? QuantizedLinear,
                 let up = sharedExpert.upProj as? QuantizedLinear,
@@ -2794,7 +2865,18 @@ enum Qwen35Language {
                 // verify rows (half the launches of a per-row block at two rows, bitwise the same rows).
                 let rows = x.size / x.dim(-1)
                 let hidden = x.dim(-1)
-                let rowInputs = MLX.split(x.reshaped(1, rows, hidden), parts: rows, axis: 1)
+                let window = x.reshaped(1, rows, hidden)
+                // Router per row: its dense product as an M = 1 batch did not reproduce the 1-row product bit
+                // for bit (Allosaurus 0.2, BENCH_ROWEXACT position 21); the shared expert's quantized products do.
+                if let sharedRows = compiledSharedExpert(window) {
+                    let parts = MLX.split(window, parts: rows, axis: 1).map { routerSelection($0) }
+                    let routing = (indices: MLX.concatenated(parts.map(\.0), axis: 1),
+                                   scores: MLX.concatenated(parts.map(\.1), axis: 1))
+                    let routed = weighted.callRouted(window, indices: routing.indices, scores: routing.scores)
+                    reportDecodeEquivalentRows()
+                    return (routed + sharedRows).reshaped(x.shape)
+                }
+                let rowInputs = MLX.split(window, parts: rows, axis: 1)
                 var indices: [MLXArray] = [], scores: [MLXArray] = [], shared: [MLXArray] = []
                 for row in rowInputs {
                     let (rowIndices, rowScores) = routerSelection(row)

@@ -1426,8 +1426,10 @@ private final class Qwen4ExpAttention: Module {
             mask = sparseMask.map { .array($0) } ?? .none
         } else {
             let keyLength = past + S
-            let queryPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(S, 1)
-            let keyPositions = MLXArray(0 ..< keyLength).asType(.int32).reshaped(1, keyLength)
+            // Device-side ranges: a host array of the whole context per QSA layer per verify window was
+            // measurable host time on the native-MTP verify path (and grows with the context).
+            let queryPositions = MLXArray.arange(past, past + S, dtype: .int32).reshaped(S, 1)
+            let keyPositions = MLXArray.arange(0, keyLength, dtype: .int32).reshaped(1, keyLength)
             var causal = MLX.lessEqual(keyPositions, queryPositions).reshaped(1, 1, S, keyLength)
             if let sparseMask { causal = MLX.logicalAnd(causal, sparseMask) }
             mask = .array(causal)
