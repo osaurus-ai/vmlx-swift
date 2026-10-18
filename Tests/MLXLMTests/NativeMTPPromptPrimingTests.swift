@@ -56,21 +56,25 @@ final class NativeMTPPromptPrimingTests: XCTestCase {
             let prompt: [Int32] = [4, 9, 1, 16, 25, 36, 49]
             let on = try run(real, prompt: prompt, primed: true, tokens: 2)
             let first = Int32(on.emitted[0])
-            // Teacher-forced oracle: trunk hidden over prompt + first token, head over (h_i, x_{i+1}).
+            // Teacher-forced oracle in the primer's call shape: the prefill window's (h_i, x_{i+1}) pairs in one head
+            // call, then (h_{n-1}, first token) on its own (1-row head calls take the decode-shaped paths).
             let ids = prompt + [first]
+            let n = prompt.count
             let trunk = real.nativeBackboneForward(
-                MLXArray(ids).reshaped(1, -1), cache: real.newCache(parameters: GenerateParameters()))
+                MLXArray(prompt).reshaped(1, -1), cache: real.newCache(parameters: GenerateParameters()))
             let oracle = real.makeNativeMTPCache()
             _ = real.nativeMTPForward(
-                hiddenStates: trunk.hiddenStates[0..., 0 ..< prompt.count],
-                nextTokenIds: MLXArray(Array(ids[1...])).reshaped(1, -1), cache: oracle)
+                hiddenStates: trunk.hiddenStates[0..., 0 ..< (n - 1)],
+                nextTokenIds: MLXArray(Array(ids[1 ..< n])).reshaped(1, -1), cache: oracle)
+            _ = real.nativeMTPForward(
+                hiddenStates: trunk.hiddenStates[0..., (n - 1)...],
+                nextTokenIds: MLXArray([first]).reshaped(1, 1), cache: oracle)
             MLX.eval(oracle)
-            let n = prompt.count
             let primedKeys = on.head[0].state[0][0..., 0..., 0 ..< n, 0...]
             let oracleKeys = oracle[0].state[0][0..., 0..., 0 ..< n, 0...]
             XCTAssertEqual(primedKeys.shape, oracleKeys.shape)
-            XCTAssertTrue(allClose(primedKeys, oracleKeys, rtol: 1e-4, atol: 1e-4).item(Bool.self),
-                          "primed head rows must be the teacher-forced head's rows")
+            XCTAssertEqual(abs(primedKeys - oracleKeys).max().item(Float.self), 0,
+                           "primed head rows must be the teacher-forced head's rows")
         }
     }
 

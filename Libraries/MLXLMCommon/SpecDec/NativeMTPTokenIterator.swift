@@ -893,7 +893,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             totalUnitCount: totalPromptCount, detail: "native-mtp"))
         // Prompt priming (recursive heads only; a block drafter reads the target cache instead).
         let usesBlockDrafts = (model as? any NativeMTPBlockDraftModel)?.nativeMTPUsesBlockDrafts ?? false
-        let primer = NativeMTPPromptPrimer.enabled && !usesBlockDrafts && !inputForPrepare.hasMediaContent
+        let primer = NativeMTPPromptPrimer.enabled && model is any NativeMTPPromptPrimingModel
+            && !usesBlockDrafts && !inputForPrepare.hasMediaContent
             ? NativeMTPPromptPrimer(model: model, cache: mtpCache) : nil
         let prepared = try NativeMTPPromptPrimer.$current.withValue(primer) {
             try prepareCapturingCacheBoundaries(

@@ -77,6 +77,11 @@ public final class NativeMTPPromptPrimer: @unchecked Sendable {
     }
 }
 
+/// A native-MTP model whose head accepts a multi-row (hidden, next token) window — the prompt history — in one
+/// forward, and whose prefill hands its chunks to `NativeMTPPromptPrimer.current`. Only such models are primed;
+/// `nativeMTPForward`'s base contract is one recursive draft step.
+public protocol NativeMTPPromptPrimingModel: NativeMTPModel {}
+
 public extension NativeMTPModel {
     /// Write head-cache rows for (hidden, next token) pairs without drafting. The default runs the draft forward
     /// and leaves its logits unevaluated (lazy), so only the cache rows are computed.
