@@ -24,52 +24,18 @@ public struct ModelWireBudgetReport: Sendable, Equatable {
     public let budget: SystemWireBudget
     /// The residency limit applied, or `nil` when the model could not be pinned.
     public let residencyTargetBytes: Int?
-    /// Installed RAM the load's memory policy used (``HostPhysicalMemory``).
-    public let physicalMemoryBytes: Int
 
-    public init(
-        modelBytes: Int, budget: SystemWireBudget, residencyTargetBytes: Int?,
-        physicalMemoryBytes: Int = Int(clamping: HostPhysicalMemory.bytes)
-    ) {
+    public init(modelBytes: Int, budget: SystemWireBudget, residencyTargetBytes: Int?) {
         self.modelBytes = modelBytes
         self.estimatedGenerationBytes = modelBytes + SystemWireBudget.estimatedGenerationOverheadBytes
         self.budget = budget
         self.residencyTargetBytes = residencyTargetBytes
-        self.physicalMemoryBytes = physicalMemoryBytes
     }
 
     /// Bytes the generation is expected to need beyond what can still be wired; `nil` when unknown.
     public var shortfallBytes: Int? {
         guard let headroom = budget.headroomBytes else { return nil }
         return max(0, estimatedGenerationBytes - headroom)
-    }
-
-    /// `VMLX_WIRE_BUDGET_CACHE_CEILING=0` disables the ceiling (same-binary A/B and diagnosis).
-    static let allocatorCacheCeilingEnabled: Bool = {
-        let value = RuntimeEnvironment.value("VMLX_WIRE_BUDGET_CACHE_CEILING") ?? "1"
-        return value != "0" && value.lowercased() != "false"
-    }()
-
-    /// Smallest MLX freed-buffer pool a ceiling may impose: below this, decode re-allocates (and re-wires) its
-    /// intermediates every step.
-    public static let minimumAllocatorCacheCeilingBytes = 512 * 1024 * 1024
-
-    /// Largest MLX freed-buffer pool (`Memory.cacheLimit`) that keeps a generation inside this Mac's wire budget,
-    /// or `nil` when there is no such constraint to apply (budget unknown, or a Mac of 64 GiB or more).
-    ///
-    /// SPEED-CRITICAL (Allosaurus 0.2 on 48 GB Macs, 2026-10-18). The GPU can only use WIRED memory, and the
-    /// allocator's freed-buffer pool is wired just like weights and KV. Hosts sized the pool from RAM and weights
-    /// only (Osaurus: 6 GB on a 48 GB Mac while MTP runs), so weights + KV + scratch + pool overran the ~31 GiB a
-    /// 48 GB Mac can wire: the kernel refused wiring on every command buffer (`vm.add_wire_count_over_global_limit`)
-    /// and decode fell from 46-64 to 23-34 tok/s, MTP on or off. The pool must fit what is left of the wire
-    /// budget (and of the residency set, whose overflow is re-wired per command buffer) after the generation's
-    /// own working set. Advisory sizing of a cache only: it never blocks or changes a load.
-    public var allocatorCacheCeilingBytes: Int? {
-        guard Self.allocatorCacheCeilingEnabled, physicalMemoryBytes < 64 * 1_073_741_824,
-            let headroom = budget.headroomBytes
-        else { return nil }
-        let wireable = min(headroom, residencyTargetBytes ?? headroom)
-        return max(Self.minimumAllocatorCacheCeilingBytes, wireable - estimatedGenerationBytes)
     }
 
     /// `true` when the estimated generation working set exceeds the measured wire headroom.
@@ -98,7 +64,6 @@ public struct ModelWireBudgetReport: Sendable, Equatable {
             + "user_wire_limit=\(v(budget.userWireLimitBytes)) gpu_wired_limit=\(v(budget.gpuWiredLimitBytes)) "
             + "wired_at_load=\(v(budget.wiredBytes)) headroom=\(v(budget.headroomBytes)) "
             + "shortfall=\(v(shortfallBytes)) residency_target=\(v(residencyTargetBytes)) "
-            + "allocator_cache_ceiling=\(v(allocatorCacheCeilingBytes)) "
             + "wire_rejections_total=\(v(budget.wireLimitRejections))"
     }
 
