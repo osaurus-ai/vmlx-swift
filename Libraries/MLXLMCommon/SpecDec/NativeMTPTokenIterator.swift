@@ -342,6 +342,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var prefixCommitCount = 0
     private(set) var rollbackRepairCount = 0
     private(set) var mtpCacheRefreshCount = 0
+    /// Head-cache rows written by prompt priming (`NativeMTPPromptPrimer`).
+    private(set) var promptPrimedRows = 0
 
     // MARK: - Aligned head cache
     //
@@ -889,9 +891,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         prefillProgressHandler?(PrefillProgress(
             stage: .prefill, completedUnitCount: restoredCount,
             totalUnitCount: totalPromptCount, detail: "native-mtp"))
-        let prepared = try prepareCapturingCacheBoundaries(
-            inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
-            prefillProgressHandler: prefillProgressHandler)
+        // Prompt priming (recursive heads only; a block drafter reads the target cache instead).
+        let usesBlockDrafts = (model as? any NativeMTPBlockDraftModel)?.nativeMTPUsesBlockDrafts ?? false
+        let primer = NativeMTPPromptPrimer.enabled && !usesBlockDrafts && !inputForPrepare.hasMediaContent
+            ? NativeMTPPromptPrimer(model: model, cache: mtpCache) : nil
+        let prepared = try NativeMTPPromptPrimer.$current.withValue(primer) {
+            try prepareCapturingCacheBoundaries(
+                inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
+                prefillProgressHandler: prefillProgressHandler)
+        }
         self.promptPrefillTime = NativeMTPClock.now() - start
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
@@ -903,6 +911,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let backbone = model.nativeBackboneForward(
                 Self.sequenceInput(tokens.tokens),
                 cache: self.cache)
+            primer?.fold(hidden: backbone.hiddenStates, tokens: Self.sequenceInput(tokens.tokens))
             firstToken = Self.sampleLast(
                 logits: backbone.logits,
                 sampler: sampler,
@@ -953,6 +962,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             firstToken.item(Int.self)
         }
         pendingTokens.append(firstID)
+        if let primer {
+            let primeStart = NativeMTPClock.now()
+            primer.finish(firstToken: firstToken)
+            promptPrimedRows = primer.foldedRows
+            self.mtpDraftTime += NativeMTPClock.now() - primeStart
+            FileHandle.standardError.write(Data(String(
+                format: "[NativeMTP] prompt_priming rows=%d prompt_positions=%d sec=%.3f\n",
+                primer.foldedRows, primer.receivedPositions, NativeMTPClock.now() - primeStart).utf8))
+        }
 
         let bridgeStart = NativeMTPClock.now()
         try Task.checkCancellation()

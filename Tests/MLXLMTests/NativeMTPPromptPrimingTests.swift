@@ -1,0 +1,92 @@
+import Foundation
+import MLX
+import MLXNN
+import MLXRandom
+import XCTest
+@testable import MLXLMCommon
+@testable import MLXVLM
+
+/// Native-MTP prompt priming on a real (toy) Qwen4Exp: the head cache holds one row per prompt position (plus the
+/// first draft), its rows equal the teacher-forced head over the prompt, and greedy output does not change.
+final class NativeMTPPromptPrimingTests: XCTestCase {
+    private func model(seed: UInt64) throws -> Qwen4Exp {
+        MLXRandom.seed(seed)
+        let config = try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: Data(Self.config.utf8))
+        return Qwen4Exp(config)
+    }
+
+    private func run(_ model: Qwen4Exp, prompt: [Int32], primed: Bool, tokens: Int)
+        throws -> (emitted: [Int], primedRows: Int, headOffset: Int, head: [KVCache])
+    {
+        let previous = NativeMTPPromptPrimer.enabled
+        NativeMTPPromptPrimer.enabled = primed
+        defer { NativeMTPPromptPrimer.enabled = previous }
+        var parameters = GenerateParameters(maxTokens: tokens, temperature: 0)
+        parameters.draftStrategy = .nativeMTP(depth: 1)
+        parameters.nativeMTPDepthPolicy = .fixed
+        var iterator = try NativeMTPTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)), model: model, parameters: parameters, depth: 1)
+        let primedRows = iterator.promptPrimedRows
+        let headOffset = iterator.mtpCache.first?.offset ?? -1
+        let head = iterator.mtpCache
+        var emitted: [Int] = []
+        while let token = iterator.next() { emitted.append(token) }
+        return (emitted, primedRows, headOffset, head)
+    }
+
+    func testPrimedHeadHoldsThePromptAndOutputIsUnchanged() throws {
+        try MLXMetalTestLock.withLock {
+            let real = try model(seed: 7101)
+            // 9 tokens: not a multiple of any block / chunk size.
+            let prompt: [Int32] = [3, 7, 11, 5, 19, 2, 23, 13, 29]
+            let off = try run(real, prompt: prompt, primed: false, tokens: 12)
+            let on = try run(real, prompt: prompt, primed: true, tokens: 12)
+            XCTAssertEqual(off.primedRows, 0)
+            XCTAssertEqual(off.headOffset, 1, "unprimed: only the first draft row")
+            XCTAssertEqual(on.primedRows, prompt.count, "n-1 prompt pairs plus (h_{n-1}, first token)")
+            XCTAssertEqual(on.headOffset, prompt.count + 1, "primed rows plus the first draft row")
+            XCTAssertFalse(on.emitted.isEmpty)
+            XCTAssertEqual(on.emitted, off.emitted, "the head only proposes: priming must not change output")
+        }
+    }
+
+    func testPrimedRowsMatchTheTeacherForcedHead() throws {
+        try MLXMetalTestLock.withLock {
+            let real = try model(seed: 7102)
+            let prompt: [Int32] = [4, 9, 1, 16, 25, 36, 49]
+            let on = try run(real, prompt: prompt, primed: true, tokens: 2)
+            let first = Int32(on.emitted[0])
+            // Teacher-forced oracle: trunk hidden over prompt + first token, head over (h_i, x_{i+1}).
+            let ids = prompt + [first]
+            let trunk = real.nativeBackboneForward(
+                MLXArray(ids).reshaped(1, -1), cache: real.newCache(parameters: GenerateParameters()))
+            let oracle = real.makeNativeMTPCache()
+            _ = real.nativeMTPForward(
+                hiddenStates: trunk.hiddenStates[0..., 0 ..< prompt.count],
+                nextTokenIds: MLXArray(Array(ids[1...])).reshaped(1, -1), cache: oracle)
+            MLX.eval(oracle)
+            let n = prompt.count
+            let primedKeys = on.head[0].state[0][0..., 0..., 0 ..< n, 0...]
+            let oracleKeys = oracle[0].state[0][0..., 0..., 0 ..< n, 0...]
+            XCTAssertEqual(primedKeys.shape, oracleKeys.shape)
+            XCTAssertTrue(allClose(primedKeys, oracleKeys, rtol: 1e-4, atol: 1e-4).item(Bool.self),
+                          "primed head rows must be the teacher-forced head's rows")
+        }
+    }
+
+    private static let config = #"""
+    {"model_type":"qwen4_exp","text_config":{
+      "model_type":"qwen4_exp_text","dtype":"float32","mamba_ssm_dtype":"float32",
+      "mtp_num_hidden_layers":1,"hidden_size":64,"num_hidden_layers":2,
+      "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":1,"head_dim":16,
+      "linear_num_value_heads":4,"linear_num_key_heads":1,"linear_key_head_dim":16,
+      "linear_value_head_dim":16,"linear_conv_kernel_dim":4,"vocab_size":128,
+      "num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,
+      "shared_expert_intermediate_size":16,"layer_types":["linear_attention","full_attention"],
+      "hc_count":4,"hc_lowrank":8,"ple_layer_ids":[],"ple_embed_dim":64,
+      "ple_conv_kernel_size":4,"ngram_size":3,"heads_per_ngram":2,"ngram_vocab_size_base":101,
+      "make_ngram_vocab_size_divisible_by":128,"seed":1234,"split_ngram_parts":4,
+      "indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":8,
+      "indexer_budget":32,"indexer_compress_ratio":4}}
+    """#
+}

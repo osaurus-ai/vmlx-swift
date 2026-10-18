@@ -2131,10 +2131,20 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                 && !cache.isEmpty
                 && cache.allSatisfy { $0.offset == 0 && $0.state.isEmpty }
             var offset = 0
+            // Native-MTP prompt priming: the chunk's pre-mixer hidden is the MTP head's input, folded into the
+            // head cache as the prefill produces it (see `NativeMTPPromptPrimer`).
+            let primer = NativeMTPPromptPrimer.current
             if step > 0 {
                 while count - offset > step {
                     try Task.checkCancellation()
-                    _ = forwardTokens(tokens[0..., offset..<(offset + step)], cache: cache)
+                    let chunk = tokens[0..., offset..<(offset + step)]
+                    if let primer {
+                        let forward = textModel.forward(
+                            chunk, cache: cache, positionOffset: ropeDelta(for: cache))
+                        primer.fold(hidden: forward.preMixer, tokens: chunk)
+                    } else {
+                        _ = forwardTokens(chunk, cache: cache)
+                    }
                     MLX.eval(cache)
                     offset += step
                     CanonicalTextPrefillCheckpointReporter.reportQwen4ExpColdTextChunk(
@@ -2145,6 +2155,12 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                 }
             }
             try Task.checkCancellation()
+            if let primer {
+                let tail = tokens[0..., offset...]
+                let forward = textModel.forward(tail, cache: cache, positionOffset: ropeDelta(for: cache))
+                primer.fold(hidden: forward.preMixer, tokens: tail)
+                return .logits(LMOutput(logits: projectToLogits(forward.mixed)))
+            }
             return .logits(LMOutput(logits: forwardTokens(tokens[0..., offset...], cache: cache)))
         }
 
