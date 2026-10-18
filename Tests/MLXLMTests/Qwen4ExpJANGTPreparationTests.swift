@@ -49,6 +49,14 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
             let routed = model.namedModules().filter { $0.1 is JANGTRoutedExpertLayer }.map(\.0).sorted()
             XCTAssertEqual(routed, ["language_model.layers.0.mlp.switch_mlp", "language_model.layers.1.mlp.switch_mlp"])
             XCTAssertTrue(model.namedModules().allSatisfy { !($0.1 is JANGHRoutedExpertLayer) })
+            // Prompt caches written by other trellis kernels must not restore: JANGT bundles carry a computation
+            // identity in the cache key; ordinary bundles keep their existing (nil) identity.
+            XCTAssertEqual(model.cacheComputationIdentity, "qwen4_exp:jangt-v2-halfbits-k1-masked-tail-v1")
+            var shellRoot = f.configuration()
+            shellRoot["quantization"] = ["group_size": 64, "bits": 8]
+            let shell = try Qwen4Exp(try JSONDecoder.json5().decode(
+                Qwen4ExpConfiguration.self, from: JSONSerialization.data(withJSONObject: shellRoot)), requesting: [.text])
+            XCTAssertNil(shell.cacheComputationIdentity)
             for name in prepared.banks.excludedTensorNames where !name.hasSuffix(".jt_cs") || name.contains("down_proj") {
                 XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key: name), name)
             }

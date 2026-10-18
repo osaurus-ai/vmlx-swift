@@ -2043,6 +2043,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     /// Exact custom tensor names (tq2_* / jt_*) owned by the mapped banks (empty for affine bundles).
     let customRoutedTensorNames: Set<String>
 
+    /// JANGT trellis experts: the sub-2-bit port (K = 1 / 1.5 units, masked tail block for the 640-wide down input)
+    /// changed the decoded expert outputs versus the earlier trellis kernels, so a prompt cache written by those
+    /// kernels must not restore into this runtime. Nil for affine and JANGH-only bundles (their keys are unchanged).
+    /// Bump only when the trellis decode semantics change, not for equivalent speedups.
+    private let jangtCacheComputationIdentity: String?
+
+    public var cacheComputationIdentity: String? { jangtCacheComputationIdentity }
+
     /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.
     private init(
         _ config: Qwen4ExpConfiguration,
@@ -2054,6 +2062,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         self.plan = plan
         self.config = config
         self.customRoutedTensorNames = customRoutedTensorNames
+        self.jangtCacheComputationIdentity = customRoutedTensorNames.contains { $0.contains(".jt_") }
+            ? "qwen4_exp:jangt-v2-halfbits-k1-masked-tail-v1" : nil
         _textModel.wrappedValue = Qwen4ExpTextModel(config, routedExperts: routedExperts)
         _head.wrappedValue = Linear(
             config.base.textConfiguration.hiddenSize,
