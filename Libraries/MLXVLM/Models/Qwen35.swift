@@ -2771,7 +2771,44 @@ enum Qwen35Language {
                         .utf8))
         }
 
+        /// Top-k expert indices and routing weights (the compiled router when it applies).
+        private func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
+            if let compiled = compiledRouter(x) { return compiled }
+            var gates = gate(x)
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+            let kth = gates.dim(-1) - topK
+            let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+            var selected = MLX.takeAlong(gates, inds, axis: -1)
+            if normTopkProb {
+                selected = selected / selected.sum(axis: -1, keepDims: true)
+            }
+            return (inds, selected)
+        }
+
         func callAsFunction(_ x: MLXArray) -> MLXArray {
+            if requiresDecodeEquivalentRows(x),
+                let weighted = switchMLP as? any WeightedRoutedExpertLayer, !(switchMLP is SwitchGLU)
+            {
+                // Custom routed banks decode every (token, slot) on its own (JANGT / JANGH decode kernels), so
+                // only the router and shared expert need the 1-row step's shapes; the bank runs once for all
+                // verify rows (half the launches of a per-row block at two rows, bitwise the same rows).
+                let rows = x.size / x.dim(-1)
+                let hidden = x.dim(-1)
+                let rowInputs = MLX.split(x.reshaped(1, rows, hidden), parts: rows, axis: 1)
+                var indices: [MLXArray] = [], scores: [MLXArray] = [], shared: [MLXArray] = []
+                for row in rowInputs {
+                    let (rowIndices, rowScores) = routerSelection(row)
+                    indices.append(rowIndices)
+                    scores.append(rowScores)
+                    shared.append(compiledSharedExpert(row)
+                        ?? compiledSigmoidGate(sharedExpertGate(row), sharedExpert(row)))
+                }
+                let routed = weighted.callRouted(
+                    x.reshaped(1, rows, hidden), indices: MLX.concatenated(indices, axis: 1),
+                    scores: MLX.concatenated(scores, axis: 1))
+                reportDecodeEquivalentRows()
+                return (routed + MLX.concatenated(shared, axis: 1)).reshaped(x.shape)
+            }
             if requiresDecodeEquivalentRows(x) {
                 let rows = x.size / x.dim(-1)
                 let hidden = x.dim(-1)
@@ -2784,21 +2821,7 @@ enum Qwen35Language {
                 return result
             }
 
-            let inds: MLXArray
-            let scores: MLXArray
-            if let compiled = compiledRouter(x) {
-                (inds, scores) = compiled
-            } else {
-                var gates = gate(x)
-                gates = MLX.softmax(gates, axis: -1, precise: true)
-                let kth = gates.dim(-1) - topK
-                inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
-                var selected = MLX.takeAlong(gates, inds, axis: -1)
-                if normTopkProb {
-                    selected = selected / selected.sum(axis: -1, keepDims: true)
-                }
-                scores = selected
-            }
+            let (inds, scores) = routerSelection(x)
 
             let routed: MLXArray?
             let eagerCombined: MLXArray?

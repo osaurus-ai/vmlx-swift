@@ -399,32 +399,45 @@ private enum Qwen4ExpCompiledMHC {
     /// the fused down+inject through `Qwen4ExpBF16Affine.dense` (23.5 us for N=324 x K=10240 against 14.4 us for
     /// MLX's quantized matmul) plus a dozen separate elementwise launches — about 9 ms per token more than the bf16
     /// mixers of the 0.1 bundle (layer profile 2026-10-17: attention_mix 0.37 vs 0.22 ms, mlp_mix 0.35 vs 0.19 ms;
-    /// everything else equal). One compiled region; the projections run as one M = 1 matmul per row
+    /// everything else equal). One compiled region over the module's own weights (down and inject stay separate:
+    /// concatenating them would keep a second, permanent copy of every mixer's weights next to the mapped
+    /// originals, ~0.3 GB here); the projections run as one M = 1 matmul per row
     /// ([rows, 1, K] against the shared weight), so the same region serves the 1-row step and 2...8 verify rows with
     /// identical per-row arithmetic (verify row == AR step). Outputs round to bf16 where `QuantizedLinear` would.
     static func callRowsF16Metadata(
         hyper: MLXArray,
         normalizedInput: MLXArray? = nil,
         normWeight: MLXArray,
-        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray,
-        downGroupSize: Int, downBits: Int, downOutputSize: Int,
-        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray,
-        upGroupSize: Int, upBits: Int,
+        down: QuantizedLinear, downBiases: MLXArray,
+        injectWeightF32: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray,
         hcCount: Int, hiddenSize: Int, eps: Float
     ) -> (MLXArray, MLXArray)? {
         let rows = hyper.ndim == 3 && hyper.dim(0) == 1 ? hyper.dim(1) : 0
-        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows),
-            rows == 1 || FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin"),
-            hyper.dtype == .bfloat16, normWeight.dtype == .bfloat16,
-            downScales.dtype == .float16, downBiases.dtype == .float16,
-            upScales.dtype == .float16, upBiases.dtype == .float16,
-            normalizedInput.map({ $0.shape == hyper.shape && $0.dtype == hyper.dtype }) ?? true
-        else { return nil }
+        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows) else { return nil }
+        if rows > 1,
+            !FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
+        {
+            return nil
+        }
+        guard hyper.dtype == .bfloat16, normWeight.dtype == .bfloat16 else { return nil }
+        guard injectWeightF32.dtype == .float32, injectWeightF32.ndim == 2 else { return nil }
+        for module in [down, up] {
+            guard module.mode == .affine, module.bias == nil, module.scales.dtype == .float16 else { return nil }
+        }
+        for biases in [downBiases, upBiases] where biases.dtype != .float16 { return nil }
+        if let normalizedInput, normalizedInput.shape != hyper.shape || normalizedInput.dtype != hyper.dtype {
+            return nil
+        }
+        let downOutputSize = down.weight.dim(0)
+        let (downGroupSize, downBits) = (down.groupSize, down.bits)
+        let (upGroupSize, upBits) = (up.groupSize, up.bits)
 
         let hasNormalizedInput = normalizedInput != nil
         let key = [
             "f16meta", String(hcCount), String(hiddenSize), String(eps),
             String(downGroupSize), String(downBits), String(downOutputSize),
+            "inject\(injectWeightF32.dim(0))",
             String(upGroupSize), String(upBits), "S\(rows)", "normalized=\(hasNormalizedInput)",
         ].joined(separator: "|")
 
@@ -439,25 +452,33 @@ private enum Qwen4ExpCompiledMHC {
                     MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: eps)
                         .reshaped(original) * args[1]
                 )
-                let width = normalized.dim(-1)
-                let combined = quantizedMM(
-                    normalized.reshaped(rows, 1, width), args[2][.newAxis],
-                    scales: args[3][.newAxis], biases: args[4][.newAxis],
-                    transpose: true, groupSize: downGroupSize, bits: downBits, mode: .affine
-                ).reshaped(1, rows, -1).asType(hyper.dtype)
-                let parts = MLX.split(combined, indices: [downOutputSize], axis: -1)
-                let activated = silu(parts[0] / Float(hcCount))
-                let projected = quantizedMM(
-                    activated.reshaped(rows, 1, downOutputSize), args[5][.newAxis],
-                    scales: args[6][.newAxis], biases: args[7][.newAxis],
-                    transpose: true, groupSize: upGroupSize, bits: upBits, mode: .affine
-                ).reshaped(1, rows, -1).asType(hyper.dtype)
+                // One M = 1 product per row: the plain 2-D call for the single decode row (MLX's fast
+                // 1-row kernel), the batched [rows, 1, K] form for verify rows; per row these are the same
+                // arithmetic (bitwise-checked by BENCH_ROWEXACT).
+                func project(_ x: MLXArray, _ w: Int, groupSize: Int, bits: Int) -> MLXArray {
+                    let k = x.dim(-1)
+                    let product = rows == 1
+                        ? quantizedMM(x.reshaped(1, k), args[w], scales: args[w + 1], biases: args[w + 2],
+                                      transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
+                        : quantizedMM(x.reshaped(rows, 1, k), args[w][.newAxis], scales: args[w + 1][.newAxis],
+                                      biases: args[w + 2][.newAxis], transpose: true, groupSize: groupSize,
+                                      bits: bits, mode: .affine)
+                    return product.reshaped(1, rows, -1).asType(hyper.dtype)
+                }
+                let mixedDown = project(normalized, 2, groupSize: downGroupSize, bits: downBits)
+                // hc_count outputs over the full width: as a 1-row matmul that is one threadgroup reading the
+                // whole row serially (~4x the down projection's cost per mixer); an F32 multiply-reduce runs
+                // wide and is the same per-row arithmetic for any row count.
+                let injected = (normalized.reshaped(rows, 1, normalized.dim(-1)).asType(.float32) * args[5])
+                    .sum(axis: -1).reshaped(1, rows, -1).asType(hyper.dtype)
+                let activated = silu(mixedDown / Float(hcCount))
+                let projected = project(activated, 6, groupSize: upGroupSize, bits: upBits)
                 let weights = sigmoid(projected).reshaped(
                     Array(projected.shape.dropLast()) + [hcCount, hiddenSize])
                 let normalizedGroups = normalized.reshaped(
                     Array(normalized.shape.dropLast()) + [hcCount, hiddenSize])
                 let mixed = (weights * normalizedGroups).mean(axis: -2).asType(hyper.dtype)
-                let injection = (2 * sigmoid(parts[1] / Float(hcCount))).asType(hyper.dtype)
+                let injection = (2 * sigmoid(injected / Float(hcCount))).asType(hyper.dtype)
                 return [mixed, injection]
             }
             regions[key] = region
@@ -466,8 +487,8 @@ private enum Qwen4ExpCompiledMHC {
         lock.unlock()
 
         let outputs = region!([
-            normalizedInput ?? hyper, normWeight, downWeight, downScales, downBiases,
-            upWeight, upScales, upBiases,
+            normalizedInput ?? hyper, normWeight, down.weight, down.scales, downBiases,
+            injectWeightF32, up.weight, up.scales, upBiases,
         ])
         guard outputs.count == 2 else { return nil }
         return (outputs[0], outputs[1])
@@ -627,27 +648,24 @@ private final class Qwen4ExpGatedResidual: Module {
         // verify rows rounded an inject value differently (Allosaurus 0.2 layer 30, 2026-10-17).
         let affineVerifyRows = combines && mixDown is QuantizedLinear
             && FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
+        if combines, let down = mixDown as? QuantizedLinear, type(of: down) == QuantizedLinear.self,
+            let up = mixUp as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+            let downBiases = down.biases, let upBiases = up.biases,
+            let injectWeightF32 = injectWeightF32ForCompiledMix(),
+            let compiled = Qwen4ExpCompiledMHC.callRowsF16Metadata(
+                hyper: hyper, normalizedInput: normalizedInput, normWeight: norm.weight,
+                down: down, downBiases: downBiases, injectWeightF32: injectWeightF32,
+                up: up, upBiases: upBiases,
+                hcCount: hcCount, hiddenSize: hiddenSize, eps: norm.eps)
+        {
+            return compiled
+        }
         var fused: FusedInputProjection?
         if Self.fuseDecodeInputs, combines,
             (Qwen4ExpCompiledMHC.supportsShape(hyper) || joinedVerifyProjection || affineVerifyRows),
             !CompiledDecodeTrace.isActive
         {
             fused = fusedProjection(for: hyper)
-        }
-        if case .affine(
-            let downWeight, let downScales, let downBiases,
-            let downGroupSize, let downBits, let downMode) = fused, downMode == .affine,
-            let up = mixUp as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
-            up.mode == .affine, up.bias == nil, let upBiases = up.biases,
-            let compiled = Qwen4ExpCompiledMHC.callRowsF16Metadata(
-                hyper: hyper, normalizedInput: normalizedInput, normWeight: norm.weight,
-                downWeight: downWeight, downScales: downScales, downBiases: downBiases,
-                downGroupSize: downGroupSize, downBits: downBits, downOutputSize: mixDown.shape.0,
-                upWeight: up.weight, upScales: up.scales, upBiases: upBiases,
-                upGroupSize: up.groupSize, upBits: up.bits,
-                hcCount: hcCount, hiddenSize: hiddenSize, eps: norm.eps)
-        {
-            return compiled
         }
         if case .affine(
             let downWeight, let downScales, let downBiases,
@@ -774,6 +792,28 @@ private final class Qwen4ExpGatedResidual: Module {
             (2 * sigmoid($0 / Float(hcCount))).asType(hyper.dtype)
         }
         return (mixed, injection)
+    }
+
+    /// The quantized inject projection (hc_count x width, f16 metadata) dequantized to F32 once for the compiled
+    /// f16-metadata mixer: 4 x 10240 x 4 bytes = 160 KB per mixer. Nil for any other inject.
+    private var injectWeightF32: MLXArray?
+    private var attemptedInjectWeightF32 = false
+    private func injectWeightF32ForCompiledMix() -> MLXArray? {
+        if !attemptedInjectWeightF32 {
+            attemptedInjectWeightF32 = true
+            if let q = inject as? QuantizedLinear, type(of: q) == QuantizedLinear.self, q.mode == .affine,
+                q.bias == nil, q.scales.dtype == .float16, let biases = q.biases, biases.dtype == .float16,
+                q.weight.dim(0) == hcCount
+            {
+                let w = dequantized(
+                    q.weight, scales: q.scales.asType(.float32), biases: biases.asType(.float32),
+                    groupSize: q.groupSize, bits: q.bits, mode: .affine
+                ).asType(.float32)
+                MLX.eval(w)
+                injectWeightF32 = w
+            }
+        }
+        return injectWeightF32
     }
 
     private func fusedProjection(for input: MLXArray) -> FusedInputProjection? {
