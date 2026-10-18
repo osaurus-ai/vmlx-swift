@@ -55,6 +55,34 @@ import Testing
             config: ["model_type": "qwen4_exp"], fallback: nil) == 3)
     }
 
+    @Test("a measured sidecar enables On (Adaptive) at its depth; Auto stays autoregressive")
+    func measuredSidecarEnablesExplicitAdaptiveOnly() throws {
+        let c = config(["moe_latent_size": 1024, "mtp_layers_block_type": ["attention", "moe"]])
+        let data = try JSONSerialization.data(withJSONObject: c)
+        func status(best: Double) -> MTPBundleStatus {
+            MTPBundleStatus(
+                bundleHasMTP: true, configuredLayers: 1, tensorCount: 40, mode: .preservedEnabled,
+                nativeMTPTuning: NativeMTPTuning(
+                    bestDepth: 2, validated: true, outputEquivalent: true, promptClass: "mixed",
+                    baselineTokensPerSecond: 37.9, bestTokensPerSecond: best,
+                    speedupVsBaseline: best / 37.9, quantizationMode: "affine",
+                    modelTypes: ["nemotron_h"]))
+        }
+        var settings = VMLXServerRuntimeSettings()
+        settings.mtp.mode = .auto
+        let adaptive = settings.resolvedMTPLaunch(
+            configData: data, jangConfig: nil, status: status(best: 49.2))
+        #expect(adaptive.launchMode == .speculative)
+        #expect(adaptive.recommendation?.depth == 2)
+        settings.mtp.mode = .familyDefault
+        #expect(settings.resolvedMTPLaunch(
+            configData: data, jangConfig: nil, status: status(best: 49.2)).launchMode == .off)
+        // A sidecar that records a loss never launches, explicit or not.
+        settings.mtp.mode = .auto
+        #expect(settings.resolvedMTPLaunch(
+            configData: data, jangConfig: nil, status: status(best: 35.0)).launchMode == .off)
+    }
+
     /// Opt-in: VMLX_SUPER_BUNDLE=<Nemotron-3.5-Super-VL-120B-A12B-JANG_4M directory>.
     @Test("real Super-VL bundle keeps Auto off without measured speedup",
         .enabled(if: ProcessInfo.processInfo.environment["VMLX_SUPER_BUNDLE"] != nil))
@@ -64,6 +92,9 @@ import Testing
         let status = try MTPBundleInspector.inspect(modelDirectory: root)
         #expect(status.hasCompleteMTPArtifact)
         #expect(status.measuredFamilyAutoDepth == nil)
+        // Holds for the published bundle (no vmlx_mtp_tuning.json); a local measured sidecar
+        // legitimately enables On (Adaptive).
+        guard status.nativeMTPTuning == nil else { return }
         let recommendation = NativeMTPAutoDecodePolicy.recommendation(
             configData: configData, jangConfig: nil, status: status)
         #expect(!status.hasUsableNativeMTPTuning)

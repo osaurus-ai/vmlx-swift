@@ -1181,8 +1181,9 @@ public actor BatchEngine {
     }
 
     private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
-        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
-            !cacheRestoreIsExactPrefix(slot.cache)
+        if requiredToolSelectionSkipsDiskBackedRestore(
+            model: context.model, cache: slot.cache,
+            restorePolicy: slot.originalInput.cacheRestorePolicy)
         {
             return true
         }
@@ -2125,13 +2126,20 @@ public actor BatchEngine {
                 return try stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare, error: error)
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
+            // Per-boundary salts, in the token space this lookup probes.
+            let saltPlan = CacheBoundarySaltPlan.make(
+                requestSalt: slot.mediaSalt, input: slot.originalInput, lookupTokenIds: tokenIds,
+                model: context.model, parameters: slot.parameters)
+            slot.cacheSaltPlan = saltPlan
             // Scope the fetch result to this coordinator branch. Ordinary
             // requests keep longest-prefix reuse. A caller that is forcing a
             // fresh tool selection may bypass only an unproven disk-backed
-            // topology; paged/full-KV and exact-prefix restores remain eligible.
-            if requiresDiskBackedRestore,
-               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection,
-               !cacheRestoreIsExactPrefix(slot.cache)
+            // topology; paged/full-KV and exact-prefix restores remain
+            // eligible, as does a model that declares its exact-prefix restore
+            // suffix-independent (`PrefixCacheInvariantModel`).
+            if requiredToolSelectionSkipsDiskBackedRestore(
+                model: context.model, cache: slot.cache,
+                restorePolicy: slot.originalInput.cacheRestorePolicy)
             {
                 Self.logger.info(
                     "Slot \(slot.id.description, privacy: .public): skipped disk-backed required-tool cache restore; caller requested fresh tool selection"
@@ -2143,7 +2151,8 @@ public actor BatchEngine {
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: slot.originalInput
                         .cacheStablePrefixTokenCounts,
-                    chainId: slot.parameters.cacheChainId)
+                    chainId: slot.parameters.cacheChainId,
+                    mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)
                 if case .hit(
                     let matchedTokens, let remaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
@@ -2258,7 +2267,8 @@ public actor BatchEngine {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,
-                                reason: "payload does not fit the runtime cache")
+                                reason: "payload does not fit the runtime cache",
+                                mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)
                         }
                     }
 
@@ -2274,7 +2284,8 @@ public actor BatchEngine {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,
-                                reason: "restored offsets do not match the boundary")
+                                reason: "restored offsets do not match the boundary",
+                                mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)
                         }
                         restored = false
                         retainedDiskRestore = false
@@ -2314,8 +2325,16 @@ public actor BatchEngine {
                         // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
                         // Same SSM-state path-dependence rationale as the
                         // remaining.nonEmpty case below.
-                        let unsafePartial =
+                        // See TokenIterator: a hit at or before the first media
+                        // token of a model that declares its pre-media state
+                        // media-independent resumes with the media carried into
+                        // the suffix; other hits with placeholders left in the
+                        // suffix roll back.
+                        let suffixHoldsMedia =
                             slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
+                        let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                            input: slot.originalInput, remainingTokens: remaining,
+                            matchedTokens: matchedTokens, plan: saltPlan)
                         // Only standalone rotating / sliding-window caches (Gemma,
                         // Mistral SWA) are proven to restore exactly and take the
                         // standard trim+re-feed fast path on a full hit. Keep the
@@ -2439,9 +2458,15 @@ public actor BatchEngine {
                             // Remaining tokens path — same 2D shape contract.
                             let remainingArray = MLXArray(remaining.map { Int32($0) })
                                 .expandedDimensions(axis: 0)
+                            if suffixHoldsMedia {
+                                inputForPrepare = mediaCarryingSuffixInput(
+                                    from: slot.originalInput, remainingTokens: remaining,
+                                    matchedTokens: matchedTokens)
+                            } else {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: remainingArray),
                                 image: nil, video: nil)
+                            }
                             retainedDiskRestore = diskArrays != nil
                         }
                         if retainedDiskRestore {
@@ -2451,7 +2476,8 @@ public actor BatchEngine {
                                 preferredDiskBoundaries: slot.originalInput
                                     .cacheStablePrefixTokenCounts,
                                 skipExactDiskBoundary: requiresDiskBackedRestore,
-                                mediaSalt: slot.mediaSalt)
+                                mediaSalt: slot.mediaSalt,
+                                mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)
                         }
                     }
                 }
@@ -2557,7 +2583,7 @@ public actor BatchEngine {
             perLayerData: [],
             ssmStates: nil,
             cache: diskStoreCache,
-            mediaSalt: slot.mediaSalt,
+            mediaSalt: slot.cacheSalt(forBoundary: tokens.count),
             chainId: slot.parameters.cacheChainId)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
@@ -2720,7 +2746,7 @@ public actor BatchEngine {
                             promptTokenIds: slot.cachePromptTokenIds,
                             genPromptLen: fullLen - (boundary - 1),
                             enableSSMReDerive: true,
-                            mediaSalt: slot.mediaSalt)
+                            mediaSalt: slot.cacheSalt(forBoundary: boundary - 1))
                         if let boundaryHead = boundaryTokenSplit.head {
                             try completePrefill(boundaryHead)
                         }
@@ -2730,7 +2756,7 @@ public actor BatchEngine {
                             promptTokenIds: slot.cachePromptTokenIds,
                             genPromptLen: fullLen - boundary,
                             enableSSMReDerive: true,
-                            mediaSalt: slot.mediaSalt)
+                            mediaSalt: slot.cacheSalt(forBoundary: boundary))
                         progressAccumulator.report(completedInPrepare: splitAt)
                         return try context.model.prepare(
                             boundaryTokenSplit.tail,
@@ -2912,7 +2938,7 @@ public actor BatchEngine {
                             ssmStates: ssmStates,
                             tokens: promptTokens,
                             boundary: promptTokens.count,
-                            mediaSalt: slot.mediaSalt,
+                            mediaSalt: slot.cacheSalt(forBoundary: promptTokens.count),
                             persistToDisk: false
                         )
                         Self.logger.debug(
@@ -3697,7 +3723,7 @@ public actor BatchEngine {
                     perLayerData: perLayerData,
                     ssmStates: ssmStates,
                     cache: diskStoreCache,
-                    mediaSalt: slot.mediaSalt,
+                    mediaSalt: slot.cacheSalt(forBoundary: tokens.count),
                     chainId: slot.parameters.cacheChainId,
                     isStableRoot: label.hasPrefix("stable-system-tool"),
                     // The rows a later prompt of this chat starts with; the
@@ -3771,7 +3797,7 @@ public actor BatchEngine {
                    let states = coordinator.ssmStateCache.fetch(
                        tokens: tokens,
                        boundary: tokens.count,
-                       mediaSalt: slot.mediaSalt),
+                       mediaSalt: slot.cacheSalt(forBoundary: tokens.count)),
                    !states.isEmpty
                 {
                     let rebuilt = storageTopologySnapshot.map { $0.copy() }
@@ -4006,7 +4032,7 @@ public actor BatchEngine {
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
-                        mediaSalt: slot.mediaSalt)
+                        mediaSalt: slot.cacheSalt(forBoundary: boundaryTokens.count))
                     {
                         Self.logger.debug(
                             "Skipped already-validated stable system/tool cache boundary for slot \(slot.id.description, privacy: .public): \(boundary, privacy: .public) tokens"
@@ -4062,7 +4088,7 @@ public actor BatchEngine {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))
                     if coordinator.hasValidatedDiskEntry(
                         tokens: strippedTokens,
-                        mediaSalt: slot.mediaSalt)
+                        mediaSalt: slot.cacheSalt(forBoundary: strippedTokens.count))
                     {
                         Self.logger.debug(
                             "Skipped already-validated gen-suffix-stripped cache boundary for slot \(slot.id.description, privacy: .public): \(stripAt, privacy: .public) tokens"

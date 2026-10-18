@@ -1054,15 +1054,24 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Size + mtime of a regular file, read with `lstat` every time.
+    ///
+    /// Not `URL.resourceValues(forKeys:)`: Foundation caches resource values
+    /// on the URL instance, so a second read through the same `URL` value
+    /// returns what the first read saw. `writeEntry` reads the fingerprint
+    /// before touching the pair and again right after, through the same
+    /// URL, and so recorded the PRE-touch mtime as the validated one while
+    /// the files already carried the new one. Every later check — a fresh
+    /// URL, the real mtime — then failed: the companion counted as neither
+    /// validated nor durable from its first re-store on, the next re-store
+    /// fell through to a full rewrite (which recorded a stale fingerprint
+    /// again), and `hasDurableDiskEntry` stopped suppressing the seed
+    /// production that the skip exists for.
     private func fileFingerprint(at url: URL) -> FileFingerprint? {
-        guard let values = try? url.resourceValues(forKeys: [
-            .contentModificationDateKey, .fileSizeKey,
-        ]),
-            let size = values.fileSize,
-            size > 0,
-            let modificationDate = values.contentModificationDate
+        guard case .regularFile(let size, let modified) = DiskCache.pathState(at: url),
+              size > 0
         else { return nil }
-        return FileFingerprint(size: size, modificationDate: modificationDate)
+        return FileFingerprint(size: Int(size), modificationDate: modified)
     }
 
     /// Touch a companion pair without changing either payload. Caller MUST

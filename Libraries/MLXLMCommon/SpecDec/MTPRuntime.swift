@@ -708,6 +708,12 @@ public struct NativeMTPForwardResult {
 }
 
 /// Capability exposed only by loaded models that have a real native MTP head.
+/// A model whose verify cost curve makes deep drafts lose: adaptive requests are bounded by this
+/// ceiling (``VMLX_MTP_DEPTH_CAP`` still overrides). Fixed requests are unaffected.
+public protocol NativeMTPAdaptiveCeilingModel {
+    var nativeMTPAdaptiveDepthCeiling: Int { get }
+}
+
 public protocol NativeMTPModel: LanguageModel {
     /// True only when the concrete model instance has an instantiated MTP module
     /// whose weights were allowed through the loader.
@@ -1139,7 +1145,7 @@ public enum NativeMTPAutoDecodePolicy {
             return NativeMTPAutoDecodeRecommendation(
                 depth: depth,
                 verifierMode: tuning.explicitVerifierMode,
-                reason: "Qwen native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
+                reason: "Native MTP uses \(NativeMTPTuning.fileName) best_depth=\(depth).",
                 evidence: tuningEvidence)
         }
 

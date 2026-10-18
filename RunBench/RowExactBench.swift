@@ -49,6 +49,46 @@ func runRowExactBench(modelPath: String) async throws {
         return (cache, first)
     }
 
+    if env["BENCH_ROWEXACT_TIME"] == "1" {
+        // Verify cost: median wall time of one AR step vs one staged verify forward of W rows, each
+        // from a fresh copy of the same prefilled cache (copy evaluated before the clock starts).
+        let reps = Int(env["BENCH_ROWEXACT_TIME_REPS"] ?? "15") ?? 15
+        let (base, first) = prefill()
+        func once(_ ids: [Int32], verify: Bool) -> Double {
+            let c = base.map { $0.copy() }
+            MLX.eval(c)
+            let input = MLXArray(ids).reshaped(1, ids.count)
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let out =
+                verify
+                ? NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                    model.nativeBackboneMTPVerifyForward(input, cache: c)
+                }
+                : model.nativeAutoregressiveBackboneForward(input, cache: c)
+            MLX.eval(out.logits)
+            return CFAbsoluteTimeGetCurrent() - t0
+        }
+        let ids = (0 ..< 8).map { Int32(first + $0 * 7) }
+        // Warm every shape (kernel JIT + bitwise admission), then interleave AR and every width
+        // within each repetition so clock drift and GPU contention hit all arms alike.
+        _ = once([ids[0]], verify: false)
+        for w in widths { _ = once(Array(ids.prefix(w)), verify: true) }
+        var arSamples: [Double] = []
+        var verifySamples = [Int: [Double]]()
+        for _ in 0 ..< reps {
+            arSamples.append(once([ids[0]], verify: false))
+            for w in widths { verifySamples[w, default: []].append(once(Array(ids.prefix(w)), verify: true)) }
+        }
+        func median(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] * 1000 }
+        let ar = median(arSamples)
+        print(String(format: "[ROWEXACT-TIME] AR step %.2f ms", ar))
+        for w in widths {
+            let v = median(verifySamples[w] ?? [0])
+            print(String(format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR)", w, v, v / ar))
+        }
+        if env["BENCH_ROWEXACT_TIME_ONLY"] == "1" { return }
+    }
+
     // 1. AR reference.
     var (cache, token) = prefill()
     var stream: [Int] = [token]
