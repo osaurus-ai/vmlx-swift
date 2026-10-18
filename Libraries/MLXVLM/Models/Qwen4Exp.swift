@@ -15,6 +15,8 @@ public enum Qwen4ExpRowExactCapture {
     nonisolated(unsafe) public static var layers: [MLXArray] = []
     nonisolated(unsafe) public static var parts: [(String, MLXArray)] = []
     nonisolated(unsafe) public static var partLayer = 0
+    /// The decoder layer currently running (set by the layer itself) for parts recorded by its sub-modules.
+    nonisolated(unsafe) static var currentLayer = -1
     static func part(_ layer: Int, _ name: String, _ value: MLXArray?) {
         guard enabled, layer == partLayer, let value else { return }
         parts.append((name, value))
@@ -55,12 +57,41 @@ enum Qwen4ExpRowExactProjection {
         return batched(flat).reshaped(1, rows, q.weight.dim(0))
     }
 
-
+    /// Every other affine projection inside actual Flash verification (4-bit attention / GDN projections of the
+    /// mixed JANGHT trunks): the AR step's M = 1 arithmetic per row. A plain multi-row call lets MLX pick a
+    /// different kernel for the row count, so a verify row would not reproduce its AR step (Allosaurus 0.2: the
+    /// first QSA layer's 4-bit q/k/v/o, 2026-10-17). Weights stream once for all rows where `RowExactAffineQMV`
+    /// admits the shape bitwise; otherwise once per row.
+    static func affineRowsProjection(_ module: Linear, _ x: MLXArray) -> MLXArray? {
+        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "qaffine"),
+            !CompiledDecodeTrace.isActive, x.ndim == 3, x.dim(0) == 1,
+            (2...8).contains(x.dim(1)),
+            jangAllowsRawQuantizedProjection(module),
+            type(of: module) == QuantizedLinear.self, let q = module as? QuantizedLinear,
+            q.mode == .affine, q.weight.ndim == 2
+        else { return nil }
+        let rows = x.dim(1)
+        func batched(_ input: MLXArray) -> MLXArray {
+            quantizedMM(
+                input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis],
+                scales: q.scales[.newAxis], biases: q.biases.map { $0[.newAxis] },
+                transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode
+            ).reshaped(input.dim(0), -1)
+        }
+        let flat = x.reshaped(rows, x.dim(-1))
+        var y = RowExactAffineQMV.project(
+            flat, weight: q.weight, scales: q.scales, biases: q.biases,
+            groupSize: q.groupSize, bits: q.bits, reference: batched) ?? batched(flat)
+        if let bias = q.bias { y = y + bias }
+        if y.dtype != x.dtype { y = y.asType(x.dtype) }
+        return y.reshaped(1, rows, -1)
+    }
 }
 
 /// Uses the qualified affine route only inside actual Flash target verification.
 func qwen4ExpProjection(_ module: Linear, _ x: MLXArray) -> MLXArray {
-    Qwen4ExpRowExactProjection.q8Projection(module, x) ?? module(x)
+    Qwen4ExpRowExactProjection.q8Projection(module, x)
+        ?? Qwen4ExpRowExactProjection.affineRowsProjection(module, x) ?? module(x)
 }
 
 public struct Qwen4ExpConfiguration: Codable, Sendable {
@@ -363,6 +394,85 @@ private enum Qwen4ExpCompiledMHC {
         return (outputs[0], outputs[1])
     }
 
+    /// Quantized mixers with f16 affine metadata against bf16 activations (Allosaurus 0.2: 8-bit hyper-connection
+    /// mixers, 97 per token). `call` above admits bf16 metadata only, so these mixers ran the uncompiled generic path:
+    /// the fused down+inject through `Qwen4ExpBF16Affine.dense` (23.5 us for N=324 x K=10240 against 14.4 us for
+    /// MLX's quantized matmul) plus a dozen separate elementwise launches — about 9 ms per token more than the bf16
+    /// mixers of the 0.1 bundle (layer profile 2026-10-17: attention_mix 0.37 vs 0.22 ms, mlp_mix 0.35 vs 0.19 ms;
+    /// everything else equal). One compiled region; the projections run as one M = 1 matmul per row
+    /// ([rows, 1, K] against the shared weight), so the same region serves the 1-row step and 2...8 verify rows with
+    /// identical per-row arithmetic (verify row == AR step). Outputs round to bf16 where `QuantizedLinear` would.
+    static func callRowsF16Metadata(
+        hyper: MLXArray,
+        normalizedInput: MLXArray? = nil,
+        normWeight: MLXArray,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray,
+        downGroupSize: Int, downBits: Int, downOutputSize: Int,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray,
+        upGroupSize: Int, upBits: Int,
+        hcCount: Int, hiddenSize: Int, eps: Float
+    ) -> (MLXArray, MLXArray)? {
+        let rows = hyper.ndim == 3 && hyper.dim(0) == 1 ? hyper.dim(1) : 0
+        guard enabled, !CompiledDecodeTrace.isActive, (1 ... 8).contains(rows),
+            rows == 1 || FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin"),
+            hyper.dtype == .bfloat16, normWeight.dtype == .bfloat16,
+            downScales.dtype == .float16, downBiases.dtype == .float16,
+            upScales.dtype == .float16, upBiases.dtype == .float16,
+            normalizedInput.map({ $0.shape == hyper.shape && $0.dtype == hyper.dtype }) ?? true
+        else { return nil }
+
+        let hasNormalizedInput = normalizedInput != nil
+        let key = [
+            "f16meta", String(hcCount), String(hiddenSize), String(eps),
+            String(downGroupSize), String(downBits), String(downOutputSize),
+            String(upGroupSize), String(upBits), "S\(rows)", "normalized=\(hasNormalizedInput)",
+        ].joined(separator: "|")
+
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let hyper = args[0]
+                let original = hyper.shape
+                let grouped = hyper.reshaped(Array(original.dropLast()) + [-1, hiddenSize])
+                let normalized = hasNormalizedInput ? hyper : (
+                    MLXFast.rmsNorm(grouped, weight: MLXArray.mlxNone, eps: eps)
+                        .reshaped(original) * args[1]
+                )
+                let width = normalized.dim(-1)
+                let combined = quantizedMM(
+                    normalized.reshaped(rows, 1, width), args[2][.newAxis],
+                    scales: args[3][.newAxis], biases: args[4][.newAxis],
+                    transpose: true, groupSize: downGroupSize, bits: downBits, mode: .affine
+                ).reshaped(1, rows, -1).asType(hyper.dtype)
+                let parts = MLX.split(combined, indices: [downOutputSize], axis: -1)
+                let activated = silu(parts[0] / Float(hcCount))
+                let projected = quantizedMM(
+                    activated.reshaped(rows, 1, downOutputSize), args[5][.newAxis],
+                    scales: args[6][.newAxis], biases: args[7][.newAxis],
+                    transpose: true, groupSize: upGroupSize, bits: upBits, mode: .affine
+                ).reshaped(1, rows, -1).asType(hyper.dtype)
+                let weights = sigmoid(projected).reshaped(
+                    Array(projected.shape.dropLast()) + [hcCount, hiddenSize])
+                let normalizedGroups = normalized.reshaped(
+                    Array(normalized.shape.dropLast()) + [hcCount, hiddenSize])
+                let mixed = (weights * normalizedGroups).mean(axis: -2).asType(hyper.dtype)
+                let injection = (2 * sigmoid(parts[1] / Float(hcCount))).asType(hyper.dtype)
+                return [mixed, injection]
+            }
+            regions[key] = region
+        }
+        reportLocked()
+        lock.unlock()
+
+        let outputs = region!([
+            normalizedInput ?? hyper, normWeight, downWeight, downScales, downBiases,
+            upWeight, upScales, upBiases,
+        ])
+        guard outputs.count == 2 else { return nil }
+        return (outputs[0], outputs[1])
+    }
+
     static func call(
         hyper: MLXArray,
         normalizedInput: MLXArray? = nil,
@@ -512,12 +622,32 @@ private final class Qwen4ExpGatedResidual: Module {
             && inject != nil && !(inject! is QuantizedLinear) && inject!.bias == nil
             && inject!.weight.shape == [4, 10240] && inject!.weight.dtype == .bfloat16
             && !CompiledDecodeTrace.isActive
+        // Quantized mixers inside actual verification: the AR step projects down+inject through the fused
+        // weight (`Qwen4ExpBF16Affine.dense`, one row per simdgroup); separate down / inject calls on the
+        // verify rows rounded an inject value differently (Allosaurus 0.2 layer 30, 2026-10-17).
+        let affineVerifyRows = combines && mixDown is QuantizedLinear
+            && FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
         var fused: FusedInputProjection?
         if Self.fuseDecodeInputs, combines,
-            (Qwen4ExpCompiledMHC.supportsShape(hyper) || joinedVerifyProjection),
+            (Qwen4ExpCompiledMHC.supportsShape(hyper) || joinedVerifyProjection || affineVerifyRows),
             !CompiledDecodeTrace.isActive
         {
             fused = fusedProjection(for: hyper)
+        }
+        if case .affine(
+            let downWeight, let downScales, let downBiases,
+            let downGroupSize, let downBits, let downMode) = fused, downMode == .affine,
+            let up = mixUp as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+            up.mode == .affine, up.bias == nil, let upBiases = up.biases,
+            let compiled = Qwen4ExpCompiledMHC.callRowsF16Metadata(
+                hyper: hyper, normalizedInput: normalizedInput, normWeight: norm.weight,
+                downWeight: downWeight, downScales: downScales, downBiases: downBiases,
+                downGroupSize: downGroupSize, downBits: downBits, downOutputSize: mixDown.shape.0,
+                upWeight: up.weight, upScales: up.scales, upBiases: upBiases,
+                upGroupSize: up.groupSize, upBits: up.bits,
+                hcCount: hcCount, hiddenSize: hiddenSize, eps: norm.eps)
+        {
+            return compiled
         }
         if case .affine(
             let downWeight, let downScales, let downBiases,
@@ -602,10 +732,15 @@ private final class Qwen4ExpGatedResidual: Module {
                     broadcast(mixDown.weight, to: [rows, 320, 10240]),
                     normalized.reshaped(rows, 10240, 1)
                 ).reshaped(1, rows, 320)
+            } else if mixDown is QuantizedLinear,
+                let rowExact = Qwen4ExpRowExactProjection.affineRowsProjection(mixDown, normalized)
+            {
+                // Quantized final mixer (no inject, so never fused): the AR step's M = 1 arithmetic per row.
+                mixedDown = rowExact
             } else {
                 mixedDown = mixDown(normalized)
             }
-            injected = inject.map { $0(normalized) }
+            injected = inject.map { qwen4ExpProjection($0, normalized) }
         }
         let scaled = mixedDown / Float(hcCount)
         var weights = silu(scaled)
@@ -620,6 +755,12 @@ private final class Qwen4ExpGatedResidual: Module {
             let rowInvariant = Qwen4ExpHCUpProjection.project(weights, weight: mixUp.weight)
         {
             projected = rowInvariant
+        } else if mixUp is QuantizedLinear,
+            let rowExact = Qwen4ExpRowExactProjection.affineRowsProjection(mixUp, weights)
+        {
+            // Quantized up-projection (8-bit mixers): the AR step's M = 1 arithmetic per verify row; the plain
+            // multi-row call rounded a later row differently (Allosaurus 0.2 layer 10, 2026-10-17).
+            projected = rowExact
         } else {
             projected = mixUp(weights)
         }
@@ -1211,6 +1352,10 @@ private final class Qwen4ExpAttention: Module {
         var key = kNorm(rawKey.reshaped(B, S, text.kvHeads, headDim)).transposed(0, 2, 1, 3)
         let rawValue = Qwen4ExpVerifyTile.padded(x) { qwen4ExpProjection(vProj, $0) }
         let value = rawValue.reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
+        let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+        Qwen4ExpRowExactCapture.part(captureLayer, "attn.q_gate_raw", rawQueryGate)
+        Qwen4ExpRowExactCapture.part(captureLayer, "attn.k_raw", rawKey)
+        Qwen4ExpRowExactCapture.part(captureLayer, "attn.v_raw", rawValue)
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
@@ -1268,6 +1413,8 @@ private final class Qwen4ExpAttention: Module {
                 scale: scale, mask: mask)
         }
         let output = attended.transposed(0, 2, 1, 3).reshaped(B, S, -1)
+        Qwen4ExpRowExactCapture.part(captureLayer, "attn.q_roped", query.transposed(0, 2, 1, 3))
+        Qwen4ExpRowExactCapture.part(captureLayer, "attn.sdpa", output)
         let gated = output * sigmoid(gate)
         let result = Qwen4ExpVerifyTile.padded(gated) { qwen4ExpProjection(oProj, $0) }
         return result
@@ -1313,7 +1460,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         _mlp.wrappedValue = Qwen35Language.SparseMoeBlock(
             text, layerIdx: layerIndex, allowFusedGateUpCache: false,
             compileDecodeRegions: true,
-            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts,
+            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts
+                || routedExperts is JANGTRoutedExpertLayer,
             routedExperts: routedExperts)
         _attentionResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         _mlpResidual.wrappedValue = Qwen4ExpGatedResidual(config)
@@ -1423,6 +1571,7 @@ private final class Qwen4ExpDecoderLayer: Module {
         }
         // PLE changes the residual before attention; a norm prepared before PLE
         // would be stale. The caller also avoids preparing it for these layers.
+        Qwen4ExpRowExactCapture.currentLayer = layerIndex
         Qwen4ExpRowExactCapture.part(layerIndex, "after_ple", hyper)
         let (attentionInput, inject) = attentionResidual.mix(
             hyper, normalizedInput: ple == nil ? normalizedInput : nil)

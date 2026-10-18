@@ -2750,10 +2750,14 @@ enum Qwen35Language {
         func requiresDecodeEquivalentRows(_ x: MLXArray) -> Bool {
             let rows = x.size / x.dim(-1)
             guard decodeEquivalentVerifierRows,
-                compileDecodeRegions, (2 ... 4).contains(rows),
-                let affine = switchMLP as? SwitchGLU
+                compileDecodeRegions, (2 ... 4).contains(rows)
             else { return false }
-            return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
+            if let affine = switchMLP as? SwitchGLU {
+                return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
+            }
+            // Custom routed banks (JANGT trellis / JANGH codebook): the compiled router and shared-expert
+            // regions switch arithmetic with the row count, so a verify row would not reproduce its AR step.
+            return switchMLP is any WeightedRoutedExpertLayer
         }
 
         private func reportDecodeEquivalentRows() {
@@ -2763,7 +2767,7 @@ enum Qwen35Language {
             Self.didReportRowIsolation = true
             FileHandle.standardError.write(
                 Data(
-                    "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=q4g64\n"
+                    "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=\(switchMLP is SwitchGLU ? "q4g64" : String(describing: type(of: switchMLP)))\n"
                         .utf8))
         }
 
