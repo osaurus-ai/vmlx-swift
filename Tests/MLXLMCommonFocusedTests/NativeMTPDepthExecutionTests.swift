@@ -98,21 +98,30 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             let start = ProcessInfo.processInfo.systemUptime
             var tokens: [Int] = []
             var previousAR = 0
+            var sawLookahead = false
             while tokens.count < 240, let token = iterator.next() {
                 tokens.append(token)
                 if iterator.autoregressiveFallbackTokenCount > previousAR {
                     previousAR = iterator.autoregressiveFallbackTokenCount
                     let kv = try XCTUnwrap(iterator.cache.last as? KVCacheSimple)
-                    XCTAssertEqual(kv.offset, 3 + tokens.count - 1)
+                    // A paused-AR lookahead has already fed the token just emitted: exactly one more row,
+                    // holding that token. Without it the cache ends one token before the emitted one.
+                    let lookahead = iterator.hasPendingARLookahead
+                    XCTAssertEqual(kv.offset, 3 + tokens.count - (lookahead ? 0 : 1))
                     let state = try XCTUnwrap(kv.readKV())
                     XCTAssertEqual(state.keys.asArray(Int32.self), (0..<kv.offset).map(Int32.init))
                     XCTAssertEqual(state.values.asArray(Int32.self),
-                                   [Int32(1), 1, 1] + tokens.dropLast().map(Int32.init))
+                                   [Int32(1), 1, 1] + (lookahead ? tokens : Array(tokens.dropLast())).map(Int32.init))
+                    if lookahead { sawLookahead = true }
                 }
             }
             XCTAssertEqual(tokens, (0..<240).map { (2 + $0) % 32 })
-            XCTAssertEqual(model.autoregressiveBackboneCalls, iterator.autoregressiveFallbackTokenCount,
-                           "only explicit AR steps may use the specialization")
+            XCTAssertEqual(model.autoregressiveBackboneCalls,
+                           iterator.autoregressiveFallbackTokenCount + (iterator.hasPendingARLookahead ? 1 : 0),
+                           "only explicit AR steps (and one pending lookahead) may use the specialization")
+            if NativeMTPTokenIterator.arLookaheadEnabled {
+                XCTAssertTrue(sawLookahead, "paused stretches must pipeline the next AR step")
+            }
             XCTAssertGreaterThan(iterator.stagedVerifierCommitCount, 0)
             XCTAssertGreaterThan(iterator.arSafetyTrips, 0)
             XCTAssertGreaterThan(iterator.autoregressiveFallbackTokenCount, 2)

@@ -311,6 +311,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// The next paused-AR step, built and submitted before the current token was read back.
     private var arLookahead: (output: NativeMTPForwardResult, token: MLXArray)?
     private(set) var arLookaheadCount = 0
+    /// `true` while the next AR step is already in the cache (one row past the last emitted token).
+    var hasPendingARLookahead: Bool { arLookahead != nil }
     private(set) var verifyPrefetchSubmitCount = 0
     private(set) var verifyPrefetchConsumedCount = 0
     private(set) var verifyPrefetchAbandonedCount = 0
