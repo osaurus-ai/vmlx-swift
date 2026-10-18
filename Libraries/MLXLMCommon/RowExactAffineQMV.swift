@@ -28,10 +28,21 @@ public enum RowExactAffineQMV {
 
     static let header = """
         // ---- verbatim from mlx/backend/metal/kernels/quantized.h (bits 4 and 8 branches) ----
-        template <typename T, typename U, int values_per_thread, int bits>
+        // WIDEN: the fork's mixed BF16-input / F16-metadata q4 branch of qmv_fast_impl (widen, then sum).
+        template <typename T, typename U, int values_per_thread, int bits, bool WIDEN = false>
         inline U rx_load_vector(const device T* x, thread U* x_thread) {
           U sum = 0;
-          if (bits == 4) {
+          if (bits == 4 && WIDEN) {
+            for (int i = 0; i < values_per_thread; i += 4) {
+              U x0 = x[i], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
+              sum += x0 + x1 + x2 + x3;
+              x_thread[i] = x0;
+              x_thread[i + 1] = x1 / 16.0f;
+              x_thread[i + 2] = x2 / 256.0f;
+              x_thread[i + 3] = x3 / 4096.0f;
+            }
+          }
+          else if (bits == 4) {
             for (int i = 0; i < values_per_thread; i += 4) {
               sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
               x_thread[i] = x[i];
@@ -177,6 +188,7 @@ public enum RowExactAffineQMV {
 
           const device uint8_t* ws = (const device uint8_t*)w;
           typedef float U;
+          constexpr bool widen = metal::is_same_v<T, bfloat16_t> && metal::is_same_v<S, float16_t>;
           thread U x_thread[values_per_thread];
           thread U result[ROWS][results_per_simdgroup];
           for (int m = 0; m < ROWS; m++)
@@ -207,7 +219,7 @@ public enum RowExactAffineQMV {
                 b_r[row] = biases[row * in_vec_size_g];
               }
               for (int m = 0; m < ROWS; m++) {
-                U sum = rx_load_vector<T, U, values_per_thread, bits>(x + m * in_vec_size, x_thread);
+                U sum = rx_load_vector<T, U, values_per_thread, bits, widen>(x + m * in_vec_size, x_thread);
                 for (int row = 0; row < results_per_simdgroup; row++) {
                   result[m][row] += rx_qdot_f<U, values_per_thread, bits>(
                       wf[row], x_thread, s_r[row], b_r[row], sum, values_per_thread);
@@ -222,7 +234,7 @@ public enum RowExactAffineQMV {
                 thread float part[RC][4];
                 for (int m = 0; m < RC; m++) {
                   for (int r = 0; r < 4; r++) part[m][r] = result[min(m0 + m, ROWS - 1)][r];
-                  if (m < rc) sums[m] = rx_load_vector<T, U, values_per_thread, bits>(x + (m0 + m) * in_vec_size, xt[m]);
+                  if (m < rc) sums[m] = rx_load_vector<T, U, values_per_thread, bits, widen>(x + (m0 + m) * in_vec_size, xt[m]);
                 }
                 rx_q4_chunk<T, S, values_per_thread, RC>(ws, scales, biases, in_vec_size_w, in_vec_size_g, xt, sums, rc, part);
                 for (int m = 0; m < rc; m++)
@@ -271,7 +283,7 @@ public enum RowExactAffineQMV {
         guard enabled, (2 ... 8).contains(rows), bits == 8 || (bits == 4 && rows <= 4), hasBiases,
             [32, 64, 128].contains(groupSize),
             inputDType == .bfloat16 || inputDType == .float16,
-            scalesDType == inputDType
+            scalesDType == inputDType || (inputDType == .bfloat16 && scalesDType == .float16)
         else { return false }
         let blockSize = (32 / bits) * 2 * 32
         return k % blockSize == 0 && n % 8 == 0 && groupSize % ((32 / bits) * 2) == 0

@@ -858,6 +858,24 @@ METAL_FUNC void qmv_fast_impl(
         x_thread[i + 2] = x2 / 16.0f;
         x_thread[i + 3] = x3 / 4.0f;
       }
+    } else if constexpr (
+        bits == 4 && metal::is_same_v<T, bfloat16_t> &&
+        metal::is_same_v<S, float16_t>) {
+      // Same for mixed q4 (the 1-row AR step of every JANG bundle with q4
+      // layers and f16 metadata): `load_vector` summed four BF16 values in
+      // BF16 before widening, rounding the bias sum. Measured 2026-10-17:
+      // ~5x the promoted-F32 output error (mean |err| 0.146 vs 0.028 at
+      // RMS 25, K=2560), and multi-row verify could never reproduce the AR
+      // step. Widening first is bitwise the promoted-F32 arithmetic.
+      sum = 0;
+      for (int i = 0; i < values_per_thread; i += 4) {
+        U x0 = x[i], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
+        sum += x0 + x1 + x2 + x3;
+        x_thread[i] = x0;
+        x_thread[i + 1] = x1 / 16.0f;
+        x_thread[i + 2] = x2 / 256.0f;
+        x_thread[i + 3] = x3 / 4096.0f;
+      }
     } else {
       sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
     }
