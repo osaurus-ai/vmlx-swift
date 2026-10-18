@@ -10,6 +10,19 @@ import XCTest
 /// The tiny model and disk table use natural full/rejected draft outcomes;
 /// no target IDs, logits or acceptance are forced.
 final class Qwen4ExpPLELazyCommitTests: XCTestCase {
+    // These rows reconstruct the head cache from an empty history; prompt priming has its own test
+    // (NativeMTPPromptPrimingTests).
+    private var primingWasEnabled = true
+    override func setUp() {
+        super.setUp()
+        primingWasEnabled = NativeMTPPromptPrimer.enabled
+        NativeMTPPromptPrimer.enabled = false
+    }
+    override func tearDown() {
+        NativeMTPPromptPrimer.enabled = primingWasEnabled
+        super.tearDown()
+    }
+
     func testActualIteratorPLECanonicalStateAfterFirstCycle() throws {
         let env = ProcessInfo.processInfo.environment
         try XCTSkipIf(env["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" || env["VMLX_MTP_VERIFY_PREFETCH"] != "0",

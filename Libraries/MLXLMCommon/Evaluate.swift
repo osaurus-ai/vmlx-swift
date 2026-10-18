@@ -1555,7 +1555,7 @@ private enum MLXPressGenerationProfile {
 /// Port of `generate_step()` from https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/utils.py
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
-private final class SoloPrefillProgressAccumulator: @unchecked Sendable {
+final class SoloPrefillProgressAccumulator: @unchecked Sendable {
     private let handler: @Sendable (PrefillProgress) -> Void
     private let completedBeforePrefill: Int
     private let totalPromptUnits: Int

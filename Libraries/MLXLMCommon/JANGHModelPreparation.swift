@@ -83,9 +83,12 @@ public final class JANGHModelPreparation {
         guard let root = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any]
         else { return false }
         let sidecarObject = sidecar.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        // `jangt` (trellis) projections are custom banks too: a pure-JANGT bundle (Qwen3.8-Flash-Next JANGHT,
+        // 2026-10-16) has no `jangtq2` projection and no codebook header, and the strict ordinary decoder refuses
+        // `mode: jangt` just as it refuses `jangtq2`.
         func customMode(_ value: Any?) -> Bool {
             guard let object = value as? [String: Any] else { return false }
-            if object["mode"] as? String == "jangtq2" { return true }
+            if let mode = object["mode"] as? String, mode == "jangtq2" || mode == "jangt" { return true }
             return object.values.contains { customMode($0) }
         }
         let text = root["text_config"] as? [String: Any]

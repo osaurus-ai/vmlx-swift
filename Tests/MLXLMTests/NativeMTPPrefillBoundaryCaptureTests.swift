@@ -31,6 +31,7 @@ private final class NativeBoundaryRecordingModel: Module, NativeMTPModel, Native
             _ = nativeBackboneForward(tokens[..<step].reshaped(1, step), cache: cache)
             MLX.eval(cache)
             tokens = tokens[step...]
+            PrefillProgressReporter.reportCompletedUnits(input.text.tokens.size - tokens.size)
         }
         return .tokens(.init(tokens: tokens))
     }
@@ -281,8 +282,16 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
         XCTAssertEqual(detail, .disk)
         XCTAssertEqual(matched, stable.count + user.count)
         let warmModel = NativeBoundaryRecordingModel()
+        let progressRows = ProgressRows()
         var warm = try NativeMTPTokenIterator(input: input(next), model: warmModel,
-            parameters: parameters(), depth: 1, cacheCoordinator: restoredCoordinator)
+            parameters: parameters(), depth: 1, cacheCoordinator: restoredCoordinator,
+            prefillProgressHandler: { progressRows.append($0) })
+        let progress = progressRows.snapshot
+        XCTAssertEqual(progress.first { $0.stage == .cacheRestore }?.completedUnitCount, matched)
+        let prefill = progress.filter { $0.stage == .prefill }
+        XCTAssertEqual(prefill.first?.completedUnitCount, matched)
+        XCTAssertEqual(prefill.last?.completedUnitCount, next.count)
+        XCTAssertEqual(prefill.map(\.completedUnitCount), prefill.map(\.completedUnitCount).sorted())
         var cold = try NativeMTPTokenIterator(input: input(next), model: NativeBoundaryRecordingModel(),
             parameters: parameters(), depth: 1)
         XCTAssertEqual(Array(warmModel.forwarded.prefix(next.count - matched)), Array(next.dropFirst(matched)))
@@ -388,6 +397,42 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
         XCTAssertEqual(model.prepareMedia, [true])
         XCTAssertTrue(iterator.prefillBoundarySnapshots.isEmpty)
         XCTAssertEqual(Array(model.forwarded.prefix(ids.count)), ids)
+    }
+
+    private final class ProgressRows: @unchecked Sendable {
+        private let lock = NSLock()
+        private var rows: [PrefillProgress] = []
+        func append(_ row: PrefillProgress) { lock.lock(); defer { lock.unlock() }; rows.append(row) }
+        var snapshot: [PrefillProgress] { lock.lock(); defer { lock.unlock() }; return rows }
+    }
+
+    func testPrefillProgressPreservesTokensAndSegmentBoundaries() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let ids = stable + user + suffix
+        for withCoordinator in [false, true] {
+            let reference = NativeBoundaryRecordingModel()
+            var plain = try NativeMTPTokenIterator(input: input(ids), model: reference,
+                parameters: parameters(), depth: 1,
+                cacheCoordinator: withCoordinator ? coordinator() : nil)
+            let observed = NativeBoundaryRecordingModel()
+            let rows = ProgressRows()
+            var reporting = try NativeMTPTokenIterator(input: input(ids), model: observed,
+                parameters: parameters(), depth: 1,
+                cacheCoordinator: withCoordinator ? coordinator() : nil,
+                prefillProgressHandler: { rows.append($0) })
+            XCTAssertEqual(observed.forwardLengths, reference.forwardLengths)
+            XCTAssertEqual(observed.forwarded, reference.forwarded)
+            let progress = rows.snapshot
+            XCTAssertTrue(progress.contains { $0.stage == .cacheLookup })
+            let prefill = progress.filter { $0.stage == .prefill }
+            XCTAssertTrue(prefill.contains { $0.completedUnitCount > 0 && $0.completedUnitCount < ids.count })
+            XCTAssertEqual(prefill.last?.completedUnitCount, ids.count)
+            XCTAssertTrue(prefill.allSatisfy { $0.totalUnitCount == ids.count })
+            XCTAssertEqual(prefill.map(\.completedUnitCount), prefill.map(\.completedUnitCount).sorted())
+            for _ in 0..<4 {
+                XCTAssertEqual(reporting.next(), plain.next())
+            }
+        }
     }
 
     func testNoCoordinatorDoesNotSplitPreparation() throws {

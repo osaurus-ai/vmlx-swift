@@ -11,6 +11,19 @@ import XCTest
 /// Fresh process: VMLX_NATIVE_MTP_AR_SAFETY=0 VMLX_MTP_VERIFY_PREFETCH=0
 /// and VMLX_MTP_ALIGNED_HEAD_CACHE unset/1. Diagnostic controls only.
 final class Qwen4ExpMTPHeadChainTests: XCTestCase {
+    // These rows reconstruct the head cache from an empty history; prompt priming has its own test
+    // (NativeMTPPromptPrimingTests).
+    private var primingWasEnabled = true
+    override func setUp() {
+        super.setUp()
+        primingWasEnabled = NativeMTPPromptPrimer.enabled
+        NativeMTPPromptPrimer.enabled = false
+    }
+    override func tearDown() {
+        NativeMTPPromptPrimer.enabled = primingWasEnabled
+        super.tearDown()
+    }
+
     func testSampledChunkCommittedHeadMatchesOracleAcrossCycles() throws {
         _ = try exercise(depth: 3, seed: 9041, vocabulary: 128,
                          sequential: false, sampled: true, cycles: 2)

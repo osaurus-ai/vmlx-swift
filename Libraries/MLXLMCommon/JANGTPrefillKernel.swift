@@ -31,22 +31,13 @@ enum JANGTPrefillKernel {
         let mult = JANGTCode.mult[k]!
         let mask = (1 << JANGTCode.stateBits) - 1
         let pl16 = JANGTCode.laneBits(k)
-        let load = k == 2
-            ? "uint a0 = r[wi], a1 = r[wi + 1];"
-            : "uint w0 = r[wi], w1 = r[wi + 1], w2 = r[wi + 2]; "
-                + "uint a0 = sh == 0u ? w0 : ((w0 >> sh) | (w1 << (32u - sh))); "
-                + "uint a1 = sh == 0u ? w1 : ((w1 >> sh) | (w2 << (32u - sh)));"
+        // Sub-chunk starts are multiples of PL16 bits, the same shift set as the decode lanes: one window rule for
+        // every width (K=1/1.5: 2 words realigned into a0; K=2.5/3: 3 words into a0/a1; K=2: static). Python
+        // `prefill._loader` (2026-10-16).
+        let load = JANGTKernelSource.windowLoad(k: k, l: JANGTCode.stateBits) { $0 == 0 ? "r[wi]" : "r[wi + \($0)]" }
         var steps: [String] = []
         for j in 0 ..< 8 {
-            let o = so[j]
-            let ex: String
-            if o + JANGTCode.stateBits <= 32 {
-                ex = o == 0 ? "a0" : "(a0 >> \(o)u)"
-            } else if o >= 32 {
-                ex = o == 32 ? "a1" : "(a1 >> \(o - 32)u)"
-            } else {
-                ex = "((a0 >> \(o)u) | (a1 << \(32 - o)u))"
-            }
+            let ex = JANGTKernelSource.stepExtract(so[j], l: JANGTCode.stateBits)
             steps.append(
                 "{ uint s = (\(ex)) & \(mask)u; half2 v = as_type<half2>(((s * \(mult)u) & \(JANGTCode.mask2)u) | \(JANGTCode.orb2)u);"
                     + " d[\(2 * j)] = T((float(v.x) - \(mu0)) * \(isd0) * s_row);"

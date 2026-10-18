@@ -16,7 +16,10 @@ struct ModelResidencyWiredTargetTests {
 
     // Reserve mirrors the policy: 35% of physical RAM, floored at 8 GB, capped at 24 GB.
     private func osReserve(physical: Int) -> Int {
-        max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
+        // 48-63 GiB: the request is bounded by XNU's own 79% wire cap, so >= 21% always stays unwired.
+        physical >= gb(48) && physical < gb(64)
+            ? physical - xnuDefaultUserWireLimit(physicalMemory: physical)
+            : max(8 * Self.gib, min(physical / 100 * 35, 24 * Self.gib))
     }
 
     @Test("128 GB Mac: a 91 GB bundle (GLM-5.3-Flash / Naive-N0.5 JANGHT) wires with a 24 GB reserve")
@@ -77,7 +80,7 @@ struct ModelResidencyWiredTargetTests {
 
     @Test("invariant: any returned target preserves the reclaim reserve")
     func returnedTargetAlwaysLeavesReserve() {
-        let physicals = [gb(8), gb(16), gb(24), gb(32), gb(64), gb(96), gb(128), gb(192)]
+        let physicals = [gb(8), gb(16), gb(24), gb(32), gb(48), gb(64), gb(96), gb(128), gb(192)]
         let models = [gb(2), gb(5), gb(9), gb(14), gb(30), gb(48), gb(76), gb(101), gb(140)]
         for physical in physicals {
             let workingSet = physical * 3 / 4  // rough Metal working-set fraction
@@ -87,8 +90,24 @@ struct ModelResidencyWiredTargetTests {
                 else { continue }
                 #expect(physical - target >= osReserve(physical: physical))
                 #expect(target <= workingSet)
-                #expect(target >= modelBytes)
+                // 48-63 GiB Macs pin a partial set rather than none when the model is larger
+                // (measured: none 0.2 tok/s, partial 18, whole working set 36-41).
+                if !(physical >= gb(48) && physical < gb(64)) { #expect(target >= modelBytes) }
             }
+        }
+    }
+
+    @Test("48 GiB: Allosaurus requests weights + generation overhead, bounded by Metal and the kernel wire cap")
+    func allosaurusOn48GiB() {
+        // Measured 2026-10-15 under a 48 GB-like wire budget + RAM pressure: no residency 0.2 tok/s
+        // (740 GB page-ins), a set capped at the wire headroom 18 tok/s, the whole working set 36-41 tok/s.
+        let weights = 36_971_767_160 + 357_581_088
+        let wanted = weights + 5 * Self.gib / 2 + Self.gib
+        let kernelCap = xnuDefaultUserWireLimit(physicalMemory: gb(48))
+        for ceiling in [gb(34), gb(36), gb(37), gb(40)] {
+            let target = modelResidencyWiredTarget(
+                modelBytes: weights, workingSet: ceiling, physicalMemory: gb(48))
+            #expect(target == min(wanted, ceiling, kernelCap), "never nil: none is the 0.2 tok/s failure")
         }
     }
 

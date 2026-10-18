@@ -654,17 +654,9 @@ public func loadModel(
         }
     }
 
-    // 3b. Apply MLX memory budget cap. This bounds the total MLX
-    //     allocation pool — calls to malloc wait on scheduled tasks if
-    //     the cap is hit. Persists for the process lifetime (no defer
-    //     restore) since the cap is a sensible default, not a load-only
-    //     override. Last-writer-wins across multiple loads — a future
-    //     refinement could compose via WiredMemoryManager tickets.
-    //
-    //     SAFETY: every cap is clamped to recommendedMaxWorkingSetBytes
-    //     so we never trip Apple's "limit larger than max working set
-    //     size" rejection (the original 847a8c7 crash condition). See
-    //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
+    // 3b. Apply the process-wide MLX allocator scheduling/reuse budget.
+    // This fork drains reusable buffers at the GC threshold; it is not a
+    // physical-footprint cap. Respect explicit limits and the device ceiling.
     if nativeResidentPoolCeiling == nil,
         let rawCap =
             memoryLimit
@@ -677,40 +669,32 @@ public func loadModel(
         MLX.Memory.memoryLimit = safeCap
     }
 
-    // 3c. Raise the MLX WIRED limit to keep the model's weights GPU-resident.
-    //     MLX's default wired limit is ~75% of the recommended working set, so
-    //     a model larger than that has its pages SWAPPED on every eval — Metal
-    //     command-buffer stalls (observed live: a 95 GB bundle pinned memory
-    //     and thrashed ~15-20 GB of swap, warmup never finished, while the same
-    //     bundle multiturns fine on the Python engine, which does exactly this
-    //     at load). Mirror `_set_wired_limit_for_model`: wire the model plus
-    //     headroom (max(16 GB, 30% of weights) — routed-expert dequant + KV +
-    //     Metal scratch spike past a flat 8 GB on big MoE bundles), CLAMPED to
-    //     the OS working set so we never trip Apple's "limit larger than max
-    //     working set" rejection. Only ever ADVISES the allocator by RAISING a
-    //     limit — it never blocks or refuses a load, and a small model simply
-    //     gets a smaller (cheaper) residency set. The user can lift the OS cap
-    //     with `sudo sysctl iogpu.wired_limit_mb=<MB>`.
-    //     SAFETY: wired pages can't be reclaimed, so this only RAISES the limit
-    //     when the whole model fits inside a safe physical-RAM reserve. On a
-    //     constrained Mac where the model is a large fraction of RAM it leaves
-    //     the swappable default instead of wiring the machine into a
-    //     memory-pressure panic (osaurus#2612). See `modelResidencyWiredTarget`.
-    //     Size against the GPU-resident weights: the Qwen4Exp n-gram table (18-54 GB) is read from SSD on
-    //     demand and is never wired. Counting it left Allosaurus (32.5 GB of weights, 88 GB bundle) and
-    //     Flash-Next JANGH4 with NO residency, so their weights were evictable between turns.
-    if facts.gpuResidentWeightBytes > 0 {
-        let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
-        let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
-        let physical = Int(clamping: facts.physicalMemory)
-        if let target = modelResidencyWiredTarget(
-            modelBytes: modelBytes,
-            workingSet: workingSet,
-            physicalMemory: physical)
-        {
-            setModelResidencyWiredLimit(target)
-        }
-    }
+    // 3c. Apply the selected model-residency budget. Unlike the allocator
+    // reuse budget above, wiring makes pages non-reclaimable. The policy must
+    // leave an OS reserve and respect the reported Metal ceiling. SSD-only
+    // n-gram tables are excluded from weight accounting.
+    let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
+    let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
+    let physical = Int(clamping: facts.physicalMemory)
+    // SPEED-CRITICAL (Allosaurus on 48 GB Macs, 2026-10-15): size residency against the SYSTEM WIRE
+    // BUDGET, not only RAM / Metal's working set. Clear our own previous residency first so the snapshot
+    // does not count this process's earlier wiring against the new model.
+    _ = setModelResidencyWiredLimit(0)
+    let wireBudget = SystemWireBudget.snapshot()
+    let residencyTarget = loadConfiguration.keepModelInMemory
+        ? modelResidencyWiredTarget(
+            modelBytes: modelBytes, workingSet: workingSet, physicalMemory: physical,
+            wireHeadroom: wireBudget.headroomBytes, systemWireLimit: wireBudget.userWireLimitBytes)
+        : nil
+    // Explicitly reset on Off or non-fitting loads: the allocator is process-wide
+    // and otherwise retains the previous model's wiring limit after unloading.
+    let residencyApplied = setModelResidencyWiredLimit(residencyTarget ?? 0)
+    let wireReport = ModelWireBudgetReport(
+        modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
+    ModelWireBudgetReport.recordLastLoad(wireReport)
+    FileHandle.standardError.write(Data(
+        "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
+    FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
 
     // 4. Optional disk-layout preparation. The permanent prestacked
     //    safetensors overlay is now explicit opt-in via

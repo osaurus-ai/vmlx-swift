@@ -64,6 +64,36 @@ struct Qwen4ExpQ6MixedAffineTests {
         }
     }
 
+    @Test("q4/q8 decode equals the promoted-F32 reduction rounded to BF16")
+    func mixedDenseQ4Q8Parity() {
+        MLXMetalTestLock.withLock {
+            for bits in [4, 8] {
+                for (k, n, seed) in [
+                    (512, 8, UInt64(3)), (2560, 512, 41), (2560, 12288, 42),
+                    (2560, 16480, 43), (6144, 2560, 44),
+                ] {
+                    let x = MLXRandom.normal([1, 1, k], key: MLXRandom.key(seed)).asType(.bfloat16)
+                    let w = (MLXRandom.normal([n, k], key: MLXRandom.key(seed + 1)) / Float(k).squareRoot())
+                        .asType(.float16)
+                    let (q, s, b) = quantized(w, groupSize: 64, bits: bits, mode: .affine)
+                    let actual = quantizedMM(
+                        x, q, scales: s, biases: b, transpose: true, groupSize: 64, bits: bits, mode: .affine)
+                    let expected = quantizedMM(
+                        x.asType(.float32), q, scales: s.asType(.float32), biases: b?.asType(.float32),
+                        transpose: true, groupSize: 64, bits: bits, mode: .affine
+                    ).asType(.bfloat16)
+                    MLX.eval(actual, expected)
+                    let unequal = (actual .!= expected).asType(.int32).sum().item(Int.self)
+                    print("[q4q8-mixed] bits=\(bits) K=\(k) N=\(n) output=\(actual.dtype) unequal=\(unequal)")
+                    #expect(actual.dtype == .bfloat16)
+                    // The mixed path skips materializing F32 operands; it must not round the affine bias sum
+                    // in BF16 (q4 did until 2026-10-17: ~5x the F32 error, and verify rows != AR).
+                    #expect(unequal == 0)
+                }
+            }
+        }
+    }
+
     @Test("q6 unsupported shapes and metadata retain the existing promotion")
     func mixedDenseQ6Fallbacks() {
         MLXMetalTestLock.withLock {

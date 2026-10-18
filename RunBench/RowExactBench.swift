@@ -267,6 +267,73 @@ func runRowExactBench(modelPath: String) async throws {
             }
         }
     }
+    if let atRaw = env["BENCH_ROWEXACT_ROW1_AT"], let at = Int(atRaw), at >= 0, at + 1 < stream.count {
+        // Row-1 bisect: AR steps t_at then t_{at+1} vs verify row 1 of [t_at, t_{at+1}], every layer, then the
+        // parts of the first differing layer.
+        var (c0, _) = prefill()
+        for i in 0 ..< at {
+            MLX.eval(model.nativeAutoregressiveBackboneForward(
+                MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0).logits)
+        }
+        MLX.eval(c0)
+        func arSecond(part: Int?) -> ([MLXArray], [(String, MLXArray)]) {
+            let c = c0.map { $0.copy() }
+            MLX.eval(c)
+            MLX.eval(model.nativeAutoregressiveBackboneForward(
+                MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c).logits)
+            Qwen4ExpRowExactCapture.layers = []
+            Qwen4ExpRowExactCapture.parts = []
+            Qwen4ExpRowExactCapture.partLayer = part ?? -1
+            Qwen4ExpRowExactCapture.enabled = true
+            MLX.eval(model.nativeAutoregressiveBackboneForward(
+                MLXArray([Int32(stream[at + 1])]).reshaped(1, 1), cache: c).logits)
+            Qwen4ExpRowExactCapture.enabled = false
+            return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
+        }
+        func verify(part: Int?) -> ([MLXArray], [(String, MLXArray)]) {
+            let c = c0.map { $0.copy() }
+            MLX.eval(c)
+            Qwen4ExpRowExactCapture.layers = []
+            Qwen4ExpRowExactCapture.parts = []
+            Qwen4ExpRowExactCapture.partLayer = part ?? -1
+            Qwen4ExpRowExactCapture.enabled = true
+            MLX.eval(NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                model.nativeBackboneMTPVerifyForward(
+                    MLXArray([Int32(stream[at]), Int32(stream[at + 1])]).reshaped(1, 2), cache: c)
+            }.logits)
+            Qwen4ExpRowExactCapture.enabled = false
+            return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
+        }
+        func last(_ x: MLXArray, row: Int) -> MLXArray {
+            let flat = x.reshaped(x.dim(0), x.dim(1), -1)
+            return flat[0, min(row, flat.dim(1) - 1)].asType(.float32)
+        }
+        let (aL, _) = arSecond(part: nil)
+        let (vL, _) = verify(part: nil)
+        MLX.eval(aL)
+        MLX.eval(vL)
+        var first: Int?
+        for (i, (x, y)) in zip(aL, vL).enumerated() {
+            let d = abs(last(x, row: 0) - last(y, row: 1))
+            let m = d.max().item(Float.self)
+            if m > 0, first == nil { first = i }
+            if m > 0 || i == aL.count - 1 {
+                print(String(format: "[ROWEXACT] row1 at=%d layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
+                             (d .> 0).sum().item(Int.self)))
+            }
+            if first != nil, i > first! + 1 { break }
+        }
+        if let first {
+            let (_, aP) = arSecond(part: first)
+            let (_, vP) = verify(part: first)
+            for ((name, x), (_, y)) in zip(aP, vP) {
+                let d = abs(last(x, row: 0) - last(y, row: 1))
+                print(String(format: "[ROWEXACT] row1 at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
+                             name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+            }
+        }
+        Qwen4ExpRowExactCapture.partLayer = 0
+    }
     if let dump = env["BENCH_ROWEXACT_DUMP"] {
         // The reference AR stream as text (compare with BENCH_SPEED_TEXT_OUT dumps of the real iterators).
         let text = context.tokenizer.decode(tokenIds: Array(stream.dropLast()))

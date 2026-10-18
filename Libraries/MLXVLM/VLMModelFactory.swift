@@ -975,6 +975,13 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         MiMoV26Contract.matches(data) {
         return (data, BaseProcessorConfiguration(processorClass: "MiMoV26Processor"))
     }
+    // Text-only qwen4_exp bundles ship no processor files (Qwen4ExpTextOnlyBundle).
+    if let synthesized = Qwen4ExpTextOnlyBundle.processorConfiguration(
+        modelDirectory: modelDirectory,
+        configData: try? Data(contentsOf: modelDirectory.appendingPathComponent("config.json")))
+    {
+        return (synthesized, try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: synthesized))
+    }
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
     let audioPreprocessorConfigURL = modelDirectory.appending(

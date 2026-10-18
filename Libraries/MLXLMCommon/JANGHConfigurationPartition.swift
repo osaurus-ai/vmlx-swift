@@ -144,7 +144,14 @@ struct JANGHConfigurationPartition: Sendable {
                 header = otherHeader
             }
         }
-        guard let header else { throw Failure.invalid("missing authoritative JANGH header") }
+        // A pure-JANGT bundle (no `jangtq2` projection, a `jangt` header) carries no codebooks and may omit `jangtq`;
+        // the format contract still refuses a `jangtq2` projection without one.
+        let declaresCodebookProjection = plan.values.contains {
+            ($0 as? [String: Any])?["mode"] as? String == "jangtq2"
+        }
+        guard header != nil || (!declaresCodebookProjection && root["jangt"] is [String: Any]) else {
+            throw Failure.invalid("missing authoritative JANGH header")
+        }
         var canonical = root
         canonical["jangtq"] = header
         canonical["quantization"] = plan

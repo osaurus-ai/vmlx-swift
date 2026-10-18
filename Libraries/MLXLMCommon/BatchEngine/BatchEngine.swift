@@ -1417,7 +1417,10 @@ public actor BatchEngine {
                         cache: nil,
                         parameters: deferredParameters,
                         depth: deferredDepth,
-                        cacheCoordinator: deferredCoordinator)
+                        cacheCoordinator: deferredCoordinator,
+                        prefillProgressHandler: { progress in
+                            continuation.yield(.prefillProgress(prefillGate.clamp(progress)))
+                        })
                 }
                 (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,

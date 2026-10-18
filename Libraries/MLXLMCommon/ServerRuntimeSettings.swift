@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
 #if canImport(os)
 import os
 #endif
@@ -675,6 +676,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         status: MTPBundleStatus?
     ) -> LoadConfiguration {
         var resolved = base
+        resolved.keepModelInMemory = memorySafety.keepModelInMemory
         let launch = resolvedMTPLaunch(
             configData: configData,
             jangConfig: jangConfig,
@@ -731,6 +733,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         loadConfiguration.deepseekV4ActivationQAT =
             effectivePerformance.deepseekV4ActivationQAT
         loadConfiguration.memoryLimit = loadCap
+        loadConfiguration.keepModelInMemory = memorySafety.keepModelInMemory
         loadConfiguration.maxResidentBytes = allocatorCap
         loadConfiguration.useMmapSafetensors = true
         loadConfiguration.jangPress = resolvedMemorySafetyJangPress(
@@ -828,6 +831,14 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             facts.physicalMemory = physicalMemory
             loadConfiguration.memoryLimit = baseLoadConfiguration.resolvedSchedulingMemoryLimit(
                 facts: facts, recommendedWorkingSetBytes: host?.recommendedWorkingSetBytes)
+        }
+        if memorySafety.keepModelInMemory, let facts = bundleFacts,
+           let workingSet = host?.recommendedWorkingSetBytes,
+           facts.gpuResidentWeightBytes > 0,
+           modelResidencyWiredTarget(
+                modelBytes: Int(clamping: facts.gpuResidentWeightBytes),
+                workingSet: workingSet, physicalMemory: Int(clamping: physicalMemory)) == nil {
+            warnings.append("This model cannot be kept fully in GPU memory within this Mac's working-set ceiling and OS reserve. If admitted by the selected memory policy, memory pressure can cause disk reads and slower replies.")
         }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
@@ -1770,6 +1781,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         set { mode = VMLXMemorySafetyMode(sliderIndex: newValue) }
     }
 
+    public var keepModelInMemory: Bool
     public var allowExperimentalMLXPress: Bool
     public var failClosedWhenEstimateUnknown: Bool
     public var customPhysicalMemoryFraction: Double?
@@ -1780,6 +1792,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case mode
         case slider
+        case keepModelInMemory
         case allowExperimentalMLXPress
         case failClosedWhenEstimateUnknown
         case customPhysicalMemoryFraction
@@ -1794,6 +1807,8 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         // disagree (they dragged the slider back when it did nothing) keeps the
         // safety level the engine has actually been enforcing for them.
         self.mode = try c.decodeIfPresent(VMLXMemorySafetyMode.self, forKey: .mode) ?? .safeAuto
+        self.keepModelInMemory =
+            try c.decodeIfPresent(Bool.self, forKey: .keepModelInMemory) ?? true
         self.allowExperimentalMLXPress =
             try c.decodeIfPresent(Bool.self, forKey: .allowExperimentalMLXPress) ?? false
         self.failClosedWhenEstimateUnknown =
@@ -1813,6 +1828,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         try c.encode(mode, forKey: .mode)
         // Still emitted so the persisted/API shape is unchanged for readers.
         try c.encode(slider, forKey: .slider)
+        try c.encode(keepModelInMemory, forKey: .keepModelInMemory)
         try c.encode(allowExperimentalMLXPress, forKey: .allowExperimentalMLXPress)
         try c.encode(failClosedWhenEstimateUnknown, forKey: .failClosedWhenEstimateUnknown)
         try c.encodeIfPresent(customPhysicalMemoryFraction, forKey: .customPhysicalMemoryFraction)
@@ -1823,6 +1839,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
 
     public init(
         mode: VMLXMemorySafetyMode = .safeAuto,
+        keepModelInMemory: Bool = true,
         allowExperimentalMLXPress: Bool = false,
         failClosedWhenEstimateUnknown: Bool = false,
         customPhysicalMemoryFraction: Double? = nil,
@@ -1831,6 +1848,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         customMaxConcurrentSequences: Int? = nil
     ) {
         self.mode = mode
+        self.keepModelInMemory = keepModelInMemory
         self.allowExperimentalMLXPress = allowExperimentalMLXPress
         self.failClosedWhenEstimateUnknown = failClosedWhenEstimateUnknown
         self.customPhysicalMemoryFraction = customPhysicalMemoryFraction

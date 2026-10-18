@@ -1542,13 +1542,16 @@ public enum NativeMTPVerifierStatePolicy {
     }
 
     public static func mode(for requestedMode: String?) -> Mode {
-        let env = ProcessInfo.processInfo.environment
+        // Read per recurrent layer per verify: the request's own mode needs no parsing, and the fallbacks use
+        // getenv (`RuntimeEnvironment`), never `ProcessInfo.environment`, which rebuilds the whole environment
+        // dictionary per call (~2 ms of host time per Allosaurus verify window, 36 GDN layers x 3 reads).
+        if requestedMode == Mode.inputCaptureStaged.rawValue { return .inputCaptureStaged }
         let raw =
             (requestedMode
-                ?? env["VMLX_NATIVE_MTP_STATE_COMMIT"]
-                ?? env["VMLINUX_NATIVE_MTP_STATE_COMMIT"]
-                ?? env["VMLX_NATIVE_MTP_HYBRID_VERIFY"]
-                ?? env["VMLINUX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? RuntimeEnvironment.value("VMLX_NATIVE_MTP_STATE_COMMIT")
+                ?? RuntimeEnvironment.value("VMLINUX_NATIVE_MTP_STATE_COMMIT")
+                ?? RuntimeEnvironment.value("VMLX_NATIVE_MTP_HYBRID_VERIFY")
+                ?? RuntimeEnvironment.value("VMLINUX_NATIVE_MTP_HYBRID_VERIFY")
                 ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()

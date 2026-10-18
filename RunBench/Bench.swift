@@ -623,6 +623,26 @@ struct Bench {
             runKernelMicroBench()
             return
         }
+        if (env["BENCH_MIXED_QMV_PROBE"] ?? "0") == "1" {
+            runMixedQMVProbe()
+            return
+        }
+        if (env["BENCH_MIXER_MICRO"] ?? "0") == "1" {
+            runMixerMicroBench()
+            return
+        }
+        if (env["BENCH_ROUTED_LAYER_MICRO"] ?? "0") == "1" {
+            try await runRoutedLayerMicroBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_MTP_PROXY"] ?? "0") == "1" {
+            try await runMTPProxyBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_FIDELITY"] ?? "0") == "1" {
+            try await runFidelityBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_K2_MULTITURN"] ?? "0") == "1" {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
@@ -8824,6 +8844,7 @@ private func runPerfBenchBody(
             var reasoning = ""
             var toolCalls = 0
             var stopReason = "unknown"
+            var generationFailure: GenerationFailure?
             var unclosedReasoning = false
             var rssMiB = 0.0
             var footprintMiB = 0.0
@@ -8836,8 +8857,7 @@ private func runPerfBenchBody(
             var lastTokenDelivery: TimeInterval?
 
             mutating func recordPrefill(_ progress: PrefillProgress) {
-                if prefillStart == nil, progress.stage == .prefill,
-                    progress.detail == "running"
+                if prefillStart == nil, progress.stage == .prefill
                 {
                     prefillStart = progress
                 }
@@ -9063,6 +9083,7 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -9085,6 +9106,7 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
@@ -9118,9 +9140,16 @@ private func runPerfBenchBody(
                         result.promptSec = info.promptTime
                         result.genSec = info.generateTime
                         result.stopReason = stopLabel(info.stopReason)
+                        result.generationFailure = info.generationFailure
                         result.unclosedReasoning = info.unclosedReasoning
                     }
                 }
+            }
+            if let failure = result.generationFailure,
+               let encoded = try? JSONSerialization.data(withJSONObject: [
+                    "stage": failure.stage.rawValue, "cause": failure.cause]),
+               let json = String(data: encoded, encoding: .utf8) {
+                print("  PERF_FAILURE label=\(label) failure=\(json)")
             }
             result.rssMiB = currentRSSMiB()
             result.footprintMiB = currentPhysFootprintMiB()
@@ -9188,6 +9217,7 @@ private func runPerfBenchBody(
                     print("    REASONING_PREVIEW \"\(compactPreview(result.reasoning))\"")
                 }
                 print("    TEXT_PREVIEW \"\(compactPreview(result.text.isEmpty ? result.reasoning : result.text))\"")
+                print("    PERF_MLX_MEMORY label=\(label) active_bytes=\(MLX.Memory.activeMemory) cache_bytes=\(MLX.Memory.cacheMemory) peak_bytes=\(MLX.Memory.peakMemory)")
                 if env["BENCH_PERF_FULL_TEXT"] == "1" {
                     printDecodedOutput(
                         label: label,
