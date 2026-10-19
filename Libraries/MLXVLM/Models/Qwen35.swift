@@ -4915,8 +4915,15 @@ extension Qwen35: PrefixCacheInvariantModel {
     /// is what made this unsafe before. MiniCPM-V's canvas positions are not covered: false there.
     public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { config.miniCPMCanvas == nil }
 
-    /// Unchanged: required-tool selection keeps its full-prefill path for this hybrid topology.
-    public var exactPrefixRestoreIsSuffixIndependent: Bool { false }
+    /// A restored exact-prefix row holds the KV, conv and F32 GDN state of exactly those tokens:
+    /// the forward is causal and the row was written from them alone, so whatever the request
+    /// appends next (a forced tool-selection tail included) cannot have influenced it. Proven on the
+    /// Qwen 3.5 hybrid fixture (`Qwen35HadamardCacheTests`): a reopened disk checkpoint continues
+    /// bitwise equal to the cold cache, and a required-tool request now restores into exactly the
+    /// state the ordinary warm request reaches. Without it, every tool_choice=required turn
+    /// re-prefilled the whole history (Ornith 122B in the app: 24,143 tokens, 20.6 s, with the
+    /// previous turn's 23,861-token boundary on disk).
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
 }
 
 extension Qwen35: MediaItemPrefixCacheModel {

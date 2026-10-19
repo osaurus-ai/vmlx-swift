@@ -164,11 +164,11 @@ struct Qwen35RestoredMediaPositionTests {
         }
     }
 
-    @Test("pre-media boundaries are media-independent for Qwen-VL positions")
+    @Test("Qwen-VL positions: pre-media boundaries media-independent, exact-prefix restore suffix-independent")
     func declaresPreMediaInvariant() throws {
         let m = try model()
         #expect(m.statesBeforeFirstMediaTokenAreMediaIndependent)
-        #expect(!m.exactPrefixRestoreIsSuffixIndependent)
+        #expect(m.exactPrefixRestoreIsSuffixIndependent)
     }
 
     // MARK: - Two images: per-item keys
