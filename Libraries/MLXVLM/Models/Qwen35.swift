@@ -3766,6 +3766,17 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
     public let config: Qwen35Configuration
 
+    /// Routed-MoE backbones prefill 2048-token chunks: each chunk's expert
+    /// matmuls then see ~64 rows per expert instead of ~16, while the GDN
+    /// recurrence and attention cost per token stay the same. Ornith 1.5 122B
+    /// (JANG_4M, 15,750-token prompt, M5 Max): 512 -> 864 tok/s, 2048 -> 1187
+    /// tok/s, 4096 -> 1216 tok/s; peak process footprint 3.4 / 6.2 / 10.3 GB.
+    /// 2048 keeps most of the speed for a quarter of 4096's extra memory.
+    /// Dense backbones keep the library default.
+    public var recommendedPrefillStepSize: Int? {
+        config.textConfiguration.numExperts > 0 ? 2048 : nil
+    }
+
     /// What this instance actually carries. Same contract as the other converted families.
     public let modalities: Set<ModelRuntimeRequestModality>
 
