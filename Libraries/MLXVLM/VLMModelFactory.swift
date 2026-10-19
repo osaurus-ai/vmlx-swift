@@ -481,6 +481,7 @@ public final class VLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
+        var loadTiming = ModelLoadTiming(scope: "vlm")
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
@@ -763,6 +764,7 @@ public final class VLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        loadTiming.mark("configuration_and_model_construction")
         // qwen4_exp's PLE embedding is a ~95 GiB table. Its model object must
         // receive the bundle directory so it can install the page-granular
         // safetensors row reader before any forward; ordinary MLX weight
@@ -773,6 +775,7 @@ public final class VLMModelFactory: ModelFactory {
         if let mimo = model as? MiMoV26 {
             try mimo.configure(modelDirectory: modelDirectory)
         }
+        loadTiming.mark("file_backed_tables")
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =
@@ -878,6 +881,7 @@ public final class VLMModelFactory: ModelFactory {
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
+        loadTiming.mark("generation_and_mtp_setup")
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             // 2026-04-28: pass top-level `quantization` through too, matching
@@ -894,6 +898,7 @@ public final class VLMModelFactory: ModelFactory {
             // their ordinary modes explicit, bypassing legacy JANG shape inference.
             jangConfig: jangHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
+        loadTiming.mark("weights")
 
         let tokenizer = try await tokenizerTask
         let processorConfigData: Data
@@ -950,6 +955,7 @@ public final class VLMModelFactory: ModelFactory {
             generationDefaults: generationConfig,
             mtpStatus: mtpStatus)
 
+        loadTiming.mark("tokenizer_and_processor")
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)

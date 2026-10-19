@@ -82,6 +82,9 @@ public struct ModelContext: @unchecked Sendable {
     public var processor: any UserInputProcessor
     public var tokenizer: Tokenizer
     public var jangPressRuntime: JangPressRuntime
+    // Shared across context copies; released with the loaded context, including
+    // cancelled/failed load cleanup. Never keyed by a model name or directory.
+    var residencyLease: ModelResidency.Lease?
 
     /// Whether this model supports vision/image input (is a VLM).
     public var isVLM: Bool { model is VisionLanguageModelProtocol }
@@ -600,7 +603,9 @@ public func loadModel(
     loadConfiguration: LoadConfiguration
 ) async throws -> (ModelContext, JangPressRuntime) {
     // 1. Inspect bundle once.
+    var loadTiming = ModelLoadTiming(scope: "runtime")
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
+    loadTiming.mark("bundle_inspection")
     let useMmapSafetensors = facts.resolveMmapSafetensors(
         requested: loadConfiguration.useMmapSafetensors)
     let memoryLimit = loadConfiguration.resolvedSchedulingMemoryLimit(
@@ -676,25 +681,22 @@ public func loadModel(
     let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
     let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
     let physical = Int(clamping: facts.physicalMemory)
-    // SPEED-CRITICAL (Allosaurus on 48 GB Macs, 2026-10-15): size residency against the SYSTEM WIRE
-    // BUDGET, not only RAM / Metal's working set. Clear our own previous residency first so the snapshot
-    // does not count this process's earlier wiring against the new model.
-    _ = setModelResidencyWiredLimit(0)
+    // Keep other contexts' residency intact. This snapshot includes existing
+    // process wiring; the report describes headroom before this incoming load.
     let wireBudget = SystemWireBudget.snapshot()
-    let residencyTarget = loadConfiguration.keepModelInMemory
-        ? modelResidencyWiredTarget(
-            modelBytes: modelBytes, workingSet: workingSet, physicalMemory: physical,
-            wireHeadroom: wireBudget.headroomBytes, systemWireLimit: wireBudget.userWireLimitBytes)
-        : nil
-    // Explicitly reset on Off or non-fitting loads: the allocator is process-wide
-    // and otherwise retains the previous model's wiring limit after unloading.
-    let residencyApplied = setModelResidencyWiredLimit(residencyTarget ?? 0)
+    let residency = ModelResidency.shared.acquire(.init(
+        weightBytes: modelBytes, enabled: loadConfiguration.keepModelInMemory,
+        physicalMemory: physical, workingSet: workingSet,
+        systemWireLimit: wireBudget.userWireLimitBytes))
+    let residencyTarget = residency.target > 0 ? residency.target : nil
+    let residencyApplied = residency.applied
     let wireReport = ModelWireBudgetReport(
         modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
     ModelWireBudgetReport.recordLastLoad(wireReport)
     FileHandle.standardError.write(Data(
         "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
     FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
+    loadTiming.mark("memory_and_residency")
 
     // 4. Optional disk-layout preparation. The permanent prestacked
     //    safetensors overlay is now explicit opt-in via
@@ -712,6 +714,7 @@ public func loadModel(
         originalURL: directory,
         enabled: useMmapSafetensors,
         alignmentRepairAuthorization: loadConfiguration.alignmentRepairAuthorization)
+    loadTiming.mark("bundle_preparation")
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
     //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
@@ -756,6 +759,7 @@ public func loadModel(
     _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
         options: resolvedOptions,
         mmapEnabled: useMmapSafetensors)
+    loadTiming.mark("factory_load")
     JangPressCanonicalExpertAdvisor.shared.configure(
         options: resolvedOptions,
         mmapEnabled: useMmapSafetensors,
@@ -771,6 +775,8 @@ public func loadModel(
         context.configuration.id = .directory(directory)
     }
     context.jangPressRuntime = runtime
+    context.residencyLease = residency.lease
+    loadTiming.mark("runtime_activation")
     return (context, runtime)
 }
 
