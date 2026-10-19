@@ -31,10 +31,13 @@ Do not bypass their Osaurus minimum-version requirement.
 ## Verification status
 
 - Release engine build: passed with Xcode's developer directory selected.
-- Focused admission and converter-rehearsal tests: in progress.
+- Focused admission and converter-rehearsal tests: 11 passed, one unrelated
+  optional dense-Qwen artifact test skipped. The rehearsal executes with and
+  without its affine MTP head, through the public load configuration.
 - Real JANG_4M Swift diagnostic with original metadata reproduces repeated,
-  incoherent reasoning and no visible answer. Corrected-metadata comparison
-  and Osaurus UI proof are pending.
+  incoherent reasoning and no visible answer. A metadata-only comparison on
+  the same tensors completes with correct arithmetic and separate reasoning.
+  Osaurus UI proof is pending.
 - JANGH2 real-bundle execution, multimodal turns, SSD companion restore,
   physical footprint, and MTP On/Off: pending.
 - Python/Electron receipts for these bundles do not establish Swift app behavior.
