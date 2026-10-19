@@ -3620,21 +3620,13 @@ public actor BatchEngine {
                 slot.originalInput.cachePrefixTokenCounts
                     + [sharedPromptStripBoundary].compactMap { $0 }
             ))
-            // A path-dependent hybrid chat prompt has one canonical reusable
-            // boundary: the prompt with its trailing generation scaffold
-            // removed.  The exact prompt boundary is deliberately rejected on
-            // restore for these topologies, while the generated/post-answer
-            // tokens are not guaranteed to match the template's historical
-            // assistant rendering.  Persisting all three used to serialize
-            // several almost-identical full snapshots at every turn (hundreds
-            // of MB each for Bonsai) even though only this stripped boundary is
-            // required by the next turn.  Dense/rotating, media-unsafe, raw,
-            // and non-chat prompts have no proven strip boundary and keep the
-            // existing prompt/post-answer policy.
-            // Still `isHybrid` on purpose — see the note in Evaluate.swift. This
-            // suppresses every other boundary; only an SSM hybrid can afford that.
-            // Standalone rotating/SWA caches keep this policy untouched and only
-            // gain the stripped-boundary store itself (below).
+            // Preserve the generation-scaffold-stripped checkpoint as the
+            // canonical fallback, without also saving the redundant exact
+            // prompt. A valid completed-answer checkpoint is stored separately
+            // below: templates preserving assistant history can resume from it;
+            // templates rewriting history still use this fallback. Concrete
+            // prefix matching, not the model family, selects the usable row.
+            // Standalone rotating/SWA retains its existing prompt policy.
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let isReusablePrefixWarmup =
@@ -4118,8 +4110,9 @@ public actor BatchEngine {
             // Store the growing-chat boundary only when the cache offset proves
             // it covers prompt + generated tokens exactly enough to resume.
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
-            if !usesCanonicalHybridBoundary,
-               !isReusablePrefixWarmup,
+            // Retain the completed-answer snapshot alongside the stripped
+            // fallback. A later exact-prefix match decides which one is usable.
+            if !isReusablePrefixWarmup,
                reason == .stop,
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),

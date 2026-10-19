@@ -3438,10 +3438,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             cachePrefixTokenCounts + [hybridStripBoundary].compactMap { $0 }
         ))
         // When a hybrid prompt exposes a generation-suffix-stripped boundary,
-        // that is the canonical cross-turn checkpoint.  Full-prompt and
-        // post-answer snapshots are both larger and not the boundary the next
-        // templated turn is guaranteed to contain.  Prompts without this
-        // processor-proven boundary keep the existing storage policy.
+        // that is the canonical fallback checkpoint. Avoid redundant exact
+        // prompt snapshots; separately retain a completed-answer snapshot when
+        // its offsets are valid, because some templates preserve generated
+        // history verbatim. Fetch validates the concrete token prefix before
+        // reusing either checkpoint. Prompts without this processor-proven
+        // boundary keep the existing prompt storage policy.
         // Standalone rotating/SWA caches deliberately keep the exact/N-1
         // disk-seed and post-answer policy (see `diskSeedBoundaryIndex`); they
         // only gain the stripped-boundary store itself.
@@ -3779,8 +3781,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                     + "canonicalHybrid=\(usesCanonicalHybridBoundary) warmup=\(isReusablePrefixWarmup) "
                     + "generated=\(generatedTokenIds.count) quantize=\(needsCacheQuantization)\n").utf8))
         }
-        guard !usesCanonicalHybridBoundary,
-            !isReusablePrefixWarmup,
+        // The stripped checkpoint is a fallback for templates that rewrite
+        // assistant history. It must not prevent saving a completed answer:
+        // templates that preserve it can resume after a long generated reply.
+        // Fetch still requires an exact token prefix; incompatible renderings
+        // use the stripped checkpoint. Keep offset, stop and tool-call guards.
+        guard !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
         else { return }
         guard !needsCacheQuantization else { return }
