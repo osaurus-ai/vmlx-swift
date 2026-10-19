@@ -1691,7 +1691,11 @@ enum Qwen35Language {
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
+            if let mask, Qwen35CausalPrefillMask.applies(
+                mask: mask, rows: L, batch: B, cache: cache, fullBufferCache: fullBufferCache)
+            {
+                attentionMask = .causal
+            } else if let mask {
                 // Full-buffer (Compilable) caches: mask and K/V both span the
                 // whole static buffer — pass through unsliced.
                 attentionMask =
@@ -4783,6 +4787,27 @@ public enum Qwen35DFlash2TreeKernelProbe {
 
 /// Verify-cost attribution on real weights: per-layer ms of each sub-op at a given row count
 /// (each timed alone, eval'd, median of `reps`). Diagnostic only (RunBench BENCH_PARTS).
+/// Prefill chunks attend with the fused kernel's own causal mode instead of the equivalent explicit
+/// mask array. The model builds that array itself (`createAttentionMask(..., returnArray: true)`), and
+/// for a plain single-sequence `KVCacheSimple` it is exactly the lower-right causal mask of the chunk
+/// against every cached key — what `.causal` computes without reading a `[rows, keys]` mask. Fused
+/// D=256 attention for a 2048-row chunk: 272 -> 234 ms at 131,072 keys, 135 -> 115 ms at 65,536.
+/// Verify widths (< 32 rows), batches, compiled full-buffer and windowed caches keep the array.
+/// `VMLX_QWEN35_CAUSAL_PREFILL_MASK=0` restores the array everywhere.
+enum Qwen35CausalPrefillMask {
+    static let enabled = RuntimeEnvironment.value("VMLX_QWEN35_CAUSAL_PREFILL_MASK") != "0"
+
+    static func applies(
+        mask: MLXArray, rows: Int, batch: Int, cache: KVCache?, fullBufferCache: Bool
+    ) -> Bool {
+        guard enabled, rows >= 32, batch == 1, !fullBufferCache, let cache,
+            type(of: cache) == KVCacheSimple.self, mask.ndim == 2
+        else { return false }
+        // The model's causal mask for this chunk: rows x (cached keys + rows).
+        return mask.dim(0) == rows && mask.dim(1) == cache.offset + rows
+    }
+}
+
 public enum Qwen35DFlash2PartsProbe {
     public static func run(model: Any, rowsList: [Int], reps: Int) -> [String] {
         guard let m = model as? Qwen35 else { return ["[PARTS] not a Qwen35 VLM model"] }
