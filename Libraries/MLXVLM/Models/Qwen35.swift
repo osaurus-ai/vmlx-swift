@@ -4270,10 +4270,12 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        languageModel.textOnlyForwardWithHidden(
-            inputs,
-            cache: cache,
-            recordPrefixCommitStates: true)
+        RoutedExpertVerificationScope.withVerification(inputShape: inputs.shape) {
+            languageModel.textOnlyForwardWithHidden(
+                inputs,
+                cache: cache,
+                recordPrefixCommitStates: true)
+        }
     }
 
     public func nativeMTPForward(

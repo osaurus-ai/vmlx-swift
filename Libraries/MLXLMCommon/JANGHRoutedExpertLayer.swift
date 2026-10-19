@@ -69,7 +69,9 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 // verify and MTP stops beating AR. Do not remove or narrow without an Allosaurus
                 // adaptive RunBench + in-app code turn A/B.
                 forceDecode: FlashVerificationScope.usesMappedDecode(
-                    inputShape: input.shape, routes: routes))
+                    inputShape: input.shape, routes: routes)
+                    || RoutedExpertVerificationScope.usesMappedDecode(
+                        inputShape: input.shape, routes: routes))
             precondition(result.shape == [tokens, inputDimensions] && result.dtype == input.dtype,
                          "JANGH routed output violates admitted architecture")
             return result.reshaped(input.shape)
