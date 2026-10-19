@@ -4919,6 +4919,47 @@ extension Qwen35: PrefixCacheInvariantModel {
     public var exactPrefixRestoreIsSuffixIndependent: Bool { false }
 }
 
+extension Qwen35: MediaItemPrefixCacheModel {
+    /// Each image owns `t*h*w / merge²` image-pad placeholders and `t*h*w` pixel rows; each video
+    /// owns that many video-pad placeholders (its frame runs may be separated by timestamp text) and
+    /// rows. Placeholders are assigned to items in order; any count mismatch returns nil.
+    public func mediaItemSpans(in input: LMInput, tokenIds: [Int]) -> [MediaItemSpan]? {
+        guard config.miniCPMCanvas == nil, input.video?.embeddingTokenCount == nil else { return nil }
+        let merge = config.visionConfiguration?.spatialMergeSize ?? 1
+        let perToken = max(1, merge * merge)
+        func spans(_ kind: MediaItemSpan.Kind, tokenId: Int, frames: [THW]?) -> [MediaItemSpan]? {
+            let positions = tokenIds.indices.filter { tokenIds[$0] == tokenId }
+            guard let frames, !frames.isEmpty else { return positions.isEmpty ? [] : nil }
+            var out: [MediaItemSpan] = []
+            var next = 0
+            var row = 0
+            for (index, frame) in frames.enumerated() {
+                let count = frame.product / perToken
+                guard count > 0, frame.product % perToken == 0, next + count <= positions.count
+                else { return nil }
+                out.append(MediaItemSpan(
+                    kind: kind,
+                    tokenRange: positions[next] ..< (positions[next + count - 1] + 1),
+                    pixelRows: row ..< (row + frame.product),
+                    frameIndex: index))
+                next += count
+                row += frame.product
+            }
+            return next == positions.count ? out : nil
+        }
+        guard let images = spans(.image, tokenId: config.imageTokenId, frames: input.image?.frames),
+            let videos = spans(.video, tokenId: config.videoTokenId, frames: input.video?.frames),
+            input.image.map({ $0.pixels.dim(0) == images.last?.pixelRows.upperBound }) ?? true,
+            input.video.map({ $0.pixels.dim(0) == videos.last?.pixelRows.upperBound }) ?? true
+        else { return nil }
+        let all = (images + videos).sorted { $0.tokenRange.lowerBound < $1.tokenRange.lowerBound }
+        for (a, b) in zip(all, all.dropFirst()) where a.tokenRange.upperBound > b.tokenRange.lowerBound {
+            return nil
+        }
+        return all.isEmpty ? nil : all
+    }
+}
+
 extension Qwen35: RestoredPrefixPositionModel {
     /// A restored prefix of a media request: arm the full prompt's M-RoPE plan so the suffix (text
     /// after a restored image, or an image after restored text) gets cold-prefill positions and

@@ -2298,7 +2298,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         } else if suffixHoldsMedia {
                             inputForPrepare = mediaCarryingSuffixInput(
                                 from: input, remainingTokens: remainingTokens,
-                                matchedTokens: matchedTokens)
+                                matchedTokens: matchedTokens, itemSpans: cacheSaltPlan.itemSpans)
                         } else {
                             let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                                 .expandedDimensions(axis: 0)

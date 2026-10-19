@@ -170,4 +170,70 @@ struct Qwen35RestoredMediaPositionTests {
         #expect(m.statesBeforeFirstMediaTokenAreMediaIndependent)
         #expect(!m.exactPrefixRestoreIsSuffixIndependent)
     }
+
+    // MARK: - Two images: per-item keys
+
+    private let pixels2 = MLXArray((0 ..< 16 * 12).map { Float(($0 * 7) % 23) / 23 }, [16, 12])
+
+    private func twoImages(_ tokens: [Int32]) -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray(tokens, [1, tokens.count]), tokenIds: tokens.map(Int.init)),
+            image: .init(
+                pixels: concatenated([pixels, pixels2], axis: 0), frames: [THW(1, 4, 4), THW(1, 4, 4)]),
+            mediaTokenIds: [98, 97])
+    }
+
+    private var firstTurn: [Int32] { [1, 2] + imageRun + [5, 6, 7] }
+    private var secondTurn: [Int32] { firstTurn + [8, 9] + imageRun + tail }
+
+    @Test("the boundary between two images is keyed like the earlier one-image turn")
+    func perItemSalt() throws {
+        let m = try model()
+        let full = twoImages(secondTurn)
+        let spans = try #require(m.mediaItemSpans(in: full, tokenIds: secondTurn.map(Int.init)))
+        #expect(spans.map(\.tokenRange) == [3 ..< 7, 14 ..< 18])
+        #expect(spans.map(\.pixelRows) == [0 ..< 16, 16 ..< 32])
+        let params = GenerateParameters()
+        let plan = CacheBoundarySaltPlan.make(
+            requestSalt: computeCacheSalt(for: full, parameters: params), input: full,
+            lookupTokenIds: secondTurn.map(Int.init), model: m, parameters: params)
+        let earlier = LMInput(
+            text: .init(tokens: MLXArray(firstTurn, [1, firstTurn.count])),
+            image: .init(pixels: pixels, frames: [THW(1, 4, 4)]), mediaTokenIds: [98, 97])
+        let earlierSalt = computeCacheSalt(for: earlier, parameters: params)
+        #expect(plan.salt(forBoundary: firstTurn.count) == earlierSalt)
+        #expect(plan.salt(forBoundary: 3) == computeCacheSalt(for: full, parameters: params, includingMedia: false))
+        #expect(plan.salt(forBoundary: secondTurn.count) == plan.requestSalt)
+        #expect(plan.requestSalt != earlierSalt)
+        #expect(plan.resumeBeforeMediaIsSafe(matchedTokens: firstTurn.count))
+        #expect(plan.resumeBeforeMediaIsSafe(matchedTokens: 14))
+        #expect(!plan.resumeBeforeMediaIsSafe(matchedTokens: 5))
+        #expect(!plan.resumeBeforeMediaIsSafe(matchedTokens: 16))
+        #expect(!plan.resumeBeforeMediaIsSafe(matchedTokens: 20))
+        #expect(plan.mediaIndependentPrefix?.salt(forBoundary: 12) == .some(earlierSalt))
+        // The suffix after the first image carries only the second image's pixels.
+        let suffix = mediaCarryingSuffixInput(
+            from: full, remainingTokens: Array(secondTurn[firstTurn.count...]).map(Int.init),
+            matchedTokens: firstTurn.count, itemSpans: plan.itemSpans)
+        #expect(suffix.image?.frames?.map(\.product) == [16])
+        #expect(suffix.image.map { maxError($0.pixels, pixels2) } == 0)
+    }
+
+    @Test("a second image after a restored first image matches a cold prefill", arguments: [0, 3])
+    func secondImageAfterRestoredFirst(window: Int) throws {
+        try MLXMetalTestLock.withLock {
+            let full = twoImages(secondTurn)
+            let expected = try cold(full)
+            let m = try model()
+            let spans = try #require(m.mediaItemSpans(in: full, tokenIds: secondTurn.map(Int.init)))
+            let prefix = LMInput(
+                text: .init(tokens: MLXArray(firstTurn, [1, firstTurn.count])),
+                image: .init(pixels: pixels, frames: [THW(1, 4, 4)]), mediaTokenIds: [98, 97])
+            let suffix = mediaCarryingSuffixInput(
+                from: full, remainingTokens: Array(secondTurn[firstTurn.count...]).map(Int.init),
+                matchedTokens: firstTurn.count, itemSpans: spans)
+            let actual = try restored(full, prefix: prefix, suffix: suffix, window: window, hook: true)
+            for (a, e) in zip(actual, expected) { #expect(maxError(a, e) < 1e-4) }
+        }
+    }
 }

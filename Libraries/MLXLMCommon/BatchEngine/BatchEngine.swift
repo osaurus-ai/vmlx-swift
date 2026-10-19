@@ -2464,7 +2464,7 @@ public actor BatchEngine {
                             if suffixHoldsMedia {
                                 inputForPrepare = mediaCarryingSuffixInput(
                                     from: slot.originalInput, remainingTokens: remaining,
-                                    matchedTokens: matchedTokens)
+                                    matchedTokens: matchedTokens, itemSpans: saltPlan.itemSpans)
                             } else {
                             inputForPrepare = LMInput(
                                 text: LMInput.Text(tokens: remainingArray),

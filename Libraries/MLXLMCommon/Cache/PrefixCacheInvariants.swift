@@ -58,11 +58,80 @@ public protocol RestoredPrefixPositionModel: AnyObject {
 public struct MediaIndependentPrefix: Sendable, Equatable {
     public let salt: String?
     public let tokenCount: Int
+    /// Per-media-item salt segments (``CacheBoundarySaltPlan/segments``); empty when only the
+    /// pre-media prefix has its own salt.
+    public let segments: [CacheBoundarySaltPlan.Segment]
 
-    public init(salt: String?, tokenCount: Int) {
+    public init(salt: String?, tokenCount: Int, segments: [CacheBoundarySaltPlan.Segment] = []) {
         self.salt = salt
         self.tokenCount = tokenCount
+        self.segments = segments
     }
+
+    /// The salt a boundary is keyed under when it is not the request salt: the pre-media salt at
+    /// or before the first media token, or the salt of exactly the media before it when the model
+    /// keys boundaries per media item. Nil: the boundary uses the request salt.
+    public func salt(forBoundary boundary: Int) -> String?? {
+        if let segment = segments.first(where: { $0.contains(boundary) }) { return .some(segment.salt) }
+        if boundary <= tokenCount { return .some(salt) }
+        return nil
+    }
+}
+
+/// One media item of a prompt (an image, or a whole video including any text between its frame
+/// runs): the token range from its first to last placeholder, and where its pixels sit in that
+/// kind's concatenated pixel tensor and frame list.
+public struct MediaItemSpan: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable { case image, video }
+    public let kind: Kind
+    public let tokenRange: Range<Int>
+    public let pixelRows: Range<Int>
+    public let frameIndex: Int
+
+    public init(kind: Kind, tokenRange: Range<Int>, pixelRows: Range<Int>, frameIndex: Int) {
+        self.kind = kind
+        self.tokenRange = tokenRange
+        self.pixelRows = pixelRows
+        self.frameIndex = frameIndex
+    }
+}
+
+/// A model whose state at a boundary depends only on the tokens before it and the media items whose
+/// placeholders all lie before it (causal forward, media spliced only at placeholders, positions of
+/// earlier tokens independent of later media). Such a boundary is keyed under the salt of exactly
+/// that earlier media, so the rows a previous turn stored (with the same earlier media) are restored
+/// when a turn adds another image or video, and only the new media is encoded.
+public protocol MediaItemPrefixCacheModel: PrefixCacheInvariantModel {
+    /// Every media item of `input` in prompt order (indices into `tokenIds`), or nil when the items
+    /// cannot be matched to the placeholders exactly; nil keeps the pre-media-only behaviour.
+    func mediaItemSpans(in input: LMInput, tokenIds: [Int]) -> [MediaItemSpan]?
+}
+
+/// `input` restricted to the media `items` (contiguous in prompt order) with `text`; image and video
+/// pixel rows and frames are sliced to exactly those items, so its media salt equals the salt of a
+/// request that carried only them.
+func mediaSubsetInput(
+    _ input: LMInput, items: ArraySlice<MediaItemSpan>, text: LMInput.Text
+) -> LMInput {
+    func subset(_ kind: MediaItemSpan.Kind, pixels: MLXArray?, frames: [THW]?) -> (MLXArray, [THW])? {
+        let chosen = items.filter { $0.kind == kind }
+        guard let pixels, let frames, let first = chosen.first, let last = chosen.last else { return nil }
+        return (
+            pixels[first.pixelRows.lowerBound ..< last.pixelRows.upperBound],
+            Array(frames[first.frameIndex ... last.frameIndex]))
+    }
+    let image = subset(.image, pixels: input.image?.pixels, frames: input.image?.frames)
+        .map { LMInput.ProcessedImage(pixels: $0.0, frames: $0.1) }
+    let video = subset(.video, pixels: input.video?.pixels, frames: input.video?.frames)
+        .map { LMInput.ProcessedVideo(pixels: $0.0, frames: $0.1) }
+    return LMInput(
+        text: text, image: image, video: video, audio: input.audio,
+        mediaTokenIds: input.mediaTokenIds, cacheScopeSalt: input.cacheScopeSalt,
+        cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+        cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+        cachePromptIntent: input.cachePromptIntent, cacheRestorePolicy: input.cacheRestorePolicy,
+        toolSchemas: input.toolSchemas,
+        canonicalRequiredToolContext: input.canonicalRequiredToolContext)
 }
 
 /// The cache salt a request uses per prompt boundary.
@@ -76,22 +145,42 @@ public struct MediaIndependentPrefix: Sendable, Equatable {
 /// the chat used. Text-only requests and every other model get a plan whose
 /// every boundary uses `requestSalt`.
 public struct CacheBoundarySaltPlan: Sendable, Equatable {
+    /// Boundaries `lower ... upper` (between the end of one media item and the start of the next)
+    /// keyed under `salt`: the salt of a request carrying exactly the media before them.
+    public struct Segment: Sendable, Equatable {
+        public let lower: Int
+        public let upper: Int
+        public let salt: String?
+        public func contains(_ boundary: Int) -> Bool { boundary >= lower && boundary <= upper }
+    }
+
     public let requestSalt: String?
     public let mediaIndependentSalt: String?
     /// Index of the first media placeholder token in the probed token list;
     /// 0 when no boundary is media-independent.
     public let mediaIndependentTokenCount: Int
+    /// Per-item segments after the first media item (``MediaItemPrefixCacheModel``); empty otherwise.
+    public let segments: [Segment]
+    /// The request's media items, when the model keys boundaries per item.
+    public let itemSpans: [MediaItemSpan]
 
     public init(requestSalt: String?) {
         self.requestSalt = requestSalt
         self.mediaIndependentSalt = nil
         self.mediaIndependentTokenCount = 0
+        self.segments = []
+        self.itemSpans = []
     }
 
-    public init(requestSalt: String?, mediaIndependentSalt: String?, mediaIndependentTokenCount: Int) {
+    public init(
+        requestSalt: String?, mediaIndependentSalt: String?, mediaIndependentTokenCount: Int,
+        segments: [Segment] = [], itemSpans: [MediaItemSpan] = []
+    ) {
         self.requestSalt = requestSalt
         self.mediaIndependentSalt = mediaIndependentSalt
         self.mediaIndependentTokenCount = max(0, mediaIndependentTokenCount)
+        self.segments = segments
+        self.itemSpans = itemSpans
     }
 
     /// Build the plan for a request. `lookupTokenIds` is the token list the
@@ -114,6 +203,25 @@ public struct CacheBoundarySaltPlan: Sendable, Equatable {
         guard let first = lookupTokenIds.firstIndex(where: media.contains), first > 0 else {
             return CacheBoundarySaltPlan(requestSalt: requestSalt)
         }
+        if let itemModel = model as? any MediaItemPrefixCacheModel,
+            let spans = itemModel.mediaItemSpans(in: input, tokenIds: lookupTokenIds),
+            let firstSpan = spans.first, firstSpan.tokenRange.lowerBound == first
+        {
+            var segments: [Segment] = []
+            for k in 1 ..< spans.count {
+                let earlier = mediaSubsetInput(input, items: spans[0 ..< k], text: input.text)
+                segments.append(Segment(
+                    lower: spans[k - 1].tokenRange.upperBound,
+                    upper: spans[k].tokenRange.lowerBound,
+                    salt: computeCacheSalt(for: earlier, parameters: parameters)))
+            }
+            return CacheBoundarySaltPlan(
+                requestSalt: requestSalt,
+                mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false),
+                mediaIndependentTokenCount: first,
+                segments: segments,
+                itemSpans: spans)
+        }
         return CacheBoundarySaltPlan(
             requestSalt: requestSalt,
             mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false),
@@ -125,6 +233,9 @@ public struct CacheBoundarySaltPlan: Sendable, Equatable {
         if mediaIndependentTokenCount > 0, tokenCount <= mediaIndependentTokenCount {
             return mediaIndependentSalt
         }
+        if let segment = segments.first(where: { $0.contains(tokenCount) }) {
+            return segment.salt
+        }
         return requestSalt
     }
 
@@ -132,7 +243,8 @@ public struct CacheBoundarySaltPlan: Sendable, Equatable {
     /// rows; nil when every boundary uses `requestSalt`.
     public var mediaIndependentPrefix: MediaIndependentPrefix? {
         guard mediaIndependentTokenCount > 0 else { return nil }
-        return MediaIndependentPrefix(salt: mediaIndependentSalt, tokenCount: mediaIndependentTokenCount)
+        return MediaIndependentPrefix(
+            salt: mediaIndependentSalt, tokenCount: mediaIndependentTokenCount, segments: segments)
     }
 }
 
@@ -146,8 +258,11 @@ extension CacheBoundarySaltPlan {
     /// at exactly the positions a cold prefill would. A boundary inside or
     /// after a run keeps the conservative rollback.
     public func resumeBeforeMediaIsSafe(matchedTokens: Int) -> Bool {
-        mediaIndependentTokenCount > 0 && matchedTokens > 0
-            && matchedTokens <= mediaIndependentTokenCount
+        guard mediaIndependentTokenCount > 0, matchedTokens > 0 else { return false }
+        // Per-item keying also resumes between two items: every item of the suffix is complete
+        // there, and `mediaCarryingSuffixInput` hands `prepare` exactly those items.
+        return matchedTokens <= mediaIndependentTokenCount
+            || segments.contains { $0.contains(matchedTokens) }
     }
 }
 
@@ -168,13 +283,21 @@ public func cacheHitSuffixRequiresMediaRollback(
 /// placeholder runs are in this suffix, so the splice needs them), the mask
 /// sliced to the suffix, and the request's cache metadata carried over.
 public func mediaCarryingSuffixInput(
-    from input: LMInput, remainingTokens: [Int], matchedTokens: Int
+    from input: LMInput, remainingTokens: [Int], matchedTokens: Int,
+    itemSpans: [MediaItemSpan] = []
 ) -> LMInput {
     let tokens = MLXArray(remainingTokens.map(Int32.init)).expandedDimensions(axis: 0)
     var suffixMask: MLXArray?
     if let mask = input.text.mask, mask.size == matchedTokens + remainingTokens.count {
         let flat = mask.reshaped(-1)[matchedTokens...]
         suffixMask = mask.ndim >= 2 ? flat[.newAxis, 0...] : flat
+    }
+    let text = LMInput.Text(tokens: tokens, mask: suffixMask, tokenIds: remainingTokens)
+    if let firstInSuffix = itemSpans.firstIndex(where: { $0.tokenRange.lowerBound >= matchedTokens }),
+        firstInSuffix > 0
+    {
+        // Items before the boundary are already in the restored state: encode only the suffix's.
+        return mediaSubsetInput(input, items: itemSpans[firstInSuffix...], text: text)
     }
     return LMInput(
         text: .init(tokens: tokens, mask: suffixMask, tokenIds: remainingTokens),

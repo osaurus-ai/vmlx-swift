@@ -838,10 +838,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         /// the chat wrote — and is probed there first; the request salt is still
         /// tried after it for rows this build or an older one wrote under it.
         func saltsToProbe(boundary: Int) -> [String?] {
-            guard let prefix = mediaIndependentPrefix, boundary <= prefix.tokenCount,
-                  prefix.salt != mediaSalt
+            guard let prefix = mediaIndependentPrefix,
+                  let boundarySalt = prefix.salt(forBoundary: boundary),
+                  boundarySalt != mediaSalt
             else { return [mediaSalt] }
-            return [prefix.salt, mediaSalt]
+            return [boundarySalt, mediaSalt]
         }
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -890,6 +891,11 @@ public final class CacheCoordinator: @unchecked Sendable {
            prefix.tokenCount > 0, prefix.tokenCount <= tokens.count
         {
             pagedProbes.append((Array(tokens.prefix(prefix.tokenCount)), prefix.salt))
+        }
+        // Per-item segments, latest first: the longest prefix a previous turn's media covers.
+        for segment in mediaIndependentPrefix?.segments ?? []
+        where segment.salt != mediaSalt && segment.upper > 0 && segment.upper <= tokens.count {
+            pagedProbes.insert((Array(tokens.prefix(segment.upper)), segment.salt), at: 1)
         }
         for probe in pagedProbes {
         if !skipPaged,
@@ -1160,10 +1166,10 @@ public final class CacheCoordinator: @unchecked Sendable {
         // The served row sits under whichever salt `fetch` probed for this
         // boundary; marking a key with no served payload changes nothing.
         var salts: [String?] = [mediaSalt]
-        if let textPrefix = mediaIndependentPrefix, boundary <= textPrefix.tokenCount,
-           textPrefix.salt != mediaSalt
+        if let boundarySalt = mediaIndependentPrefix?.salt(forBoundary: boundary),
+           boundarySalt != mediaSalt
         {
-            salts.insert(textPrefix.salt, at: 0)
+            salts.insert(boundarySalt, at: 0)
         }
         var marked = false
         for salt in salts where !marked {
@@ -1359,9 +1365,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             let tokens = boundary == requestTokens.count
                 ? requestTokens
                 : Array(requestTokens.prefix(boundary))
-            let boundarySalt = mediaIndependentPrefix.flatMap { prefix in
-                boundary <= prefix.tokenCount ? prefix.salt : nil
-            } ?? mediaSalt
+            let boundarySalt = mediaIndependentPrefix?.salt(forBoundary: boundary) ?? mediaSalt
             let touchedKV = diskCache.touchRecency(
                 tokens: tokens,
                 mediaSalt: boundarySalt,
