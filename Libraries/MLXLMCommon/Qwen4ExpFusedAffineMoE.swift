@@ -24,6 +24,10 @@ public enum Qwen4ExpFusedAffineMoE {
         inputDimensions: 2560, expertDimensions: 640, routes: 10)
     private static let ornith35Shape = Shape(
         inputDimensions: 2048, expertDimensions: 512, routes: 8)
+    /// Draft qualification: q4g64 BF16 only. See runtime/ornith-122b-affine-kernel.md
+    /// for numerical coverage and the outstanding model/app promotion gates.
+    private static let ornith122BShape = Shape(
+        inputDimensions: 3072, expertDimensions: 1024, routes: 8)
     /// GLM-5.3 (`glm5_next`): hidden 4096, `moe_intermediate_size` 2048, 8 of 288 experts routed.
     ///
     /// Added with the parity coverage this comment asks for — `Qwen4ExpFusedAffineMoEShapeTests`
@@ -35,7 +39,7 @@ public enum Qwen4ExpFusedAffineMoE {
     /// compute.
     private static let glm5NextShape = Shape(
         inputDimensions: 4096, expertDimensions: 2048, routes: 8)
-    private static let supportedShapes = [qwen4ExpShape, ornith35Shape, glm5NextShape]
+    private static let supportedShapes = [qwen4ExpShape, ornith35Shape, ornith122BShape, glm5NextShape]
     private static let supportedBits = Set([2, 3, 4, 5, 6])
     /// 128 joins 32 and 64 for GLM-5.3, whose 2-bit expert projections are grouped at 128.
     ///
@@ -351,6 +355,17 @@ public enum Qwen4ExpFusedAffineMoE {
             return nil
         }
         let shape = matched
+        // The 122B bundle has a different geometry from the older Ornith.
+        // Admit only its measured affine layout; other quantization/storage
+        // combinations retain the generic implementation until qualified.
+        if shape == ornith122BShape,
+            ![gate, up, down].allSatisfy({
+                $0.bits == 4 && $0.groupSize == 64
+                    && $0.scales.dtype == .bfloat16 && $0.biases?.dtype == .bfloat16
+            })
+        {
+            return nil
+        }
         guard enabled,
             supportedShapes.contains(shape),
             geometryIsRepresentable(shape, gate: gate, up: up, down: down),
