@@ -149,6 +149,23 @@ public struct BaseConfiguration: Codable, Sendable {
             func addWithAttentionAlias(_ value: String) {
                 add(value)
 
+                // Qwen4Exp.sanitize splits the checkpoint MTP gate/up bank
+                // and renames its down bank. Keep their explicit quantization
+                // through that structural transformation; otherwise all three
+                // leaves fall through to the unrelated top-level default.
+                var bare = value
+                if bare.hasPrefix("language_model.") { bare.removeFirst("language_model.".count) }
+                if bare.hasPrefix("model.") { bare.removeFirst("model.".count) }
+                if bare.hasPrefix("mtp.layers.") {
+                    for (runtimeName, checkpointName) in [
+                        (".mlp.switch_mlp.gate_proj", ".mlp.experts.gate_up_proj"),
+                        (".mlp.switch_mlp.up_proj", ".mlp.experts.gate_up_proj"),
+                        (".mlp.switch_mlp.down_proj", ".mlp.experts.down_proj"),
+                    ] where value.hasSuffix(runtimeName) {
+                        add(value.replacingOccurrences(of: runtimeName, with: checkpointName))
+                    }
+                }
+
                 // DeepseekV4Model.sanitize structurally renames the dense
                 // shared expert's w1/w2/w3 checkpoint leaves to the runtime's
                 // gate/down/up projections. Preserve exact quantization

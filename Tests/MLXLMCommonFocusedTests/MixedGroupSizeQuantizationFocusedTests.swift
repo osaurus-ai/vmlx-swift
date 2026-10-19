@@ -10,6 +10,35 @@ import Testing
 struct MixedGroupSizeQuantizationFocusedTests {
     private let bareExpertPath = "layers.1.mlp.switch_mlp.gate_proj"
 
+    @Test("Qwen4 MTP split banks retain checkpoint quantization")
+    func qwen4MTPSplitBanksRetainQuantization() {
+        let expert = BaseConfiguration.Quantization(groupSize: 64, bits: 2)
+        let runtimeGate = "mtp.layers.0.mlp.switch_mlp.gate_proj"
+        var declarations: [String: BaseConfiguration.QuantizationOption] = [
+            "mtp.layers.0.mlp.experts.gate_up_proj": .quantize(expert),
+            "mtp.layers.0.mlp.experts.down_proj": .quantize(expert),
+        ]
+        func settings() -> BaseConfiguration.PerLayerQuantization {
+            .init(quantization: .init(groupSize: 64, bits: 8),
+                  perLayerQuantization: declarations)
+        }
+        for prefix in ["", "model.", "language_model.", "language_model.model."] {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                #expect(settings().quantization(
+                    layer: "\(prefix)mtp.layers.0.mlp.switch_mlp.\(projection)") == expert)
+            }
+        }
+        // Exact runtime metadata keeps precedence. The alias is MTP-only,
+        // and an explicit skip must survive the split as well.
+        declarations[runtimeGate] = .quantize(.init(groupSize: 64, bits: 4))
+        #expect(settings().quantization(layer: runtimeGate)?.bits == 4)
+        #expect(settings().quantization(layer: "layers.0.mlp.switch_mlp.gate_proj")?.bits == 8)
+        declarations.removeValue(forKey: runtimeGate)
+        declarations["mtp.layers.0.mlp.experts.gate_up_proj"] = .skip
+        #expect(settings().quantization(layer: runtimeGate) == nil)
+        #expect(settings().declaresSkipForAnyAlias(of: runtimeGate))
+    }
+
     @Test("model-prefixed override resolves for a bare module path")
     func modelPrefixedOverrideResolvesForBareModulePath() throws {
         let configJSON = """
