@@ -102,6 +102,44 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
                 configuration: data(missingHeader), sidecar: data(denseQwenSummary())))
     }
 
+    func testQwenMoERoutedPlanKeepsAffineMTPAndCalibrationMetadataSeparate() throws {
+        var config = configuration()
+        config["model_type"] = "qwen3_5_moe"
+        var plan = config["quantization"] as! [String: Any]
+        for role in ["gate_proj", "up_proj", "down_proj"] {
+            plan["language_model." + prefix + role] = plan.removeValue(forKey: prefix + role)
+        }
+        let mtp = "mtp.layers.0.mlp.experts.0.gate_proj"
+        plan[mtp] = ["mode": "affine", "bits": 4, "group_size": 64]
+        config["quantization"] = plan
+        config["quantization_config"] = plan
+        var summary: [String: Any] = [
+            "format": "jangtq2", "format_version": "2.0",
+            "quantization": ["method": "jang-gptq", "block_size": 64,
+                "bit_widths_used": [2, 3, 4, 8], "profile": "JANGH2",
+                "awq": ["experts": ["folds": "calibration provenance"]]],
+        ]
+        let partition = try JANGHConfigurationPartition(
+            configuration: data(config), sidecar: data(summary))
+        XCTAssertEqual(partition.customModules.count, 3)
+        let ordinary = try XCTUnwrap(JSONSerialization.jsonObject(with: partition.ordinaryConfiguration)
+            as? [String: Any])
+        let result = try XCTUnwrap(ordinary["quantization"] as? [String: Any])
+        XCTAssertEqual((result[mtp] as? [String: Any])?["bits"] as? Int, 4)
+        for role in ["gate_proj", "up_proj", "down_proj"] {
+            XCTAssertEqual(result["language_model." + prefix + role] as? Bool, false)
+        }
+        var badPlan = summary["quantization"] as! [String: Any]
+        badPlan[mtp] = ["bits": 8]
+        summary["quantization"] = badPlan
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+        summary.removeValue(forKey: "quantization")
+        var wrongHeader = config["jangtq"] as! [String: Any]
+        wrongHeader["rotation"] = "none"
+        summary["jangtq"] = wrongHeader
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+    }
+
     func testDenseK2RetainsStrictSidecarOwnership() throws {
         var config = configuration()
         config["model_type"] = "k2_horizon"
