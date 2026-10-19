@@ -31,3 +31,21 @@ A naturally completed 553-token answer stored both its 13,361-token stripped fal
 - First turn's model reload took 14.71 s, separately from its 806 ms generation-submit TTFT. Do not present the latter as Send-to-first-output latency.
 
 Quality limitation: the longer answer incorrectly claimed that removing odd items from `[1,2,2,3]` during iteration leaves `[2,2,3]`; executing that snippet leaves `[2,2]`. Cache recall passed, but the whole generated code explanation is not an accuracy pass. Runtime causation is not established.
+
+## Long-context app result and unresolved policy transition
+
+Same Release artifact and connected chat, AR throughout:
+
+| Prompt tokens | SSD restored | New tokens | Prompt stage | New-token prefill/s | Generation tok/s | Result |
+|---:|---:|---:|---:|---:|---:|---|
+| 45,323 | 14,180 | 31,143 | 53.755 s | 579.35 | 29.3 | Correct ledger lookup and earlier review label |
+| 130,590 | 45,453 | 85,137 | 336.810 s | 252.77 | 19.8 | Correct new/old ledger records and earlier label |
+| 132,263 | 0 | 132,263 | stopped after confirmed miss | not a completed row | no output | Policy switched to maxKV=65536; all prior checkpoint identities missed |
+
+This is evidence of slower long-context execution, not proof that #619 caused the slowdown. No matched old-head 130k control was run. The 130k row's generation-submit TTFT was337.707s; derived Send-to-runtime-first-token was341.674s. Sampled process footprint peaked19.43GB, including finalization, with zero wire rejections. Whole-system swap was7.7GB at a near-end snapshot; no pre-run swap baseline exists, so no zero-swap claim.
+
+The130k stripped/completed records carry3.363/3.367GB payloads. Synchronous store-return times were419.6/387.4ms; background writes1677/1598ms, the second queued1294ms. Full F32 recurrent state remains150,994,944bytes; BF16 KV/conv accounts for~3.216GB in the completed checkpoint. The extra full checkpoint has a material storage/latency cost at long context.
+
+The132,263-token follow-up hit the existing Safe Auto threshold: `CacheCoordinatorConfig.resolveKVPolicy` applies `defaultMaxKVSize=65536` only when prompt length exceeds twice that value. `Qwen35.makeCache` then selects RotatingKVCache for full-attention layers. Salt changed from maxKV=none to65536 despite unchanged prefix tokens; rejecting cross-policy restore is correct. Native MTP also cannot run when rotation is reachable (`nativeMTPEffectiveParameters`). No settings were changed between these rows.
+
+This policy interaction is not fixed here. Do not drop maxKV from the cache key or bypass rotating-cache MTP safety to fabricate a hit/speedup. A separate design must reconcile architecture-aware KV memory budgeting, context preservation, explicit user caps, policy-transition semantics and rollback. Actual132k reuse, sustained long decoding and MTP at that context remain unqualified.
