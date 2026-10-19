@@ -37,9 +37,19 @@ Do not bypass their Osaurus minimum-version requirement.
 - Real JANG_4M Swift diagnostic with original metadata reproduces repeated,
   incoherent reasoning and no visible answer. A metadata-only comparison on
   the same tensors completes with correct arithmetic and separate reasoning.
-  Osaurus UI proof is pending.
-- JANGH2 real-bundle execution, multimodal turns, SSD companion restore,
-  physical footprint, and MTP On/Off: pending.
+  Both real bundle layouts now load in optimized Swift diagnostics.
+- JANGH2 Osaurus Release AR completes a connected arithmetic/tool turn with a
+  visible correct answer; the first step decoded at 33.9 token/s and the cached
+  tool continuation at 33.6 token/s. This run overlapped compilation, so these
+  are observed rates, not a controlled performance comparison.
+- Optimized inherited convenience construction previously lost the Qwen35MoE
+  dynamic type and skipped its sanitizer. The designated initializer is now
+  module-internal; the tiny and real MTP bundles load under optimization.
+- Real JANGH2 staged verify currently differs from sequential AR logits at
+  widths 2/4/8 (48 rows tested, greedy argmax unchanged). This is an open
+  speculative correctness investigation, not evidence of row exactness.
+- Multimodal turns, final-pin SSD companion restore, controlled performance,
+  and MTP On/Off app qualification remain pending.
 - Python/Electron receipts for these bundles do not establish Swift app behavior.
 
 No speculative speedup or merge readiness is claimed. Existing MTP tuning and

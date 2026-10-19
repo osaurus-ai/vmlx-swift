@@ -21,6 +21,8 @@ final class Ornith122BJANGHLoadTests: XCTestCase {
                 from: URL(fileURLWithPath: path), using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: load)
             let model = try XCTUnwrap(context.model as? Qwen35MoE)
+            XCTAssertTrue(type(of: context.model) == Qwen35MoE.self,
+                "Optimized construction must preserve the MoE sanitizer's dynamic type")
             XCTAssertFalse(model.customDenseTensorNames.isEmpty)
             XCTAssertFalse(model.customDenseTensorNames.contains { $0.contains("mtp.") })
             let cache = model.newCache(parameters: nil)

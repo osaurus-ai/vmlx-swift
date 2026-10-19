@@ -3827,9 +3827,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser. Private on purpose: a plan can only come from
-    /// `resolveConstruction`, so no caller can hand this an empty or unsupported selection.
-    private init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
+    /// Keep the designated initializer module-internal. With a private initializer,
+    /// optimized inherited convenience initialization can allocate a Qwen35 rather
+    /// than its Qwen35MoE subclass, bypassing the MoE sanitizer through LanguageModel.
+    /// External callers still use the public initializers and resolveConstruction.
+    init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
         self.plan = plan
         self.config = config
         // Built first, so the capability report can be COLLECTED from what actually exists rather
