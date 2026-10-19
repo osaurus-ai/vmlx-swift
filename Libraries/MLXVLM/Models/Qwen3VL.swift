@@ -155,8 +155,21 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let imageFrames = try input.images.map {
-                try preprocess(images: [$0.asCIImage()], processing: input.processing)
+            let imageFrames = try input.images.enumerated().map { index, image in
+                let source = try image.asCIImage()
+                let result = try preprocess(images: [source], processing: input.processing)
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    // Per-image input and output identity: the media cache salt hashes these pixels.
+                    MLX.eval(result.0)
+                    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+                    for byte in result.0.asData(access: .copy).data { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3 }
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][media/image] index=\(index) extent=\(source.extent) "
+                            + "colorSpace=\(source.colorSpace?.name.map { $0 as String } ?? "nil") "
+                            + "properties=\(source.properties.count) grid=\(result.1.t)x\(result.1.h)x\(result.1.w) "
+                            + "values=\(String(hash, radix: 16))\n").utf8))
+                }
+                return result
             }
             let concatenated = concatenated(imageFrames.map { $0.0 })
             processedImage = .init(pixels: concatenated, frames: imageFrames.map { $0.1 })
