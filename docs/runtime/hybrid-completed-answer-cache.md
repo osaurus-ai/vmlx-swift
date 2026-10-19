@@ -2,7 +2,7 @@
 
 Status: candidate; app proof pending.
 
-A Release Osaurus Ornith 122B JANG_4M chat generated 10,384 tokens and stopped normally. Its next short recall request restored only 2,613 of 13,160 prompt tokens and spent 17.411 seconds in the prompt stage (17.681 seconds to first token). The previous turn logged `canonicalHybrid=true` and skipped completed-answer storage.
+A Release Osaurus Ornith 122B JANG_4M chat generated 10,384 tokens and stopped normally. Its next short recall request restored only 2,613 of 13,160 prompt tokens and spent 17.411 seconds in the prompt stage (17.681 seconds from generation submission to first token, excluding a preceding 5.4-second model reload). The previous turn logged `canonicalHybrid=true` and skipped completed-answer storage.
 
 The stripped-prompt checkpoint remains essential for templates that rewrite assistant history. It does not justify suppressing a valid completed-answer checkpoint for templates that preserve it. The candidate retains both, while continuing to omit redundant exact-prompt records for canonical hybrid chats. Fetch chooses a checkpoint only by matching actual tokens and the existing semantic/media/model cache identity. No model-name exception is introduced.
 
