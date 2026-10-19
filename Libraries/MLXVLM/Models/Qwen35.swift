@@ -3640,7 +3640,8 @@ enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            lastRowLogits: Bool = false
         ) -> LMOutput {
             let positionIds = resolvedPositionIds(
                 inputs: inputs,
@@ -3657,6 +3658,13 @@ enum Qwen35Language {
                 cache: cache,
                 positionIds: positionIds
             )
+            // The last call of a CHUNKED prefill only needs the next-token row (its callers already
+            // receive just the final chunk's rows and read the last one): the LM head over every row
+            // of a 2,048-row chunk is ~3 TFLOP and a [rows, 248k] logits buffer for nothing. A prompt
+            // that fits one window keeps full-prompt logits (Qwen35MediaPrefillTests contract).
+            if lastRowLogits, out.dim(1) > 1 {
+                out = out[0..., (out.dim(1) - 1)..., 0...]
+            }
 
             out = headLogits(out)
 
@@ -4164,7 +4172,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 inputIds[0..., offset...],
                 inputsEmbeds: inputEmbeddings[0..., offset..., 0...],
                 cache: typedCache,
-                positionIds: positions[0..., 0..., offset...]))
+                positionIds: positions[0..., 0..., offset...],
+                lastRowLogits: true))
         }
 
         // Chunked text-only prefill so the UI prefill counter advances instead
@@ -4217,7 +4226,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 positionIds: nil,
                 pixelValues: nil,
                 imageGridTHW: nil,
-                videoGridTHW: nil
+                videoGridTHW: nil,
+                lastRowLogits: true
             )
             return .logits(output)
         }

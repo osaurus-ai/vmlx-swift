@@ -84,6 +84,15 @@ struct Qwen35RestoredMediaPositionTests {
         return result.logits[0..., -1, 0...]
     }
 
+    /// Decode steps and every rotated key must match the cold prefill to 1e-4 (keys are where a
+    /// position error shows at full size). The first-token logits may come from a 1-row LM head on
+    /// the chunked path and a full-prompt head on the cold one: different matmul kernels, so they
+    /// get a small absolute tolerance instead.
+    private func assertMatchesCold(_ actual: [MLXArray], _ expected: [MLXArray]) {
+        #expect(maxError(actual[0], expected[0]) < 5e-3)
+        for (a, e) in zip(actual.dropFirst(), expected.dropFirst()) { #expect(maxError(a, e) < 1e-4) }
+    }
+
     private func maxError(_ a: MLXArray, _ b: MLXArray) -> Float {
         MLX.max(abs(a.asType(.float32) - b.asType(.float32))).item(Float.self)
     }
@@ -136,7 +145,7 @@ struct Qwen35RestoredMediaPositionTests {
             let actual = try restored(
                 full, prefix: input(head, image: true), suffix: input(tail, image: false),
                 window: window, hook: true)
-            for (a, e) in zip(actual, expected) { #expect(maxError(a, e) < 1e-4) }
+            assertMatchesCold(actual, expected)
             // Control: without the full-prompt plan the suffix is placed at offset + index, past
             // the image's compressed positions, and the logits move.
             let control = try restored(
@@ -157,7 +166,7 @@ struct Qwen35RestoredMediaPositionTests {
                 from: full, remainingTokens: (imageRun + tail).map(Int.init), matchedTokens: head.count)
             let actual = try restored(
                 full, prefix: input(head, image: false), suffix: suffix, window: window, hook: true)
-            for (a, e) in zip(actual, expected) { #expect(maxError(a, e) < 1e-4) }
+            assertMatchesCold(actual, expected)
             let control = try restored(
                 full, prefix: input(head, image: false), suffix: suffix, window: window, hook: false)
             #expect(maxError(control.last!, expected.last!) > 1e-2)
@@ -233,7 +242,7 @@ struct Qwen35RestoredMediaPositionTests {
                 from: full, remainingTokens: Array(secondTurn[firstTurn.count...]).map(Int.init),
                 matchedTokens: firstTurn.count, itemSpans: spans)
             let actual = try restored(full, prefix: prefix, suffix: suffix, window: window, hook: true)
-            for (a, e) in zip(actual, expected) { #expect(maxError(a, e) < 1e-4) }
+            assertMatchesCold(actual, expected)
         }
     }
 }
