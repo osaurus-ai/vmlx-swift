@@ -2616,6 +2616,13 @@ public actor BatchEngine {
             totalUnitCount: totalPromptUnits,
             detail: "running")))
 
+        if let positioned = context.model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: slot.originalInput,
+                restoredTokenCount: max(
+                    0, slot.originalInput.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
+
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let firstToken: MLXArray
         do {

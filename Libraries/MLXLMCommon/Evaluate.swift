@@ -2432,6 +2432,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             chunkSize: effectiveParameters.prefillStepSize,
             targets: canonicalTargets, salt: requiredCanonicalModel == nil ? self.mediaSalt : canonicalRequiredSalt,
             canonicalModel: requiredCanonicalModel)
+        if let positioned = self.model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: input,
+                restoredTokenCount: Swift.max(
+                    0, input.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {

@@ -42,6 +42,15 @@ public protocol PrefixCacheInvariantModel: AnyObject {
     var exactPrefixRestoreIsSuffixIndependent: Bool { get }
 }
 
+/// A model whose prefill positions depend on the WHOLE prompt (M-RoPE: media placeholders occupy
+/// compressed positions), so a suffix prefilled after a cache restore must be positioned from the
+/// full request, not from the suffix alone. Both schedulers call this once per prefill, right before
+/// the first `prepare`, with the request's full input and the number of prompt tokens the cache
+/// already holds (0 for a cold prefill). A model must leave cold prefills exactly as they were.
+public protocol RestoredPrefixPositionModel: AnyObject {
+    func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int)
+}
+
 /// A prefix of the lookup token list whose rows may be keyed under a salt
 /// without the media component. `tokenCount` is the index of the first media
 /// placeholder token in the probed token space, so a boundary `b` qualifies

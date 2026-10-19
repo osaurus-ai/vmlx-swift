@@ -3432,6 +3432,47 @@ enum Qwen35Language {
         func resetPositionState() {
             precomputedPositionIds = nil
             ropeDeltas = nil
+            restoredPrefixPositionsArmed = false
+        }
+
+        /// True from ``armRestoredPrefixPositions(inputIds:imageGridTHW:videoGridTHW:)`` until the
+        /// prefill that follows a cache restore has consumed the last prompt position. While set,
+        /// `prepare` keeps the plan instead of resetting it and `resolvedPositionIds` slices it.
+        fileprivate var restoredPrefixPositionsArmed = false
+
+        /// M-RoPE positions and decode delta of the request's FULL prompt (all tokens, every media
+        /// grid), for a request whose prefix was restored from the cache. The suffix then takes
+        /// exactly the positions a cold prefill gives it: after a restored image its text continues
+        /// from the compressed media positions (not offset + index), and an image in the suffix is
+        /// placed after the restored text. Decode continues from offset + the full prompt's delta.
+        func armRestoredPrefixPositions(
+            inputIds: MLXArray, imageGridTHW: [THW]?, videoGridTHW: [THW]?
+        ) {
+            let ids = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let computed: MLXArray
+            let deltas: MLXArray
+            if let canvas = config.miniCPMCanvas {
+                (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                    inputIds: ids,
+                    imageGrids: imageGridTHW,
+                    videoGrids: videoGridTHW,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    canvas: canvas)
+            } else {
+                (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                    inputIds: ids,
+                    imageGridTHW: imageGridTHW,
+                    videoGridTHW: videoGridTHW,
+                    spatialMergeSize: config.visionConfiguration?.spatialMergeSize ?? 1,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    visionStartTokenId: config.visionStartTokenId,
+                    attentionMask: nil)
+            }
+            precomputedPositionIds = computed
+            ropeDeltas = deltas
+            restoredPrefixPositionsArmed = true
         }
 
         fileprivate func resolvedPositionIds(
@@ -3443,6 +3484,21 @@ enum Qwen35Language {
             videoGridTHW: [THW]?,
             resetForMedia: Bool
         ) -> MLXArray? {
+            if restoredPrefixPositionsArmed {
+                restoredPrefixPositionsArmed = false
+                if providedPositionIds == nil, let plan = precomputedPositionIds,
+                    let cache, let faCache = cache[model.faIdx],
+                    graphOffsetArray(for: faCache) == nil
+                {
+                    let start = faCache.offset
+                    let end = start + inputs.dim(1)
+                    if end <= plan.dim(2) {
+                        // Stay armed for the next prefill chunk until the prompt is consumed.
+                        restoredPrefixPositionsArmed = end < plan.dim(2)
+                        return plan[0..., 0..., start ..< end]
+                    }
+                }
+            }
             if resetForMedia {
                 precomputedPositionIds = nil
                 ropeDeltas = nil
@@ -4055,7 +4111,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
-        } else {
+        } else if !languageModel.restoredPrefixPositionsArmed {
             languageModel.resetPositionState()
         }
 
@@ -4847,6 +4903,35 @@ public enum Qwen35DFlash2PartsProbe {
             lines.append(String(format: "[PARTS] rows=%d model-scaled serial total=%.1f ms", rows, total))
         }
         return lines
+    }
+}
+
+extension Qwen35: PrefixCacheInvariantModel {
+    /// Qwen-VL M-RoPE gives every token before the first media placeholder the text position equal
+    /// to its index (the media compression only shifts what follows), the GDN recurrence and
+    /// attention are causal, and media embeddings are spliced only at placeholders. So the state at
+    /// a boundary before the first placeholder is the text-only prompt's state. The suffix that
+    /// carries the media is positioned from the full prompt (`RestoredPrefixPositionModel`), which
+    /// is what made this unsafe before. MiniCPM-V's canvas positions are not covered: false there.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { config.miniCPMCanvas == nil }
+
+    /// Unchanged: required-tool selection keeps its full-prefill path for this hybrid topology.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { false }
+}
+
+extension Qwen35: RestoredPrefixPositionModel {
+    /// A restored prefix of a media request: arm the full prompt's M-RoPE plan so the suffix (text
+    /// after a restored image, or an image after restored text) gets cold-prefill positions and
+    /// decode continues from the full prompt's delta. Text-only and cold requests reset as before.
+    public func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int) {
+        guard restoredTokenCount > 0, fullInput.image != nil || fullInput.video != nil else {
+            languageModel.resetPositionState()
+            return
+        }
+        languageModel.armRestoredPrefixPositions(
+            inputIds: fullInput.text.tokens,
+            imageGridTHW: fullInput.image?.frames,
+            videoGridTHW: fullInput.video?.frames)
     }
 }
 
