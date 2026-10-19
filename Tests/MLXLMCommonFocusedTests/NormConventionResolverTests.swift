@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import Testing
@@ -9,6 +10,15 @@ import Testing
 /// an UNRECOGNIZED `norm_convention` declaration must NOT silently disable the shift — it defers to
 /// the order-independent vote, so a converter typo can't strand a raw bundle's norms unshifted.
 struct NormConventionResolverTests {
+    // Swift Testing does not always launch inside the XCTest resource bundle.
+    private static let metalFixture: Void = {
+        if let path = ProcessInfo.processInfo.environment["VMLX_TEST_METALLIB_PATH"] {
+            precondition(FileManager.default.isReadableFile(atPath: path))
+            precondition(mlx_metal_set_metallib_path(path) == 0)
+        }
+    }()
+
+    init() { _ = Self.metalFixture }
 
     private let probes = [".input_layernorm.weight", ".post_attention_layernorm.weight"]
 
@@ -38,6 +48,21 @@ struct NormConventionResolverTests {
             NormConventionResolver.shouldApplyPlusOneShift(
                 metadataConvention: "mlx_plus_one", configConvention: nil, declaredConvention: nil,
                 weights: shiftedWeights(), probeSuffixes: probes) == true)
+    }
+
+    @Test func rawQwenAWQDeclarationOverridesShiftedLookingMean() {
+        // AWQ preserves raw-deviation storage but changes its magnitude:
+        // (1 + 0.3) / 0.5 - 1 = 1.6. A mean threshold mistakes this for
+        // an already-shifted tensor and produces the wrong normalization.
+        let rawFolded = (MLXArray(converting: [0.3, 0.4]) + 1) / 0.5 - 1
+        let weights = ["model.layers.0.post_attention_layernorm.weight": rawFolded]
+        #expect(NormConventionResolver.weightsAppearUnshifted(weights, probeSuffixes: probes) == false)
+        #expect(NormConventionResolver.shouldApplyPlusOneShift(
+            metadataConvention: "qwen3_5_raw_weight", configConvention: nil,
+            declaredConvention: nil, weights: weights, probeSuffixes: probes))
+        #expect(NormConventionResolver.shouldApplyPlusOneShift(
+            metadataConvention: nil, configConvention: "qwen3_5_raw_weight",
+            declaredConvention: nil, weights: weights, probeSuffixes: probes))
     }
 
     @Test func noDeclarationVotesOnWeights() {

@@ -17,10 +17,10 @@ requests use the same validated VLM construction without requiring vision input.
 The AWQ exporter stores Qwen language norms as `(1 + weight) / scale - 1`.
 These raw deviations require `+1` at load. AWQ can move their means above 0.5,
 so the legacy mean-based fallback cannot reliably identify this storage state.
-Bundles must declare the existing supported value:
+Bundles must declare the explicit raw-storage value:
 
 ```json
-{"runtime": {"norm_convention": "qwen3_5_language_mlx_plus_one"}}
+{"runtime": {"norm_convention": "qwen3_5_raw_weight"}}
 ```
 
 in `jang_config.json`. This is a storage declaration, not a sampler override.
