@@ -145,6 +145,151 @@ enum SafetensorsByteWriter {
         return .strided(base: base, chunkBytes: chunkBytes, offsets: offsets)
     }
 
+    /// Names (with counts) of floating-point tensors holding a NaN or ±Inf, read from the host
+    /// bytes ``payload(of:)`` produced — no MLX call, so any thread may run it while the payload's
+    /// arrays are alive. A value is non-finite exactly when its exponent bits are all ones, which
+    /// is what this tests per element, so unlike a sum screen it has no overflow false alarms.
+    /// Work is split into slices across cores; a clean 3.36 GB payload reads in well under the
+    /// time one GPU reduction took on the synchronous store path.
+    static func nonFiniteTensorNames(_ tensors: [Tensor], limit: Int = 4) -> [String] {
+        struct Slice { let tensor: Int; let base: UnsafeRawPointer; let bytes: Int }
+        func width(_ dtype: String) -> Int? {
+            switch dtype {
+            case "BF16", "F16": return 2
+            case "F32": return 4
+            case "F64": return 8
+            default: return nil
+            }
+        }
+        let sliceBytes = 8 << 20
+        var slices: [Slice] = []
+        // `Data` storage for contiguous payloads must stay pinned while slices point into it.
+        var pinned: [Data] = []
+        var smallFlagged: [Int] = []
+        for (index, tensor) in tensors.enumerated() {
+            guard let item = width(tensor.dtype) else { continue }
+            func add(_ base: UnsafeRawPointer, _ bytes: Int) {
+                var offset = 0
+                while offset < bytes {
+                    let n = min(sliceBytes, bytes - offset)
+                    slices.append(Slice(tensor: index, base: base + offset, bytes: n - n % item))
+                    offset += n
+                }
+            }
+            switch tensor.payload {
+            case .contiguous(let data):
+                guard !data.isEmpty else { continue }
+                if data.count < sliceBytes {
+                    // Small `Data` may be stored inline, where a pointer is only valid inside
+                    // `withUnsafeBytes`: screen it right here.
+                    let hit = data.withUnsafeBytes { raw in
+                        raw.baseAddress.map {
+                            containsNonFinite($0, bytes: raw.count - raw.count % item, dtype: tensor.dtype)
+                        } ?? false
+                    }
+                    if hit { smallFlagged.append(index) }
+                    continue
+                }
+                // Large payloads are heap buffers (the MLX array's own, no copy); `pinned`
+                // keeps each `Data` alive while its slices are read.
+                pinned.append(data)
+                data.withUnsafeBytes { raw in
+                    if let base = raw.baseAddress { add(base, raw.count) }
+                }
+            case .strided(let base, let chunkBytes, let offsets):
+                for offset in offsets { add(base + offset, chunkBytes) }
+            }
+        }
+        let dtypes = tensors.map(\.dtype)
+        var flags = [Bool](repeating: false, count: slices.count)
+        flags.withUnsafeMutableBufferPointer { out in
+            DispatchQueue.concurrentPerform(iterations: slices.count) { i in
+                let slice = slices[i]
+                out[i] = containsNonFinite(slice.base, bytes: slice.bytes, dtype: dtypes[slice.tensor])
+            }
+        }
+        var flagged = Set(smallFlagged)
+        for (slice, flag) in zip(slices, flags) where flag { flagged.insert(slice.tensor) }
+        var names: [String] = []
+        for index in flagged.sorted() {
+            let count: Int
+            if case .contiguous(let data) = tensors[index].payload, data.count < sliceBytes {
+                count = data.withUnsafeBytes { raw in
+                    raw.baseAddress.map { countNonFinite($0, bytes: raw.count, dtype: dtypes[index]) } ?? 0
+                }
+            } else {
+                count = slices.filter { $0.tensor == index }.reduce(0) {
+                    $0 + countNonFinite($1.base, bytes: $1.bytes, dtype: dtypes[index])
+                }
+            }
+            names.append("\(tensors[index].name)(\(count))")
+            if names.count >= limit { break }
+        }
+        withExtendedLifetime(pinned) {}
+        return names
+    }
+
+    private static func containsNonFinite(_ base: UnsafeRawPointer, bytes: Int, dtype: String) -> Bool {
+        switch dtype {
+        case "BF16", "F16":
+            let mask: UInt16 = dtype == "BF16" ? 0x7F80 : 0x7C00
+            let vmask = SIMD32<UInt16>(repeating: mask)
+            let count = bytes / 2
+            var hit = SIMDMask<SIMD32<UInt16>.MaskStorage>(repeating: false)
+            var i = 0
+            while i + 32 <= count {
+                let v = base.loadUnaligned(fromByteOffset: i * 2, as: SIMD32<UInt16>.self)
+                hit .|= (v & vmask) .== vmask
+                i += 32
+            }
+            if any(hit) { return true }
+            while i < count {
+                if base.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self) & mask == mask { return true }
+                i += 1
+            }
+            return false
+        case "F32":
+            let mask: UInt32 = 0x7F80_0000
+            let vmask = SIMD16<UInt32>(repeating: mask)
+            let count = bytes / 4
+            var hit = SIMDMask<SIMD16<UInt32>.MaskStorage>(repeating: false)
+            var i = 0
+            while i + 16 <= count {
+                let v = base.loadUnaligned(fromByteOffset: i * 4, as: SIMD16<UInt32>.self)
+                hit .|= (v & vmask) .== vmask
+                i += 16
+            }
+            if any(hit) { return true }
+            while i < count {
+                if base.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self) & mask == mask { return true }
+                i += 1
+            }
+            return false
+        default:
+            return countNonFinite(base, bytes: bytes, dtype: dtype) > 0
+        }
+    }
+
+    private static func countNonFinite(_ base: UnsafeRawPointer, bytes: Int, dtype: String) -> Int {
+        var n = 0
+        switch dtype {
+        case "BF16", "F16":
+            let mask: UInt16 = dtype == "BF16" ? 0x7F80 : 0x7C00
+            for i in 0 ..< bytes / 2
+            where base.loadUnaligned(fromByteOffset: i * 2, as: UInt16.self) & mask == mask { n += 1 }
+        case "F32":
+            for i in 0 ..< bytes / 4
+            where base.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self) & 0x7F80_0000 == 0x7F80_0000 { n += 1 }
+        case "F64":
+            let mask: UInt64 = 0x7FF0_0000_0000_0000
+            for i in 0 ..< bytes / 8
+            where base.loadUnaligned(fromByteOffset: i * 8, as: UInt64.self) & mask == mask { n += 1 }
+        default:
+            break
+        }
+        return n
+    }
+
     /// The header bytes (length prefix included) for `tensors` in the given order.
     static func header(for tensors: [Tensor], metadata: [String: String]) throws -> Data {
         var entries: [String: Any] = [:]
