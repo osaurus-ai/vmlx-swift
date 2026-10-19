@@ -48,8 +48,26 @@ Do not bypass their Osaurus minimum-version requirement.
 - Real JANGH2 staged verify currently differs from sequential AR logits at
   widths 2/4/8 (48 rows tested, greedy argmax unchanged). This is an open
   speculative correctness investigation, not evidence of row exactness.
-- Multimodal turns, final-pin SSD companion restore, controlled performance,
-  and MTP On/Off app qualification remain pending.
+- Final loader-pin Release app (engine c080bfb1a, app 2f4be285): JANGH2
+  correctly reads a real image (ORCHID47 / blue square), recalls it and a
+  previous label, and completes same-model Helper delegation with calculator
+  use and parent continuation. Child tool continuation restores 2,444 tokens
+  from SSD; parent continuation restores 6,132. First-image recall changes the
+  media salt and misses, which remains an open issue.
+- JANG_4M completes a 10,384-token code answer at 32.2 token/s and correctly
+  recalls CEDAR-82 in a connected follow-up. Its generated code fails one of
+  its own assertions; this is not an all-quality pass or proof of a runtime
+  cause. A separate Orchestrator attempt was refused at child-memory admission.
+- The follow-up restores only 2,613 of 13,160 tokens; the old canonical hybrid
+  policy discarded the generated-answer checkpoint. Generation-submit TTFT is
+  17.681 seconds, excluding a preceding 5.403-second reload. Engine #619 tracks
+  a separate candidate; no fixed-app latency claim yet.
+- Explicit On (Adaptive) persists in the UI, but this untuned bundle remains
+  AR. MTP On/Off speed qualification and sustained 128k-context proof remain
+  open; the 10k-output row is not 128k-context evidence.
+- Actual SSD headers contain BF16 attention/conv and F32 recurrent state. The
+  `kv=fp16` key does not describe all tensor storage. Mapped weight pages also
+  make app physical footprint alone insufficient for total model-RAM claims.
 - Python/Electron receipts for these bundles do not establish Swift app behavior.
 
 No speculative speedup or merge readiness is claimed. Existing MTP tuning and
