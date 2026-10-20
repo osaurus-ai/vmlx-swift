@@ -497,6 +497,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// AR's own context growth (context-fair baseline).
     private var arSafetyFirstVerifySec: TimeInterval?
     private var arSafetyPaused = false
+    /// The last token `next()` returned. When the consumer stops on it (a stop token it does not
+    /// append) and a verify had already committed its row, it labels the cache's extra row.
+    private var lastReturnedTokenId: Int?
     /// Live AR step cost at the CURRENT context, EMA over paused steps.
     private var arSafetyLiveStepSec: TimeInterval?
     /// Wall clock at the end of the previous AR step when the step before this one was also AR, so a
@@ -1115,6 +1118,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let token = pendingTokens[pendingIndex]
         pendingIndex += 1
         tokenCount += 1
+        lastReturnedTokenId = token
         lastTokenReturnedAt = NativeMTPClock.now()
         return token
     }
@@ -1376,7 +1380,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let postAnswerTokens = promptTokenIds + generatedTokenIds
                 let postAnswerSnapshot = cache.map { $0.copy() }
                 let offsets = postAnswerSnapshot.map(\.offset)
-                if let offset = offsets.first,
+                let leafOffsets = Set(cacheBoundaryLeafOffsets(postAnswerSnapshot))
+                // A verify that accepted the stop token as a draft committed its row, so every
+                // layer sits one past prompt + generated, and the consumer never appended that
+                // token. Recurrent (GDN) state cannot be trimmed back, so the store used to be
+                // dropped, and a media chat on this path then stored nothing for the turn. Key
+                // the row by the stop token, as TokenIterator keys its forwarded stop token.
+                let stopRowToken: Int? =
+                    leafOffsets == [postAnswerTokens.count + 1]
+                        && tokenCount == generatedTokenIds.count + 1
+                    ? lastReturnedTokenId : nil
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
+                            + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
+                            + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil)\n").utf8))
+                }
+                if let stopRowToken {
+                    store(
+                        tokens: postAnswerTokens + [stopRowToken],
+                        snapshot: postAnswerSnapshot,
+                        label: "post-answer")
+                } else if let offset = offsets.first,
                    offsets.allSatisfy({ $0 == offset })
                 {
                     if offset == postAnswerTokens.count {
