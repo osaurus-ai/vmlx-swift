@@ -171,10 +171,6 @@ final class MediaIndependentPrefixCacheTests: XCTestCase {
 
         // Turn 3: identical tokens, a DIFFERENT image. The post-media row of
         // turn 2 must not be served; the longest pre-media row (12) is.
-        let otherModel = InvariantHybridModel()
-        _ = try TokenIterator(input: mediaInput(pixelSeed: 2), model: otherModel,
-            parameters: parameters(), cacheCoordinator: disk)
-        XCTAssertEqual(otherModel.forwarded, Array(mediaPrompt.dropFirst(12)))
         let otherSalt = computeCacheSalt(for: mediaInput(pixelSeed: 2), parameters: parameters())
         if case .hit(let matched, _, _, _, _, _) = disk.fetch(
             tokens: mediaPrompt, mediaSalt: otherSalt, skipExactDiskBoundary: true,
@@ -186,6 +182,13 @@ final class MediaIndependentPrefixCacheTests: XCTestCase {
         } else {
             XCTFail("the pre-media row must be reachable under another image's salt")
         }
+
+        // Check lookup before preparing the second image: preparation now
+        // publishes that image's own checkpoint, legitimately advancing its hit.
+        let otherModel = InvariantHybridModel()
+        _ = try TokenIterator(input: mediaInput(pixelSeed: 2), model: otherModel,
+            parameters: parameters(), cacheCoordinator: disk)
+        XCTAssertEqual(otherModel.forwarded, Array(mediaPrompt.dropFirst(12)))
 
         // Turn 4: the SAME image again resumes from its own strip row (25).
         let sameModel = InvariantHybridModel()

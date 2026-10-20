@@ -111,12 +111,12 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         super.tearDown()
     }
 
-    private func makeCoordinator(hybrid: Bool = true) -> CacheCoordinator {
+    private func makeCoordinator(hybrid: Bool = true, paged: Bool = true) -> CacheCoordinator {
         let diskDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("hybrid-strip-\(UUID().uuidString)")
         tempDirs.append(diskDir)
         let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
-            usePagedCache: true,
+            usePagedCache: paged,
             enableDiskCache: true,
             diskCacheDir: diskDir,
             modelKey: "recording-hybrid|reasoning=off"))
@@ -127,6 +127,34 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
     /// `<turn-start> assistant \n` — the generation prompt the next turn replaces.
     private let genPromptSuffix = [201, 202, 203]
     private let userTurn = [11, 12, 13, 14, 15, 16, 17]
+
+    func testDiskOnlyBoundarySpillsBeforeDecodeAndRestoresAfterRestart() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let disk = makeCoordinator(paged: false)
+        disk.setGenPromptSuffixTokens(genPromptSuffix)
+        let model = RecordingHybridModel()
+        let prompt = userTurn + genPromptSuffix
+        let parameters = GenerateParameters(maxTokens: 3, temperature: 0, prefillStepSize: 3)
+        let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count))
+        var iterator = try TokenIterator(input: input, model: model,
+            parameters: parameters, cacheCoordinator: disk)
+        XCTAssertTrue(iterator.hybridStripBoundarySpilled)
+        XCTAssertNil(iterator.hybridStripSnapshot)
+        XCTAssertNil(iterator.promptCacheSnapshot)
+        let salt = computeCacheSalt(for: input, parameters: parameters)
+        XCTAssertTrue(disk.hasValidatedDiskEntry(tokens: userTurn, mediaSalt: salt))
+        let before = model.forwarded
+        while iterator.next() != nil {}
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(Array(model.forwarded.prefix(before.count)), before)
+        let reopened = CacheCoordinator(config: .init(usePagedCache: false, enableDiskCache: true,
+            diskCacheDir: tempDirs.last!, modelKey: "recording-hybrid|reasoning=off"))
+        let arrays = try XCTUnwrap(reopened.diskCache?.fetch(tokens: userTurn, mediaSalt: salt))
+        var restored: [KVCache] = [MambaCache()]
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), userTurn.count)
+        XCTAssertEqual(restored[0].state[0].asArray(Float.self),
+            [Float(userTurn.reduce(0, +)), Float(userTurn.count)])
+    }
 
     func testPrefillForwardsEachPromptTokenExactlyOnce() throws {
         let lock = lockSerializedMLXTest()

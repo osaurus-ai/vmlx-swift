@@ -118,6 +118,19 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
                        [Float(NativeBoundaryRecordingModel.state(after: prefix)), Float(prefix.count)], file: file, line: line)
     }
 
+    private func assertSpilled(_ iterator: NativeMTPTokenIterator, disk: CacheCoordinator,
+                               prefix: [Int], input prepared: LMInput,
+                               step: Int = 512, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertNil(iterator.promptCacheSnapshot, file: file, line: line)
+        XCTAssertNil(iterator.prefillBoundarySnapshots[prefix.count], file: file, line: line)
+        XCTAssertEqual(iterator.spilledHybridStripBoundary, prefix.count, file: file, line: line)
+        let salt = computeCacheSalt(for: prepared, parameters: parameters(step: step))
+        let arrays = try XCTUnwrap(disk.diskCache?.fetch(tokens: prefix, mediaSalt: salt), file: file, line: line)
+        var restored: [KVCache] = [MambaCache()]
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), prefix.count, file: file, line: line)
+        assertSnapshot(restored, prefix: prefix, file: file, line: line)
+    }
+
     func testStableSeedAndCanonicalBoundaryAreCapturedInsideThePrefillHeadWithoutReplayAtStore() throws {
         let lock = lockSerializedMLXTest(); defer { lock.unlock() }
         for step in [3, 512] {
@@ -134,9 +147,9 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
             // N itself (5) is not captured — and every token is still
             // forwarded exactly once, in order.
             XCTAssertEqual(model.forwardLengths, step == 3 ? [3, 1, 3, 3, 2, 3, 1] : [4, 8, 3, 1])
-            XCTAssertEqual(Set(iterator.prefillBoundarySnapshots.keys), Set([stable.count - 1, stable.count + user.count]))
+            XCTAssertEqual(Set(iterator.prefillBoundarySnapshots.keys), Set([stable.count - 1]))
             assertSnapshot(iterator.prefillBoundarySnapshots[stable.count - 1], prefix: Array(stable.dropLast()))
-            assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
+            try assertSpilled(iterator, disk: disk, prefix: stable + user, input: input(prompt), step: step)
             let before = model.forwarded.count
             iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
             // The terminal store consumes both captured snapshots; nothing is
@@ -184,7 +197,7 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
         // segment up to the canonical boundary, exactly as before.
         XCTAssertEqual(model.forwardLengths, [12, 3, 1])
         XCTAssertNil(iterator.prefillBoundarySnapshots[stable.count - 1])
-        assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
+        try assertSpilled(iterator, disk: disk, prefix: stable + user, input: fresh)
         let before = model.forwarded.count
         iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
         XCTAssertEqual(Array(model.forwarded.dropFirst(before)), [],
@@ -247,8 +260,9 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
             // hiding whether validation changes cold-prefill segmentation.
             XCTAssertEqual(model.forwardLengths, [6, 3, 1, 3, 1])
             XCTAssertEqual(Array(model.forwarded.prefix(ids.count)), ids)
-            XCTAssertEqual(Set(iterator.prefillBoundarySnapshots.keys), Set([6, 9, 10]))
-            for count in [6, 9, 10] {
+            XCTAssertEqual(Set(iterator.prefillBoundarySnapshots.keys), Set([9, 10]))
+            try assertSpilled(iterator, disk: disk, prefix: Array(ids.prefix(6)), input: prepared)
+            for count in [9, 10] {
                 assertSnapshot(iterator.prefillBoundarySnapshots[count], prefix: Array(ids.prefix(count)))
             }
         }
@@ -256,12 +270,13 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
 
     func testCapturedRecurrentSnapshotsRemainIndependentOfDecode() throws {
         let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let disk = coordinator()
         var iterator = try NativeMTPTokenIterator(input: input(stable + user + suffix),
             model: NativeBoundaryRecordingModel(), parameters: parameters(), depth: 1,
-            cacheCoordinator: coordinator())
+            cacheCoordinator: disk)
         while iterator.next() != nil {}
         assertSnapshot(iterator.prefillBoundarySnapshots[stable.count - 1], prefix: Array(stable.dropLast()))
-        assertSnapshot(iterator.prefillBoundarySnapshots[stable.count + user.count], prefix: stable + user)
+        try assertSpilled(iterator, disk: disk, prefix: stable + user, input: input(stable + user + suffix))
     }
 
     func testFreshDiskCoordinatorContinuationMatchesColdStateAndTokens() throws {

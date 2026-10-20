@@ -244,6 +244,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     var promptCacheSnapshot: [KVCache]?
     // Owned exact checkpoints captured during text prefill, not reconstructed after decode.
     var prefillBoundarySnapshots: [Int: [KVCache]] = [:]
+    var spilledHybridStripBoundary: Int?
     let mediaSalt: String?
 
     var tokenCount = 0
@@ -497,6 +498,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// AR's own context growth (context-fair baseline).
     private var arSafetyFirstVerifySec: TimeInterval?
     private var arSafetyPaused = false
+    /// The last token `next()` returned. When the consumer stops on it (a stop token it does not
+    /// append) and a verify had already committed its row, it labels the cache's extra row.
+    private var lastReturnedTokenId: Int?
     /// Live AR step cost at the CURRENT context, EMA over paused steps.
     private var arSafetyLiveStepSec: TimeInterval?
     /// Wall clock at the end of the previous AR step when the step before this one was also AR, so a
@@ -714,6 +718,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
+        MemoryStageTrace.log("request-start", tokens: promptTokenIds.count, detail: "native-mtp")
         prefillProgressHandler?(PrefillProgress(
             stage: .cacheLookup, completedUnitCount: 0,
             totalUnitCount: promptTokenIds.count, detail: "native-mtp"))
@@ -944,7 +949,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 prefillProgressHandler: prefillProgressHandler)
         }
         self.promptPrefillTime = NativeMTPClock.now() - start
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        MemoryStageTrace.log("prefill-complete", tokens: promptTokenIds.count, detail: "native-mtp")
+        if retainsPromptSnapshotForStores {
+            self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        }
+        spillHybridStripBoundaryAfterPrefill()
+        MemoryStageTrace.log(
+            "prompt-snapshot", tokens: promptTokenIds.count,
+            detail: promptCacheSnapshot == nil ? "native-mtp none" : "native-mtp retained")
 
         let firstToken: MLXArray
         switch prepared {
@@ -1115,6 +1127,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let token = pendingTokens[pendingIndex]
         pendingIndex += 1
         tokenCount += 1
+        lastReturnedTokenId = token
         lastTokenReturnedAt = NativeMTPClock.now()
         return token
     }
@@ -1128,10 +1141,48 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         NativeMTPClock.now() - consumerWaitTotal
     }
 
+    private var retainsPromptSnapshotForStores: Bool {
+        guard let coordinator = cacheCoordinator, coordinator.isHybrid,
+              !canTrimPromptCache(cache) else { return true }
+        return TokenIterator.hybridStripBoundaryIndex(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: cache) == nil
+    }
+
+    private mutating func spillHybridStripBoundaryAfterPrefill() {
+        guard !retainsPromptSnapshotForStores,
+              originalInput.cachePromptIntent != .auxiliary,
+              !originalInput.requiresPostPrepareCacheKey,
+              let coordinator = cacheCoordinator,
+              let boundary = TokenIterator.hybridStripBoundaryIndex(
+                coordinator: coordinator, promptTokenIds: promptTokenIds,
+                input: originalInput, cache: cache),
+              let snapshot = prefillBoundarySnapshots[boundary],
+              storeCapturedHybridBoundary(
+                snapshot, tokens: Array(promptTokenIds.prefix(boundary)),
+                coordinator: coordinator, mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                kvBits: cacheInitParameters.kvBits,
+                kvMode: cacheInitParameters.kvMode,
+                kvGroupSize: cacheInitParameters.kvGroupSize,
+                quantizedKVStart: cacheInitParameters.quantizedKVStart)
+        else { return }
+        spilledHybridStripBoundary = boundary
+        prefillBoundarySnapshots.removeValue(forKey: boundary)
+        MemoryStageTrace.log("strip-spilled", tokens: boundary, detail: "native-mtp accepted")
+    }
+
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        MemoryStageTrace.log(
+            "decode-end", tokens: promptTokenIds.count + generatedTokenIds.count, detail: "native-mtp")
+        defer {
+            MemoryStageTrace.log(
+                "stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
+                detail: "native-mtp")
+        }
         // A paused-AR lookahead past the last emitted token wrote one extra row; finish it so no snapshot races
         // its pending graph. The post-answer store below trims that row or skips (offset != tokens).
         if let lookahead = arLookahead {
@@ -1151,7 +1202,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
            // Auxiliary (title/suggestion/summary) prompts never store a
            // boundary — see `CachePromptIntent.auxiliary`.
            originalInput.cachePromptIntent != .auxiliary,
-           let promptCacheSnapshot
+           let promptCacheSnapshot = promptCacheSnapshot
+                ?? (retainsPromptSnapshotForStores ? nil : cache)
         {
             // Shared with the solo and batched engines — see the note there.
             let sharedPromptStripBoundary = TokenIterator.hybridStripBoundaryIndex(
@@ -1201,7 +1253,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // because this helper runs once per boundary. (MTP was the fourth
                 // store path; the first three were guarded and this one was missed.)
                 guard CacheStoreBudget.canStore(snapshot) else { return }
-                let cacheSnapshot = snapshot.map { $0.copy() }
+                // Every caller supplies an owned prefill/boundary snapshot or
+                // a post-answer copy. Copying it again doubles terminal KV RAM.
+                let cacheSnapshot = snapshot
                 MLX.eval(cacheSnapshot)
                 let tCopy = Date()
                 let requiresDiskBackedRestore =
@@ -1343,7 +1397,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                    (coordinator.isHybrid
                        || cacheHasStandaloneRotatingWindowState(cache)),
                    !originalInput.hasMediaContent,
-                   let stripAt = sharedPromptStripBoundary
+                   let stripAt = sharedPromptStripBoundary,
+                   spilledHybridStripBoundary != stripAt
                 {
                     // NOTE: intentionally NOT gated on
                     // `!cachePrefixTokenCounts.contains(stripAt)` — see the solo
@@ -1376,7 +1431,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 let postAnswerTokens = promptTokenIds + generatedTokenIds
                 let postAnswerSnapshot = cache.map { $0.copy() }
                 let offsets = postAnswerSnapshot.map(\.offset)
-                if let offset = offsets.first,
+                let leafOffsets = Set(cacheBoundaryLeafOffsets(postAnswerSnapshot))
+                // A verify that accepted the stop token as a draft committed its row, so every
+                // layer sits one past prompt + generated, and the consumer never appended that
+                // token. Recurrent (GDN) state cannot be trimmed back, so the store used to be
+                // dropped, and a media chat on this path then stored nothing for the turn. Key
+                // the row by the stop token, as TokenIterator keys its forwarded stop token.
+                let stopRowToken: Int? =
+                    leafOffsets == [postAnswerTokens.count + 1]
+                        && tokenCount == generatedTokenIds.count + 1
+                    ? lastReturnedTokenId : nil
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
+                            + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
+                            + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil)\n").utf8))
+                }
+                if let stopRowToken {
+                    store(
+                        tokens: postAnswerTokens + [stopRowToken],
+                        snapshot: postAnswerSnapshot,
+                        label: "post-answer")
+                } else if let offset = offsets.first,
                    offsets.allSatisfy({ $0 == offset })
                 {
                     if offset == postAnswerTokens.count {
@@ -1817,12 +1893,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
         let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
         let trimCount = promptTokenIds.count - tokens.count
-        let trimmed = promptSnapshot.map { $0.copy() }
-        if keepsMedia, canTrimPromptCache(trimmed),
-           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
-        {
-            MLX.eval(trimmed)
-            return trimmed
+        if keepsMedia, canTrimPromptCache(promptSnapshot) {
+            let trimmed = promptSnapshot.map { $0.copy() }
+            if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                MLX.eval(trimmed)
+                return trimmed
+            }
         }
 
         // `allowDiskBackedRederive` bypasses the disk-backed skip-guard for the
