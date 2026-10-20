@@ -293,7 +293,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private struct PendingVerify {
         let verifier: NativeMTPForwardResult
         let requested: [MLXArray]
-        let requestedInputIds: [Int32]
+        /// The requested ids as one lazy int32 array; read back at consume.
+        let requestedInputArray: MLXArray
         let depth: Int
         let checkpoint: NativeMTPCacheCheckpoint
         /// Signalled when the background `asyncEval` has finished SCHEDULING
@@ -329,6 +330,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Context ceiling for prefetch eligibility — see the regime gate in
     /// `maybePrefetchNextVerify`. Default matches the qwen4_exp QSA
     /// indexer budget.
+    private static let verifyPrefetchContextCapExplicit =
+        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"] != nil
     private static let verifyPrefetchMaxContext: Int = {
         if let raw = ProcessInfo.processInfo
             .environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"],
@@ -496,7 +499,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyPaused = false
     /// Live AR step cost at the CURRENT context, EMA over paused steps.
     private var arSafetyLiveStepSec: TimeInterval?
+    /// Wall clock at the end of the previous AR step when the step before this one was also AR, so a
+    /// paused stretch is costed per emitted token INCLUDING the consumer's time between `next()` calls,
+    /// the same yardstick as the MTP windows (wall per emitted token). See `generateAutoregressiveToken`.
+    private var lastARStepWallEnd: TimeInterval?
     private var arSafetyTokensSincePause = 0
+    /// Wall time and tokens of the current paused AR stretch (see `arSafetyAfterARStep`).
+    private var arSafetyStretchWall: TimeInterval = 0
+    private var arSafetyStretchTokens = 0
     private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
     private var arSafetyProbeCyclesRemaining = 0
     private var arSafetyProbeStartedAt: TimeInterval?
@@ -718,6 +728,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheLookupTokenIds = effectiveTokens
             cacheLookupUsesPostPrepareAlias = true
         }
+        // Per-boundary salts (as TokenIterator): a prefix that ends before a chat's newest image is keyed
+        // by the media before it, so a turn that adds media restores everything up to that media and
+        // encodes only the new item. Before this the native-MTP path probed with the whole prompt's salt
+        // and dropped any restore whose suffix held media: on Ornith 122B the image turn of an in-app
+        // chat re-prefilled 15.5k tokens (TTFT 3.1 s on the AR path -> 14.2 s on MTP).
+        let cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
+            model: model, parameters: effectiveParameters)
         if let coordinator = cacheCoordinator,
            !cacheLookupTokenIds.isEmpty,
             (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
@@ -752,7 +770,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
                     preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
-                    chainId: parameters.cacheChainId
+                    chainId: parameters.cacheChainId,
+                    mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix
                 )
             }
             switch result {
@@ -831,8 +850,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                     let requiresDiskBackedRestore =
                         cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-                    let unsafePartial =
+                    let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                        input: input, remainingTokens: remainingTokens,
+                        matchedTokens: matchedTokens, plan: cacheSaltPlan)
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         self.cache = model.newCache(parameters: effectiveParameters)
@@ -855,6 +877,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(text: LMInput.Text(tokens: lastToken))
                             retainedDiskRestore = diskArrays != nil
                         }
+                    } else if suffixHoldsMedia {
+                        // Restore up to the newest media and prefill from there, encoding only the
+                        // media in the suffix (same as TokenIterator).
+                        inputForPrepare = mediaCarryingSuffixInput(
+                            from: input, remainingTokens: remainingTokens,
+                            matchedTokens: matchedTokens, itemSpans: cacheSaltPlan.itemSpans)
+                        retainedDiskRestore = diskArrays != nil
                     } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                             .expandedDimensions(axis: 0)
@@ -901,6 +930,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let primer = NativeMTPPromptPrimer.enabled && model is any NativeMTPPromptPrimingModel
             && !usesBlockDrafts && !inputForPrepare.hasMediaContent
             ? NativeMTPPromptPrimer(model: model, cache: mtpCache) : nil
+        // A restored suffix of a media chat continues at the FULL prompt's M-RoPE positions (as
+        // TokenIterator does); without this the suffix was positioned from the suffix alone.
+        if let positioned = model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: input,
+                restoredTokenCount: Swift.max(
+                    0, input.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
         let prepared = try NativeMTPPromptPrimer.$current.withValue(primer) {
             try prepareCapturingCacheBoundaries(
                 inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
@@ -1829,6 +1866,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func verifyCycle() throws {
+        lastARStepWallEnd = nil
         guard let primary = nextMain, !drafts.isEmpty else {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
@@ -1906,7 +1944,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let requestedInputIds: [Int32]
         if let consumedPrefetch {
             requested = consumedPrefetch.requested
-            requestedInputIds = consumedPrefetch.requestedInputIds
+            requestedInputIds = recordMaterializeSync {
+                consumedPrefetch.requestedInputArray.asArray(Int32.self)
+            }
         } else {
             requested = [primary] + drafts
             // ONE batched materialization for every id this cycle needs. The old
@@ -2396,8 +2436,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // indexer-engagement region. Threshold matches qwen4_exp's
         // indexer_budget (block 4 × top-512 = 2048); tunable for other
         // topologies via VMLX_MTP_VERIFY_PREFETCH_MAX_CTX.
+        // The gate exists for the QSA indexer lanes only: a cache without a QSA layer (Ornith / Qwen 3.5
+        // MoE, every app chat starting above 2048 tokens of system prompt + tools) has nothing for the
+        // background scheduling thread to fence against, and gating it disabled prefetch for every real
+        // conversation. `VMLX_MTP_VERIFY_PREFETCH_MAX_CTX` still caps any family when set explicitly.
         let contextOffset = cache.lazy.map(\.offset).max() ?? 0
-        if contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext {
+        if Self.verifyPrefetchContextCapExplicit || cache.contains(where: { $0 is QSAKVCache }),
+            contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext
+        {
             return
         }
         // Nothing left in the token budget to overlap against.
@@ -2405,10 +2451,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         let requested = [primary] + drafts
-        let requestedInputIds = recordMaterializeSync {
-            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
-        }
-        let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
+        // Lazy ids: the verify graph is built on the drafts' arrays instead of their host values,
+        // so building it overlaps the draft forward on the GPU instead of waiting for it (a host
+        // drain per cycle). The ids are read back once, at consume, after the verify was scheduled.
+        let requestedArray = stacked(requested.map { $0.reshaped(-1).asType(.int32) })
+        let input = requestedArray.reshaped(1, requested.count)
         let checkpointStart = NativeMTPClock.now()
         let checkpoint = NativeMTPCacheCheckpoint(cache)
         cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
@@ -2452,7 +2499,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         pendingVerify = PendingVerify(
             verifier: verifier,
             requested: requested,
-            requestedInputIds: requestedInputIds,
+            requestedInputArray: requestedArray,
             depth: currentDepth,
             checkpoint: checkpoint,
             scheduled: scheduled)
@@ -2750,6 +2797,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
         }
         arSafetyTokensSincePause = 0
+        arSafetyStretchWall = 0
+        arSafetyStretchTokens = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
         // A calibration is a measurement, not a verdict: remember the winning depth and resume it.
         arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
@@ -2789,7 +2838,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         guard arSafetyPaused else { return }
-        arSafetyLiveStepSec = arSafetyLiveStepSec.map { 0.7 * $0 + 0.3 * stepSec } ?? stepSec
+        // Live AR cost = the paused stretch's wall time per emitted token. Per-step samples are not
+        // comparable with each other under the one-token lookahead: the stretch's first step waits for
+        // two steps' work (~46 ms on Ornith 122B) and the last one before a resume probe has no lookahead
+        // and only reads back work the previous step already ran (~2.7 ms). An EMA of those samples ended
+        // every stretch on the cheap one, read AR at ~17 ms against a real ~23.6 ms/token, and paused MTP
+        // that won the reply overall (Ornith 122B sampled: MTP 44.5 vs AR 42.3 tok/s while every probe
+        // was scored a loss). The stretch total is exact wherever in it the work is waited on.
+        arSafetyStretchWall += stepSec
+        arSafetyStretchTokens += 1
+        if arSafetyStretchTokens >= 2 {
+            arSafetyLiveStepSec = arSafetyStretchWall / Double(arSafetyStretchTokens)
+        } else if arSafetyLiveStepSec == nil {
+            arSafetyLiveStepSec = stepSec
+        }
         arSafetyLastMeasuredToken = tokenCount
         arSafetyTokensSincePause += 1
         if arSafetyCalibrationRemaining > 0 {
@@ -3292,8 +3354,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         drafts.removeAll(keepingCapacity: true)
         draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
+        // Cost the AR token like an MTP window: wall clock per emitted token, consumer included. The
+        // in-step time alone excludes the consumer's per-token work (detokenize / stream / UI, ~5 ms a
+        // token in Osaurus) and, with the lookahead, most of the GPU time that overlaps it, so it read
+        // ~20 % cheaper than AR really is and the governor paused MTP that was winning (Ornith 122B, app
+        // sampling: MTP 43.0 vs AR 39.4 tok/s over the whole reply while the governor reported MTP losing).
+        // The first AR step after a verify cycle has no AR predecessor and keeps the in-step time.
+        let stepEnd = NativeMTPClock.now()
+        let stepSec = lastARStepWallEnd.map { stepEnd - $0 } ?? (stepEnd - verifyStart)
+        lastARStepWallEnd = stepEnd
         arSafetyAfterARStep(
-            stepSec: NativeMTPClock.now() - verifyStart,
+            stepSec: stepSec,
             hidden: Self.lastHidden(output.hiddenStates),
             nextToken: token)
     }

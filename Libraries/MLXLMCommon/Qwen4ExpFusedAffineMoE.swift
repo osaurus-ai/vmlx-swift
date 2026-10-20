@@ -407,10 +407,13 @@ public enum Qwen4ExpFusedAffineMoE {
             // BF16 activation/result contract.
             let rows = input.size / shape.inputDimensions
             let leadingShape = Array(input.shape.dropLast())
-            // Extra verifier rows must retain the single-row expert arithmetic.
+            // Extra verifier rows must retain the single-row expert arithmetic: every row is its own
+            // grid slice here, so the kernel IS the 1-row step per row. Ornith (Qwen3.5 MoE) native-MTP
+            // verify enters the same scope; without it a 2-row verify fell back to the generic gather +
+            // BF16 sum and differed from AR in the MoE output (Ornith 122B 4M, layer 9).
             // Keep ordinary prefill and other model geometries on their existing routes.
             let rowLimit =
-                shape == qwen4ExpShape
+                [qwen4ExpShape, ornith35Shape, ornith122BShape].contains(shape)
                     && FlashVerificationScope.usesRowExactVerification(
                         inputShape: input.shape, site: "moe")
                 ? 8 : maximumRows

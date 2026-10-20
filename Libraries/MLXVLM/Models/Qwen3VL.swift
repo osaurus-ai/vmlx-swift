@@ -24,9 +24,11 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
+    /// Frames are rendered without colour management (`asMLXArrayUnmanaged`), so the stored,
+    /// already gamma-encoded values are resampled and normalized as the reference processor does;
+    /// no tone-curve conversion here (it compensated the managed linear working space).
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
         image
-            .toSRGB()
             .resampled(to: resizedSize, method: .bicubic)
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
     }
@@ -121,7 +123,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     mean: config.imageMeanTuple,
                     std: config.imageStdTuple)
             }
-            .map { MediaProcessing.asMLXArray($0) }
+            .map { MediaProcessing.asMLXArrayUnmanaged($0) }
 
         return try QwenVL.patchify(
             images: normalized,
@@ -215,7 +217,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 let resizedSize = CGSize(width: width, height: height)
                 accumulatedFrames.append(
                     sequence.frames.map {
-                        preprocess(image: $0.frame, resizedSize: resizedSize).asMLXArray()
+                        MediaProcessing.asMLXArrayUnmanaged(
+                            preprocess(image: $0.frame, resizedSize: resizedSize))
                     })
             }
 

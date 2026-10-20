@@ -20,6 +20,13 @@ public struct ProcessedVideoFrames {
 
 private let context = CIContext()
 
+/// No colour management: every filter and the render see the image's stored component values,
+/// which is what PIL / torchvision processors feed the reference models (`Image.open(...).convert("RGB")`
+/// ignores the ICC profile; resampling happens on the gamma-encoded values).
+private let unmanagedContext = CIContext(options: [
+    .workingColorSpace: NSNull(), .outputColorSpace: NSNull(),
+])
+
 /// Collection of methods for processing media (images, video, etc.).
 ///
 /// A typical image preparation pipeline might look like this:
@@ -190,6 +197,26 @@ public enum MediaProcessing {
         array = array.reshaped(1, h, w, 3).transposed(0, 3, 1, 2)
 
         return array
+    }
+
+    /// `asMLXArray` without colour management: planar `[1, C, H, W]` float32 of the image's stored
+    /// RGB values after the (unmanaged) filter chain. The managed render converts the source profile
+    /// (Display P3, ITU-R 2020, ...) into CoreImage's linear working space, so a processor that
+    /// normalizes it the PIL way sees linear-light, gamut-converted values instead of the reference
+    /// pixels: Ornith 1.5 / Qwen 3.5 on a 2020-tagged PNG got (-0.969, -0.758, -0.206) where the
+    /// reference has (-0.427, -0.247, 0.278).
+    public static func asMLXArrayUnmanaged(_ image: CIImage) -> MLXArray {
+        let w = Int(image.extent.size.width.rounded())
+        let h = Int(image.extent.size.height.rounded())
+        let bytesPerRow = w * 16
+        var data = Data(count: w * h * 16)
+        data.withUnsafeMutableBytes { ptr in
+            unmanagedContext.render(
+                image, toBitmap: ptr.baseAddress!, rowBytes: bytesPerRow, bounds: image.extent,
+                format: .RGBAf, colorSpace: nil)
+        }
+        let array = MLXArray(data, [h, w, 4], type: Float32.self)[0..., 0..., ..<3]
+        return array.reshaped(1, h, w, 3).transposed(0, 3, 1, 2)
     }
 
     /// Return `true` if the size is smaller or equal to the size of the `extent`.
