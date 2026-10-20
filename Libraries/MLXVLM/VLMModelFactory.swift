@@ -530,6 +530,11 @@ public final class VLMModelFactory: ModelFactory {
         if let miniCPMJANGHPreparation {
             configData = miniCPMJANGHPreparation.banks.ordinaryConfiguration
         }
+        let qwen35MoEJANGHPreparation = try Qwen35MoEJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let qwen35MoEJANGHPreparation {
+            configData = qwen35MoEJANGHPreparation.banks.ordinaryConfiguration
+        }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -557,7 +562,7 @@ public final class VLMModelFactory: ModelFactory {
         // without `jang_config.json` skip this entirely.
         var mergedConfigData = configData
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if jangHPreparation == nil, nemotronJANGHPreparation == nil,
+        if jangHPreparation == nil, nemotronJANGHPreparation == nil, qwen35MoEJANGHPreparation == nil,
             FileManager.default.fileExists(atPath: jangConfigURL.path),
             let jangData = try? Data(contentsOf: jangConfigURL),
             let jangJSON = try? JSONSerialization.jsonObject(with: jangData)
@@ -737,6 +742,10 @@ public final class VLMModelFactory: ModelFactory {
                     configurationData: mergedConfigData, requesting: configuration.requestedModalities)
             } else if let qwen35JANGHPreparation {
                 model = try qwen35JANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
+            } else if let qwen35MoEJANGHPreparation {
+                model = try qwen35MoEJANGHPreparation.construct(
                     configurationData: mergedConfigData,
                     requesting: configuration.requestedModalities)
             } else if let miniCPMJANGHPreparation {

@@ -532,6 +532,11 @@ public protocol LanguageModel: Module {
     /// batched forward.
     var maximumSupportedDecodeBatchSize: Int? { get }
 
+    /// Prefill chunk size measured fastest for this architecture. Hosts apply it
+    /// only when neither the request nor a per-model tuning record picks one;
+    /// `nil` keeps ``GenerateParameters/prefillStepSize``'s library default.
+    var recommendedPrefillStepSize: Int? { get }
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// This can return:
@@ -591,6 +596,8 @@ extension LanguageModel {
     /// Most standard-attention and wrapped recurrent-cache architectures use
     /// the batch engine's configured width.
     public var maximumSupportedDecodeBatchSize: Int? { nil }
+
+    public var recommendedPrefillStepSize: Int? { nil }
 
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput

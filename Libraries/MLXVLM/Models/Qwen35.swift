@@ -1691,7 +1691,11 @@ enum Qwen35Language {
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
+            if let mask, Qwen35CausalPrefillMask.applies(
+                mask: mask, rows: L, batch: B, cache: cache, fullBufferCache: fullBufferCache)
+            {
+                attentionMask = .causal
+            } else if let mask {
                 // Full-buffer (Compilable) caches: mask and K/V both span the
                 // whole static buffer — pass through unsliced.
                 attentionMask =
@@ -3432,6 +3436,47 @@ enum Qwen35Language {
         func resetPositionState() {
             precomputedPositionIds = nil
             ropeDeltas = nil
+            restoredPrefixPositionsArmed = false
+        }
+
+        /// True from ``armRestoredPrefixPositions(inputIds:imageGridTHW:videoGridTHW:)`` until the
+        /// prefill that follows a cache restore has consumed the last prompt position. While set,
+        /// `prepare` keeps the plan instead of resetting it and `resolvedPositionIds` slices it.
+        fileprivate var restoredPrefixPositionsArmed = false
+
+        /// M-RoPE positions and decode delta of the request's FULL prompt (all tokens, every media
+        /// grid), for a request whose prefix was restored from the cache. The suffix then takes
+        /// exactly the positions a cold prefill gives it: after a restored image its text continues
+        /// from the compressed media positions (not offset + index), and an image in the suffix is
+        /// placed after the restored text. Decode continues from offset + the full prompt's delta.
+        func armRestoredPrefixPositions(
+            inputIds: MLXArray, imageGridTHW: [THW]?, videoGridTHW: [THW]?
+        ) {
+            let ids = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let computed: MLXArray
+            let deltas: MLXArray
+            if let canvas = config.miniCPMCanvas {
+                (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                    inputIds: ids,
+                    imageGrids: imageGridTHW,
+                    videoGrids: videoGridTHW,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    canvas: canvas)
+            } else {
+                (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                    inputIds: ids,
+                    imageGridTHW: imageGridTHW,
+                    videoGridTHW: videoGridTHW,
+                    spatialMergeSize: config.visionConfiguration?.spatialMergeSize ?? 1,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    visionStartTokenId: config.visionStartTokenId,
+                    attentionMask: nil)
+            }
+            precomputedPositionIds = computed
+            ropeDeltas = deltas
+            restoredPrefixPositionsArmed = true
         }
 
         fileprivate func resolvedPositionIds(
@@ -3443,6 +3488,21 @@ enum Qwen35Language {
             videoGridTHW: [THW]?,
             resetForMedia: Bool
         ) -> MLXArray? {
+            if restoredPrefixPositionsArmed {
+                restoredPrefixPositionsArmed = false
+                if providedPositionIds == nil, let plan = precomputedPositionIds,
+                    let cache, let faCache = cache[model.faIdx],
+                    graphOffsetArray(for: faCache) == nil
+                {
+                    let start = faCache.offset
+                    let end = start + inputs.dim(1)
+                    if end <= plan.dim(2) {
+                        // Stay armed for the next prefill chunk until the prompt is consumed.
+                        restoredPrefixPositionsArmed = end < plan.dim(2)
+                        return plan[0..., 0..., start ..< end]
+                    }
+                }
+            }
             if resetForMedia {
                 precomputedPositionIds = nil
                 ropeDeltas = nil
@@ -3580,7 +3640,8 @@ enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            lastRowLogits: Bool = false
         ) -> LMOutput {
             let positionIds = resolvedPositionIds(
                 inputs: inputs,
@@ -3597,6 +3658,13 @@ enum Qwen35Language {
                 cache: cache,
                 positionIds: positionIds
             )
+            // The last call of a CHUNKED prefill only needs the next-token row (its callers already
+            // receive just the final chunk's rows and read the last one): the LM head over every row
+            // of a 2,048-row chunk is ~3 TFLOP and a [rows, 248k] logits buffer for nothing. A prompt
+            // that fits one window keeps full-prompt logits (Qwen35MediaPrefillTests contract).
+            if lastRowLogits, out.dim(1) > 1 {
+                out = out[0..., (out.dim(1) - 1)..., 0...]
+            }
 
             out = headLogits(out)
 
@@ -3766,6 +3834,17 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
 
     public let config: Qwen35Configuration
 
+    /// Routed-MoE backbones prefill 2048-token chunks: each chunk's expert
+    /// matmuls then see ~64 rows per expert instead of ~16, while the GDN
+    /// recurrence and attention cost per token stay the same. Ornith 1.5 122B
+    /// (JANG_4M, 15,750-token prompt, M5 Max): 512 -> 864 tok/s, 2048 -> 1187
+    /// tok/s, 4096 -> 1216 tok/s; peak process footprint 3.4 / 6.2 / 10.3 GB.
+    /// 2048 keeps most of the speed for a quarter of 4096's extra memory.
+    /// Dense backbones keep the library default.
+    public var recommendedPrefillStepSize: Int? {
+        config.textConfiguration.numExperts > 0 ? 2048 : nil
+    }
+
     /// What this instance actually carries. Same contract as the other converted families.
     public let modalities: Set<ModelRuntimeRequestModality>
 
@@ -3827,9 +3906,11 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting))
     }
 
-    /// The one real initialiser. Private on purpose: a plan can only come from
-    /// `resolveConstruction`, so no caller can hand this an empty or unsupported selection.
-    private init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
+    /// Keep the designated initializer module-internal. With a private initializer,
+    /// optimized inherited convenience initialization can allocate a Qwen35 rather
+    /// than its Qwen35MoE subclass, bypassing the MoE sanitizer through LanguageModel.
+    /// External callers still use the public initializers and resolveConstruction.
+    init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
         self.plan = plan
         self.config = config
         // Built first, so the capability report can be COLLECTED from what actually exists rather
@@ -4042,7 +4123,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
-        } else {
+        } else if !languageModel.restoredPrefixPositionsArmed {
             languageModel.resetPositionState()
         }
 
@@ -4091,7 +4172,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 inputIds[0..., offset...],
                 inputsEmbeds: inputEmbeddings[0..., offset..., 0...],
                 cache: typedCache,
-                positionIds: positions[0..., 0..., offset...]))
+                positionIds: positions[0..., 0..., offset...],
+                lastRowLogits: true))
         }
 
         // Chunked text-only prefill so the UI prefill counter advances instead
@@ -4144,7 +4226,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 positionIds: nil,
                 pixelValues: nil,
                 imageGridTHW: nil,
-                videoGridTHW: nil
+                videoGridTHW: nil,
+                lastRowLogits: true
             )
             return .logits(output)
         }
@@ -4268,10 +4351,12 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        languageModel.textOnlyForwardWithHidden(
-            inputs,
-            cache: cache,
-            recordPrefixCommitStates: true)
+        RoutedExpertVerificationScope.withVerification(inputShape: inputs.shape) {
+            languageModel.textOnlyForwardWithHidden(
+                inputs,
+                cache: cache,
+                recordPrefixCommitStates: true)
+        }
     }
 
     public func nativeMTPForward(
@@ -4712,6 +4797,27 @@ public enum Qwen35DFlash2TreeKernelProbe {
 
 /// Verify-cost attribution on real weights: per-layer ms of each sub-op at a given row count
 /// (each timed alone, eval'd, median of `reps`). Diagnostic only (RunBench BENCH_PARTS).
+/// Prefill chunks attend with the fused kernel's own causal mode instead of the equivalent explicit
+/// mask array. The model builds that array itself (`createAttentionMask(..., returnArray: true)`), and
+/// for a plain single-sequence `KVCacheSimple` it is exactly the lower-right causal mask of the chunk
+/// against every cached key — what `.causal` computes without reading a `[rows, keys]` mask. Fused
+/// D=256 attention for a 2048-row chunk: 272 -> 234 ms at 131,072 keys, 135 -> 115 ms at 65,536.
+/// Verify widths (< 32 rows), batches, compiled full-buffer and windowed caches keep the array.
+/// `VMLX_QWEN35_CAUSAL_PREFILL_MASK=0` restores the array everywhere.
+enum Qwen35CausalPrefillMask {
+    static let enabled = RuntimeEnvironment.value("VMLX_QWEN35_CAUSAL_PREFILL_MASK") != "0"
+
+    static func applies(
+        mask: MLXArray, rows: Int, batch: Int, cache: KVCache?, fullBufferCache: Bool
+    ) -> Bool {
+        guard enabled, rows >= 32, batch == 1, !fullBufferCache, let cache,
+            type(of: cache) == KVCacheSimple.self, mask.ndim == 2
+        else { return false }
+        // The model's causal mask for this chunk: rows x (cached keys + rows).
+        return mask.dim(0) == rows && mask.dim(1) == cache.offset + rows
+    }
+}
+
 public enum Qwen35DFlash2PartsProbe {
     public static func run(model: Any, rowsList: [Int], reps: Int) -> [String] {
         guard let m = model as? Qwen35 else { return ["[PARTS] not a Qwen35 VLM model"] }
@@ -4832,6 +4938,83 @@ public enum Qwen35DFlash2PartsProbe {
             lines.append(String(format: "[PARTS] rows=%d model-scaled serial total=%.1f ms", rows, total))
         }
         return lines
+    }
+}
+
+extension Qwen35: PrefixCacheInvariantModel {
+    /// Qwen-VL M-RoPE gives every token before the first media placeholder the text position equal
+    /// to its index (the media compression only shifts what follows), the GDN recurrence and
+    /// attention are causal, and media embeddings are spliced only at placeholders. So the state at
+    /// a boundary before the first placeholder is the text-only prompt's state. The suffix that
+    /// carries the media is positioned from the full prompt (`RestoredPrefixPositionModel`), which
+    /// is what made this unsafe before. MiniCPM-V's canvas positions are not covered: false there.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { config.miniCPMCanvas == nil }
+
+    /// A restored exact-prefix row holds the KV, conv and F32 GDN state of exactly those tokens:
+    /// the forward is causal and the row was written from them alone, so whatever the request
+    /// appends next (a forced tool-selection tail included) cannot have influenced it. Proven on the
+    /// Qwen 3.5 hybrid fixture (`Qwen35HadamardCacheTests`): a reopened disk checkpoint continues
+    /// bitwise equal to the cold cache, and a required-tool request now restores into exactly the
+    /// state the ordinary warm request reaches. Without it, every tool_choice=required turn
+    /// re-prefilled the whole history (Ornith 122B in the app: 24,143 tokens, 20.6 s, with the
+    /// previous turn's 23,861-token boundary on disk).
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+}
+
+extension Qwen35: MediaItemPrefixCacheModel {
+    /// Each image owns `t*h*w / merge²` image-pad placeholders and `t*h*w` pixel rows; each video
+    /// owns that many video-pad placeholders (its frame runs may be separated by timestamp text) and
+    /// rows. Placeholders are assigned to items in order; any count mismatch returns nil.
+    public func mediaItemSpans(in input: LMInput, tokenIds: [Int]) -> [MediaItemSpan]? {
+        guard config.miniCPMCanvas == nil, input.video?.embeddingTokenCount == nil else { return nil }
+        let merge = config.visionConfiguration?.spatialMergeSize ?? 1
+        let perToken = max(1, merge * merge)
+        func spans(_ kind: MediaItemSpan.Kind, tokenId: Int, frames: [THW]?) -> [MediaItemSpan]? {
+            let positions = tokenIds.indices.filter { tokenIds[$0] == tokenId }
+            guard let frames, !frames.isEmpty else { return positions.isEmpty ? [] : nil }
+            var out: [MediaItemSpan] = []
+            var next = 0
+            var row = 0
+            for (index, frame) in frames.enumerated() {
+                let count = frame.product / perToken
+                guard count > 0, frame.product % perToken == 0, next + count <= positions.count
+                else { return nil }
+                out.append(MediaItemSpan(
+                    kind: kind,
+                    tokenRange: positions[next] ..< (positions[next + count - 1] + 1),
+                    pixelRows: row ..< (row + frame.product),
+                    frameIndex: index))
+                next += count
+                row += frame.product
+            }
+            return next == positions.count ? out : nil
+        }
+        guard let images = spans(.image, tokenId: config.imageTokenId, frames: input.image?.frames),
+            let videos = spans(.video, tokenId: config.videoTokenId, frames: input.video?.frames),
+            input.image.map({ $0.pixels.dim(0) == images.last?.pixelRows.upperBound }) ?? true,
+            input.video.map({ $0.pixels.dim(0) == videos.last?.pixelRows.upperBound }) ?? true
+        else { return nil }
+        let all = (images + videos).sorted { $0.tokenRange.lowerBound < $1.tokenRange.lowerBound }
+        for (a, b) in zip(all, all.dropFirst()) where a.tokenRange.upperBound > b.tokenRange.lowerBound {
+            return nil
+        }
+        return all.isEmpty ? nil : all
+    }
+}
+
+extension Qwen35: RestoredPrefixPositionModel {
+    /// A restored prefix of a media request: arm the full prompt's M-RoPE plan so the suffix (text
+    /// after a restored image, or an image after restored text) gets cold-prefill positions and
+    /// decode continues from the full prompt's delta. Text-only and cold requests reset as before.
+    public func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int) {
+        guard restoredTokenCount > 0, fullInput.image != nil || fullInput.video != nil else {
+            languageModel.resetPositionState()
+            return
+        }
+        languageModel.armRestoredPrefixPositions(
+            inputIds: fullInput.text.tokens,
+            imageGridTHW: fullInput.image?.frames,
+            videoGridTHW: fullInput.video?.frames)
     }
 }
 

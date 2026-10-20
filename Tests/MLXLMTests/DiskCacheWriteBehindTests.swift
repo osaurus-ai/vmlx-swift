@@ -557,5 +557,79 @@ struct DiskCacheWriteBehindTests {
             ]) == ["b(1)"])
         }
     }
+
+    /// The host screen the write-behind writer runs gives the same verdicts as the GPU screen,
+    /// on contiguous payloads, on strided `..<offset` KV views, and across float widths, including
+    /// payloads large enough to be split into several slices.
+    @Test func hostNonFiniteScreenMatchesTheGPUScreen() throws {
+        try MLXMetalTestLock.withLock {
+            func host(_ arrays: [String: MLXArray]) throws -> [String] {
+                eval(Array(arrays.values))
+                let tensors = try #require(SafetensorsByteWriter.tensors(from: arrays))
+                return SafetensorsByteWriter.nonFiniteTensorNames(tensors)
+            }
+            func one(_ values: [Float], _ dtype: DType) throws -> [String] {
+                try host(["t": MLXArray(values).asType(dtype)])
+            }
+            for dtype in [DType.float32, .bfloat16, .float16] {
+                #expect(try one([1, 2, 3], dtype).isEmpty)
+                #expect(try one([1, .nan, 3], dtype) == ["t(1)"])
+                #expect(try one([1, .infinity, 3], dtype) == ["t(1)"])
+                #expect(try one([.infinity, -.infinity, 3], dtype) == ["t(2)"])
+            }
+            // Largest finite values are not flagged (exponent not all ones).
+            #expect(try one([60_000, -65_504, 65_504], .float16).isEmpty)
+            #expect(try one([3.3e38, -3.3e38], .float32).isEmpty)
+            // Multi-slice payload (> 8 MiB) with one NaN near the end, 4,000,001 bf16 values.
+            var big = MLXArray.ones([4_000_001], dtype: .bfloat16)
+            big[3_999_990] = MLXArray(Float.nan).asType(.bfloat16)
+            #expect(try host(["big": big, "clean": MLXArray.zeros([5_000_000], dtype: .float32)]) == ["big(1)"])
+            // Strided view: a `..<offset` slice of a step-padded KV buffer. A NaN beyond the offset
+            // is outside the payload and must not be reported; one inside must.
+            var buffer = MLXArray.zeros([1, 2, 4_096, 128], dtype: .bfloat16)
+            buffer[0, 1, 3_000, 5] = MLXArray(Float.nan).asType(.bfloat16)
+            let inside = buffer[0..., 0..., ..<3_500, 0...]
+            let outside = buffer[0..., 0..., ..<2_500, 0...]
+            #expect(try host(["kv": outside]).isEmpty)
+            #expect(try host(["kv": inside]) == ["kv(1)"])
+            let tensors = try #require(SafetensorsByteWriter.tensors(from: ["kv": inside]))
+            if case .strided = tensors[0].payload {} else { Issue.record("expected a strided payload") }
+            // Agreement with the GPU screen on the same arrays.
+            for arrays in [["kv": inside], ["kv": outside], ["big": big]] {
+                #expect(try host(arrays) == DiskCache.nonFiniteTensorNames(in: arrays))
+            }
+        }
+    }
+
+    /// A write-behind store returns without screening; the writer refuses a non-finite payload before
+    /// it reaches disk, and a lookup that races the writer never receives it.
+    @Test func writeBehindRefusesNonFinitePayloadWithoutServingIt() throws {
+        try MLXMetalTestLock.withLock {
+            let dir = root("nonfinite")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let cache = DiskCache(cacheDir: dir, maxSizeBytes: 50_000_000, modelKey: "wb")
+            cache.writeBehind = true
+            cache.writeDelayForTesting = 0.3
+            let tokens = Array(500 ..< 541)
+            var keys = MLXArray.ones([1, 2, 64, 16], dtype: .bfloat16)
+            keys[0, 0, 10, 3] = MLXArray(Float.nan).asType(.bfloat16)
+            cache.store(tokens: tokens, arrays: ["kv_0_keys": keys, "ssm_1": MLXArray.zeros([1, 4, 8, 8])])
+            #expect(cache.fetch(tokens: tokens) == nil)
+            #expect(cache.waitForPendingWrites(timeout: 10))
+            #expect(cache.refusedNonFiniteStores == 1)
+            #expect(cache.stores == 0)
+            #expect(cache.fetch(tokens: tokens) == nil)
+            #expect(!cache.hasDurableEntry(tokens: tokens))
+            let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+                .filter { $0.hasSuffix(".safetensors") || $0.hasSuffix(".tmp") }
+            #expect(files.isEmpty)
+            // A finite payload for the same boundary then stores and serves normally.
+            let finite = ["kv_0_keys": MLXArray.ones([1, 2, 64, 16], dtype: .bfloat16)]
+            cache.store(tokens: tokens, arrays: finite)
+            #expect(cache.fetch(tokens: tokens) != nil)
+            #expect(cache.waitForPendingWrites(timeout: 10))
+            #expect(cache.hasDurableEntry(tokens: tokens))
+        }
+    }
 }
 

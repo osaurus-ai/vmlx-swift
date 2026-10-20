@@ -31,11 +31,19 @@ func runRowExactBench(modelPath: String) async throws {
         from: modelDir, using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration(nativeMTP: true)
     ).0
-    guard let model = context.model as? any NativeMTPAutoregressiveBackboneModel,
+    guard let model = context.model as? any NativeMTPModel,
         let staged = context.model as? any DFlash2StagedVerifyRollbackModel
     else {
-        print("[ROWEXACT] model lacks native AR / staged verify")
+        print("[ROWEXACT] model lacks native MTP / staged verify")
         return
+    }
+    // Match NativeMTPTokenIterator's AR dispatch: Qwen3.5 uses the ordinary
+    // backbone, while families with a dedicated one-row path opt into it.
+    func autoregressiveForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        if let ar = model as? any NativeMTPAutoregressiveBackboneModel {
+            return ar.nativeAutoregressiveBackboneForward(inputs, cache: cache)
+        }
+        return model.nativeBackboneForward(inputs, cache: cache)
     }
     var input = UserInput(prompt: promptText)
     input.additionalContext = ["enable_thinking": false]
@@ -65,7 +73,7 @@ func runRowExactBench(modelPath: String) async throws {
                 ? NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
                     model.nativeBackboneMTPVerifyForward(input, cache: c)
                 }
-                : model.nativeAutoregressiveBackboneForward(input, cache: c)
+                : autoregressiveForward(input, cache: c)
             // Graph construction ends here (early-submit layers may already be running on the GPU).
             buildSamples[verify ? ids.count : 0, default: []].append(CFAbsoluteTimeGetCurrent() - t0)
             MLX.eval(out.logits)
@@ -103,7 +111,7 @@ func runRowExactBench(modelPath: String) async throws {
         let out =
             env["BENCH_ROWEXACT_AR"] == "plain"
             ? model.nativeBackboneForward(tokenInput, cache: cache)
-            : model.nativeAutoregressiveBackboneForward(tokenInput, cache: cache)
+            : autoregressiveForward(tokenInput, cache: cache)
         let row = out.logits[0, -1].asType(.float32)
         MLX.eval(row)
         arLogits.append(row)
@@ -125,7 +133,7 @@ func runRowExactBench(modelPath: String) async throws {
         }
         var (c1, t0) = prefill()
         let arLayers = capture {
-            let a = model.nativeAutoregressiveBackboneForward(MLXArray([Int32(t0)]).reshaped(1, 1), cache: c1)
+            let a = autoregressiveForward(MLXArray([Int32(t0)]).reshaped(1, 1), cache: c1)
             MLX.eval(a.logits)
         }
         (c1, _) = prefill()
@@ -149,7 +157,7 @@ func runRowExactBench(modelPath: String) async throws {
         Qwen4ExpRowExactCapture.layers = []
         Qwen4ExpRowExactCapture.parts = []
         Qwen4ExpRowExactCapture.enabled = true
-        let a = model.nativeAutoregressiveBackboneForward(
+        let a = autoregressiveForward(
             MLXArray([Int32(t0)]).reshaped(1, 1), cache: c1)
         MLX.eval(a.logits)
         let arLayers = Qwen4ExpRowExactCapture.layers
@@ -196,7 +204,7 @@ func runRowExactBench(modelPath: String) async throws {
         // Layer bisect at position `at`: AR-step 0..<at, copy the cache, then AR step `at` vs verify [t_at, t_at+1].
         var (c0, _) = prefill()
         for i in 0 ..< at {
-            let o = model.nativeAutoregressiveBackboneForward(
+            let o = autoregressiveForward(
                 MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0)
             MLX.eval(o.logits)
         }
@@ -208,7 +216,7 @@ func runRowExactBench(modelPath: String) async throws {
         Qwen4ExpRowExactCapture.layers = []
         Qwen4ExpRowExactCapture.parts = []
         Qwen4ExpRowExactCapture.enabled = true
-        let a = model.nativeAutoregressiveBackboneForward(
+        let a = autoregressiveForward(
             MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: cAR)
         MLX.eval(a.logits)
         let arLayers = Qwen4ExpRowExactCapture.layers
@@ -241,7 +249,7 @@ func runRowExactBench(modelPath: String) async throws {
                 Qwen4ExpRowExactCapture.parts = []
                 Qwen4ExpRowExactCapture.enabled = true
                 MLX.eval(
-                    model.nativeAutoregressiveBackboneForward(
+                    autoregressiveForward(
                         MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c1
                     ).logits)
                 let ap = Qwen4ExpRowExactCapture.parts
@@ -276,20 +284,20 @@ func runRowExactBench(modelPath: String) async throws {
         // parts of the first differing layer.
         var (c0, _) = prefill()
         for i in 0 ..< at {
-            MLX.eval(model.nativeAutoregressiveBackboneForward(
+            MLX.eval(autoregressiveForward(
                 MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0).logits)
         }
         MLX.eval(c0)
         func arSecond(part: Int?) -> ([MLXArray], [(String, MLXArray)]) {
             let c = c0.map { $0.copy() }
             MLX.eval(c)
-            MLX.eval(model.nativeAutoregressiveBackboneForward(
+            MLX.eval(autoregressiveForward(
                 MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c).logits)
             Qwen4ExpRowExactCapture.layers = []
             Qwen4ExpRowExactCapture.parts = []
             Qwen4ExpRowExactCapture.partLayer = part ?? -1
             Qwen4ExpRowExactCapture.enabled = true
-            MLX.eval(model.nativeAutoregressiveBackboneForward(
+            MLX.eval(autoregressiveForward(
                 MLXArray([Int32(stream[at + 1])]).reshaped(1, 1), cache: c).logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)

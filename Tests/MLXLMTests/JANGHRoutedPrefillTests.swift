@@ -177,6 +177,31 @@ final class JANGHRoutedPrefillTests: XCTestCase {
         }
     }
 
+    func testQwenTargetVerificationAtEightRouteThresholdMatchesSerialDecode() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (banks, _) = try fixture(directory, inputRotation: true, outputRotation: true, bits: [2, 3, 3])
+        let layer = try JANGHRoutedExpertLayer(
+            banks: banks, parentModule: parent, inputDimensions: width, activationLimit: nil)
+        for count in [4, 8] {
+            let x = MLXArray((0 ..< count * width).map { Float($0 % 31 - 15) / 128 },
+                             [1, count, width]).asType(.bfloat16)
+            let ids = MLXArray((0 ..< count * routes).map { UInt32(($0 * 7) % experts) },
+                               [1, count, routes])
+            let scores = MLXArray((0 ..< count * routes).map { Float($0 % 11) / 64 }, ids.shape)
+            let actual = RoutedExpertVerificationScope.withVerification(inputShape: [1, count]) {
+                layer.callRouted(x, indices: ids, scores: scores)
+            }
+            let expected = concatenated((0 ..< count).map { row in
+                layer.callRouted(x[0..., row ..< row + 1, 0...],
+                                 indices: ids[0..., row ..< row + 1, 0...],
+                                 scores: scores[0..., row ..< row + 1, 0...])
+            }, axis: 1)
+            XCTAssertEqual(actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                           expected.asType(.float32).asArray(Float.self).map(\.bitPattern))
+        }
+    }
+
     func testFlashVerificationScopeAdmissionAndRestoration() {
         XCTAssertFalse(FlashVerificationScope.usesMappedDecode(inputShape: [1, 7, 64], routes: 10))
         FlashVerificationScope.withVerification(inputShape: [1, 7]) {

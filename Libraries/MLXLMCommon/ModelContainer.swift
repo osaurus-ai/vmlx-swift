@@ -534,7 +534,12 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// The loaded architecture's ``LanguageModel/recommendedPrefillStepSize``,
+    /// readable without entering the container.
+    public let recommendedPrefillStepSize: Int?
+
     public init(context: consuming ModelContext) {
+        self.recommendedPrefillStepSize = context.model.recommendedPrefillStepSize
         let cachePolicies = [
             context.model.cacheStorageDTypeIdentity,
             JangHadamardAttention.cacheKeyComponent(model: context.model),

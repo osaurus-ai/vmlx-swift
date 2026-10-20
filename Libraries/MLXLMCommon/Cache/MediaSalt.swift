@@ -275,9 +275,26 @@ public func computeCacheSalt(
             : "excluded"
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
-                + "scope=\(scopeDesc) media=\(mediaDesc)\n").utf8))
+                + "scope=\(scopeDesc) media=\(mediaDesc)"
+                + (includingMedia ? mediaComponentTrace(for: input) : "") + "\n").utf8))
     }
     return salt
+}
+
+/// Trace-only description of each media component the salt hashes: shape, dtype, frame grids and a
+/// digest of the values alone, so two salts that differ show whether resolution or pixels changed.
+private func mediaComponentTrace(for input: LMInput) -> String {
+    func describe(_ name: String, _ pixels: MLXArray, _ frames: [THW]?) -> String {
+        var hasher = SHA256()
+        hasher.update(data: pixels.asData(access: .noCopyIfContiguous).data)
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined().prefix(12)
+        let grids = frames.map { $0.map { "\($0.t)x\($0.h)x\($0.w)" }.joined(separator: ",") } ?? "-"
+        return " \(name)=[\(pixels.shape) \(pixels.dtype) grids=\(grids) values=\(digest)]"
+    }
+    var out = ""
+    if let image = input.image { out += describe("image", image.pixels, image.frames) }
+    if let video = input.video { out += describe("video", video.pixels, video.frames) }
+    return out
 }
 
 private func cachePolicySalt(for parameters: GenerateParameters) -> String {

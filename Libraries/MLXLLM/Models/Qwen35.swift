@@ -1714,3 +1714,14 @@ extension Qwen35Model: JangHadamardRuntimeModel {
         }
     }
 }
+
+extension Qwen35Model: PrefixCacheInvariantModel {
+    /// Text-only construction: there is no media, so no media prefix to reuse.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { false }
+
+    /// Same contract and evidence as the VLM construction (`MLXVLM.Qwen35`): a restored
+    /// exact-prefix row holds the KV, conv and F32 GDN state of exactly those tokens, and
+    /// `Qwen35HadamardCacheTests` shows a reopened checkpoint continuing bitwise equal to the
+    /// cold cache. A required-tool selection therefore keeps the ordinary longest-prefix restore.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+}

@@ -50,6 +50,17 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     }
 }
 
+private final class FinishingHybridModel: RecordingHybridModel, @unchecked Sendable {
+    override func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        _ = super.callAsFunction(inputs, cache: cache)
+        let last = inputs.reshaped(-1)[-1].item(Int.self)
+        let target: Int32 = last == 1 ? 2 : 1
+        let vocab = MLXArray(Int32(0)..<Int32(64))
+        return broadcast((vocab .== MLXArray(target)).asType(.float32) * 100,
+            to: [1, inputs.dim(1), 64])
+    }
+}
+
 private final class CancelledHybridModel: RecordingHybridModel, @unchecked Sendable {
     override func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         if prepareCalls == 1 { throw CancellationError() }
@@ -289,7 +300,7 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
             "typed canonical contract must keep the cold head layout unchanged")
     }
 
-    func testHybridStorePublishesOnlyCanonicalStrippedBoundary() throws {
+    func testUnforwardedAnswerPublishesOnlyCanonicalStrippedBoundary() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }
 
@@ -314,7 +325,7 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         let stats = coordinator.snapshotStats().diskStats
         XCTAssertEqual(
             stats?.stores, 1,
-            "hybrid chat must not serialize prompt + stripped + post-answer full snapshots")
+            "An unforwarded generated token must not create a post-answer snapshot")
         let restored = coordinator.fetch(
             tokens: prompt + [77],
             mediaSalt: mediaSalt,
@@ -325,6 +336,103 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         XCTAssertEqual(matched, userTurn.count)
         XCTAssertEqual(remaining, genPromptSuffix + [77])
         XCTAssertEqual(detail, .disk)
+    }
+
+    func testCompletedHybridAnswerResumesWithRecurrentState() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        coordinator.setGenPromptSuffixTokens(genPromptSuffix)
+        let prompt = userTurn + genPromptSuffix
+        let input = LMInput(tokens: MLXArray(prompt.map { Int32($0) }).expandedDimensions(axis: 0))
+        let parameters = GenerateParameters(maxTokens: 8, temperature: 0)
+        let salt = computeCacheSalt(for: input, parameters: parameters)
+        var iterator = try TokenIterator(input: input, model: model,
+            parameters: parameters, cacheCoordinator: coordinator)
+        // Consume actual predictions, allowing the iterator's forward pipeline
+        // to advance the recurrent cache. No synthetic offset repair.
+        var generated: [Int] = []
+        for _ in 0..<4 { generated.append(try XCTUnwrap(iterator.next())) }
+        eval(iterator.cache)
+        let offsets = cacheBoundaryLeafOffsets(iterator.cache)
+        let boundary = try XCTUnwrap(offsets.max())
+        let liveState = try XCTUnwrap((iterator.cache.first as? MambaCache)?.state.first)
+            .asArray(Float.self)
+        iterator.storeCacheAfterGeneration(generatedTokenIds: generated, includeGeneratedBoundary: true)
+        // The recorder predicts zero; the drained token, if forwarded, is also
+        // zero. Query with one additional token to require a partial SSD hit.
+        let completed = prompt + Array(repeating: 0, count: boundary - prompt.count)
+        let nextPrompt = completed + [31]
+        let hit = coordinator.fetch(tokens: nextPrompt, mediaSalt: salt, skipExactDiskBoundary: true)
+        guard case .hit(let matched, let remaining, let detail, _, _, let arrays) = hit else {
+            return XCTFail("completed hybrid answer was not persisted")
+        }
+        XCTAssertEqual(matched, boundary)
+        XCTAssertEqual(remaining, [31])
+        XCTAssertEqual(detail, .disk)
+        let layers = TQDiskSerializer.deserialize(try XCTUnwrap(arrays))
+        guard case .mamba(let recurrent) = layers.first else {
+            return XCTFail("SSD restore lost the recurrent companion")
+        }
+        XCTAssertEqual(recurrent.offset, boundary)
+        XCTAssertEqual(recurrent.state0.dtype, .float32)
+        XCTAssertEqual(recurrent.state0.asArray(Float.self), liveState,
+            "SSD restore must retain the exact recurrent companion")
+        let changedHistory = prompt + [9, 0, 0, 0, 31]
+        let mismatch = coordinator.fetch(tokens: changedHistory, mediaSalt: salt, skipExactDiskBoundary: true)
+        guard case .hit(let fallback, _, _, _, _, _) = mismatch else {
+            return XCTFail("canonical fallback must survive a rewritten answer")
+        }
+        XCTAssertEqual(fallback, userTurn.count)
+    }
+
+    func testBatchCompletedHybridAnswerIsStoredWithoutAnswerReplay() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("batch-hybrid-answer-\(UUID().uuidString)")
+        tempDirs.append(directory)
+        let suffix = genPromptSuffix
+        let prompt = userTurn + suffix
+        try await MLXMetalTestLock.withLock {
+            let model = FinishingHybridModel()
+            let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+                modelKey: "batch-hybrid-answer"))
+            coordinator.setHybrid(true)
+            coordinator.setGenPromptSuffixTokens(suffix)
+            let processor = TestInputProcessor()
+            var configuration = processor.configuration
+            configuration.eosTokenIds = [2]
+            let context = ModelContext(configuration: configuration, model: model,
+                processor: processor, tokenizer: processor.tokenizer)
+            let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
+            let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)))
+            let parameters = GenerateParameters(maxTokens: 8, temperature: 0)
+            let salt = computeCacheSalt(for: input, parameters: parameters)
+            let (_, stream) = await engine.submit(input: input, parameters: parameters)
+            var emitted: [Int] = []
+            var completion: GenerateCompletionInfo?
+            for await event in stream {
+                if case .token(let token) = event { emitted.append(token) }
+                if case .info(let info) = event { completion = info }
+            }
+            await engine.shutdown()
+            XCTAssertEqual(emitted, [1])
+            XCTAssertEqual(completion?.stopReason, .stop)
+            XCTAssertNil(completion?.generationFailure)
+            let key = prompt + emitted
+            let arrays = try XCTUnwrap(coordinator.diskCache?.fetch(tokens: key,
+                mediaSalt: salt))
+            var restored = model.newCache(parameters: parameters)
+            XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), key.count)
+            let expected = Float(key.reduce(0, +))
+            XCTAssertEqual(restored[0].state[0].asArray(Float.self), [expected, Float(key.count)])
+            // The scheduler's existing stripped-prompt fallback replays the
+            // user prefix. The added post-answer store must not replay the
+            // generated suffix or the full completed answer as well.
+            XCTAssertEqual(model.forwarded, key + Array(prompt.dropLast(suffix.count)),
+                "Completed-answer persistence must not add an answer replay")
+        }
     }
 
     func testHybridStableBoundaryPublishesWarmupSafeSeed() throws {

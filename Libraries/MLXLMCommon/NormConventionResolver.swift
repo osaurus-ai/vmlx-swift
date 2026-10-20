@@ -19,6 +19,11 @@ public enum NormConventionResolver {
     /// Accepted markers for the "(1 + weight)" RMSNorm convention.
     public static func usesPlusOne(_ value: String?) -> Bool {
         switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        // Raw Qwen storage, including AWQ-folded `(1+w)/scale - 1`.
+        // Keep this distinct from historical converter markers whose names
+        // describe the architecture rather than the stored tensor state.
+        case "qwen3_5_raw_weight":
+            return true
         case "qwen3_5_language_mlx_plus_one", "qwen35_language_mlx_plus_one", "mlx_plus_one":
             return true
         default:

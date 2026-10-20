@@ -1590,13 +1590,13 @@ public final class LLMModelFactory: ModelFactory {
             throw ModelFactoryError.unsupportedModelType("glm5_next")
         }
         if let route = try? JSONDecoder.json5().decode(FactoryRoutingConfiguration.self, from: configData),
-            route.model_type == "qwen4_exp",
+            (route.model_type == "qwen4_exp" || route.model_type == "qwen3_5_moe"),
             JANGHModelPreparation.declaresCustomFormat(configuration: configData, sidecar: nil)
         {
-            // qwen4_exp JANGH bundles are admitted by the VLM factory (Qwen4ExpJANGHPreparation).
+            // Qwen routed JANGH bundles are admitted by the VLM factory, including text-only requests.
             // Without this, the LLM factory's strict quantization decode rejects `mode: jangtq2`
             // and that unrelated error wins the factory fallback.
-            throw ModelFactoryError.unsupportedModelType("qwen4_exp")
+            throw ModelFactoryError.unsupportedModelType(route.model_type ?? "")
         }
         let k2JANGHPreparation = try K2HorizonJANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)

@@ -96,7 +96,7 @@ struct JANGHConfigurationPartition: Sendable {
                         throw Failure.invalid("invalid LFM routed summary")
                     }
                 }
-            } else if modelType == "qwen3_5" || modelType == "minicpmv4_7", let authoritative = header {
+            } else if modelType == "qwen3_5" || modelType == "minicpmv4_7" || modelType == "qwen3_5_moe", let authoritative = header {
                 // This converter's sidecar carries chat/runtime metadata and a
                 // scalar summary, not another per-module quantization owner.
                 let version = other["format_version"]
@@ -113,18 +113,36 @@ struct JANGHConfigurationPartition: Sendable {
                     throw Failure.invalid("sidecar quantization ownership is not supported")
                 }
                 if let summary = try Self.optionalObject(other, "quantization") {
-                    // `method` / `layout` are descriptive strings (MiniCPM-V 4.7), never a per-module plan.
-                    guard
-                        Set(summary.keys).isSubset(of: [
-                            "bits", "group_size", "bit_widths_used", "method", "layout",
-                        ]),
-                        summary["bits"] is Int, summary["group_size"] is Int,
-                        summary["bit_widths_used"] is [Int],
-                        summary["method"] == nil || summary["method"] is String,
-                        summary["layout"] == nil || summary["layout"] is String
-                    else {
-                        throw Failure.invalid(
-                            "dense Qwen sidecar quantization must be summary metadata")
+                    if modelType == "qwen3_5_moe" {
+                        // Ornith's sidecar is calibration provenance, not an
+                        // executable plan. The config header/plan above remains
+                        // authoritative; reject module names and plan-like keys.
+                        let fields: Set<String> = [
+                            "method", "profile", "actual_bits", "block_size", "calibrated",
+                            "imatrix", "gptq", "awq_layers", "calibration_method",
+                            "quantization_method", "bit_widths_used", "quantization_scheme",
+                            "quantization_backend", "experts_gptq_vs_rtn", "awq", "layout",
+                            "experts_jangh_units",
+                        ]
+                        guard Set(summary.keys).isSubset(of: fields),
+                            summary["method"] as? String == "jang-gptq",
+                            summary["block_size"] is Int,
+                            summary["bit_widths_used"] is [Int]
+                        else { throw Failure.invalid("Qwen MoE sidecar must be calibration metadata") }
+                    } else {
+                        // `method` / `layout` are descriptive strings (MiniCPM-V 4.7), never a per-module plan.
+                        guard
+                            Set(summary.keys).isSubset(of: [
+                                "bits", "group_size", "bit_widths_used", "method", "layout",
+                            ]),
+                            summary["bits"] is Int, summary["group_size"] is Int,
+                            summary["bit_widths_used"] is [Int],
+                            summary["method"] == nil || summary["method"] is String,
+                            summary["layout"] == nil || summary["layout"] is String
+                        else {
+                            throw Failure.invalid(
+                                "dense Qwen sidecar quantization must be summary metadata")
+                        }
                     }
                 }
             } else {
@@ -195,7 +213,8 @@ struct JANGHConfigurationPartition: Sendable {
             }
             // MiniCPM-V 4.7 (Qwen3.5-MoE text under a VLM wrapper) keeps its routed banks at
             // `language_model.model.layers.L.mlp.switch_mlp.*`; admitted for that model type only.
-            if modelType == "minicpmv4_7", components.first == "language_model" {
+            if (modelType == "minicpmv4_7" || modelType == "qwen3_5_moe"),
+                components.first == "language_model" {
                 components.removeFirst()
             }
             guard components.count == 6, components[0] == "model",

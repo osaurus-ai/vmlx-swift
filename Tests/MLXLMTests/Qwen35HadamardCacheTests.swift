@@ -368,9 +368,12 @@ struct Qwen35HadamardCacheTests {
                 #expect(accepted?.detail == "disk")
                 #expect(warmCache.allSatisfy { $0.offset == nextPrompt.count })
 
-                // An existing eligible record must NOT override the explicit
-                // required-tool fresh-selection gate. Observe actual iterator
-                // prefill stages and fetch telemetry, not a source keyword.
+                // Qwen 3.5 declares its exact-prefix restore suffix-independent
+                // (the reopened checkpoint above continues bitwise equal to the
+                // cold cache), so a required-tool selection keeps the ordinary
+                // longest-prefix restore instead of re-prefilling the history,
+                // and lands in exactly the state the ordinary warm turn reached.
+                // Observe actual iterator prefill stages and fetch telemetry.
                 let progress = OSAllocatedUnfairLock(initialState: [PrefillProgress]())
                 let hitsBefore = reader.snapshotStats().diskStats?.hits
                 let requiredCache = model.newCache(parameters: parameters)
@@ -381,10 +384,12 @@ struct Qwen35HadamardCacheTests {
                     prefillProgressHandler: { event in progress.withLock { $0.append(event) } })
                 withExtendedLifetime(required) { MLX.eval(requiredCache) }
                 let observed = progress.withLock { $0 }
-                #expect(!observed.contains { $0.stage == .cacheRestore })
-                #expect(observed.first(where: { $0.stage == .prefill })?.completedUnitCount == 0)
+                let requiredRestore = observed.first { $0.stage == .cacheRestore }
+                #expect(requiredRestore?.completedUnitCount == Self.canonical.count)
+                #expect(requiredRestore?.detail == "disk")
                 #expect(requiredCache.allSatisfy { $0.offset == nextPrompt.count })
-                #expect(reader.snapshotStats().diskStats?.hits == hitsBefore)
+                #expect(reader.snapshotStats().diskStats?.hits == hitsBefore.map { $0 + 1 })
+                try Self.assertCacheEqual(requiredCache, warmCache)
 
                 var logits: [Float] = []
                 for token in Self.continuation {

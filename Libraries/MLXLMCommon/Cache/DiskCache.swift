@@ -610,6 +610,27 @@ public final class DiskCache: @unchecked Sendable {
             self.rowKind = rowKind
         }
 
+        /// Host-side NaN/Inf screen of `tensors` (``SafetensorsByteWriter/nonFiniteTensorNames(_:)``),
+        /// started at enqueue on a concurrent queue so it overlaps the writer's queue wait. Nothing
+        /// that needs the payload's verdict proceeds without it: the writer and an in-flight fetch
+        /// both call ``awaitScreen()``. The screen takes no lock, so waiting under one is safe.
+        private let screenDone = DispatchGroup()
+        private var screenResult: [String] = []
+
+        func startScreen() {
+            screenDone.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                screenResult = SafetensorsByteWriter.nonFiniteTensorNames(tensors)
+                screenDone.leave()
+            }
+        }
+
+        /// Names of non-finite tensors (empty when the payload is clean). Blocks until the screen ends.
+        func awaitScreen() -> [String] {
+            screenDone.wait()
+            return screenResult
+        }
+
         /// What `hasValidatedEntry`/`hasDurableEntry` answer for it: the payload passed the store's
         /// non-finite check and is materialized; it is on its way to disk, so it never needs producing
         /// again (asking otherwise would rederive a boundary that is being written).
@@ -760,7 +781,18 @@ public final class DiskCache: @unchecked Sendable {
         if let delay = writeDelayForTesting { Thread.sleep(forTimeInterval: delay) }
         let start = Date()
         var outcome = "stored"
-        do {
+        let nonFinite = entry.awaitScreen()
+        if !nonFinite.isEmpty {
+            outcome = "refused-non-finite"
+            lock.lock()
+            entry.invalidated = true
+            refusedNonFiniteStores += 1
+            stores -= 1
+            lock.unlock()
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+        } else { do {
             let tmp = temporaryURLForTesting?(finalURL) ?? Self.temporaryURL(for: finalURL)
             switch Self.removeRegularFile(at: tmp) {
             case .removed, .missing: break
@@ -824,7 +856,7 @@ public final class DiskCache: @unchecked Sendable {
             outcome = "failed"
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/disk] write-behind store failed for hash \(hash): \(error)\n".utf8))
-        }
+        } }
         let end = Date()
         lock.lock()
         let finalizedChainId = entry.chainId
@@ -1315,21 +1347,6 @@ public final class DiskCache: @unchecked Sendable {
             return
         }
         trace.mark("before-validation")
-        let nonFinite = Self.nonFiniteTensorNames(in: arrays)
-        trace.mark("validation")
-        if !nonFinite.isEmpty {
-            refusedNonFiniteStores += 1
-            FileHandle.standardError.write(Data(
-                ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
-                    + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
-            return
-        }
-        stores += 1
-        // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
-        if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
-            return
-        }
-        trace.mark("reuse-and-path-check")
         // Pre-realize arrays under the lock so Metal work completes
         // before the writer hits the C++ save path AND no other thread
         // can interleave MLX ops on the same device during this window.
@@ -1347,7 +1364,31 @@ public final class DiskCache: @unchecked Sendable {
         synchronizeComputeStream()
         let tEval = Date()
         trace.mark("materialize")
-        if behind, let tensors = SafetensorsByteWriter.tensors(from: arrays) {
+        // A write-behind store screens its payload for NaN/Inf on the host, off this
+        // synchronous path (`InflightWrite.screen`): the writer refuses a non-finite payload
+        // before any byte reaches disk, and an in-flight fetch waits for the verdict, so nothing
+        // non-finite is published or restored either way. The GPU screen here cost 417 ms at a
+        // 130k-token Ornith 122B checkpoint (3.36 GB), on every turn's end and before every tool
+        // call. Synchronous stores keep it.
+        let behindTensors = behind ? SafetensorsByteWriter.tensors(from: arrays) : nil
+        if behindTensors == nil {
+            let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+            trace.mark("validation")
+            if !nonFinite.isEmpty {
+                refusedNonFiniteStores += 1
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/disk-store] REFUSED non-finite payload count=\(tokenCount) "
+                        + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") tensors=\(nonFinite)\n").utf8))
+                return
+            }
+        }
+        stores += 1
+        // Refuse before the expensive part: see `_refuseOccupiedStoreLocked`.
+        if _refuseOccupiedStoreLocked(finalURL: url, hash: hash, tokenCount: tokenCount) {
+            return
+        }
+        trace.mark("reuse-and-path-check")
+        if behind, let tensors = behindTensors {
             let bytes = tensors.reduce(0) { $0 + $1.byteCount }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 // Payload shape of the handoff: strided = non-contiguous views written in place.
@@ -1367,6 +1408,7 @@ public final class DiskCache: @unchecked Sendable {
             let entry = InflightWrite(
                 arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry,
                 chainId: chainId, rowKind: rowKind)
+            entry.startScreen()
             inflight[hash] = entry
             inflightBytes += bytes
             inflightStoreCount += 1
@@ -1653,7 +1695,9 @@ public final class DiskCache: @unchecked Sendable {
     ) -> [String: MLXArray]? {
         // Still being written: serve the payload the store validated and materialized. Same
         // content-addressed bytes the file will hold; no wait, no disk read.
-        if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count {
+        if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count,
+            entry.awaitScreen().isEmpty
+        {
             inflightFetches += 1
             if countHit { hits += 1 }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
