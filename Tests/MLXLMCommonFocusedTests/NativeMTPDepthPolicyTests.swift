@@ -69,11 +69,27 @@ final class NativeMTPDepthPolicyTests: XCTestCase {
             .resolve(requestedDepth: 3, runtimeCap: 5))
     }
 
-    func testParametersDefaultToFixedAndCopiesPreserveExplicitPolicy() {
+    /// Adaptive is the default; `.fixed` is an explicit choice. A `.fixed` default made any resolved
+    /// depth (bundle `recommended_num_drafts`, tuning sidecar, family default) a hard ceiling — the vmlx
+    /// Python bug of 2026-10-20 that capped Ornith 1.5 122B's Adaptive at its stamped D1.
+    func testParametersDefaultToAdaptiveAndCopiesPreserveExplicitPolicy() {
         var parameters = GenerateParameters()
-        XCTAssertEqual(parameters.nativeMTPDepthPolicy, .fixed)
-        parameters.nativeMTPDepthPolicy = .adaptive(maximumDepth: 3)
+        XCTAssertEqual(
+            parameters.nativeMTPDepthPolicy,
+            .adaptive(maximumDepth: GenerateParameters.defaultAdaptiveDepthCeiling))
+        parameters.nativeMTPDepthPolicy = .fixed
         let copy = parameters
-        XCTAssertEqual(copy.nativeMTPDepthPolicy, .adaptive(maximumDepth: 3))
+        XCTAssertEqual(copy.nativeMTPDepthPolicy, .fixed)
+    }
+
+    /// A stamped / sidecar / family-default depth only sets where the default policy STARTS.
+    func testResolvedDepthIsAStartNotACeilingByDefault() throws {
+        for stamped in [1, 2, 3] {
+            let resolution = try GenerateParameters().nativeMTPDepthPolicy.resolve(
+                requestedDepth: stamped, runtimeCap: 5)
+            XCTAssertEqual(resolution.initialDepth, stamped)
+            XCTAssertEqual(resolution.maximumDepth, GenerateParameters.defaultAdaptiveDepthCeiling)
+        }
+        XCTAssertGreaterThanOrEqual(GenerateParameters.defaultAdaptiveDepthCeiling, 3)
     }
 }

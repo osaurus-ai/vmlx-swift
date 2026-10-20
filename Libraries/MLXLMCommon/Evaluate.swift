@@ -279,9 +279,18 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
-    /// Fixed native-MTP depth is a ceiling; adaptive exploration must be
-    /// requested explicitly. Either policy may descend to shallower work or AR.
-    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .fixed
+    /// Native-MTP depth policy. ADAPTIVE BY DEFAULT: the requested depth (a bundle's
+    /// `recommended_num_drafts` / tuning sidecar / family default) is only where a request STARTS; the
+    /// request may climb to `defaultAdaptiveDepthCeiling` and steps down (or to AR) when a deeper depth
+    /// loses. `.fixed` turns the requested depth into a hard ceiling and is an explicit choice only (the
+    /// app's manual depth button, RunBench manual-depth runs). A `.fixed` default here was the vmlx
+    /// Python bug class of 2026-10-20 (Ornith's stamped D1 capped Adaptive at D1); never make a
+    /// resolved depth a ceiling implicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .adaptive(
+        maximumDepth: GenerateParameters.defaultAdaptiveDepthCeiling)
+
+    /// The adaptive ceiling every request gets unless it sets its own (matches the app's On (Adaptive)).
+    public static let defaultAdaptiveDepthCeiling = 5
 
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
