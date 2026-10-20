@@ -1976,6 +1976,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Gemma3n, Gemma4 SWA layers, Mistral4 with maxKVSize, MiMoV2Flash,
         // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
         // persistence + paged restore on cache hit.
+        MemoryStageTrace.log("request-start", tokens: promptTokenIds.count)
         var cacheLookupTokenIds = promptTokenIds
         var cacheLookupUsesPostPrepareAlias = false
         if input.requiresPostPrepareCacheKey,

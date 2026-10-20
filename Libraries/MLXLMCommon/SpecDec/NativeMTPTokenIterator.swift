@@ -717,6 +717,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.setPagedIncompatible(true)
         }
 
+        MemoryStageTrace.log("request-start", tokens: promptTokenIds.count, detail: "native-mtp")
         prefillProgressHandler?(PrefillProgress(
             stage: .cacheLookup, completedUnitCount: 0,
             totalUnitCount: promptTokenIds.count, detail: "native-mtp"))
@@ -947,7 +948,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 prefillProgressHandler: prefillProgressHandler)
         }
         self.promptPrefillTime = NativeMTPClock.now() - start
+        MemoryStageTrace.log("prefill-complete", tokens: promptTokenIds.count, detail: "native-mtp")
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        MemoryStageTrace.log(
+            "prompt-snapshot", tokens: promptTokenIds.count,
+            detail: promptCacheSnapshot == nil ? "native-mtp none" : "native-mtp retained")
 
         let firstToken: MLXArray
         switch prepared {
@@ -1136,6 +1141,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        MemoryStageTrace.log(
+            "decode-end", tokens: promptTokenIds.count + generatedTokenIds.count, detail: "native-mtp")
+        defer {
+            MemoryStageTrace.log(
+                "stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
+                detail: "native-mtp")
+        }
         // A paused-AR lookahead past the last emitted token wrote one extra row; finish it so no snapshot races
         // its pending graph. The post-answer store below trims that row or skips (offset != tokens).
         if let lookahead = arLookahead {

@@ -878,6 +878,7 @@ public final class DiskCache: @unchecked Sendable {
                     + "outcome=\(outcome) queuedMs=\(Int(start.timeIntervalSince(enqueued) * 1000)) "
                     + "writeMs=\(Int(end.timeIntervalSince(start) * 1000))\n").utf8))
         }
+        MemoryStageTrace.log("write-settled", tokens: tokenCount, detail: "payload-held-by-writer")
         return finalizedChainId
     }
 
