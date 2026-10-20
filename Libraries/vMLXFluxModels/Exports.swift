@@ -15,6 +15,7 @@ public enum VMLXFluxModels {
         _ = Flux1Dev._register
         _ = Flux1Kontext._register
         _ = Flux1Fill._register
+        _ = Flux3Klein._register
         _ = Flux2Klein._register
         _ = Flux2KleinEdit._register
         _ = ZImage._register
