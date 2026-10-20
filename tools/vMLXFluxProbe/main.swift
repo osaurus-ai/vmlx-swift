@@ -14,6 +14,10 @@ struct VMLXFluxProbe {
                 try await runImageMemoryCheck(Array(CommandLine.arguments.dropFirst(2)), estimateOnly: command == "memory-estimate")
                 return
             }
+            if CommandLine.arguments.dropFirst().first == "flux3-check" {
+                try await runFlux3Check(Array(CommandLine.arguments.dropFirst(2)))
+                return
+            }
             if CommandLine.arguments.dropFirst().first == "sampling-check" {
                 try await runSamplingCheck(Array(CommandLine.arguments.dropFirst(2)))
                 return

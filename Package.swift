@@ -1037,7 +1037,8 @@ let package = Package(
         .testTarget(
             name: "vMLXFluxTests",
             dependencies: ["vMLXFlux", "vMLXFluxKit", "vMLXFluxModels", "vMLXFluxVideo", "vMLXSeedVR2"],
-            path: "Tests/vMLXFluxTests"
+            path: "Tests/vMLXFluxTests",
+            resources: [.copy("Resources")]
         ),
 
         // ------

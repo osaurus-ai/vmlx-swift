@@ -1,0 +1,66 @@
+{
+  "architectures": [
+    "Qwen3VLTextModel"
+  ],
+  "model_type": "qwen3_vl_text",
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "dtype": "bfloat16",
+    "eos_token_id": 151645,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 2560,
+    "initializer_range": 0.02,
+    "intermediate_size": 9728,
+    "max_position_embeddings": 262144,
+    "model_type": "qwen3_vl_text",
+    "num_attention_heads": 32,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": {
+      "mrope_interleaved": true,
+      "mrope_section": [
+        24,
+        20,
+        20
+      ],
+      "rope_type": "default"
+    },
+    "rope_theta": 5000000,
+    "tie_word_embeddings": true,
+    "use_cache": true,
+    "vocab_size": 151936
+  },
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 151643,
+  "dtype": "bfloat16",
+  "eos_token_id": 151645,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 2560,
+  "initializer_range": 0.02,
+  "intermediate_size": 9728,
+  "max_position_embeddings": 262144,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 32,
+  "num_key_value_heads": 8,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": {
+    "mrope_interleaved": true,
+    "mrope_section": [
+      24,
+      20,
+      20
+    ],
+    "rope_type": "default"
+  },
+  "rope_theta": 5000000,
+  "tie_word_embeddings": true,
+  "use_cache": true,
+  "vocab_size": 151936,
+  "note": "Truncated FLUX 3 text encoder: Qwen3-VL-4B language layers 0-31, no vision tower, no lm_head (features read from layers 4..32)."
+}
