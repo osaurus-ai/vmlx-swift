@@ -1165,7 +1165,7 @@ public enum NativeMTPAutoDecodePolicy {
                 depth: familyColdStartDepth,
                 verifierMode: nil,
                 reason:
-                    "Measured family cold-start depth \(familyColdStartDepth) (\(Self.isOrnith122BTopology(config) ? "Ornith 1.5 122B" : "Qwen3.8 Flash-Next")); live acceptance may adapt downward.",
+                    "Measured family cold-start depth \(familyColdStartDepth) (Qwen3.8 Flash-Next); live acceptance may adapt downward.",
                 evidence: evidence + [
                     "activation=qwen4_exp_measured_family_cold_start",
                     "family_cold_start_depth=\(familyColdStartDepth)",
@@ -1265,30 +1265,11 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> Int? {
         let types = modelTypes(config: config, fallback: fallback)
         if types.contains(where: isQwen4ExpModelType) { return 3 }
-        // Ornith 1.5 122B (Qwen 3.5 MoE, 48 layers x 3072, 256 experts / top-8, one native MTP layer):
-        // its verify rows are bitwise the AR step (row-exact verify, 2026-10-20), so greedy MTP output
-        // equals AR, and depth 1 measured faster than AR on code and prose. Keyed from model_type plus
-        // topology (never a path or name); a bundle's explicit tuning block still wins, and the request's
-        // adaptive controller still falls back to AR on a workload that does not accept drafts.
-        if isOrnith122BTopology(config) { return ornith122BColdStartDepth }
         // Nemotron's row-exact verifier and LiLiCorr proposer still need an
         // in-app speedup measurement. Physical head presence establishes
         // capability, not profitability. Keep Auto tuning-file driven;
         // explicit manual depths remain available for measurement.
         return nil
-    }
-
-    static let ornith122BColdStartDepth = 1
-
-    static func isOrnith122BTopology(_ config: [String: Any]?) -> Bool {
-        guard let config else { return false }
-        let text = (config["text_config"] as? [String: Any]) ?? config
-        func int(_ key: String) -> Int? { (text[key] as? NSNumber)?.intValue }
-        let modelType = normalize((text["model_type"] as? String) ?? "")
-        return (modelType == "qwen3_5_moe_text" || modelType == "qwen3_5_moe")
-            && int("hidden_size") == 3072 && int("num_hidden_layers") == 48
-            && int("num_experts") == 256 && int("num_experts_per_tok") == 8
-            && (int("mtp_num_hidden_layers") ?? 0) >= 1
     }
 
     private static func isQwen4ExpModelType(_ value: String) -> Bool {
