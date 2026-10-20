@@ -293,7 +293,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private struct PendingVerify {
         let verifier: NativeMTPForwardResult
         let requested: [MLXArray]
-        let requestedInputIds: [Int32]
+        /// The requested ids as one lazy int32 array; read back at consume.
+        let requestedInputArray: MLXArray
         let depth: Int
         let checkpoint: NativeMTPCacheCheckpoint
         /// Signalled when the background `asyncEval` has finished SCHEDULING
@@ -498,7 +499,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var arSafetyPaused = false
     /// Live AR step cost at the CURRENT context, EMA over paused steps.
     private var arSafetyLiveStepSec: TimeInterval?
+    /// Wall clock at the end of the previous AR step when the step before this one was also AR, so a
+    /// paused stretch is costed per emitted token INCLUDING the consumer's time between `next()` calls,
+    /// the same yardstick as the MTP windows (wall per emitted token). See `generateAutoregressiveToken`.
+    private var lastARStepWallEnd: TimeInterval?
     private var arSafetyTokensSincePause = 0
+    /// Wall time and tokens of the current paused AR stretch (see `arSafetyAfterARStep`).
+    private var arSafetyStretchWall: TimeInterval = 0
+    private var arSafetyStretchTokens = 0
     private var arSafetyResumeInterval = NativeMTPTokenIterator.arSafetyResumeIntervalStart
     private var arSafetyProbeCyclesRemaining = 0
     private var arSafetyProbeStartedAt: TimeInterval?
@@ -1831,6 +1839,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func verifyCycle() throws {
+        lastARStepWallEnd = nil
         guard let primary = nextMain, !drafts.isEmpty else {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
@@ -1908,7 +1917,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let requestedInputIds: [Int32]
         if let consumedPrefetch {
             requested = consumedPrefetch.requested
-            requestedInputIds = consumedPrefetch.requestedInputIds
+            requestedInputIds = recordMaterializeSync {
+                consumedPrefetch.requestedInputArray.asArray(Int32.self)
+            }
         } else {
             requested = [primary] + drafts
             // ONE batched materialization for every id this cycle needs. The old
@@ -2413,10 +2424,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         let requested = [primary] + drafts
-        let requestedInputIds = recordMaterializeSync {
-            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
-        }
-        let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
+        // Lazy ids: the verify graph is built on the drafts' arrays instead of their host values,
+        // so building it overlaps the draft forward on the GPU instead of waiting for it (a host
+        // drain per cycle). The ids are read back once, at consume, after the verify was scheduled.
+        let requestedArray = stacked(requested.map { $0.reshaped(-1).asType(.int32) })
+        let input = requestedArray.reshaped(1, requested.count)
         let checkpointStart = NativeMTPClock.now()
         let checkpoint = NativeMTPCacheCheckpoint(cache)
         cacheSnapshotRestoreTime += NativeMTPClock.now() - checkpointStart
@@ -2460,7 +2472,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         pendingVerify = PendingVerify(
             verifier: verifier,
             requested: requested,
-            requestedInputIds: requestedInputIds,
+            requestedInputArray: requestedArray,
             depth: currentDepth,
             checkpoint: checkpoint,
             scheduled: scheduled)
@@ -2758,6 +2770,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetyResumeInterval * 2, Self.arSafetyResumeIntervalMax)
         }
         arSafetyTokensSincePause = 0
+        arSafetyStretchWall = 0
+        arSafetyStretchTokens = 0
         arSafetyCalibrationRemaining = loss ? 0 : 2
         // A calibration is a measurement, not a verdict: remember the winning depth and resume it.
         arSafetyCalibrationResumeDepth = loss ? nil : currentDepth
@@ -2797,7 +2811,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
         guard arSafetyPaused else { return }
-        arSafetyLiveStepSec = arSafetyLiveStepSec.map { 0.7 * $0 + 0.3 * stepSec } ?? stepSec
+        // Live AR cost = the paused stretch's wall time per emitted token. Per-step samples are not
+        // comparable with each other under the one-token lookahead: the stretch's first step waits for
+        // two steps' work (~46 ms on Ornith 122B) and the last one before a resume probe has no lookahead
+        // and only reads back work the previous step already ran (~2.7 ms). An EMA of those samples ended
+        // every stretch on the cheap one, read AR at ~17 ms against a real ~23.6 ms/token, and paused MTP
+        // that won the reply overall (Ornith 122B sampled: MTP 44.5 vs AR 42.3 tok/s while every probe
+        // was scored a loss). The stretch total is exact wherever in it the work is waited on.
+        arSafetyStretchWall += stepSec
+        arSafetyStretchTokens += 1
+        if arSafetyStretchTokens >= 2 {
+            arSafetyLiveStepSec = arSafetyStretchWall / Double(arSafetyStretchTokens)
+        } else if arSafetyLiveStepSec == nil {
+            arSafetyLiveStepSec = stepSec
+        }
         arSafetyLastMeasuredToken = tokenCount
         arSafetyTokensSincePause += 1
         if arSafetyCalibrationRemaining > 0 {
@@ -3300,8 +3327,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         drafts.removeAll(keepingCapacity: true)
         draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
+        // Cost the AR token like an MTP window: wall clock per emitted token, consumer included. The
+        // in-step time alone excludes the consumer's per-token work (detokenize / stream / UI, ~5 ms a
+        // token in Osaurus) and, with the lookahead, most of the GPU time that overlaps it, so it read
+        // ~20 % cheaper than AR really is and the governor paused MTP that was winning (Ornith 122B, app
+        // sampling: MTP 43.0 vs AR 39.4 tok/s over the whole reply while the governor reported MTP losing).
+        // The first AR step after a verify cycle has no AR predecessor and keeps the in-step time.
+        let stepEnd = NativeMTPClock.now()
+        let stepSec = lastARStepWallEnd.map { stepEnd - $0 } ?? (stepEnd - verifyStart)
+        lastARStepWallEnd = stepEnd
         arSafetyAfterARStep(
-            stepSec: NativeMTPClock.now() - verifyStart,
+            stepSec: stepSec,
             hidden: Self.lastHidden(output.hiddenStates),
             nextToken: token)
     }
