@@ -72,10 +72,13 @@ struct Qwen35RowExactVerifyTests {
         return model
     }
 
-    @Test("verify rows equal AR steps bitwise", arguments: [2, 3, 4])
-    func verifyMatchesAutoregressive(width: Int) throws {
+    /// (width, prompt tokens). 1,023 prompt tokens make a 2-row verify straddle MLX's 1,024-key vector
+    /// SDPA block-class step (row 0 decodes at 1,024 keys, row 1 at 1,025).
+    @Test("verify rows equal AR steps bitwise",
+        arguments: [(2, 40), (3, 40), (4, 40), (2, 1023), (3, 1022)])
+    func verifyMatchesAutoregressive(width: Int, promptTokens: Int) throws {
         let model = try model()
-        let prompt = MLXArray((0 ..< 40).map { Int32(($0 * 37 + 11) % 500) }).reshaped(1, -1)
+        let prompt = MLXArray((0 ..< promptTokens).map { Int32(($0 * 37 + 11) % 500) }).reshaped(1, -1)
         let tokens = (0 ..< width).map { Int32(($0 * 53 + 3) % 500) }
 
         let base = model.newCache(parameters: GenerateParameters())

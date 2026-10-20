@@ -1789,6 +1789,18 @@ enum Qwen35Language {
             super.init()
         }
 
+        /// MLX's vector SDPA (`sdpa_vector_2pass`, scaled_dot_product_attention.cpp) picks its key-block
+        /// count from the key count; on 's'-class GPUs (M5 Max) with 16 query heads: 64 up to 1,024 keys,
+        /// 128 up to 8,192, 256 up to 32,768, 512 up to 65,536, 1,024 above. A 2-row verify call is one
+        /// launch at the second row's key count, so when the first row's own decode step had fewer keys
+        /// across one of those steps it reduced in a different block split and the pair is not row-exact
+        /// (vmlx Python 201ac128 found the same pitfall). Conservative on other GPU classes: any of
+        /// these thresholds counts.
+        static func vectorSDPAKeyClassChanges(lastRowKeys: Int) -> Bool {
+            let thresholds = [1024, 8192, 16384, 32768, 65536]
+            return thresholds.contains(lastRowKeys - 1)
+        }
+
         func callAsFunction(
             _ x: MLXArray,
             mask: MLXArray?,
@@ -1889,14 +1901,17 @@ enum Qwen35Language {
 
             let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             let attended: MLXArray
-            if B == 1, (3...8).contains(L), !hadamard, let simple = cache,
+            if B == 1, (2...8).contains(L), !hadamard, let simple = cache,
                 type(of: simple) == KVCacheSimple.self,
-                FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn")
+                FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
+                L >= 3 || Self.vectorSDPAKeyClassChanges(lastRowKeys: simple.offset + L)
             {
                 // Verify rows 3...8: one single-query attention per row over exactly the keys its AR step
                 // saw. With 16 query heads per KV head, `rows x 16 > 32` leaves MLX's vector kernel for the
                 // full SDPA kernel, so every row of a 3+-row verify differed from AR (Ornith 122B 4M, W=3
-                // row 0). Two rows stay on the vector kernel and are already row-exact.
+                // row 0). Two rows stay on the vector kernel and match their decode steps, unless the
+                // pair straddles a key count where MLX changes the kernel's key-block split (see
+                // `vectorSDPAKeyClassChanges`); then each row is attended alone too.
                 let (cachedKeys, cachedValues) = simple.update(keys: keys, values: values)
                 let total = cachedKeys.dim(2)
                 attended = MLX.concatenated(
