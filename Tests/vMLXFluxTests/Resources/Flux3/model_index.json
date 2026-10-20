@@ -1,0 +1,84 @@
+{
+  "_class_name": "Flux3DistilledModularPipeline",
+  "_diffusers_version": "0.41.0.dev0",
+  "scheduler": [
+    "mflux",
+    "Flux3FlowMapScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "Qwen3VLForConditionalGeneration"
+  ],
+  "tokenizer": [
+    "transformers",
+    "Qwen3VLProcessor"
+  ],
+  "transformer": [
+    "diffusers",
+    "Flux3Transformer2DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLFlux2"
+  ],
+  "osaurus_image": {
+    "family": "flux3-image-klein",
+    "variant": "distilled",
+    "mflux_model": "flux3-image-klein",
+    "source": {
+      "repo": "black-forest-labs/flux-3-image-klein",
+      "revision": "337337621b8526e120f2275d250242f4a6bedd75"
+    },
+    "quantization": {
+      "library": "mflux",
+      "mode": "affine",
+      "bits": 4,
+      "group_size": 64,
+      "components": {
+        "transformer": 4,
+        "text_encoder": 4,
+        "vae": "bf16 except 8 mid-block attention linears"
+      }
+    },
+    "defaults": {
+      "steps": 16,
+      "guidance": null,
+      "width": 1024,
+      "height": 1024
+    },
+    "limits": {
+      "size_multiple": 16,
+      "min_side": 64,
+      "max_side": 4096,
+      "max_reference_images": 10,
+      "single_reference_max_pixels": 4194304,
+      "multi_reference_max_pixels_each": 1048576
+    },
+    "capabilities": {
+      "text_to_image": true,
+      "image_edit": true,
+      "multiple_source_images": true,
+      "negative_prompt": false,
+      "guidance": false,
+      "bounding_box_prompts": true,
+      "lora": true
+    },
+    "text_features": {
+      "hidden_state_layers": [
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+        32
+      ],
+      "pad_multiple": 80,
+      "max_tokens_mflux": 4096,
+      "max_tokens_reference": 8192,
+      "chat_template": "Qwen3-VL user turn + add_generation_prompt"
+    },
+    "notes": "Guidance-distilled flow-map model: no CFG pass exists, so guidance and negative prompts have no effect."
+  }
+}

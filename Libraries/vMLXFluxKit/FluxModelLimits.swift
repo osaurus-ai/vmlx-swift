@@ -10,6 +10,8 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     public let minimumSteps: Int
     public let maximumSteps: Int?
     public let fixedSteps: Int?
+    /// Distilled families accept negative prompts without conditioning on them.
+    public let ignoresNegativePrompt: Bool
     public let supportsNegativePrompt: Bool
     public let supportsEditNegativePrompt: Bool
     public let supportsStrength: Bool
@@ -30,7 +32,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         dimensionMultiple: Int, minDimension: Int, maxDimension: Int? = nil,
         maxPixels: Int? = nil, minimumSteps: Int, maximumSteps: Int? = nil,
         fixedSteps: Int? = nil, supportsNegativePrompt: Bool,
-        supportsEditNegativePrompt: Bool, supportsStrength: Bool,
+        supportsEditNegativePrompt: Bool, ignoresNegativePrompt: Bool = false, supportsStrength: Bool,
         supportsMask: Bool, maxSourceImages: Int, supportedFormats: [ImageFormat],
         maximumImages: Int = 1, maximumParallelImages: Int = 1,
         negativePromptRequiresGuidanceAbove: Float? = 1,
@@ -44,6 +46,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         self.minimumSteps = minimumSteps
         self.maximumSteps = maximumSteps
         self.fixedSteps = fixedSteps
+        self.ignoresNegativePrompt = ignoresNegativePrompt
         self.supportsNegativePrompt = supportsNegativePrompt
         self.supportsEditNegativePrompt = supportsEditNegativePrompt
         self.supportsStrength = supportsStrength
@@ -63,7 +66,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case samplers, schedulers, defaultSampler, defaultScheduler, supportsShift
         case dimensionMultiple, minDimension, maxDimension, maxPixels, minimumSteps, maximumSteps, fixedSteps
-        case supportsNegativePrompt, supportsEditNegativePrompt, supportsStrength, supportsMask, maxSourceImages
+        case ignoresNegativePrompt, supportsNegativePrompt, supportsEditNegativePrompt, supportsStrength, supportsMask, maxSourceImages
         case supportedFormats, maximumImages, maximumParallelImages, negativePromptRequiresGuidanceAbove
     }
 
@@ -79,6 +82,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
             fixedSteps: try c.decodeIfPresent(Int.self, forKey: .fixedSteps),
             supportsNegativePrompt: try c.decode(Bool.self, forKey: .supportsNegativePrompt),
             supportsEditNegativePrompt: try c.decode(Bool.self, forKey: .supportsEditNegativePrompt),
+            ignoresNegativePrompt: try c.decodeIfPresent(Bool.self, forKey: .ignoresNegativePrompt) ?? false,
             supportsStrength: try c.decode(Bool.self, forKey: .supportsStrength),
             supportsMask: try c.decode(Bool.self, forKey: .supportsMask),
             maxSourceImages: try c.decode(Int.self, forKey: .maxSourceImages),
@@ -108,6 +112,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         try c.encode(minimumSteps, forKey: .minimumSteps)
         try c.encode(maximumSteps, forKey: .maximumSteps)
         try c.encode(fixedSteps, forKey: .fixedSteps)
+        try c.encode(ignoresNegativePrompt, forKey: .ignoresNegativePrompt)
         try c.encode(supportsNegativePrompt, forKey: .supportsNegativePrompt)
         try c.encode(supportsEditNegativePrompt, forKey: .supportsEditNegativePrompt)
         try c.encode(supportsStrength, forKey: .supportsStrength)
@@ -125,7 +130,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         try validateCommon(width: request.width, height: request.height, steps: request.steps,
                            guidance: request.guidance, format: request.outputFormat)
         try ImageBatchPlan.validate(request, maximumImages: maximumImages)
-        if let negative = request.negativePrompt, !negative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        if !ignoresNegativePrompt, let negative = request.negativePrompt, !negative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !supportsNegativePrompt || negativePromptRequiresGuidanceAbove.map({ request.guidance <= $0 }) == true {
             throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: negativePromptRequiresGuidanceAbove.map { "a supported CFG path with guidance > \($0)" } ?? "a supported negative-conditioning path")
         }
@@ -145,7 +150,7 @@ public struct FluxModelLimits: Sendable, Codable, Equatable {
         sourceCount: Int, hasMask: Bool, strength: Float?, negativePrompt: String? = nil
     ) throws {
         try validateCommon(width: width, height: height, steps: steps, guidance: guidance, format: format)
-        if let negativePrompt, !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        if !ignoresNegativePrompt, let negativePrompt, !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             !supportsEditNegativePrompt {
             throw FluxError.invalidField(field: "negativePrompt", value: "provided", allowed: "no edit negative prompt")
         }

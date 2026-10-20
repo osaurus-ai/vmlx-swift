@@ -551,13 +551,16 @@ private func q21RotateHalf(_ x: MLXArray) -> MLXArray {
     return concatenated([-x[.ellipsis, half...], x[.ellipsis, ..<half]], axis: -1)
 }
 
-private final class Q21TextLayer {
+// Shared language block: FLUX 3 uses the same Qwen3-VL decoder without a vision tower.
+final class Q21TextLayer {
     let inputNorm, postNorm, qNorm, kNorm: MLXArray
     let q, k, v, o, gate, up, down: MFluxLinear
     let heads, kvHeads, headDim: Int
     let eps: Float
+    let normWeightInFloat32: Bool
 
-    init(store: MFluxStore, index: Int, cfg: QwenImage21Config) throws {
+    init(store: MFluxStore, index: Int, cfg: QwenImage21Config, normWeightInFloat32: Bool = false) throws {
+        self.normWeightInFloat32 = normWeightInFloat32
         let p = "language_model.layers.\(index)"
         heads = cfg.textHeads; kvHeads = cfg.kvHeads; headDim = cfg.textHeadDim; eps = cfg.rmsEps
         inputNorm = try store.tensor("text_encoder", "\(p).input_layernorm.weight")
@@ -574,11 +577,18 @@ private final class Q21TextLayer {
         down = try store.linear("text_encoder", "\(p).mlp.down_proj", inputDimensions: cfg.intermediate, outputDimensions: h)
     }
 
+    private func normalize(_ x: MLXArray, weight: MLXArray, eps: Float) -> MLXArray {
+        guard normWeightInFloat32 else { return q21TextRMS(x, weight: weight, eps: eps) }
+        // FLUX 3 mflux Qwen3VLRMSNorm multiplies the weight BEFORE the bf16 cast.
+        let f = x.asType(.float32)
+        return (weight.asType(.float32) * (f * rsqrt(mean(f * f, axis: -1, keepDims: true) + eps))).asType(x.dtype)
+    }
+
     func callAsFunction(_ x: MLXArray, cos: MLXArray, sin: MLXArray, mask: MLXArray) -> MLXArray {
         let b = x.dim(0), s = x.dim(1)
-        let normed = q21TextRMS(x, weight: inputNorm, eps: eps)
-        var qs = q21TextRMS(q(normed).reshaped([b, s, heads, headDim]), weight: qNorm, eps: eps).transposed(0, 2, 1, 3)
-        var ks = q21TextRMS(k(normed).reshaped([b, s, kvHeads, headDim]), weight: kNorm, eps: eps).transposed(0, 2, 1, 3)
+        let normed = normalize(x, weight: inputNorm, eps: eps)
+        var qs = normalize(q(normed).reshaped([b, s, heads, headDim]), weight: qNorm, eps: eps).transposed(0, 2, 1, 3)
+        var ks = normalize(k(normed).reshaped([b, s, kvHeads, headDim]), weight: kNorm, eps: eps).transposed(0, 2, 1, 3)
         var vs = v(normed).reshaped([b, s, kvHeads, headDim]).transposed(0, 2, 1, 3)
         let c = cos.expandedDimensions(axis: 1), sn = sin.expandedDimensions(axis: 1)
         qs = qs * c + q21RotateHalf(qs) * sn
@@ -593,7 +603,7 @@ private final class Q21TextLayer {
             scale: 1 / Float(headDim).squareRoot(), mask: .array(mask)
         ).asType(qs.dtype)
         let h = x + o(attended.transposed(0, 2, 1, 3).reshaped([b, s, heads * headDim]))
-        let m = q21TextRMS(h, weight: postNorm, eps: eps)
+        let m = normalize(h, weight: postNorm, eps: eps)
         return h + down(silu(gate(m)) * up(m))
     }
 }

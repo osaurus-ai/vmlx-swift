@@ -176,6 +176,9 @@ public struct MLXStudioModelStore: Sendable {
         if key.contains("ideogram") {
             return "ideogram"
         }
+        if key.contains("flux3") || key.contains("flux-3") {
+            return key.split(separator: "-").contains("base") ? nil : "flux3-image-klein"
+        }
         if key.contains("flux2") || key.contains("flux-2") {
             return key.contains("edit") ? "flux2-klein-edit" : "flux2-klein"
         }
@@ -286,6 +289,9 @@ public struct MLXStudioModelStore: Sendable {
             } else if try hasSafetensors(in: url, recursive: true) {
                 components.insert(component)
             }
+        }
+        if fm.fileExists(atPath: directory.appendingPathComponent("text_encoder/tokenizer.json").path) {
+            components.insert(.tokenizer)
         }
         return components
     }
@@ -433,6 +439,7 @@ public struct MLXStudioModelStore: Sendable {
         case "flux1-dev": return "FLUX.1 Dev"
         case "flux1-kontext": return "FLUX.1 Kontext"
         case "flux1-fill": return "FLUX.1 Fill"
+        case "flux3-image-klein": return "FLUX 3 Image Klein"
         case "flux2-klein": return "FLUX.2 Klein"
         case "flux2-klein-edit": return "FLUX.2 Klein Edit"
         case "z-image-turbo": return "Z-Image Turbo"

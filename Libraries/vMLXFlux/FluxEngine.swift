@@ -83,9 +83,16 @@ public actor FluxEngine {
 
     public func estimatedPeakBytes(for request: ImageEditRequest, modelURL: URL, name: String? = nil) throws -> Int {
         let family = try estimateFamily(modelURL, name: name)
-        try limits(for: modelURL, name: family).validate(request)
+        var validated = request
+        if family == "flux3-image-klein" { validated.width = nil; validated.height = nil }
+        try limits(for: modelURL, name: family).validate(validated)
+        var sourcePixels = request.sourceImages.count * 1024 * 1024
         let width: Int, height: Int
-        if family == "qwen-image-edit" {
+        if family == "flux3-image-klein" {
+            let geometry = try Flux3Klein.editGeometry(modelPath: modelURL, sources: request.sourceImages,
+                width: request.width, height: request.height)
+            width = geometry.width; height = geometry.height; sourcePixels = geometry.sourcePixels
+        } else if family == "qwen-image-edit" {
             let plan = try QwenImageEditPreprocessPlan(sourceImages: request.sourceImages,
                 requestedWidth: request.width, requestedHeight: request.height,
                 steps: request.steps, guidance: request.guidance)
@@ -98,7 +105,7 @@ public actor FluxEngine {
             width = request.width ?? w; height = request.height ?? h
         }
         return try ImageMemoryEstimator.estimate(model: modelURL, family: family, width: width, height: height,
-            sourcePixels: request.sourceImages.count * 1024 * 1024, guidance: request.guidance,
+            sourcePixels: sourcePixels, guidance: family == "flux3-image-klein" ? 1 : request.guidance,
             previewMaxPixel: request.previewInterval == nil ? nil : request.previewMaxPixel,
             adapters: request.adapters).peakBytes
     }
