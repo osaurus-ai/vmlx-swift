@@ -2458,11 +2458,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             completedUnitCount: promptTokenCount,
             totalUnitCount: promptTokenCount,
             detail: "decode_ready"))
+        MemoryStageTrace.log("prefill-complete", tokens: promptTokenCount)
         // The prefill-captured N-1 state is the only prompt checkpoint an
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
         self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
             from: self.cache)
+        MemoryStageTrace.log(
+            "prompt-snapshot", tokens: promptTokenCount,
+            detail: promptCacheSnapshot == nil ? "none" : "retained")
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             // The Compilable caches are FIXED-size buffers with no overflow
@@ -3410,6 +3414,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         includeGeneratedBoundary: Bool
     ) {
         reconcileUnoCache()
+        MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count)
+        defer {
+            MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count)
+        }
         defer {
             if !Task.isCancelled,
                let coordinator = cacheCoordinator,
