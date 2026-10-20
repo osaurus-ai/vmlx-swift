@@ -24,7 +24,15 @@ public enum RowExactAffineQMV {
     static let enabled = ProcessInfo.processInfo.environment["VMLX_ROW_EXACT_QMV_ROWS"] != "0"
 
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
+    nonisolated(unsafe) private static var verdicts: [VerdictKey: Bool] = [:]
+
+    /// Admission key. A plain struct, not an interpolated string: a native-MTP verify of a 48-layer
+    /// trunk makes ~370 of these calls per forward, and building the string (DType descriptions)
+    /// cost ~1.5 ms of graph-build time per verify on Ornith 122B.
+    private struct VerdictKey: Hashable {
+        let dtype: DType, scales: DType
+        let bits: Int, groupSize: Int, k: Int, n: Int, rows: Int
+    }
 
     static let header = """
         // ---- verbatim from mlx/backend/metal/kernels/quantized.h (bits 4 and 8 branches) ----
@@ -318,7 +326,8 @@ public enum RowExactAffineQMV {
                 grid: (32, (n / 8) * 2, 1), threadGroup: (32, 2, 1),
                 outputShapes: [[rows, n]], outputDTypes: [dtype])[0]
         }
-        let key = "\(dtype):\(scales.dtype):\(bits):\(groupSize):\(k):\(n):\(rows)"
+        let key = VerdictKey(
+            dtype: dtype, scales: scales.dtype, bits: bits, groupSize: groupSize, k: k, n: n, rows: rows)
         lock.lock()
         let known = verdicts[key]
         lock.unlock()

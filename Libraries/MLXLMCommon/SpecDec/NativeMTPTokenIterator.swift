@@ -329,6 +329,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Context ceiling for prefetch eligibility — see the regime gate in
     /// `maybePrefetchNextVerify`. Default matches the qwen4_exp QSA
     /// indexer budget.
+    private static let verifyPrefetchContextCapExplicit =
+        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"] != nil
     private static let verifyPrefetchMaxContext: Int = {
         if let raw = ProcessInfo.processInfo
             .environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"],
@@ -2396,8 +2398,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // indexer-engagement region. Threshold matches qwen4_exp's
         // indexer_budget (block 4 × top-512 = 2048); tunable for other
         // topologies via VMLX_MTP_VERIFY_PREFETCH_MAX_CTX.
+        // The gate exists for the QSA indexer lanes only: a cache without a QSA layer (Ornith / Qwen 3.5
+        // MoE, every app chat starting above 2048 tokens of system prompt + tools) has nothing for the
+        // background scheduling thread to fence against, and gating it disabled prefetch for every real
+        // conversation. `VMLX_MTP_VERIFY_PREFETCH_MAX_CTX` still caps any family when set explicitly.
         let contextOffset = cache.lazy.map(\.offset).max() ?? 0
-        if contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext {
+        if Self.verifyPrefetchContextCapExplicit || cache.contains(where: { $0 is QSAKVCache }),
+            contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext
+        {
             return
         }
         // Nothing left in the token budget to overlap against.
