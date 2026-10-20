@@ -1008,6 +1008,131 @@ private func vlmGatedDeltaKernel(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused MoE router tail (softmax + top-k + normalize, one dispatch)
+//
+// After the router gemv, `routerSelection` ran precise softmax, argPartition (a full GPU merge sort),
+// takeAlong, sum and divide: five latency-bound dispatches per MoE layer, 1.8 ms of a 48-layer Ornith
+// 122B decode step for 75 MB of router weights. This kernel does the tail in one threadgroup per row
+// and reproduces the op chain bit for bit:
+// - softmax: MLX `softmax_single_row` (block kernel) with its thread layout (N_READS = 4 consecutive
+//   values per thread, E/4 threads), fast::exp, simd/threadgroup reductions and T(ld * (1/sum));
+// - selection: argPartition is a stable ascending argsort, so `[kth...]` holds the top-k in ascending
+//   (value, index) order; picking the max (bf16 bits << 16 | index) key k times and writing the picks
+//   back to front gives the same indices in the same slot order (slot order matters: the routed
+//   reduction sums routes in slot order);
+// - normalization: MLX's T-accumulated slot-order sum of the selected T values, then T(v / sum).
+let routerTailKernel: MLXFast.MLXFastKernel = {
+    let source = """
+        auto row = threadgroup_position_in_grid.y;
+        auto lid = thread_position_in_threadgroup.x;
+        auto lane = thread_index_in_simdgroup;
+        auto sg = simdgroup_index_in_threadgroup;
+        constexpr int N_READS = 4;
+        threadgroup float local_max[32];
+        threadgroup float local_normalizer[32];
+        threadgroup uint keys[E];
+        threadgroup uint picks[K];
+
+        float ld[N_READS];
+        const device T* in = logits + row * E + lid * N_READS;
+        for (int i = 0; i < N_READS; i++) {
+          ld[i] = (lid * N_READS + i) < E ? float(in[i]) : Limits<float>::min;
+        }
+        if (sg == 0) {
+          local_max[lane] = Limits<float>::min;
+          local_normalizer[lane] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float maxval = Limits<float>::finite_min;
+        for (int i = 0; i < N_READS; i++) {
+          maxval = (maxval < ld[i]) ? ld[i] : maxval;
+        }
+        maxval = simd_max(maxval);
+        if (lane == 0) { local_max[sg] = maxval; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          maxval = simd_max(local_max[lane]);
+          if (lane == 0) { local_max[0] = maxval; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        maxval = local_max[0];
+        float normalizer = 0;
+        for (int i = 0; i < N_READS; i++) {
+          float exp_x = fast::exp(ld[i] - maxval);
+          ld[i] = exp_x;
+          normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        if (lane == 0) { local_normalizer[sg] = normalizer; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          normalizer = simd_sum(local_normalizer[lane]);
+          if (lane == 0) { local_normalizer[0] = normalizer; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        normalizer = 1 / local_normalizer[0];
+        for (int i = 0; i < N_READS; i++) {
+          int e = lid * N_READS + i;
+          if (e < E) {
+            T p = T(ld[i] * normalizer);
+            keys[e] = (uint(as_type<ushort>(p)) << 16) | uint(e);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Top-K by repeated max over (value bits, index); probabilities are >= 0 so their bf16/f16
+        // bit patterns order like the values. Simdgroup 0 selects.
+        if (sg == 0) {
+          for (int k = 0; k < K; k++) {
+            uint best = 0;
+            for (int e = lane; e < E; e += 32) { best = max(best, keys[e]); }
+            best = simd_max(best);
+            if (lane == 0) {
+              picks[K - 1 - k] = best;
+              keys[best & 0xFFFF] = 0;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          if (lane == 0) {
+            // MLX `sum` over a short BF16 row (row_reduce_small): a T accumulator, slot order, each add
+            // rounded to T.
+            T sum = T(0);
+            for (int k = 0; k < K; k++) { sum = as_type<T>(ushort(picks[k] >> 16)) + sum; }
+            for (int k = 0; k < K; k++) {
+              T v = as_type<T>(ushort(picks[k] >> 16));
+              indices[row * K + k] = picks[k] & 0xFFFF;
+              scores[row * K + k] = NORM ? T(v / sum) : v;
+            }
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_router_tail", inputNames: ["logits"], outputNames: ["indices", "scores"],
+        source: source)
+}()
+
+enum Qwen35RouterTail {
+    static let enabled = ProcessInfo.processInfo.environment["VMLX_QWEN35_ROUTER_TAIL"] != "0"
+
+    /// `logits` [..., E] (BF16/F16, E % 4 == 0, E <= 4096) -> (indices [..., K] uint32, scores [..., K]).
+    static func call(_ logits: MLXArray, topK: Int, normalize: Bool) -> (MLXArray, MLXArray)? {
+        let e = logits.dim(-1)
+        guard enabled, logits.dtype == .bfloat16 || logits.dtype == .float16,
+            e % 4 == 0, e <= 4096, e >= 32, (1 ... 32).contains(topK), topK <= e
+        else { return nil }
+        let rows = logits.size / e
+        let threads = ((e / 4 + 31) / 32) * 32
+        let leading = Array(logits.shape.dropLast())
+        let out = routerTailKernel(
+            [logits],
+            template: [("T", logits.dtype), ("E", e), ("K", topK), ("NORM", normalize)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [leading + [topK], leading + [topK]],
+            outputDTypes: [.uint32, logits.dtype])
+        return (out[0], out[1])
+    }
+}
+
 // MARK: - DFlash 2 tree GatedDelta (port of TensorFold lane_tree._TREE_SOURCE, Apache-2.0)
 //
 // One verify window holding a draft TREE: row r continues from its parent's state, not from row
@@ -3000,7 +3125,7 @@ enum Qwen35Language {
         }
 
         /// Top-k expert indices and routing weights (the compiled router when it applies).
-        private func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
             if let compiled = compiledRouter(x) { return compiled }
             var gates: MLXArray
             if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),
@@ -3014,6 +3139,9 @@ enum Qwen35Language {
                     MLX.split(x, parts: x.dim(1), axis: 1).map { gate($0) }, axis: 1)
             } else {
                 gates = gate(x)
+            }
+            if let fused = Qwen35RouterTail.call(gates, topK: topK, normalize: normTopkProb) {
+                return fused
             }
             gates = MLX.softmax(gates, axis: -1, precise: true)
             let kth = gates.dim(-1) - topK
@@ -5037,6 +5165,73 @@ public enum Qwen35DFlash2PartsProbe {
             let z = gdn.inProjZ(x).reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
             MLX.eval(q, k, v, g, y, z)
             var parts: [(String, Double)] = []
+            // 36 chained GDN layer forwards (each output feeds the next, real caches), one eval: the
+            // serial cost of a decode step's GDN stack including dispatch gaps (`/36` per layer).
+            let chainCaches = (0 ..< 36).map { _ in MambaCache() }
+            parts.append(("gdn_chain36", time {
+                var h = x
+                for cache in chainCaches { h = h + gdn(h, cache: cache) * 0.01 }
+                return [h]
+            }))
+            // The same chain with only the five GDN projections (in_proj qkv/z/b/a + out_proj), and with
+            // only the two big ones: how much of the stack is projection streaming vs everything else.
+            parts.append(("proj5_chain36", time {
+                var h = x
+                for _ in 0 ..< 36 {
+                    let zz = gdn.inProjZ(h)
+                    let side = gdn.inProjQKV(h).sum(axis: -1, keepDims: true)
+                        + gdn.inProjB(h).sum(axis: -1, keepDims: true)
+                        + gdn.inProjA(h).sum(axis: -1, keepDims: true)
+                    h = h + gdn.outProj(zz) * 0.01 + side * 0
+                }
+                return [h]
+            }))
+            parts.append(("proj2_chain36", time {
+                var h = x
+                for _ in 0 ..< 36 {
+                    let side = gdn.inProjQKV(h).sum(axis: -1, keepDims: true)
+                    h = h + gdn.outProj(gdn.inProjZ(h)) * 0.01 + side * 0
+                }
+                return [h]
+            }))
+            parts.append(("moe_chain48", time {
+                var h = x
+                for _ in 0 ..< 48 {
+                    h = h + (gdnLayer.mlp as! UnaryLayer)(gdnLayer.postAttentionLayerNorm(h)) * 0.01
+                }
+                return [h]
+            }))
+            if let moe = gdnLayer.mlp as? Qwen35Language.SparseMoeBlock {
+                // MoE stack pieces, chained 48 deep like the real step.
+                parts.append(("router_chain48", time {
+                    var h = x
+                    for _ in 0 ..< 48 {
+                        let (i, sc) = moe.routerSelection(h)
+                        h = h + (sc.sum(axis: -1, keepDims: true) + i.asType(.bfloat16).sum(axis: -1, keepDims: true) * 0).asType(h.dtype) * 0.01
+                    }
+                    return [h]
+                }))
+                let (fixedIdx, fixedScores) = moe.routerSelection(x)
+                MLX.eval(fixedIdx, fixedScores)
+                if let affine = moe.switchMLP as? SwitchGLU {
+                    parts.append(("routed_chain48", time {
+                        var h = x
+                        for _ in 0 ..< 48 {
+                            let r = affine.qwen4ExpReduced(h, indices: fixedIdx, scores: fixedScores)
+                                ?? (affine(h, fixedIdx) * fixedScores[.ellipsis, .newAxis]).sum(axis: -2)
+                            h = h + r * 0.01
+                        }
+                        return [h]
+                    }))
+                }
+                parts.append(("shared_chain48", time {
+                    var h = x
+                    for _ in 0 ..< 48 {
+                        h = h + sigmoid(moe.sharedExpertGate(h)) * moe.sharedExpert(h) * 0.01
+                    }
+                    return [h]
+                }))
+            }
             parts.append(("gdn_inproj4", time {
                 [gdn.inProjQKV(x), gdn.inProjZ(x), gdn.inProjB(x), gdn.inProjA(x)]
             }))
@@ -5123,7 +5318,8 @@ public enum Qwen35DFlash2PartsProbe {
                 switch part.0 {
                 case let n where n.hasPrefix("gdn_rec_tree"): return sum
                 case let n where n.hasPrefix("gdn_"): return sum + part.1 * Double(gdnCount)
-                case "moe_router", "moe_shared": return sum
+                case "moe_router", "moe_shared", "gdn_chain36", "proj5_chain36", "proj2_chain36",
+                    "moe_chain48", "router_chain48", "routed_chain48", "shared_chain48": return sum
                 case "mlp", "layernorms2": return sum + part.1 * Double(layers.count)
                 case let n where n.hasPrefix("attn_"): return sum + part.1 * Double(attnCount)
                 default: return sum + part.1
