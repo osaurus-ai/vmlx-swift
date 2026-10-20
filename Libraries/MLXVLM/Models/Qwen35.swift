@@ -4032,18 +4032,29 @@ enum Qwen35Language {
                 cache: cacheOpt,
                 positionIds: positionIds,
                 recordPrefixCommitStates: recordPrefixCommitStates)
+            let normed = model.norm(hidden)
             let logits: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
                 let start = Date.timeIntervalSinceReferenceDate
-                logits = headLogits(model.norm(hidden))
+                logits = headLogits(normed)
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - start)
             } else {
-                logits = headLogits(model.norm(hidden))
+                logits = headLogits(normed)
             }
-            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+            // The hidden handed to the MTP head: post-final-norm for routed-MoE Qwen 3.5 (Ornith), the
+            // trunk's own pre-norm hidden otherwise. vmlx Python ec3618d6 measured the MoE head
+            // accepting more with the post-norm input (teacher-forced code 71.5 -> 76.6 %, live D1
+            // 71.0 -> 73.8 %). The logits are unchanged (one final norm either way).
+            return NativeMTPForwardResult(
+                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
+        }
+
+        static func mtpUsesPostNormHidden(_ config: Qwen35Configuration.TextConfiguration) -> Bool {
+            config.numExperts > 0
+                && ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"] != "pre"
         }
 
         func nativeMTPForward(
@@ -4067,20 +4078,27 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - blockStart)
 
                 let headStart = Date.timeIntervalSinceReferenceDate
-                let logits = headLogits(mtp.norm(hidden))
+                let normed = mtp.norm(hidden)
+                let logits = headLogits(normed)
                 MLX.eval(logits)
                 NativeMTPPhaseDiagnostics.record(
                     "vlm_mtp_lm_head",
                     seconds: Date.timeIntervalSinceReferenceDate - headStart)
-                return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+                return NativeMTPForwardResult(
+                    logits: logits,
+                    hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
             }
             let hidden = mtp.preNormHidden(
                 hiddenStates: hiddenStates,
                 nextTokenIds: nextTokenIds,
                 embedTokens: model.embedTokens,
                 cache: cache)
-            let logits = headLogits(mtp.norm(hidden))
-            return NativeMTPForwardResult(logits: logits, hiddenStates: hidden)
+            let normed = mtp.norm(hidden)
+            let logits = headLogits(normed)
+            // Chained drafts feed the head's post-`mtp.norm` output, matching the trunk hidden it was
+            // seeded with (see `textOnlyForwardWithHidden`).
+            return NativeMTPForwardResult(
+                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
