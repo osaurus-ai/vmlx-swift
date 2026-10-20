@@ -891,6 +891,7 @@ let package = Package(
                 "NativeMTPDemotionCompatibilityTests.swift",
                 "NativeMTPDepthPolicyTests.swift",
                 "NemotronMTPFamilyColdStartTests.swift",
+                "OrnithMTPFamilyColdStartTests.swift",
                 "NativeMTPDepthExecutionTests.swift",
                 "WireBudgetPolicyTests.swift",
                 "ModelResidencyTests.swift",
