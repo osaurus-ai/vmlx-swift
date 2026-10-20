@@ -5364,6 +5364,14 @@ public enum Qwen35DFlash2PartsProbe {
     }
 }
 
+/// Native MTP in chats that carry images or video. The native forwards (`textOnlyForwardWithHidden`:
+/// AR steps, verify windows, bridges) resolve positions through `resolvedPositionIds` with the
+/// prefill's `ropeDeltas`, so they continue at the media-shifted M-RoPE positions exactly like the
+/// normal decode step. `Qwen35RestoredMediaPositionTests.nativeForwardsAfterImagePrefill` pins it.
+/// Without this conformance every turn after the first image of a conversation ran AR (Ornith 122B
+/// in-app 4k->128k session S5, 2026-10-20: MTP on turns 1-2, off on all 13 later turns).
+extension Qwen35: NativeMTPMediaCapable {}
+
 extension Qwen35: PrefixCacheInvariantModel {
     /// Qwen-VL M-RoPE gives every token before the first media placeholder the text position equal
     /// to its index (the media compression only shifts what follows), the GDN recurrence and

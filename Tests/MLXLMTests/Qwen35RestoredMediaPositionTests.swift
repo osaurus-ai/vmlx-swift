@@ -126,6 +126,57 @@ struct Qwen35RestoredMediaPositionTests {
         return out
     }
 
+    /// Native MTP after a media prefill (`NativeMTPMediaCapable`): the native AR step and the native
+    /// verify window must continue at the media-shifted M-RoPE positions exactly like the normal
+    /// decode step. A missing rope delta shifts every later position and shows at full size here.
+    @Test("native AR and verify continue at the media-shifted positions after an image prefill")
+    func nativeForwardsAfterImagePrefill() throws {
+        let prompt = input([1, 2, 96, 98, 98, 98, 98, 95, 5, 6, 7], image: true)
+        let tokens: [Int32] = [31, 32, 33]
+
+        let mA = try model()
+        let cacheA = mA.newCache(parameters: nil)
+        MLX.eval(try logits(mA.prepare(prompt, cache: cacheA, windowSize: 0)), cacheA)
+        let normal = tokens.map { mA(MLXArray([$0], [1, 1]), cache: cacheA)[0, -1, 0...] }
+        MLX.eval(normal)
+
+        let mB = try model()
+        let cacheB = mB.newCache(parameters: nil)
+        MLX.eval(try logits(mB.prepare(prompt, cache: cacheB, windowSize: 0)), cacheB)
+        let native = tokens.map {
+            mB.nativeBackboneForward(MLXArray([$0], [1, 1]), cache: cacheB).logits[0, -1, 0...]
+        }
+        MLX.eval(native)
+
+        let mC = try model()
+        let cacheC = mC.newCache(parameters: nil)
+        MLX.eval(try logits(mC.prepare(prompt, cache: cacheC, windowSize: 0)), cacheC)
+        let verify = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+            mC.nativeBackboneMTPVerifyForward(MLXArray(tokens, [1, tokens.count]), cache: cacheC)
+        }.logits[0]
+        MLX.eval(verify)
+
+        // Control: the same native steps WITHOUT the image's M-RoPE state (text-only prefill of the
+        // same token ids) must differ, or this test could not see a position error.
+        let mD = try model()
+        let cacheD = mD.newCache(parameters: nil)
+        MLX.eval(try logits(mD.prepare(input([1, 2, 96, 98, 98, 98, 98, 95, 5, 6, 7], image: false),
+            cache: cacheD, windowSize: 0)), cacheD)
+        let textOnly = mD.nativeBackboneForward(MLXArray([tokens[0]], [1, 1]), cache: cacheD)
+            .logits[0, -1, 0...]
+        MLX.eval(textOnly)
+
+        for i in 0 ..< tokens.count {
+            #expect(maxError(native[i], normal[i]) < 1e-4, "native AR step \(i) vs normal decode")
+            // Position errors show at the control's scale (~1.6 here). This f32 toy model's multi-row
+            // kernels round differently from the 1-row step (~0.003-0.009); bitwise row-exactness is
+            // a BF16 contract covered by Qwen35RowExactVerifyTests.
+            #expect(maxError(verify[i], normal[i]) < 0.02,
+                "verify row \(i) vs normal decode: \(maxError(verify[i], normal[i])) (text-only control \(maxError(textOnly, normal[0])))")
+        }
+        #expect(maxError(textOnly, normal[0]) > 1e-3, "control must differ")
+    }
+
     /// Rotated keys of the full-attention layer (layer 4 of 4), every cached row: RoPE makes them a
     /// direct function of each row's position, so a mispositioned suffix shows here at full size.
     private func attentionKeys(_ cache: [any KVCache]) -> MLXArray {
