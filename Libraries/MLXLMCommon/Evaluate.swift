@@ -1767,6 +1767,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// as prefill passes through the boundary costs one cache copy instead of
     /// a second full prefill. Released once stored.
     var hybridStripSnapshot: [KVCache]?
+    var hybridStripBoundarySpilled = false
 
     /// Cache state at each processor-declared stable boundary, captured during
     /// prefill, keyed by the token count actually stored.
@@ -2472,8 +2473,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         // The prefill-captured N-1 state is the only prompt checkpoint an
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
-        self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: self.cache)
+        if retainsPromptSnapshotForStores {
+            self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: self.cache)
+        }
+        spillHybridStripBoundaryAfterPrefill()
         MemoryStageTrace.log(
             "prompt-snapshot", tokens: promptTokenCount,
             detail: promptCacheSnapshot == nil ? "none" : "retained")
@@ -3419,6 +3422,35 @@ public struct TokenIterator: TokenIteratorProtocol {
         return forwardedToken
     }
 
+    // Canonical hybrid prompts are never stored exactly, and their recurrent state
+    // cannot be trimmed to a previous boundary. Keep only the captured boundary.
+    var retainsPromptSnapshotForStores: Bool {
+        !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
+            && !canTrimPromptCache(cache))
+    }
+
+    mutating func spillHybridStripBoundaryAfterPrefill() {
+        guard !retainsPromptSnapshotForStores,
+              originalInput.cachePromptIntent != .auxiliary,
+              !originalInput.requiresPostPrepareCacheKey,
+              let coordinator = cacheCoordinator,
+              let stripAt = hybridStripBoundary,
+              let snapshot = hybridStripSnapshot,
+              storeCapturedHybridBoundary(
+                snapshot, tokens: Array(promptTokenIds.prefix(stripAt)),
+                coordinator: coordinator,
+                mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
+                chainId: cacheInitParameters?.cacheChainId,
+                kvMode: selectivePromptBoundaryDiskKVMode(cache: snapshot, requested: kvMode),
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart)
+        else { return }
+        hybridStripBoundarySpilled = true
+        hybridStripSnapshot = nil
+        stableBoundarySnapshots.removeValue(forKey: stripAt)
+        MemoryStageTrace.log("strip-spilled", tokens: stripAt, detail: "solo accepted")
+    }
+
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
@@ -3487,7 +3519,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             kvMode diskKVMode: KVQuantizationMode,
             isStableBoundary: Bool = false,
             isResumeBoundary: Bool = false,
-            isPostAnswer: Bool = false
+            isPostAnswer: Bool = false,
+            ownsSnapshot: Bool = false
         ) {
             var trace = CacheFinalizationTrace("solo-entry", tokens: tokens.count)
             defer { trace.mark("return") }
@@ -3508,7 +3541,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 )
                 return
             }
-            let snapshot = cacheToStore.map { $0.copy() }
+            // Prefill/boundary snapshots are already owned and evaluated. Only
+            // a live post-answer cache needs sealing before the async writer.
+            let snapshot = ownsSnapshot ? cacheToStore : cacheToStore.map { $0.copy() }
             let requiresDiskBackedRestore =
                 cacheRequiresDiskBackedCoordinatorRestore(snapshot)
             if !requiresDiskBackedRestore {
@@ -3582,7 +3617,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         // exact-prompt duplicate. Stores are synchronous, so release it as soon
         // as this method returns.
         let capturedDiskSeed = diskSeedSnapshot
+        // Live state substitutes only for topology inspection on non-trimmable hybrids.
         let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed
+            ?? (retainsPromptSnapshotForStores ? nil : cache)
         let storageSnapshotTokenCount = promptCacheSnapshot == nil
             ? diskSeedBoundary ?? promptTokenIds.count
             : promptTokenIds.count
@@ -3606,7 +3643,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
                     kvBits: nil,
-                    kvMode: promptDiskKVMode)
+                    kvMode: promptDiskKVMode, ownsSnapshot: true)
             } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
                 Self.logger.info(
                     "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
@@ -3650,7 +3687,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: seedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode), ownsSnapshot: true)
                     }
                 }
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
@@ -3678,7 +3715,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // which means a boundary at least that long is already stored, and
                 // it is the one the next turn will match — or on cache topologies
                 // (DSV4's pool cache) that cannot hold this boundary at all.
-                if let stripAt = hybridStripBoundary {
+                if let stripAt = hybridStripBoundary, !hybridStripBoundarySpilled {
                     // NOTE: intentionally NOT gated on
                     // `!cachePrefixTokenCounts.contains(stripAt)`. For hybrid caches
                     // the history-boundary loop below calls `cacheSnapshotForBoundary`
@@ -3697,7 +3734,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
                                 requested: kvMode),
-                            isResumeBoundary: true)
+                            isResumeBoundary: true, ownsSnapshot: true)
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3759,9 +3796,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // cannot trim, which is a whole extra prefill per boundary
                     // and runs after the answer is already visible.
                     let boundarySnapshotOrNil =
-                        stableBoundarySnapshots[storeBoundary].map { captured in
-                            captured.map { $0.copy() }
-                        }
+                        stableBoundarySnapshots[storeBoundary]
                         ?? cacheSnapshotForBoundary(
                             tokens: boundaryTokens,
                             storageSnapshot: storageTopologySnapshot,
@@ -3794,7 +3829,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                             // A message boundary that is not the shared root
                             // is what the next prompt of this chat (or an
                             // edited one) starts with.
-                            isResumeBoundary: !isStableBoundary)
+                            isResumeBoundary: !isStableBoundary, ownsSnapshot: true)
                     }
                 }
         }
@@ -3885,12 +3920,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
         let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
         let trimCount = storageSnapshotTokenCount - tokens.count
-        let trimmed = storageSnapshot.map { $0.copy() }
-        if keepsMedia, canTrimPromptCache(trimmed),
-           trimPromptCache(trimmed, numTokens: trimCount) == trimCount
-        {
-            MLX.eval(trimmed)
-            return trimmed
+        if keepsMedia, canTrimPromptCache(storageSnapshot) {
+            let trimmed = storageSnapshot.map { $0.copy() }
+            if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                MLX.eval(trimmed)
+                return trimmed
+            }
         }
 
         if !allowDiskBackedRederive,

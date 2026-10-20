@@ -51,6 +51,48 @@ func makeRetainedExactPromptSnapshot(
     return makePromptBoundaryCacheSnapshot(from: cache)
 }
 
+/// Hand an already-owned, evaluated prefill checkpoint to the disk writer.
+/// No model replay, live-cache mutation, or additional full snapshot is needed.
+/// A refusal leaves ownership with the iterator for its ordinary terminal store.
+/// The writer can still be in flight on return; it owns its arrays until completion.
+func storeCapturedHybridBoundary(
+    _ snapshot: [any KVCache],
+    tokens: [Int],
+    coordinator: CacheCoordinator,
+    mediaSalt: String?,
+    chainId: String?,
+    kvBits: Int? = nil,
+    kvMode: KVQuantizationMode,
+    kvGroupSize: Int,
+    quantizedKVStart: Int
+) -> Bool {
+    guard ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_EARLY_SPILL"] != "0",
+          !Task.isCancelled,
+          coordinator.diskCache != nil,
+          coordinator.pagedCache == nil,
+          coordinator.isHybrid,
+          !tokens.isEmpty,
+          !snapshot.isEmpty,
+          !canTrimPromptCache(snapshot),
+          cacheBoundaryLeafOffsets(snapshot).allSatisfy({ $0 == tokens.count }),
+          CacheStoreBudget.canStore(snapshot)
+    else { return false }
+
+    // A paged hybrid may need intermediate recurrent seeds, not just this
+    // endpoint. Keep that existing path at turn end; this path is disk-only.
+    let states = exactBoundarySSMStatesFromSnapshotIfSufficient(
+        coordinator: coordinator, snapshot: snapshot, tokenCount: tokens.count)
+    guard !coordinator.requiresSeparateRecurrentPayload || states != nil else { return false }
+    let diskCache = makeDiskStoreCache(
+        fromPromptBoundary: snapshot, kvBits: kvBits,
+        kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
+        kvMode: kvMode)
+    coordinator.storeAfterGeneration(
+        promptTokens: tokens, perLayerData: [], ssmStates: states, cache: diskCache,
+        mediaSalt: mediaSalt, chainId: chainId, isResumeBoundary: true)
+    return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
+}
+
 /// Build the cache object list passed to ``TQDiskSerializer`` from a clean
 /// prompt-boundary snapshot.
 ///
