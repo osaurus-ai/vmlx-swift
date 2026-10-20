@@ -48,6 +48,11 @@ public enum ImageMemoryEstimator {
             latentScale = 16; textRows = 1024; vaeChannels = 144
         case "ideogram":
             hidden = integer("hidden_size", 2048); latentScale = 16; textRows = 512; vaeChannels = 128
+        case "flux3-image-klein":
+            // Flux3Transformer2DModel: 24 heads x 128 (checked by Flux3Bundle); the text
+            // encoder pads prompts to multiples of 80, so 512 rows covers ordinary prompts.
+            hidden = try attentionWidth(heads: 24, dimension: 128)
+            latentScale = 16; textRows = 512; vaeChannels = 128
         case "seedvr2":
             // VAE downsamples by 8; the transformer then packs 2x2 patches.
             hidden = integer("hidden_size", 2560); latentScale = 16; textRows = 58; vaeChannels = 128
@@ -76,7 +81,7 @@ public enum ImageMemoryEstimator {
         // alter allocator limits to make an estimate look correct.
         let decodeMaps: Int
         switch family {
-        case "z-image-turbo", "flux1-schnell": decodeMaps = 28
+        case "z-image-turbo", "flux1-schnell", "flux3-image-klein": decodeMaps = 28
         // Native Flux peaks22.268/32.265GB at512/1024 with17.932GB live
         // weights. Ideogram peaks31.213/41.209/76.615GB at512/1024/2048
         // with26.880GB live weights. Legacy Qwen and Edit share the96-channel
