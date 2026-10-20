@@ -728,6 +728,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheLookupTokenIds = effectiveTokens
             cacheLookupUsesPostPrepareAlias = true
         }
+        // Per-boundary salts (as TokenIterator): a prefix that ends before a chat's newest image is keyed
+        // by the media before it, so a turn that adds media restores everything up to that media and
+        // encodes only the new item. Before this the native-MTP path probed with the whole prompt's salt
+        // and dropped any restore whose suffix held media: on Ornith 122B the image turn of an in-app
+        // chat re-prefilled 15.5k tokens (TTFT 3.1 s on the AR path -> 14.2 s on MTP).
+        let cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
+            model: model, parameters: effectiveParameters)
         if let coordinator = cacheCoordinator,
            !cacheLookupTokenIds.isEmpty,
             (!input.requiresPostPrepareCacheKey || cacheLookupUsesPostPrepareAlias)
@@ -762,7 +770,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
                     preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
-                    chainId: parameters.cacheChainId
+                    chainId: parameters.cacheChainId,
+                    mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix
                 )
             }
             switch result {
@@ -841,8 +850,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                     let requiresDiskBackedRestore =
                         cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-                    let unsafePartial =
+                    let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafePartial = cacheHitSuffixRequiresMediaRollback(
+                        input: input, remainingTokens: remainingTokens,
+                        matchedTokens: matchedTokens, plan: cacheSaltPlan)
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         self.cache = model.newCache(parameters: effectiveParameters)
@@ -865,6 +877,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             inputForPrepare = LMInput(text: LMInput.Text(tokens: lastToken))
                             retainedDiskRestore = diskArrays != nil
                         }
+                    } else if suffixHoldsMedia {
+                        // Restore up to the newest media and prefill from there, encoding only the
+                        // media in the suffix (same as TokenIterator).
+                        inputForPrepare = mediaCarryingSuffixInput(
+                            from: input, remainingTokens: remainingTokens,
+                            matchedTokens: matchedTokens, itemSpans: cacheSaltPlan.itemSpans)
+                        retainedDiskRestore = diskArrays != nil
                     } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                             .expandedDimensions(axis: 0)
@@ -911,6 +930,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let primer = NativeMTPPromptPrimer.enabled && model is any NativeMTPPromptPrimingModel
             && !usesBlockDrafts && !inputForPrepare.hasMediaContent
             ? NativeMTPPromptPrimer(model: model, cache: mtpCache) : nil
+        // A restored suffix of a media chat continues at the FULL prompt's M-RoPE positions (as
+        // TokenIterator does); without this the suffix was positioned from the suffix alone.
+        if let positioned = model as? any RestoredPrefixPositionModel {
+            positioned.prepareRestoredPrefixPositions(
+                fullInput: input,
+                restoredTokenCount: Swift.max(
+                    0, input.text.tokens.size - inputForPrepare.text.tokens.size))
+        }
         let prepared = try NativeMTPPromptPrimer.$current.withValue(primer) {
             try prepareCapturingCacheBoundaries(
                 inputForPrepare, windowSize: effectiveParameters.prefillStepSize,
