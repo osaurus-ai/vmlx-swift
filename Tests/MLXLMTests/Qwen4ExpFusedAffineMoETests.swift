@@ -247,7 +247,10 @@ struct Qwen4ExpFusedAffineMoETests {
         }
     }
 
-    @Test("Flash verifier scope does not widen another family's affine reducer")
+    /// Ornith (Qwen 3.5 MoE) native-MTP verify enters the Flash verification scope (row-exact verify,
+    /// 2026-10-20), so its reducer admits 5...8 scoped rows like Flash Next's; every row is its own grid
+    /// slice, so each row must still equal the single-row decode. Ordinary (unscoped) wide calls stay nil.
+    @Test("Flash verifier scope admits Ornith geometry rows, each equal to its single-row decode")
     func scopedWideRowsPreserveOtherGeometryAdmission() throws {
         let (gate, _) = Self.makeProjection(
             inputDims: 2048, outputDims: 512, bits: 5, groupSize: 64, seed: 16001)
@@ -261,13 +264,20 @@ struct Qwen4ExpFusedAffineMoETests {
         let i = MLXArray((0..<40).map { UInt32($0 % 8) }, [1, 5, 8])
         let s = MLXArray.ones([1, 5, 8], dtype: .float32) * Float(0.125)
         #expect(reducer(x, i, s) == nil)
-        #expect(FlashVerificationScope.withVerification(inputShape: [1, 5]) {
+        let scoped = try #require(FlashVerificationScope.withVerification(inputShape: [1, 5]) {
             reducer(x, i, s)
-        } == nil)
-        let single = try #require(reducer(
-            x[0..., ..<1, 0...], i[0..., ..<1, 0...], s[0..., ..<1, 0...]))
-        MLX.eval(single)
-        #expect(single.shape == [1, 1, 2048])
+        })
+        MLX.eval(scoped)
+        #expect(scoped.shape == [1, 5, 2048])
+        for row in 0 ..< 5 {
+            let single = try #require(reducer(
+                x[0..., row ..< (row + 1), 0...], i[0..., row ..< (row + 1), 0...],
+                s[0..., row ..< (row + 1), 0...]))
+            MLX.eval(single)
+            #expect(single.asData(access: .copy).data
+                == scoped[0..., row ..< (row + 1), 0...].asData(access: .copy).data,
+                "scoped row \(row) must be the single-row decode bit for bit")
+        }
     }
 
     @Test("native-MTP rows 2 through 4 match independent row-1 decode for every qualified layout")
