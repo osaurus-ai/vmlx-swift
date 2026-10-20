@@ -152,7 +152,10 @@ enum SafetensorsByteWriter {
     /// Work is split into slices across cores; a clean 3.36 GB payload reads in well under the
     /// time one GPU reduction took on the synchronous store path.
     static func nonFiniteTensorNames(_ tensors: [Tensor], limit: Int = 4) -> [String] {
-        struct Slice { let tensor: Int; let base: UnsafeRawPointer; let bytes: Int }
+        // Read-only views into payload buffers the caller keeps alive for the whole screen.
+        struct Slice: @unchecked Sendable { let tensor: Int; let base: UnsafeRawPointer; let bytes: Int }
+        // Each concurrent iteration writes only its own index.
+        struct FlagWriter: @unchecked Sendable { let base: UnsafeMutablePointer<Bool> }
         func width(_ dtype: String) -> Int? {
             switch dtype {
             case "BF16", "F16": return 2
@@ -201,13 +204,16 @@ enum SafetensorsByteWriter {
             }
         }
         let dtypes = tensors.map(\.dtype)
-        var flags = [Bool](repeating: false, count: slices.count)
-        flags.withUnsafeMutableBufferPointer { out in
-            DispatchQueue.concurrentPerform(iterations: slices.count) { i in
-                let slice = slices[i]
-                out[i] = containsNonFinite(slice.base, bytes: slice.bytes, dtype: dtypes[slice.tensor])
-            }
+        let work = slices
+        let flagStorage = UnsafeMutablePointer<Bool>.allocate(capacity: max(1, work.count))
+        flagStorage.initialize(repeating: false, count: max(1, work.count))
+        defer { flagStorage.deallocate() }
+        let writer = FlagWriter(base: flagStorage)
+        DispatchQueue.concurrentPerform(iterations: work.count) { i in
+            let slice = work[i]
+            writer.base[i] = containsNonFinite(slice.base, bytes: slice.bytes, dtype: dtypes[slice.tensor])
         }
+        let flags = Array(UnsafeBufferPointer(start: flagStorage, count: work.count))
         var flagged = Set(smallFlagged)
         for (slice, flag) in zip(slices, flags) where flag { flagged.insert(slice.tensor) }
         var names: [String] = []
