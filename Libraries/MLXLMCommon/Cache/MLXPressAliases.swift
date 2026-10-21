@@ -45,13 +45,6 @@ public typealias MLXPressMachStats = JangPressMachStats
 /// Public MLXPress spelling for a Mach purgeable routed expert tile.
 public typealias MLXPressTile = JangPressTile
 
-/// Public MLXPress spelling for canonical expert-advisor status.
-public typealias MLXPressCanonicalExpertAdvisorStatus =
-    JangPressCanonicalExpertAdvisorStatus
-
-/// Public MLXPress spelling for the canonical expert advisor.
-public typealias MLXPressCanonicalExpertAdvisor = JangPressCanonicalExpertAdvisor
-
 /// Public MLXPress spelling for prestack/alignment bundle preparation.
 public typealias MLXPressPrestacker = JangPressPrestacker
 

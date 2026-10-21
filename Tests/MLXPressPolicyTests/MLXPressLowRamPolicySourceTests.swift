@@ -19,9 +19,6 @@ struct MLXPressLowRamPolicySourceTests {
         let streamingExperts = try String(
             contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
             encoding: .utf8)
-        let coldSweep = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/MLXPressMmapColdSweep.swift",
-            encoding: .utf8)
         let machCache = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Cache/JangPressMachCache.swift",
             encoding: .utf8)
@@ -449,9 +446,8 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(attentionUtils.contains("if queryLength == 1 && originalDtype != .float32"))
         #expect(attentionUtils.contains("queries.asType(.float32)"))
         #expect(attentionUtils.contains("return out.asType(originalDtype)"))
-        #expect(coldSweep.contains("mlx_safetensors_mmap_advise_layer"))
-        #expect(deepseekJANGTQ.contains("MLXPressMmapColdSweep.afterLayer"))
-        #expect(hy3.contains("MLXPressMmapColdSweep.afterLayer"))
+        #expect(!deepseekJANGTQ.contains("MLXPressMmapColdSweep.afterLayer"))
+        #expect(!hy3.contains("MLXPressMmapColdSweep.afterLayer"))
         #expect(safetensors.contains("safetensors_mmap_advise_layer"))
         #expect(safetensors.contains("load_safetensors_mmap"))
         #expect(safetensors.contains("MLX_SAFETENSORS_MMAP_COLD_ADVICE"))

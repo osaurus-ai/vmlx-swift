@@ -756,15 +756,7 @@ public func loadModel(
             }
         }
     }
-    _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
-        options: resolvedOptions,
-        mmapEnabled: useMmapSafetensors)
     loadTiming.mark("factory_load")
-    JangPressCanonicalExpertAdvisor.shared.configure(
-        options: resolvedOptions,
-        mmapEnabled: useMmapSafetensors,
-        numRoutedExperts: facts.numRoutedExperts,
-        topK: facts.topK)
 
     // 5. Activate JangPress per resolved options. `.disabled` short-
     //    circuits inside `JangPressActivation.activate` and returns
@@ -948,60 +940,6 @@ private func withMmapSafetensorsEnv<R>(
     #endif
     return try await body()
 }
-
-@discardableResult
-private func adviseCanonicalMmapRoutedExpertsIfAvailable(
-    options: JangPressLoadOptions,
-    mmapEnabled: Bool
-) -> Int64? {
-    guard mmapEnabled,
-        options.enabled,
-        options.backend == .mmap,
-        options.compressPct > 0
-    else { return nil }
-
-    #if canImport(Cmlx)
-        guard let adviseRouted = lookupSafetensorsMmapAdviseRouted() else {
-            return nil
-        }
-
-        let advised = adviseRouted(
-            0,  // 0 = cold advice; C++ defaults to MADV_DONTNEED and can be env-selected.
-            Int32(max(0, min(100, options.compressPct))))
-
-        let env = ProcessInfo.processInfo.environment
-        if advised > 0,
-            env["MLXPRESS_DEBUG"] == "1"
-                || env["JANGPRESS_DEBUG"] == "1"
-                || env["MLX_SAFETENSORS_MMAP_DEBUG"] == "1"
-        {
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPress] advised \(advised) canonical mmap routed bytes cold (pct=\(options.compressPct))\n"
-                        .utf8))
-        }
-        return advised
-    #else
-        return nil
-    #endif
-}
-
-#if canImport(Cmlx)
-    private typealias SafetensorsMmapAdviseRoutedFn =
-        @convention(c) (
-            Int32,
-            Int32
-        ) -> Int64
-
-    private func lookupSafetensorsMmapAdviseRouted() -> SafetensorsMmapAdviseRoutedFn? {
-        guard let handle = dlopen(nil, RTLD_NOW),
-            let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_routed")
-        else {
-            return nil
-        }
-        return unsafeBitCast(symbol, to: SafetensorsMmapAdviseRoutedFn.self)
-    }
-#endif
 
 /// Protocol for types that can provide ModelFactory instances.
 ///

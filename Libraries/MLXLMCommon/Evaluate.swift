@@ -5573,19 +5573,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
 
-            // Router-advice readback runs on its own Dispatch queue. Drain it
-            // after MLX synchronization so short-lived CLI runs and app unload
-            // paths do not tear down runtime state while the advisor is still
-            // applying mmap page advice.
-            MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()
             if genTailTrace {
-                let tailT4 = Date()
                 print(
                     "[vmlx][gen/tail] infoEmitted=early"
                         + " drain1=\(tailT1.timeIntervalSince(tailT0))s"
                         + " store=\(tailT2.timeIntervalSince(tailT1))s"
-                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s"
-                        + " advisor=\(tailT4.timeIntervalSince(tailT3))s")
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
             }
 
             // Finalize the stream — the serialization point for the next

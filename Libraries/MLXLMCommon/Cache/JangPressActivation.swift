@@ -7,9 +7,7 @@
 // removed because they advised a parallel mapping rather than MLX's
 // canonical tensor storage. This activator now builds the mmap
 // tile-classification probe and the orthogonal Zipfian embed cache.
-// Canonical routed-expert warm/cold advice is handled separately by
-// `JangPressCanonicalExpertAdvisor` after the patched MLX loader has
-// registered mmap-backed tensor ranges.
+// Router-aware canonical page advice has been removed.
 
 import Foundation
 
@@ -29,9 +27,7 @@ public enum JangPressActivation {
     ///   - options: `JangPressLoadOptions(enabled: ..., compressPct:
     ///     ..., backend: ...)`. The `forceMode` and `enablePrefetch`
     ///     fields exist on `JangPressLoadOptions`; `enablePrefetch`
-    ///     affects the probe tier's start-cold behavior, and
-    ///     `enableRouterAdvice` is consumed by
-    ///     `JangPressCanonicalExpertAdvisor` in the load path.
+    ///     affects the probe tier's start-cold behavior. Router advice is retired.
     /// - Returns: `JangPressRuntime` with `mmap` and/or `embed`
     ///   populated per the options.
     public static func activate(

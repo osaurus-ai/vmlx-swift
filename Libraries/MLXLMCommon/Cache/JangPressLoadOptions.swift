@@ -110,10 +110,6 @@ public struct JangPressLoadOptions: Sendable, Equatable {
 ///     not in this probe object.
 ///   * `embed` — Zipfian embed/lm_head cache, orthogonal to the
 ///     routed-expert tier and still useful on its own.
-///   * `JangPressCanonicalExpertAdvisor` — legacy internal name for the
-///     MLXPress global decode-time policy
-///     that reports router-selected experts to the patched MLX mmap
-///     registry for `MADV_WILLNEED` / `MADV_DONTNEED`.
 public struct JangPressRuntime: Sendable {
     public var mmap: JangPressMmapTier?
     public var embed: JangPressEmbedTier?

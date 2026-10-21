@@ -222,7 +222,6 @@ enum JangPressRegressionBench {
         print("           JangPress: enabled=\(s0.enabled) cold=\(s0.coldFraction.map { String(format: "%.2f", $0) } ?? "—") backend=\(s0.backend.rawValue) state=\(backendName(s0.backend)) tiles=\(s0.tilesUnderManagement) routed=\(String(format: "%.1f", r.jpTotalRoutedBytes_GB)) GB")
         print(String(format: "           mmap tracked Metal buffers: %.1f GB",
             r.mmapTrackedBufferBytes_GB))
-        printAdvisorStatus(prefix: "           [post-load]")
         if loadOnly {
             r.totalSecs = CFAbsoluteTimeGetCurrent() - t0
             r.jpStateAfterQuiesce = backendName(s0.backend)
@@ -335,7 +334,6 @@ enum JangPressRegressionBench {
         let sDec = runtime.status()
         if r.jpEnabled {
             print("           [post-decode] JangPress: backend=\(backendName(sDec.backend)) tiles=\(sDec.tilesUnderManagement) routed=\(String(format: "%.1f", Double(sDec.totalRoutedBytes)/1_073_741_824.0)) GB")
-            printAdvisorStatus(prefix: "           [post-decode]")
         }
         // Coherency: every turn produced non-empty text + no obvious
         // 16-char repeating window in the join.
@@ -437,7 +435,6 @@ enum JangPressRegressionBench {
             r.postquiesceFootprint_GB,
             r.postquiesceFootprint_GB - r.postloadFootprint_GB))
         print("           JangPress: backend=\(r.jpStateAfterQuiesce) tiles=\(r.jpTilesUnderManagement) routed=\(String(format: "%.1f", r.jpTotalRoutedBytes_GB)) GB")
-        printAdvisorStatus(prefix: "           [post-quiesce]", waitForIdle: true)
 
         r.totalSecs = CFAbsoluteTimeGetCurrent() - t0
         printSummary(r)
@@ -451,17 +448,6 @@ enum JangPressRegressionBench {
     }
 
     // MARK: - Helpers
-
-    private static func printAdvisorStatus(
-        prefix: String,
-        waitForIdle: Bool = false
-    ) {
-        if waitForIdle {
-            JangPressCanonicalExpertAdvisor.shared.waitUntilIdle()
-        }
-        let s = JangPressCanonicalExpertAdvisor.shared.snapshot()
-        print("\(prefix) RouterAdvice: enabled=\(s.enabled) async=\(s.asyncReadback) warmAdvice=\(s.warmAdvice) symbol=\(s.symbolAvailable) hotPerLayer=\(s.hotPerLayer) hot=\(s.hotExpertCount) pending=\(s.pendingObservations) droppedQueue=\(s.droppedQueueFull) readbacks=\(s.readbacks) skippedLarge=\(s.skippedLargeIndexTensors) skippedTracer=\(s.skippedTracerArrays) rewarms=\(s.rewarms) coldPairs=\(s.distinctColdAdvisedPairs) warmCalls=\(s.warmCalls) coldCalls=\(s.coldCalls) warmBytes=\(byteString(s.warmBytes)) coldBytes=\(byteString(s.coldBytes))")
-    }
 
     private static func byteString(_ bytes: Int64) -> String {
         String(format: "%.2f GB", Double(bytes) / 1_073_741_824.0)
