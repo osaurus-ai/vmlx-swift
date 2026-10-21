@@ -21,7 +21,7 @@ import Testing
         #expect(second.bytes == 42 * Int(gb))
     }
 
-    @Test(arguments: [Double?.none, 10.0, 0.005])
+    @Test(arguments: [Double?.none, 10.0, 60.0, 100.0, 0.005])
     func cacheGrowthDoesNotRatchetTheCap(percent: Double?) {
         let empty = DiskCacheCapPolicy.resolve(
             percent: percent, legacyGB: nil, totalBytes: 256 * gb,
@@ -51,13 +51,36 @@ import Testing
         #expect(!result.limitedByHost)
     }
 
-    @Test func explicitCeilingNamesTheRequestedAndEffectiveCap() {
+    @Test func explicitLimitIsHonoredEvenWhenDiskSpaceIsLower() {
         let result = DiskCacheCapPolicy.resolve(
             percent: 10, legacyGB: nil, totalBytes: 1000 * gb,
             freeBytes: 60 * gb, ownBytes: 20 * gb)
         #expect(result.requestedBytes == 100 * gb)
-        #expect(result.capBytes == 20 * gb)
-        #expect(result.limitedByHost)
+        #expect(result.capBytes == 100 * gb)
+        #expect(!result.limitedByHost)
+        #expect(result.exceedsAvailableSpace)
+    }
+
+    @Test(arguments: [30.0, 60, 80, 100])
+    func dedicatedVolumeHonorsLargeShares(percent: Double) {
+        let result = DiskCacheCapPolicy.resolve(
+            percent: percent, legacyGB: nil, totalBytes: 1000 * gb,
+            freeBytes: 700 * gb, ownBytes: 100 * gb)
+        #expect(result.capBytes == Int64(Double(1000 * gb) * percent / 100))
+        #expect(!result.limitedByHost)
+        #expect(result.exceedsAvailableSpace == (percent > 80))
+    }
+
+    @Test func legacySizeIsAlsoExplicitAndUnknownFreeSpaceDoesNotClampIt() {
+        for free: Int64? in [0, 10 * gb, nil] {
+            let result = DiskCacheCapPolicy.resolve(
+                percent: nil, legacyGB: 500, totalBytes: 1000 * gb,
+                freeBytes: free, ownBytes: 0)
+            #expect(result.capBytes == 500 * gb)
+            #expect(result.rule == .legacyGB)
+            #expect(!result.limitedByHost)
+            #expect(result.exceedsAvailableSpace == (free != nil))
+        }
     }
 
     @Test(arguments: [0, 1, 2 * 1_073_741_824] as [Int64])

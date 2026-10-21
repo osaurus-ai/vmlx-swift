@@ -6,7 +6,6 @@ import Foundation
 /// cache filling itself does not shrink its own quota on the next model load.
 public enum DiskCacheCapPolicy {
     public static let automaticFraction = 0.30
-    public static let explicitHostFraction = 0.25
     public static let unknownVolumeBytes: Int64 = 10 * 1_073_741_824
 
     /// Configs use Float GiB for compatibility. Converting their rounded
@@ -27,7 +26,10 @@ public enum DiskCacheCapPolicy {
         public let capBytes: Int64
         public let requestedBytes: Int64
         public let rule: Rule
+        /// Kept for source compatibility; explicit limits are no longer clamped.
         public let limitedByHost: Bool
+        /// Advisory only: the quota is a ceiling, not a disk reservation.
+        public let exceedsAvailableSpace: Bool
         /// Advisory only. Never disables a tier or rejects a request.
         public let lowFreeSpace: Bool
         public var capGB: Double { Double(capBytes) / 1_073_741_824 }
@@ -66,18 +68,14 @@ public enum DiskCacheCapPolicy {
             rule = .unknownVolume
         }
 
-        // Preserve the existing explicit-size host ceiling, but base it on
-        // free + owned bytes. Automatic already has its own 30% policy and
-        // must not be reduced to 25% by applying this ceiling a second time.
-        let cap: Int64
-        if rule == .explicitPercent || rule == .legacyGB, let available {
-            cap = min(requested, positiveBytes(Double(available) * explicitHostFraction))
-        } else {
-            cap = requested
-        }
+        // An explicit quota is the user's ceiling, not a reservation. Free-space
+        // changes must not silently rewrite it or evict a dedicated drive's cache
+        // at 25%. The writer still reports actual filesystem failures normally.
         return Resolution(
-            capBytes: cap, requestedBytes: requested, rule: rule,
-            limitedByHost: cap < requested, lowFreeSpace: lowFreeSpace)
+            capBytes: requested, requestedBytes: requested, rule: rule,
+            limitedByHost: false,
+            exceedsAvailableSpace: available.map { requested > $0 } ?? false,
+            lowFreeSpace: lowFreeSpace)
     }
 
     private static func positiveBytes(_ value: Double) -> Int64 {
