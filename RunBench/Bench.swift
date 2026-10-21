@@ -8625,6 +8625,7 @@ private func runPerfBenchBody(
         var perfLine = ""
 
         do {
+        ProcessMemoryObservation.log(stage: "before_load")
         let rssBeforeLoad = currentRSSMiB()
         let footprintBeforeLoad = currentPhysFootprintMiB()
         print(String(format:
@@ -8699,6 +8700,7 @@ private func runPerfBenchBody(
             MLX.Memory.cacheLimit = persistentAllocatorCap
         }
         let rssAfterLoad = currentRSSMiB()
+        ProcessMemoryObservation.log(stage: "after_load")
         let footprintAfterLoad = currentPhysFootprintMiB()
         peakRSSMiB = max(peakRSSMiB, rssAfterLoad)
         peakFootprintMiB = max(peakFootprintMiB, footprintAfterLoad)
@@ -9084,6 +9086,7 @@ private func runPerfBenchBody(
                let json = String(data: encoded, encoding: .utf8) {
                 print("  PERF_FAILURE label=\(label) failure=\(json)")
             }
+            ProcessMemoryObservation.log(stage: "after_\(label)")
             result.rssMiB = currentRSSMiB()
             result.footprintMiB = currentPhysFootprintMiB()
             peakRSSMiB = max(peakRSSMiB, result.rssMiB)
@@ -9225,7 +9228,7 @@ private func runPerfBenchBody(
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
-            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
+            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d max_observed_rss_mib=%.0f max_observed_footprint_mib=%.0f memory_sampling=post_load_and_post_turn graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
             modelName, variant, pathLabel, samplingSource, perfSeedLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
             context.model.modelWeightAccounting().supplementalMappedBytes > 0
