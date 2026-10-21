@@ -61,6 +61,19 @@ extension UnusedPromptSnapshotTests {
         XCTAssertEqual(iterator.next(), 6)
     }
 
+    func testInstalledCoordinatorWithBothTiersOffDoesNotRetainCheckpoint() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false, enableDiskCache: false))
+        XCTAssertFalse(coordinator.canPersistBoundaries)
+        var iterator = try TokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])), model: SnapshotProbeModel(),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0), cacheCoordinator: coordinator)
+        XCTAssertNil(iterator.promptCacheSnapshot)
+        XCTAssertEqual(iterator.next(), 6)
+    }
+
     func testAuxiliaryIteratorDoesNotRetainAnUnpublishablePrompt() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }

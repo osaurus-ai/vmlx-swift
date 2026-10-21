@@ -2866,6 +2866,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     private func prefillBoundaryCapture(
         of input: LMInput
     ) -> (kind: PrefillBoundaryCapture, head: LMInput?, tail: LMInput)? {
+        guard cacheCoordinator?.canPersistBoundaries == true,
+              originalInput.cachePromptIntent != .auxiliary else { return nil }
         if let boundary = hybridStripBoundary,
            hybridStripSnapshot == nil,
            let split = boundarySplit(of: input, at: boundary)
@@ -3425,7 +3427,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Canonical hybrid prompts are never stored exactly, and their recurrent state
     // cannot be trimmed to a previous boundary. Keep only the captured boundary.
     var retainsPromptSnapshotForStores: Bool {
-        guard cacheCoordinator != nil, originalInput.cachePromptIntent != .auxiliary else {
+        guard cacheCoordinator?.canPersistBoundaries == true, originalInput.cachePromptIntent != .auxiliary else {
             return false
         }
         return !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil

@@ -1142,7 +1142,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private var retainsPromptSnapshotForStores: Bool {
-        guard cacheCoordinator != nil, originalInput.cachePromptIntent != .auxiliary else {
+        guard cacheCoordinator?.canPersistBoundaries == true, originalInput.cachePromptIntent != .auxiliary else {
             return false
         }
         guard let coordinator = cacheCoordinator, coordinator.isHybrid,
