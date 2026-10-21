@@ -45,8 +45,12 @@ func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache]
 /// Standalone rotating/SWA caches retain their existing exact snapshot because
 /// their prompt/stable-boundary storage policy still consumes it.
 func makeRetainedExactPromptSnapshot(
-    from cache: [any KVCache]
+    from cache: [any KVCache],
+    storageEnabled: Bool = true
 ) -> [any KVCache]? {
+    // Auxiliary requests and coordinator-free batching never publish a prompt
+    // boundary. Do not allocate a sealed copy that only survives until cleanup.
+    guard storageEnabled else { return nil }
     guard !cacheRequiresPrefillCapturedDiskSeed(cache) else { return nil }
     return makePromptBoundaryCacheSnapshot(from: cache)
 }

@@ -2898,7 +2898,9 @@ public actor BatchEngine {
         // The captured DSV4 N-1 seed replaces the unusable exact-prompt
         // snapshot. Retain one cache copy through decode, not two.
         slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: slot.cache)
+            from: slot.cache,
+            storageEnabled: cacheCoordinator != nil
+                && slot.originalInput.cachePromptIntent != .auxiliary)
 
         let tokenID = firstToken.item(Int.self)
         try error.check()
@@ -3776,12 +3778,12 @@ public actor BatchEngine {
                     tokens: tokens, fullPromptTokenIds: promptTokens) else { return nil }
                 let keepsMedia = !slot.originalInput.hasMediaContent || mediaBoundaryInput.hasMediaContent
                 let trimCount = storageSnapshotTokenCount - tokens.count
-                let trimmed = storageTopologySnapshot.map { $0.copy() }
-                if keepsMedia, canTrimPromptCache(trimmed),
-                   trimPromptCache(trimmed, numTokens: trimCount) == trimCount
-                {
-                    MLX.eval(trimmed)
-                    return trimmed
+                if keepsMedia, canTrimPromptCache(storageTopologySnapshot) {
+                    let trimmed = storageTopologySnapshot.map { $0.copy() }
+                    if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                        MLX.eval(trimmed)
+                        return trimmed
+                    }
                 }
 
                 // Hybrid fast path: only the recurrent layers make the trim
