@@ -24,7 +24,7 @@ func runMTPProxyBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration(nativeMTP: true)
-    ).0
+    )
     guard let model = context.model as? any NativeMTPAutoregressiveBackboneModel,
         let mtp = context.model as? any NativeMTPModel, mtp.nativeMTPAvailable
     else {

@@ -24,7 +24,7 @@ func runRowCostBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration(nativeMTP: env["BENCH_ROWCOST_NOMTP"] != "1")
-    ).0
+    )
     guard let model = context.model as? any NativeMTPModel else {
         print("[ROWCOST] model is not a NativeMTPModel")
         return

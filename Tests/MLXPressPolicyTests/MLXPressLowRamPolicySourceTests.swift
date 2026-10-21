@@ -7,20 +7,11 @@ import Testing
 struct MLXPressLowRamPolicySourceTests {
     @Test("canonical mmap and quantized compute survive cold-tier retirement")
     func canonicalRuntimeSurvivesColdTierRetirement() throws {
-        let prestacker = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/JangPressPrestacker.swift",
-            encoding: .utf8)
         let factory = try String(
             contentsOfFile: "Libraries/MLXLMCommon/ModelFactory.swift",
             encoding: .utf8)
         let streamingExperts = try String(
             contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
-            encoding: .utf8)
-        let machCache = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/JangPressMachCache.swift",
-            encoding: .utf8)
-        let aliases = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/MLXPressAliases.swift",
             encoding: .utf8)
         let load = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Load.swift",
@@ -56,13 +47,9 @@ struct MLXPressLowRamPolicySourceTests {
             contentsOfFile: "scripts/summarize-mlxpress-metrics.py",
             encoding: .utf8)
 
-        #expect(prestacker.contains("prestackExplicitlyEnabled = isEnabledFlag(prestackRaw)"))
-        #expect(prestacker.contains("if hasJANGTQSidecar && prestackExplicitlyEnabled"))
-        #expect(prestacker.contains("MLXPRESS_PRESTACK_EPHEMERAL"))
-        #expect(prestacker.contains("cleanupEphemeralPrestackDirectories"))
-        #expect(prestacker.contains("cleanupEphemeralPrestackDirectory(_ url: URL)"))
-        #expect(prestacker.contains("atexit(jangPressPrestackerCleanupAtExit)"))
         #expect(!factory.contains("JangPressPrestacker.prepareBundleIfNeeded"))
+        #expect(!streamingExperts.contains("loadMachBackedTensor"))
+        #expect(!streamingExperts.contains("MLXPRESS_STREAMING_MACH"))
         #expect(factory.contains("SafetensorsStorageHealer.healBundleIfEligible"))
         #expect(!factory.contains("context.configuration.id = .directory(directory)"))
         #expect(!factory.contains("MLXPRESS_PRESTACK=1 / JANGPRESS_PRESTACK=1"))
@@ -71,61 +58,9 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(factory.contains("MLX_SAFETENSORS_MMAP"))
         #expect(factory.contains("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"))
         #expect(factory.contains("MLXPRESS_MMAP_TENSOR_BUFFERS"))
-        #expect(machCache.contains("VM_FLAGS_PURGABLE"))
-        #expect(machCache.contains("releaseColdTiles"))
-        #expect(machCache.contains("VM_PURGABLE_VOLATILE"))
-        #expect(machCache.contains("component: String"))
-        #expect(machCache.contains("registerFilled"))
-        #expect(machCache.contains("public func remove(layer: Int"))
-        #expect(machCache.contains("MLXPRESS_MACH_RELEASE_POLICY"))
-        #expect(machCache.contains("JANGPRESS_MACH_RELEASE_POLICY"))
-        #expect(machCache.contains("MADV_PAGEOUT"))
-        #expect(machCache.contains("VM_VOLATILE_GROUP_7"))
-        #expect(machCache.contains("VM_PURGABLE_BEHAVIOR_LIFO"))
-        #expect(machCache.contains("VM_PURGABLE_NO_AGING"))
-        #expect(machCache.contains("let readCount = min(tile.byteCount - readBytes, 64 * 1024 * 1024)"))
-        #expect(machCache.contains("pread("))
-        #expect(machCache.contains("mlx_array_new_data_managed_payload"))
-        #expect(aliases.contains("MLXPressMachCache"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_ACTIVE_TENSORS"))
-        #expect(streamingExperts.contains("tensor.mach_register"))
-        #expect(streamingExperts.contains("releaseMachColdTiles"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_OFFSET_SPANS"))
-        #expect(streamingExperts.contains("JANGPRESS_STREAMING_MACH_OFFSET_SPANS"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_OFFSET_SPAN_BUDGET_MB"))
-        #expect(streamingExperts.contains("JANGPRESS_STREAMING_MACH_OFFSET_SPAN_BUDGET_MB"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_FULL_OFFSET_SPANS"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_PREWARM_FULL_OFFSET_SPANS"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_FULL_OFFSET_LAZY"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_PREWARM_MAX_LAYERS"))
-        #expect(streamingExperts.contains("MLXPRESS_STREAMING_MACH_PREWARM_MAX_GB"))
-        #expect(streamingExperts.contains("machOffsetSpansEnabled"))
-        #expect(streamingExperts.contains("machFullOffsetSpansEnabled"))
-        #expect(streamingExperts.contains("machPrewarmFullOffsetSpansEnabled"))
-        #expect(streamingExperts.contains("machFullOffsetLazyEnabled"))
-        #expect(streamingExperts.contains("machOffsetSpanBudgetBytes"))
-        #expect(streamingExperts.contains("machOffsetSpanRegisteredBytes"))
-        #expect(streamingExperts.contains("StreamingMachTensorEntry"))
-        #expect(streamingExperts.contains("loadMachOffsetSpan"))
-        #expect(streamingExperts.contains("makeMachFullOffsetSpanArray"))
-        #expect(streamingExperts.contains("prewarmFullOffsetSpansIfNeeded"))
-        #expect(streamingExperts.contains("tensor.mach_full_offset_read"))
-        #expect(streamingExperts.contains("tensor.mach_full_offset_hit"))
-        #expect(streamingExperts.contains("tensor.mach_full_offset_prewarm"))
-        #expect(streamingExperts.contains("registerMachBackedTensor"))
-        #expect(streamingExperts.contains("useNoCacheForRegistration"))
-        #expect(
-            streamingExperts.contains(
-                "cachedDarwinFileDescriptor(for: ref.fileURL, useNoCache: useNoCache)"))
         #expect(streamingExperts.contains("cachedDarwinFileDescriptor(for url: URL, useNoCache: Bool)"))
         #expect(streamingExperts.contains(#"let cacheKey = "\(useNoCache ? "nocache" : "cache"):\(key)""#))
         #expect(streamingExperts.contains("let readCount = min(count - total, 64 * 1024 * 1024)"))
-        #expect(streamingExperts.contains("machCache.registerFilled"))
-        #expect(streamingExperts.contains("tensor.mach_offset_read"))
-        #expect(streamingExperts.contains("tensor.mach_offset_array"))
-        #expect(streamingExperts.contains("tensor.mach_offset_evict"))
-        #expect(streamingExperts.contains("tensor.mach_offset_budget_skip"))
-        #expect(streamingExperts.contains("machTensorEvictions"))
         #expect(streamingExperts.contains("MLXPRESS_STREAMING_OFFSET_SPAN_CACHE_MB"))
         #expect(streamingExperts.contains("tensor.offset_span_cache_hit"))
         #expect(streamingExperts.contains("tensor.offset_span_cache_store"))

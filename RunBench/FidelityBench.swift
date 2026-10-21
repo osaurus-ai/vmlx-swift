@@ -46,7 +46,7 @@ func runFidelityBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration(nativeMTP: true)
-    ).0
+    )
     guard let model = context.model as? any NativeMTPAutoregressiveBackboneModel else {
         print("[FIDELITY] INVALID: model lacks a native backbone forward")
         return

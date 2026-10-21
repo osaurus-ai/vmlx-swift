@@ -1,83 +1,15 @@
 // Copyright © 2026 Jinho Jang. All rights reserved.
-//
-// LoadConfiguration — typed, Sendable surface for cold-tier (MLXPress)
-// + resident-cap policy. Designed so osaurus / JANG Studio / CLI tools
-// can pin behavior from settings without touching env vars.
-//
-// Env-var precedence is preserved as a fallback so headless CLI
-// invocations keep working: explicit value > env > .auto threshold.
-//
-// See docs/MLXPRESS.md for the current wiring guide. Older JANGPRESS docs
-// record historical design evidence and remain useful during migration.
+// Typed canonical loading, allocator and residency configuration.
 
 import Foundation
 import MLX
 
-/// Cold-weight (axis E, MLXPress) policy. The driver picks a concrete
-/// `MLXPressLoadOptions` from this at load-entry time.
-///
-/// Three states:
-///
-/// - ``disabled`` — never instantiate the MLXPress tier; the loader
-///   takes the legacy full-resident path. Use this when you want
-///   strict byte-compat with pre-iter-23 behavior, or when the host
-///   has plenty of RAM and cold-fault latency is not desired.
-///
-/// - ``enabled(coldFraction:)`` — always instantiate, with a fixed
-///   fraction of routed-MoE bytes treated as cold (`0.0 ... 0.95`).
-///   `0.70` is the production-recommended value for 128 GB hosts.
-///
-/// - ``auto(envFallback:)`` — pick at load time:
-///   1. If `envFallback == true`, honor `MLXPRESS` env var, with
-///      `JANGPRESS` accepted as a legacy fallback:
-///      `0`/`off`/`false` → disabled; integer `N` in `[0, 95]` →
-///      `.enabled(coldFraction: Double(N) / 100.0)`.
-///   2. Otherwise: enable with `coldFraction = 0.70` iff the bundle
-///      is detected as routed (MoE) AND raw bytes exceed 50% of
-///      physical memory. Otherwise disabled.
-public enum JangPressPolicy: Sendable, Equatable {
-    case disabled
-    case enabled(coldFraction: Double)
-    case auto(envFallback: Bool)
-
-    /// Production default — `.auto` with env fallback on. Behavior
-    /// adapts per host and respects an explicit `MLXPRESS=` override.
-    public static let `default`: JangPressPolicy = .auto(envFallback: true)
-
-    /// Equality treats `coldFraction` bit-exactly (intended; consumers
-    /// should pass canonical doubles like 0.70, not arithmetic that
-    /// might round).
-    public static func == (lhs: JangPressPolicy, rhs: JangPressPolicy) -> Bool {
-        switch (lhs, rhs) {
-        case (.disabled, .disabled): return true
-        case (.enabled(let a), .enabled(let b)): return a == b
-        case (.auto(let a), .auto(let b)): return a == b
-        default: return false
-        }
-    }
-}
-
-/// Hard cap on resident weight bytes during load. Independent of
-/// `MLXPressPolicy` — a caller may disable MLXPress and still want a
-/// fail-loud cap, or enable MLXPress without any cap.
-///
-/// - ``unlimited`` — no cap. Loader behaves as it always has;
-///   `MLX_set_wired_limit` and the `MLX.Memory.cacheLimit` are
-///   untouched. Current behavior pre-iter-25.
-///
-/// - ``fraction(_:)`` — cap at `fraction × ProcessInfo.physicalMemory`.
-///   `0.70` is the production-recommended value for 128 GB hosts.
-///
-/// - ``absolute(_:)`` — cap at exactly N bytes. Useful for CI / VMs
-///   with restricted memory limits independent of physical RAM.
 public enum ResidentCap: Sendable, Equatable {
     case unlimited
     case fraction(Double)
     case absolute(UInt64)
 
-    /// Production default — 70% of physical RAM. Matches the
-    /// `MLXPress=70` recommendation but is enforced even when
-    /// MLXPress is disabled.
+    /// Generic default; model-specific admission may resolve a different cap.
     public static let `default`: ResidentCap = .fraction(0.70)
 
     /// Resolve to a concrete byte cap given physical RAM. Returns
@@ -95,21 +27,10 @@ public enum ResidentCap: Sendable, Equatable {
     }
 }
 
-/// Top-level load-time configuration. Wraps the cold-tier policy and
-/// resident cap so osaurus can stash a single Sendable struct in its
-/// settings store and pass it through to `loadModel` / `loadContainer`.
-///
-/// **Source-compat**: this is purely additive. Existing callers that
-/// use `loadModel(from:using:)` (no MLXPress) or
-/// `loadModel(from:using:jangPress:)` (legacy explicit `JangPressLoadOptions`)
-/// keep working unchanged. The new
-/// `loadModel(from:using:loadConfiguration:)` overload (added in
-/// step 2) consumes this struct.
+/// Typed canonical model loading, memory limits and optional model features.
 public struct LoadConfiguration: Sendable, Equatable {
     /// Default-denied original-file repair. Does not replace the existing opt-in.
     public var alignmentRepairAuthorization: AlignmentRepairAuthorization = .disabled
-    /// Cold-weight (MLXPress) policy.
-    public var jangPress: JangPressPolicy
 
     /// Hard cap on resident weight bytes (deprecated semantics — use
     /// ``memoryLimit`` instead). Kept for backwards-source-compat.
@@ -141,7 +62,7 @@ public struct LoadConfiguration: Sendable, Equatable {
     public private(set) var memoryLimitWasExplicit: Bool
 
     /// Use MLX's mmap-backed safetensors loader when the pinned
-    /// `mlx-swift` build supports it. For MLXPress `.mmap` loads, the
+    /// `mlx-swift` build supports it. The
     /// Osaurus MLX fork maps safetensors tensors as page-aligned
     /// no-copy Metal buffers and creates MLX tensor views into those
     /// buffers, avoiding the stock `pread()` copy into anonymous
@@ -184,42 +105,12 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// and reloading the model.
     public var deepseekV4ActivationQAT: Bool?
 
-    /// Production default — MLXPress `.disabled` (opt-in), 70% cache +
-    /// memory caps, mmap-backed safetensors enabled. Osaurus and other
-    /// host integrators get spike-survival memory caps and the patched
-    /// mmap loader without engaging the experimental routed-expert
-    /// cold-tier. Callers that have validated MLXPress for a specific
-    /// bundle family should pass an explicit `.enabled(coldFraction:)`
-    /// or `.auto(envFallback:)` policy.
+    /// Canonical mmap loading with the existing allocator and memory policies.
     public static let `default` = LoadConfiguration()
-
-    /// Opt-in MLXPress with auto-detection (`.auto(envFallback: true)`).
-    /// Use this when the host has validated MLXPress for the bundles it
-    /// serves AND wants the iter-26 routed-MoE cold-tier on bundles
-    /// whose total weight bytes exceed half of physical RAM.
-    /// `MLXPRESS=N` (0–95) and `MLXPRESS=off` env overrides honored;
-    /// legacy `JANGPRESS=*` remains accepted.
-    public static let experimentalJangPressAuto = LoadConfiguration(
-        jangPress: .auto(envFallback: true),
-        maxResidentBytes: .default,
-        memoryLimit: .default,
-        useMmapSafetensors: true,
-        nativeMTP: false)
-
-    /// Production host preset for Osaurus/vMLX server integrations.
-    ///
-    /// Keep the conservative load-time memory caps and mmap safetensors
-    /// path from ``default`` without automatically engaging the
-    /// experimental routed-expert cold tier. Hosts that have validated
-    /// MLXPress for a specific bundle family should pass
-    /// ``experimentalJangPressAuto`` or an explicit
-    /// ``JangPressPolicy/enabled(coldFraction:)`` policy from settings.
     public static let osaurusProduction = LoadConfiguration.default
 
-    /// Everything off — strict byte-compat with pre-iter-23 behavior.
-    /// MLXPress disabled, no caps, no mmap loader.
+    /// Explicit diagnostic preset without memory caps or mmap loading.
     public static let off = LoadConfiguration(
-        jangPress: .disabled,
         maxResidentBytes: .unlimited,
         memoryLimit: .unlimited,
         useMmapSafetensors: false,
@@ -227,14 +118,12 @@ public struct LoadConfiguration: Sendable, Equatable {
         deepseekV4ActivationQAT: false)
 
     public init(
-        jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
         memoryLimit: ResidentCap? = nil,
         useMmapSafetensors: Bool = true,
         nativeMTP: Bool = false,
         deepseekV4ActivationQAT: Bool? = nil
     ) {
-        self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
         self.memoryLimit = memoryLimit ?? .default
         self.memoryLimitWasExplicit = memoryLimit != nil
@@ -304,7 +193,7 @@ public enum DeepseekV4ActivationQAT {
 
 // MARK: - Resolution
 
-/// Snapshot of the bundle facts needed by `MLXPressPolicy.resolve` —
+/// Snapshot of bundle facts used for canonical loading and memory admission —
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
@@ -369,7 +258,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     public var isRouted: Bool
 
     /// Best-effort routed-expert count sniffed from `config.json`.
-    /// Used by router-aware MLXPress advice to size each layer's hot
+    /// Describes the routed expert topology, including each layer's
     /// set. `nil` when the bundle does not expose the shape.
     public var numRoutedExperts: Int?
 
@@ -417,7 +306,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let fm = FileManager.default
         let physical = HostPhysicalMemory.bytes
 
-        // Walk top-level for *.safetensors. Don't recurse — MLXPress
+        // Walk top-level for *.safetensors. Do not recurse: the loader
         // bundles never nest weights under subdirs.
         var totalBytes: UInt64 = 0
         if let entries = try? fm.contentsOfDirectory(
@@ -807,159 +696,6 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// above, so RAM admission remains the owning safety gate for both caps.
     public func resolveMLXAllocatorCacheLimit(requested: ResidentCap) -> ResidentCap {
         requiresUncappedResidentPools ? .unlimited : requested
-    }
-}
-
-extension JangPressPolicy {
-    /// Resolve to a concrete `MLXPressLoadOptions` for the given
-    /// bundle. Precedence: explicit value > env (`MLXPRESS=...`, then
-    /// legacy `JANGPRESS=...`) >
-    /// `.auto` threshold (routed AND bundleBytes > 0.5 × physicalMemory).
-    ///
-    /// The default cold fraction for `.auto` is `0.70` (matches the
-    /// production tuning verified in iter 25 across 4 model families).
-    public func resolve(facts: LoadBundleFacts) -> JangPressLoadOptions {
-        switch self {
-        case .disabled:
-            return .disabled
-
-        case .enabled(let coldFraction):
-            let pct = Int((max(0.0, min(0.95, coldFraction)) * 100.0).rounded())
-            return JangPressLoadOptions(enabled: true, compressPct: pct)
-
-        case .auto(let envFallback):
-            if envFallback,
-                let raw = ProcessInfo.processInfo.environment["MLXPRESS"]
-                    ?? ProcessInfo.processInfo.environment["JANGPRESS"]
-            {
-                let lowered = raw.lowercased()
-                if lowered == "0" || lowered == "off" || lowered == "false" {
-                    return .disabled
-                }
-                if let n = Int(raw), (0...95).contains(n) {
-                    return JangPressLoadOptions(enabled: true, compressPct: n)
-                }
-                // Garbage env value — fall through to threshold.
-            }
-
-            // Threshold rule: enable iff routed AND bundle bytes
-            // exceed half of physical RAM. Conservative on dense
-            // models (no benefit) and tiny MoE (no pressure).
-            //
-            // Qwen3.8 Flash Next JANG is excluded from the threshold: its
-            // directory bytes include a 20-29 GiB PLE/ngram table that the
-            // model-owned exact-row SSD reader serves and that never becomes
-            // resident, so the whole-bundle size wildly overstates the
-            // resident need (96 GiB dir -> ~73 GiB resident on the 4-bit
-            // tier). The family's runtime contract requires every non-PLE
-            // compute weight resident — cold-compressing it only adds fault-in
-            // latency to a model that already fits.
-            if facts.isQwen4ExpBF16JANG {
-                return .disabled
-            }
-            let halfRAM = facts.physicalMemory / 2
-            if facts.isRouted && facts.totalSafetensorsBytes > halfRAM {
-                return JangPressLoadOptions(enabled: true, compressPct: 70)
-            }
-            return .disabled
-        }
-    }
-}
-
-// MARK: - Inspection
-
-/// Runtime status of the MLXPress runtime — used by osaurus / JANG
-/// Studio settings panels. **Drastically simplified in iter 26**: the
-/// controller state machine and routing counters were removed because
-/// nothing in production drove them. What remains is the mmap probe's
-/// tile-classification snapshot (used for UI bookkeeping like "how
-/// many routed-expert tiles did we identify in this bundle?").
-///
-/// For real memory metrics (heap budget, RSS, recommended working set)
-/// use ``MemoryStatus/snapshot()`` — that's the surface that reflects
-/// the actual cap that ships today via `LoadConfiguration.memoryLimit`.
-public struct JangPressStatus: Sendable, Equatable {
-    /// True iff at least one tier (mmap probe or embed cache) is
-    /// attached. Purely informational — nothing about cold-tier
-    /// reclaim or controller state is implied by this flag today.
-    public let enabled: Bool
-
-    /// Cold-fraction setting captured at activation time, expressed as
-    /// `0.0 ... 0.95`. Today this controls how aggressively the embed
-    /// tier shrinks its hot row count; the routed-expert tier no
-    /// longer drives any madvise calls. `nil` when disabled.
-    public let coldFraction: Double?
-
-    /// Routed-expert backend chosen at activation time. With `.mach`
-    /// removed in iter 26 the only meaningful values are `.mmap`
-    /// (probe attached) or `.none`.
-    public let backend: JangPressLoadOptions.Backend
-
-    /// Number of routed-expert tiles classified by the mmap probe.
-    /// `0` when no mmap probe is attached or when the lazy probe has
-    /// not yet been built (`snapshotIfBuilt()` returns zeros until
-    /// something forces it).
-    public let tilesUnderManagement: Int
-
-    /// Total bytes of routed-expert weights identified by the mmap
-    /// probe. `0` when the probe is not built / not attached.
-    public let totalRoutedBytes: UInt64
-
-    /// Empty-status sentinel — represents `JangPressRuntime.none`.
-    public static let disabled = JangPressStatus(
-        enabled: false,
-        coldFraction: nil,
-        backend: .none,
-        tilesUnderManagement: 0,
-        totalRoutedBytes: 0)
-
-    public init(
-        enabled: Bool,
-        coldFraction: Double?,
-        backend: JangPressLoadOptions.Backend,
-        tilesUnderManagement: Int,
-        totalRoutedBytes: UInt64
-    ) {
-        self.enabled = enabled
-        self.coldFraction = coldFraction
-        self.backend = backend
-        self.tilesUnderManagement = tilesUnderManagement
-        self.totalRoutedBytes = totalRoutedBytes
-    }
-}
-
-extension JangPressRuntime {
-    /// Snapshot the current state of the JangPress probes. Returns
-    /// ``JangPressStatus/disabled`` for ``JangPressRuntime/none``.
-    public func status() -> JangPressStatus {
-        guard isActive else { return .disabled }
-
-        let backend: JangPressLoadOptions.Backend
-        var totalRoutedBytes: UInt64 = 0
-        var tiles: Int = 0
-        if let mmap {
-            backend = .mmap
-            let s = mmap.snapshotIfBuilt()
-            totalRoutedBytes = s.totalRoutedBytes
-            tiles = s.expertCount
-        } else {
-            backend = .none
-        }
-
-        // Cold fraction is recovered from the appliedOptions stash
-        // (set by `JangPressActivation.activate`). compressPct is the
-        // % of routed mass open to compression; coldFraction is the
-        // same value as a 0..1 double for consumer ergonomics.
-        let coldFraction: Double? = appliedOptions.map {
-            Double($0.compressPct) / 100.0
-        }
-
-        return JangPressStatus(
-            enabled: true,
-            coldFraction: coldFraction,
-            backend: backend,
-            tilesUnderManagement: tiles,
-            totalRoutedBytes: totalRoutedBytes)
     }
 }
 

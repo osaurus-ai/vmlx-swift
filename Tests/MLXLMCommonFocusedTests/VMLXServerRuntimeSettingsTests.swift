@@ -222,8 +222,8 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
     }
 
-    @Test("Osaurus production preset keeps MLXPress opt-in while preserving MTP resolution")
-    func osaurusProductionPresetKeepsMLXPressOptInWhilePreservingMTPResolution() {
+    @Test("Osaurus production preset preserves memory and MTP resolution")
+    func osaurusProductionPresetPreservesMemoryAndMTPResolution() {
         let settings = VMLXServerRuntimeSettings()
 
         let resolved = settings.resolvedLoadConfiguration(
@@ -232,7 +232,6 @@ struct VMLXServerRuntimeSettingsTests {
             jangConfig: nil,
             status: nil)
 
-        #expect(resolved.jangPress == .disabled)
         #expect(resolved.maxResidentBytes == .default)
         #expect(resolved.memoryLimit == .default)
         #expect(resolved.useMmapSafetensors)
@@ -267,23 +266,6 @@ struct VMLXServerRuntimeSettingsTests {
             VMLXServerPerformanceSettings.self, from: data)
 
         #expect(decoded.deepseekV4ActivationQAT == false)
-    }
-
-    @Test("experimental MLXPress preset remains available for explicit host opt-in")
-    func experimentalMLXPressPresetRemainsAvailableForExplicitHostOptIn() {
-        let settings = VMLXServerRuntimeSettings()
-
-        let resolved = settings.resolvedLoadConfiguration(
-            base: .experimentalJangPressAuto,
-            configData: nil,
-            jangConfig: nil,
-            status: nil)
-
-        #expect(resolved.jangPress == .auto(envFallback: true))
-        #expect(resolved.maxResidentBytes == .default)
-        #expect(resolved.memoryLimit == .default)
-        #expect(resolved.useMmapSafetensors)
-        #expect(!resolved.nativeMTP)
     }
 
     @Test("tool parser settings resolve into model configuration overrides")

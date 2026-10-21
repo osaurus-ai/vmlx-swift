@@ -120,38 +120,6 @@ struct Bench {
             return
         }
 
-        // BENCH_JANGPRESS=1 activates the JangPress cold-weight tier
-        // (axis E) for THIS bench run. Holds the runtime alive for
-        // the full bench so the controller's failsafe state machine
-        // ticks during inference. Knobs:
-        //   BENCH_JANGPRESS_PCT=70        compress 70% of routed mass
-        //   BENCH_JANGPRESS_FORCE=0       soft (madvise DONTNEED) vs
-        //                                 force (msync MS_INVALIDATE)
-        //   BENCH_JANGPRESS_PREFETCH=1    pre-fault top hot tiles at arm
-        let jangPressOn = (env["BENCH_JANGPRESS"] ?? "0") == "1"
-        let jangPressOpts: JangPressLoadOptions = jangPressOn ? .init(
-            enabled: true,
-            compressPct: Int(env["BENCH_JANGPRESS_PCT"] ?? "70") ?? 70,
-            backend: .mmap,
-            forceMode: (env["BENCH_JANGPRESS_FORCE"] ?? "0") == "1" ? .force : .soft,
-            enablePrefetch: (env["BENCH_JANGPRESS_PREFETCH"] ?? "1") == "1"
-        ) : .disabled
-        var jangPressRuntime = JangPressRuntime.none
-        if jangPressOn {
-            jangPressRuntime = JangPressActivation.activate(
-                bundleURL: modelDir, options: jangPressOpts)
-            if jangPressRuntime.isActive {
-                FileHandle.standardError.write(Data(
-                    "[bench] JangPress active: pct=\(jangPressOpts.compressPct) force=\(jangPressOpts.forceMode == .force) prefetch=\(jangPressOpts.enablePrefetch)\n".utf8))
-            } else {
-                FileHandle.standardError.write(Data(
-                    "[bench] JangPress activation requested but tier returned .none\n".utf8))
-            }
-        }
-        defer {
-            if jangPressOn { JangPressActivation.deactivate(jangPressRuntime) }
-        }
-
         // BENCH_VL=1 dispatches to VLBench: loads the real HF tokenizer +
         // synthesises a 224×224 image, runs two turns through the VLM
         // processor + cache to verify vision path + multi-turn cache reuse.
@@ -508,20 +476,6 @@ struct Bench {
         // bundle. No HTTP layer; runs from this binary directly.
         if (env["BENCH_STABILITY"] ?? "0") == "1" {
             try await StabilityBench.run(modelPath: modelPath, maxNewTokens: maxNew)
-            return
-        }
-
-        // BENCH_JPREG=1 (2026-05-03): per-bundle regression sweep that
-        // exercises the new typed `LoadConfiguration` path end-to-end.
-        // Loads with `LoadConfiguration.default` (JangPress disabled +
-        // 70% caps + mmap), runs 3-turn coherency, samples RSS at four
-        // checkpoints, and exercises hybrid-SSM warm-pass plus
-        // TurboQuant disk round-trip checks where applicable.
-        // Designed to be invoked once per bundle from a shell loop so
-        // each model gets a fresh process.
-        if (env["BENCH_JPREG"] ?? "0") == "1" {
-            try await JangPressRegressionBench.run(
-                modelPath: modelPath, maxNewTokens: maxNew)
             return
         }
 
@@ -1382,7 +1336,7 @@ private func loadBenchModelContext(from modelDir: URL) async throws -> ModelCont
         from: modelDir,
         using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .osaurusProduction)
-    return loaded.0
+    return loaded
 }
 
 // MARK: - BatchEngine multi-turn chat (iter 26)
@@ -2255,7 +2209,7 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     let loaded = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .osaurusProduction)
-    let context = loaded.0
+    let context = loaded
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
@@ -3114,18 +3068,17 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(
-                jangPress: .disabled,
                 maxResidentBytes: .unlimited,
                 memoryLimit: .unlimited,
                 useMmapSafetensors: true,
                 nativeMTP: true))
-        context = loaded.0
+        context = loaded
     } else if useMmap {
         let loaded = try await MLXLMCommon.loadModel(
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(useMmapSafetensors: true))
-        context = loaded.0
+        context = loaded
     } else {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())
@@ -6046,11 +5999,10 @@ func runThinkingLoopProbe(modelPath: String, maxNew: Int) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     print("\n=== BENCH_THINK_LOOP_PROBE: validation-task </think> emission ===")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let (context, jangPressRuntime) = try await MLXLMCommon.loadModel(
+    let context = try await MLXLMCommon.loadModel(
         from: modelDir,
         using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .default)
-    _ = jangPressRuntime
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
     print(String(format: "maxTokens budget: %d", maxNew))
@@ -8668,7 +8620,6 @@ private func runPerfBenchBody(
     } else { conversationPrompts = nil }
     var conversationHistory: [Chat.Message] = []
     let modelName = modelDir.lastPathComponent
-    let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
         let pathLabel = useTokenIterator ? "iter" : (env["BENCH_PERF_PATH"] ?? "batch")
         var perfLine = ""
@@ -8683,23 +8634,10 @@ private func runPerfBenchBody(
         var peakFootprintMiB = footprintBeforeLoad
         let loadStart = CFAbsoluteTimeGetCurrent()
         let context: ModelContext
-        let jangPressRuntime: JangPressRuntime?
         let nativeMTPRequestedAtLoad =
             env["BENCH_PERF_NATIVE_MTP_DEPTH"] != nil
             || env["BENCH_PERF_LOAD_NATIVE_MTP"] == "1"
-        if useJangPressLoad {
-            let loaded = try await MLXLMCommon.loadModel(
-                from: modelDir,
-                using: #huggingFaceTokenizerLoader(),
-                loadConfiguration: LoadConfiguration(
-                    jangPress: .enabled(coldFraction: 0.70),
-                    maxResidentBytes: .fraction(0.70),
-                    memoryLimit: .fraction(0.70),
-                    useMmapSafetensors: useMmap,
-                    nativeMTP: nativeMTPRequestedAtLoad))
-            context = loaded.0
-            jangPressRuntime = loaded.1
-        } else if nativeMTPRequestedAtLoad {
+        if nativeMTPRequestedAtLoad {
             let allocatorCap: ResidentCap = env["BENCH_PERF_ALLOCATOR_CACHE_BYTES"]
                 .flatMap(UInt64.init).map(ResidentCap.absolute) ?? .unlimited
             let memoryCap: ResidentCap = env["BENCH_PERF_MEMORY_LIMIT_FRACTION"]
@@ -8708,13 +8646,11 @@ private func runPerfBenchBody(
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: allocatorCap,
+                        maxResidentBytes: allocatorCap,
                     memoryLimit: memoryCap,
                     useMmapSafetensors: useMmap,
                     nativeMTP: true))
-            context = loaded.0
-            jangPressRuntime = loaded.1
+            context = loaded
         } else {
             if useMmap {
                 var requestedLoad = LoadConfiguration(useMmapSafetensors: true)
@@ -8735,15 +8671,13 @@ private func runPerfBenchBody(
                     from: modelDir,
                     using: #huggingFaceTokenizerLoader(),
                     loadConfiguration: requestedLoad)
-                context = loaded.0
-                jangPressRuntime = loaded.1
-            } else {
+                context = loaded
+                } else {
                 context = try await MLXLMCommon.loadModel(
                     from: modelDir, using: #huggingFaceTokenizerLoader())
-                jangPressRuntime = nil
             }
         }
-        print("PERF_POST_LOAD_POLICY memory_limit_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(MLX.Memory.activeMemory) cached_bytes=\(MLX.Memory.cacheMemory) recommended_bytes=\(GPU.maxRecommendedWorkingSetBytes().map(String.init) ?? "unknown") supplemental_mapped_bytes=\(context.model.modelWeightAccounting().supplementalMappedBytes) jangpress_applied=\(jangPressRuntime?.appliedOptions?.enabled == true) mmap_requested=\(useMmap)")
+        print("PERF_POST_LOAD_POLICY memory_limit_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(MLX.Memory.activeMemory) cached_bytes=\(MLX.Memory.cacheMemory) recommended_bytes=\(GPU.maxRecommendedWorkingSetBytes().map(String.init) ?? "unknown") supplemental_mapped_bytes=\(context.model.modelWeightAccounting().supplementalMappedBytes) mmap_requested=\(useMmap)")
         // Explicit diagnostic only. This never changes a production load default.
         if let raw = env["BENCH_PERF_POST_LOAD_MEMORY_LIMIT_BYTES"] {
             let physical = ProcessInfo.processInfo.physicalMemory
@@ -8768,11 +8702,6 @@ private func runPerfBenchBody(
         let footprintAfterLoad = currentPhysFootprintMiB()
         peakRSSMiB = max(peakRSSMiB, rssAfterLoad)
         peakFootprintMiB = max(peakFootprintMiB, footprintAfterLoad)
-        defer {
-            if let jangPressRuntime {
-                JangPressActivation.deactivate(jangPressRuntime)
-            }
-        }
         let loadSec = CFAbsoluteTimeGetCurrent() - loadStart
         print(String(format:
             "PERF_MEMORY label=after_load rss_mib=%.0f footprint_mib=%.0f loadSec=%.2f",
@@ -9296,10 +9225,9 @@ private func runPerfBenchBody(
         let head = String(
             gitShortHead(modelDir: FileManager.default.currentDirectoryPath))
         perfLine = String(format:
-            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
+            "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
             modelName, variant, pathLabel, samplingSource, perfSeedLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
-            jangPressRuntime?.appliedOptions?.enabled == true ? "on" : "off",
             context.model.modelWeightAccounting().supplementalMappedBytes > 0
                 ? "custom-banks-mapped"
                 : (LoadBundleFacts.inspect(bundleURL: modelDir).resolveMmapSafetensors(requested: useMmap)
@@ -10211,12 +10139,11 @@ func runProdMatrix(modelPath: String, maxNew: Int) async throws {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(
-                jangPress: .disabled,
                 maxResidentBytes: .unlimited,
                 memoryLimit: .unlimited,
                 useMmapSafetensors: true,
                 nativeMTP: true))
-        context = loaded.0
+        context = loaded
     } else {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader())

@@ -44,7 +44,7 @@ enum VLBench {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: .osaurusProduction)
-        return loaded.0
+        return loaded
     }
 
     static func run(modelPath: String, maxNewTokens: Int) async throws {
@@ -1383,12 +1383,11 @@ enum VLBench {
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
+                        maxResidentBytes: .unlimited,
                     memoryLimit: .unlimited,
                     useMmapSafetensors: true,
                     nativeMTP: true))
-            context = loaded.0
+            context = loaded
         } else {
             context = try await loadProductionContext(from: modelDir)
         }
@@ -1825,12 +1824,11 @@ enum VLBench {
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
-                    jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
+                        maxResidentBytes: .unlimited,
                     memoryLimit: .unlimited,
                     useMmapSafetensors: true,
                     nativeMTP: true))
-            context = loaded.0
+            context = loaded
         } else {
             context = try await loadProductionContext(from: modelDir)
         }

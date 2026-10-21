@@ -54,7 +54,7 @@ enum NemotronParityBench {
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: .osaurusProduction
-            ).0
+            )
         }
         print(String(format: "PARITY load: %.2fs model=%@", CFAbsoluteTimeGetCurrent() - loadStart,
             String(describing: type(of: context.model))))

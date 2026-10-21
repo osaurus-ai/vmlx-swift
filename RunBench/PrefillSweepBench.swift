@@ -20,7 +20,7 @@ func runPrefillSweepBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .osaurusProduction
-    ).0
+    )
     var input = UserInput(prompt: text)
     input.additionalContext = ["enable_thinking": false]
     let prepared = try await context.processor.prepare(input: input)

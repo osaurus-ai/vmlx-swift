@@ -927,8 +927,6 @@ let package = Package(
                 "JANGTQHadamardShuffleTests.swift",
                 "Glm4GridInvariantTests.swift",
                 "MiniMaxJANGTQResidentExpertTests.swift",
-                "JangPressMachCacheTests.swift",
-                "JangPressPrestackerCleanupTests.swift",
                 "JangAffine1RuntimeContractTests.swift",
                 "DeepseekV4IndexerCausalTopKTests.swift",
                 "DeepseekV4ReasoningPolicyTests.swift",

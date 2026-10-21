@@ -132,7 +132,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
             throw AffineStreamingExpertError.malformedIndex(indexURL)
         }
 
-        var shards: [URL: JangPressShard] = [:]
+        var shards: [URL: MappedSafetensorsShard] = [:]
         var built: [Int: LayerSpec] = [:]
         built.reserveCapacity(layerCount)
 
@@ -153,11 +153,11 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
                 throw AffineStreamingExpertError.missingTensor(canonical)
             }
             let url = resolved.appendingPathComponent(filename)
-            let shard: JangPressShard
+            let shard: MappedSafetensorsShard
             if let existing = shards[url] {
                 shard = existing
             } else {
-                shard = try JangPressShard(path: url)
+                shard = try MappedSafetensorsShard(path: url)
                 shards[url] = shard
             }
             guard let descriptor = shard.descriptor(for: indexedName),

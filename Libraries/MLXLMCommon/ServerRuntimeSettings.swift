@@ -744,9 +744,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         loadConfiguration.keepModelInMemory = memorySafety.keepModelInMemory
         loadConfiguration.maxResidentBytes = allocatorCap
         loadConfiguration.useMmapSafetensors = true
-        loadConfiguration.jangPress = resolvedMemorySafetyJangPress(
-            base: baseLoadConfiguration.jangPress,
-            facts: bundleFacts)
 
 
         var resolvedConcurrency = concurrency
@@ -853,10 +850,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         if case .diagnosticDangerous = memorySafety.mode {
             warnings.append("Diagnostic memory mode uses caller-supplied limits and may exceed the host working set.")
         }
-        if !memorySafety.allowExperimentalMLXPress,
-           baseLoadConfiguration.jangPress != .disabled {
-            warnings.append("MLXPress/JangPress was not selected by the memory slider. It remains disabled unless the host enables a proven routed-bundle lane explicitly.")
-        }
 
         let resolvedBudgetBytes = loadCap.resolve(physicalMemory: physicalMemory)
         if let estimate = request {
@@ -896,22 +889,6 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             warnings: warnings,
             blockingIssues: blockingIssues,
             displaySummary: displaySummary)
-    }
-
-    private func resolvedMemorySafetyJangPress(
-        base: JangPressPolicy,
-        facts: LoadBundleFacts?
-    ) -> JangPressPolicy {
-        guard memorySafety.allowExperimentalMLXPress else {
-            return .disabled
-        }
-        guard let facts,
-              facts.isRouted,
-              facts.hasJangConfig || facts.hasJangTQRuntime
-        else {
-            return .disabled
-        }
-        return base
     }
 
     /// Apply explicit server-panel parser overrides to a model configuration.
@@ -1790,7 +1767,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     }
 
     public var keepModelInMemory: Bool
-    public var allowExperimentalMLXPress: Bool
     public var failClosedWhenEstimateUnknown: Bool
     public var customPhysicalMemoryFraction: Double?
     public var customAllocatorCacheBytes: UInt64?
@@ -1801,7 +1777,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         case mode
         case slider
         case keepModelInMemory
-        case allowExperimentalMLXPress
         case failClosedWhenEstimateUnknown
         case customPhysicalMemoryFraction
         case customAllocatorCacheBytes
@@ -1817,8 +1792,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         self.mode = try c.decodeIfPresent(VMLXMemorySafetyMode.self, forKey: .mode) ?? .safeAuto
         self.keepModelInMemory =
             try c.decodeIfPresent(Bool.self, forKey: .keepModelInMemory) ?? true
-        self.allowExperimentalMLXPress =
-            try c.decodeIfPresent(Bool.self, forKey: .allowExperimentalMLXPress) ?? false
         self.failClosedWhenEstimateUnknown =
             try c.decodeIfPresent(Bool.self, forKey: .failClosedWhenEstimateUnknown) ?? false
         self.customPhysicalMemoryFraction =
@@ -1837,7 +1810,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         // Still emitted so the persisted/API shape is unchanged for readers.
         try c.encode(slider, forKey: .slider)
         try c.encode(keepModelInMemory, forKey: .keepModelInMemory)
-        try c.encode(allowExperimentalMLXPress, forKey: .allowExperimentalMLXPress)
         try c.encode(failClosedWhenEstimateUnknown, forKey: .failClosedWhenEstimateUnknown)
         try c.encodeIfPresent(customPhysicalMemoryFraction, forKey: .customPhysicalMemoryFraction)
         try c.encodeIfPresent(customAllocatorCacheBytes, forKey: .customAllocatorCacheBytes)
@@ -1848,7 +1820,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     public init(
         mode: VMLXMemorySafetyMode = .safeAuto,
         keepModelInMemory: Bool = true,
-        allowExperimentalMLXPress: Bool = false,
         failClosedWhenEstimateUnknown: Bool = false,
         customPhysicalMemoryFraction: Double? = nil,
         customAllocatorCacheBytes: UInt64? = nil,
@@ -1857,7 +1828,6 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     ) {
         self.mode = mode
         self.keepModelInMemory = keepModelInMemory
-        self.allowExperimentalMLXPress = allowExperimentalMLXPress
         self.failClosedWhenEstimateUnknown = failClosedWhenEstimateUnknown
         self.customPhysicalMemoryFraction = customPhysicalMemoryFraction
         self.customAllocatorCacheBytes = customAllocatorCacheBytes

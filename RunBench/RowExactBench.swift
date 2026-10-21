@@ -30,7 +30,7 @@ func runRowExactBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration(nativeMTP: true)
-    ).0
+    )
     guard let model = context.model as? any NativeMTPModel,
         let staged = context.model as? any DFlash2StagedVerifyRollbackModel
     else {
