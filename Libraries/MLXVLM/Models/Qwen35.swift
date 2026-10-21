@@ -1194,7 +1194,7 @@ private let vlmGatedDeltaTreeKernel: MLXFast.MLXFastKernel = {
         source: source)
 }()
 
-/// y `[1, W, Hv, Dv]` for a draft tree (B == 1, W ≤ 16). `state` `[1, Hv, Dv, Dk]` float32.
+/// y `[1, W, Hv, Dv]` for a draft tree (B == 1). `state` `[1, Hv, Dv, Dk]` float32.
 private func vlmGatedDeltaTree(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
     parents: [Int]
@@ -1204,11 +1204,13 @@ private func vlmGatedDeltaTree(
     let Dk = k.dim(3)
     let Hv = v.dim(2)
     let Dv = v.dim(3)
-    precondition(W <= 16 && Dk % 32 == 0)
+    // Size register storage for the actual tree, including the chooser's
+    // 32-row candidates. Keep the existing specialization for small trees.
+    precondition(W > 0 && parents.count == W && Dk % 32 == 0)
     let outputs = vlmGatedDeltaTreeKernel(
         [q, k, v, g, b, state, MLXArray(parents.map(Int32.init)), MLXArray([Int32(W)])],
         template: [
-            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", 16),
+            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", Swift.max(16, W)),
         ],
         grid: (32, Dv, Hv),
         threadGroup: (32, 4, 1),
@@ -2724,16 +2726,22 @@ enum Qwen35Language {
             } else {
                 convState = MLXArray.zeros([1, nKeep, convDim], dtype: inputs.dtype)
             }
-            let mixedQKV = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(1, W, numVHeads, headVDim)
-            let b = inProjB(inputs)
-            let a = inProjA(inputs)
+            let mixedQKV = qwen4ExpProjection(inProjQKV, inputs)
+            let z = qwen4ExpProjection(inProjZ, inputs).reshaped(1, W, numVHeads, headVDim)
+            let b = qwen4ExpProjection(inProjB, inputs)
+            let a = qwen4ExpProjection(inProjA, inputs)
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.qkv", mixedQKV)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.z", z)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.b", b)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.a", a)
             mark("tree_gdn_inproj", mixedQKV, z, b, a)
             let source = concatenated([convState, mixedQKV], axis: 1)[0]  // [nKeep + W, convDim]
             let windows = scope.convWindows(nKeep: nKeep)  // [W, nKeep + 1]
             let gathered = take(source, windows.reshaped(-1), axis: 0)
                 .reshaped(W, nKeep + 1, convDim)
             let convOut = silu(conv1d(gathered)).reshaped(1, W, convDim)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.conv_silu", convOut)
             let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
             let q = split[0].reshaped(1, W, numKHeads, headKDim)
             let k = split[1].reshaped(1, W, numKHeads, headKDim)
@@ -2751,9 +2759,21 @@ enum Qwen35Language {
                 q: qNormed, k: kNormed, v: v, g: g, b: b, state: state,
                 parents: scope.plan.parents)
             scope.records[ObjectIdentifier(cache)] = [qNormed, kNormed, v, a, b, mixedQKV, convState]
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.q_normed", qNormed)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.k_normed", kNormed)
+            Qwen4ExpRowExactCapture.part(captureLayer, "gdn.recurrence", y)
             mark("tree_gdn_recurrence", y)
-            let normed = norm(y, gate: z)
-            let out = outProj(normed.reshaped(1, W, -1))
+            let out: MLXArray
+            if FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape, site: "gdn") {
+                out = concatenated((0..<W).map { row in
+                    let output = y[0..., row..<(row + 1), 0..., 0...]
+                    let gate = z[0..., row..<(row + 1), 0..., 0...]
+                    if let tail = compiledDecodeTail(output, gate: gate) { return tail }
+                    return outProj(norm(output, gate: gate).reshaped(1, 1, -1))
+                }, axis: 1)
+            } else {
+                out = outProj(norm(y, gate: z).reshaped(1, W, -1))
+            }
             mark("tree_gdn_out", out)
             return out
         }
@@ -3404,7 +3424,21 @@ enum Qwen35Language {
             }
             let mlpInput = postAttentionLayerNorm(h)
             Qwen4ExpRowExactCapture.part(layerIndex, "mlp_input", mlpInput)
-            let mlpOut = (mlp as! UnaryLayer)(mlpInput)
+            let mlpOut: MLXArray
+            if mlpInput.dim(1) > 8,
+                FlashVerificationScope.usesRowExactVerification(inputShape: mlpInput.shape)
+            {
+                mlpOut = concatenated(stride(from: 0, to: mlpInput.dim(1), by: 8).map { start in
+                    let end = min(start + 8, mlpInput.dim(1))
+                    return FlashVerificationScope.withVerification(inputShape: [1, end - start]) {
+                        RoutedExpertVerificationScope.withVerification(inputShape: [1, end - start]) {
+                            (mlp as! UnaryLayer)(mlpInput[0..., start..<end, 0...])
+                        }
+                    }
+                }, axis: 1)
+            } else {
+                mlpOut = (mlp as! UnaryLayer)(mlpInput)
+            }
             Qwen4ExpRowExactCapture.part(layerIndex, "mlp_out", mlpOut)
             let out = h + mlpOut
             if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(out) }
@@ -5020,16 +5054,48 @@ extension Qwen35Language.Attention {
     func treeAttention(_ x: MLXArray, cache: KVCache, scope: DFlash2TreeScope) -> MLXArray {
         let L = x.dim(1)
         let start = cache.offset + scope.positionDelta
-        let qSplit = qProj(x).reshaped(1, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
+        let qSplit = qwen4ExpProjection(qProj, x).reshaped(1, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
         let gate = qSplit[1].reshaped(1, L, -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        var keys = kNorm(kProj(x).reshaped(1, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(1, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        var keys = kNorm(qwen4ExpProjection(kProj, x).reshaped(1, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
+        let values = qwen4ExpProjection(vProj, x).reshaped(1, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
         let (cosValues, sinValues) = rotaryEmbedding(
             x: values, positionIds: scope.plan.positionIds(start: start))
         (queries, keys) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: queries, k: keys, cos: cosValues, sin: sinValues)
         let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+        if !hadamard, type(of: cache) == KVCacheSimple.self,
+            FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn")
+        {
+            let prefix = cache.offset
+            let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+            var outputs: [MLXArray] = []
+            for row in 0..<L {
+                let path = scope.plan.paths[row]
+                let contiguous = path.enumerated().allSatisfy { $0.offset == $0.element }
+                let rowKeys: MLXArray
+                let rowValues: MLXArray
+                if contiguous {
+                    rowKeys = cachedKeys[0..., 0..., ..<(prefix + path.count), 0...]
+                    rowValues = cachedValues[0..., 0..., ..<(prefix + path.count), 0...]
+                } else {
+                    let indices = MLXArray(path.map { Int32(prefix + $0) })
+                    rowKeys = concatenated([cachedKeys[0..., 0..., ..<prefix, 0...],
+                                            take(cachedKeys, indices, axis: 2)], axis: 2)
+                    rowValues = concatenated([cachedValues[0..., 0..., ..<prefix, 0...],
+                                              take(cachedValues, indices, axis: 2)], axis: 2)
+                }
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: queries[0..., 0..., row..<(row + 1), 0...],
+                    keys: rowKeys, values: rowValues, scale: scale, mask: .none)
+                // A branched path needs a contiguous prefix+ancestor gather for MLX's vector kernel.
+                // Settle it here so multiple full-prefix temporaries cannot accumulate across rows.
+                if !contiguous { MLX.eval(attended) }
+                outputs.append(attended)
+            }
+            let output = concatenated(outputs, axis: 2).transposed(0, 2, 1, 3).reshaped(1, L, -1)
+            return qwen4ExpProjection(oProj, compiledSigmoidMultiply(output, gate))
+        }
         if MultiRowDecodeAttention.enabled, !hadamard, type(of: cache) == KVCacheSimple.self, L <= 16 {
             // Draft-tree verify through the multi-row kernel: prefix fully visible, window by root path.
             let prefix = cache.offset
@@ -5044,7 +5110,7 @@ extension Qwen35Language.Attention {
                     queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                     mask: .array(scope.attentionMask(prefix: prefix, dtype: queries.dtype)))
             }
-            return oProj(compiledSigmoidMultiply(attended.transposed(0, 2, 1, 3).reshaped(1, L, -1), gate))
+            return qwen4ExpProjection(oProj, compiledSigmoidMultiply(attended.transposed(0, 2, 1, 3).reshaped(1, L, -1), gate))
         }
         let mask = scope.attentionMask(prefix: cache.offset, dtype: queries.dtype)
         let output = JangHadamardAttention.attention(
@@ -5054,7 +5120,7 @@ extension Qwen35Language.Attention {
         )
         .transposed(0, 2, 1, 3)
         .reshaped(1, L, -1)
-        return oProj(compiledSigmoidMultiply(output, gate))
+        return qwen4ExpProjection(oProj, compiledSigmoidMultiply(output, gate))
     }
 }
 
@@ -5066,9 +5132,17 @@ extension Qwen35: DFlash2TreeVerifyModel {
         _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: Set<Int>, scope: DFlash2TreeScope
     ) -> (MLXArray, [Int: MLXArray]) {
         scope.positionDelta = dflash2PositionDelta
-        return DFlash2TreeScope.with(scope) {
-            languageModel.textOnlyForwardCapturing(
-                inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        let forward = {
+            DFlash2TreeScope.with(scope) {
+                self.languageModel.textOnlyForwardCapturing(
+                    inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+            }
+        }
+        // Routed Qwen3.5 targets need the same projection/expert/attention arithmetic as their
+        // single-row verifier. Dense targets retain their separately qualified tree path.
+        guard config.textConfiguration.numExperts > 0 else { return forward() }
+        return FlashVerificationScope.withTreeVerification(inputShape: inputs.shape) {
+            RoutedExpertVerificationScope.withTreeVerification(inputShape: inputs.shape, operation: forward)
         }
     }
 
@@ -5450,6 +5524,8 @@ extension Qwen35: RestoredPrefixPositionModel {
 }
 
 extension Qwen35: DFlash2MediaPrefillModel {
+    public var dflash2SupportsRestoredMediaSuffix: Bool { config.miniCPMCanvas == nil }
+
     public func dflash2MediaPrefill(
         _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
         restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
@@ -5479,11 +5555,14 @@ extension Qwen35: DFlash2MediaPrefillModel {
         let start = Swift.max(0, Swift.min(restoredPrefix, total - 1))
         let textEmbeds = languageModel.model.embedTokens(inputIds)
         let embeddings: MLXArray
-        if start > 0 {
+        let suffixTokens = inputIds[0..., start...].reshaped(-1).asArray(Int.self)
+        if start > 0, !input.cacheHitSuffixContainsMediaPlaceholder(suffixTokens) {
             // Restored prefix holds every media span: the suffix is text only.
             embeddings = textEmbeds
         } else {
-            // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+            // A restored text prefix can precede new media. Merge features exactly as in
+            // a cold prefill; only rows after `start` are forwarded below. Full-prompt
+            // M-RoPE positions must still include all previous image/video grids.
             let visionHidden = visionPath.features(pixels: concatenated(pixelParts), frames: frames)
             embeddings = try mergeInputIdsWithImageFeatures(
                 imageFeatures: visionHidden.asType(textEmbeds.dtype),

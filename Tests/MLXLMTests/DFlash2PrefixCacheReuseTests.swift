@@ -31,7 +31,7 @@ import XCTest
 /// Hybrid target that records forwarded tokens and satisfies everything
 /// DFlash 2 asks of a target: per-layer capture, a shared embedding and
 /// LM head, and per-step recurrent prefix-state recording.
-private final class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCaptureModel,
+private class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCaptureModel,
     TokenEmbedderModel, @unchecked Sendable
 {
     private(set) var forwarded: [Int] = []
@@ -124,6 +124,37 @@ private final class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCa
     }
 
     var supportsCapturingPrefixCommitRecording: Bool { true }
+}
+
+private final class RecordingMediaDFlash2Target: RecordingDFlash2Target,
+    DFlash2MediaPrefillModel, PrefixCacheInvariantModel, @unchecked Sendable
+{
+    var dflash2SupportsRestoredMediaSuffix = true
+    var statesBeforeFirstMediaTokenAreMediaIndependent = true
+    var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+    var dflash2PositionDelta: Int { 0 }
+    func dflash2ResetPositionState() {}
+
+    func dflash2MediaPrefill(
+        _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
+        onChunk: ([Int: MLXArray]) -> Void
+    ) throws -> MLXArray {
+        var offset = restoredPrefix
+        var logits: MLXArray?
+        while offset < input.text.tokens.dim(1) {
+            var end = min(offset + stepSize, input.text.tokens.dim(1))
+            if let boundary, offset < boundary, boundary < end { end = boundary }
+            let output = callAsFunction(input.text.tokens[0..., offset..<end], cache: cache,
+                                        captureLayerIDs: captureLayerIDs)
+            onChunk(output.capturedHiddenStates)
+            MLX.eval(cache)
+            if end == boundary { onBoundary() }
+            logits = output.logits[0..., (end - offset - 1)..., 0...]
+            offset = end
+        }
+        return try XCTUnwrap(logits)
+    }
 }
 
 final class DFlash2PrefixCacheReuseTests: XCTestCase {
@@ -299,8 +330,52 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         }
     }
 
-    /// Turn 1 must forward the prompt exactly once — no replay to
-    /// reconstruct a boundary after the fact.
+    /// Publish the reusable boundary before decode without retaining either checkpoint.
+    func testCanonicalCheckpointIsStoredBeforeDecodeWithoutRetainedCopies() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let coordinator = makeCoordinator(usePagedCache: false)
+        let disk = try XCTUnwrap(coordinator.diskCache)
+        disk.writeBehind = true
+        var iterator = try DFlash2TokenIterator(
+            input: input(turn1User + genPromptSuffix), target: target,
+            drafter: makeDrafter(), blockSize: nil, parameters: parameters(),
+            cacheCoordinator: coordinator)
+
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [])
+        XCTAssertEqual(target.forwarded, turn1User + genPromptSuffix)
+        XCTAssertTrue(disk.waitForPendingWrites(timeout: 10))
+        let salt = computeCacheSalt(for: input(turn1User + genPromptSuffix), parameters: parameters())
+        let arrays = try XCTUnwrap(disk.fetch(tokens: turn1User, mediaSalt: salt))
+        var restored = target.newCache(parameters: parameters())
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), turn1User.count)
+        XCTAssertEqual(restored.first?.state.first?.item(Float.self), Float(turn1User.reduce(0, +)))
+        let stores = disk.snapshotStats().stores
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(disk.snapshotStats().stores, stores, "terminal store must not enqueue the same boundary again")
+    }
+
+    func testRejectedEarlyPublicationKeepsOnlyCanonicalCheckpointForRetry() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let coordinator = makeCoordinator(usePagedCache: false)
+        let disk = try XCTUnwrap(coordinator.diskCache)
+        disk.publishFaultForTesting = { throw CocoaError(.fileWriteUnknown) }
+        var iterator = try DFlash2TokenIterator(
+            input: input(turn1User + genPromptSuffix), target: target,
+            drafter: makeDrafter(), blockSize: nil, parameters: parameters(),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [turn1User.count])
+        let salt = computeCacheSalt(for: input(turn1User + genPromptSuffix), parameters: parameters())
+        XCTAssertFalse(coordinator.hasValidatedDiskEntry(tokens: turn1User, mediaSalt: salt))
+        disk.publishFaultForTesting = nil
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [])
+        XCTAssertNotNil(disk.fetch(tokens: turn1User, mediaSalt: salt))
+    }
+
     func testPrefillForwardsEachPromptTokenExactlyOnce() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }
@@ -435,6 +510,39 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
             XCTAssertEqual(target.forwarded, includePreviousBoundary ? [prompt.last!] : prompt)
             XCTAssertEqual(target.lastOffsets, [prompt.count, prompt.count])
             XCTAssertEqual(target.recurrentSum, Float(prompt.reduce(0, +)))
+        }
+    }
+
+    func testNewMediaRestoresIndependentTextPrefixOnlyWithBothCapabilities() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        if let path = ProcessInfo.processInfo.environment["VMLX_DIAGNOSTIC_METALLIB"] {
+            _ = path.withCString { mlx_metal_set_metallib_path($0) }
+        }
+        for (independent, mediaSuffix) in [(true, true), (false, true), (true, false)] {
+            let target = RecordingMediaDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+            target.statesBeforeFirstMediaTokenAreMediaIndependent = independent
+            target.dflash2SupportsRestoredMediaSuffix = mediaSuffix
+            let coordinator = makeCoordinator(usePagedCache: false)
+            var first = try DFlash2TokenIterator(
+                input: input(turn1User + genPromptSuffix), target: target,
+                drafter: makeDrafter(), blockSize: nil, parameters: parameters(),
+                cacheCoordinator: coordinator)
+            first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+            target.resetRecording()
+            let suffix = [99, 31, 32] + genPromptSuffix
+            let prompt = turn1User + suffix
+            let media = LMInput(text: input(prompt).text,
+                image: .init(pixels: MLXArray.zeros([1, 3, 2, 2])), mediaTokenIds: [99])
+            var second = try DFlash2TokenIterator(
+                input: media, target: target, drafter: makeDrafter(), blockSize: nil,
+                parameters: parameters(), cacheCoordinator: coordinator)
+            XCTAssertEqual(target.forwarded, independent && mediaSuffix ? suffix : prompt)
+            XCTAssertEqual(target.recurrentSum, Float(prompt.reduce(0, +)))
+            XCTAssertEqual(target.lastOffsets, [prompt.count, prompt.count])
+            second.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
         }
     }
 

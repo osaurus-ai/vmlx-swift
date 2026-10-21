@@ -67,7 +67,7 @@ func runSpeedProbe(modelPath: String) async throws {
     let defaultStrategy = settings.resolvedMTPDraftStrategy(
         configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
     let defaultLoad = settings.resolvedLoadConfiguration(
-        configData: configData, jangConfig: jang, status: status)
+        configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
     let maxTokens = Int(env["BENCH_SPEED_MAXTOK"] ?? "300") ?? 300
     let loadStart = CFAbsoluteTimeGetCurrent()
     let context: ModelContext

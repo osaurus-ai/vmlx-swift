@@ -21,7 +21,7 @@ func runMTPResolveBench() throws {
         let launch = settings.resolvedMTPLaunch(
             configData: configData, jangConfig: jang, status: status)
         let load = settings.resolvedLoadConfiguration(
-            configData: configData, jangConfig: jang, status: status)
+            configData: configData, jangConfig: jang, status: status, bundleDirectory: url)
         let strategy = settings.resolvedMTPDraftStrategy(
             configData: configData, jangConfig: jang, status: status, bundleDirectory: url)
         print("[MTPRESOLVE] \(url.lastPathComponent)")

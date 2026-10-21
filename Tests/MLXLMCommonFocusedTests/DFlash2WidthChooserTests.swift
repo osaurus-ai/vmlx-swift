@@ -10,6 +10,11 @@ import XCTest
 
 final class DFlash2WidthChooserTests: XCTestCase {
 
+    func testTraceReportsOneExpectedTokenForAR() {
+        let chooser = DFlash2WidthChooser(widths: [1, 5, 16], costs: DFlash2WidthCostTable())
+        XCTAssertTrue(chooser.traceDescription.hasPrefix("1:-/1.00/- "))
+    }
+
     func testAcceptanceLengthExcludesAutoregressiveFallback() {
         var stats = DFlash2GenerationStats()
         stats.verifyCalls = 2

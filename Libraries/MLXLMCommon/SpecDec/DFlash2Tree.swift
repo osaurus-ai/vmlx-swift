@@ -1,7 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 //
 // DFlash 2 draft TREES: one drafter forward → a candidate lattice → a best-first tree of up to
-// 15 nodes → ONE ≤16-row target verify with ancestor-path attention and a per-branch GatedDelta
+// the chosen width → ONE target verify with ancestor-path attention and a per-branch GatedDelta
 // recurrence → the longest accepted root path is committed (KV rows compacted, recurrent state
 // replayed along the kept path only).
 //
@@ -315,14 +315,19 @@ public enum DFlash2TreeAcceptance {
 /// while capturing the drafter's hidden-state taps, then continue with text-only drafting and
 /// verify at the media-shifted (M-RoPE) positions. Without it a media request decodes plain AR.
 public protocol DFlash2MediaPrefillModel {
+    /// Can resume before complete media spans while resolving positions from the full prompt.
+    /// Existing implementations default to text-only suffix restoration.
+    var dflash2SupportsRestoredMediaSuffix: Bool { get }
+
     /// Full-prompt prefill of `input` (vision tower → merged embeddings → full-prompt M-RoPE
     /// positions) in chunks of `stepSize`; `onChunk` receives each chunk's captured hiddens.
     /// Returns the last row's logits `[1, 1, V]`.
     /// `boundary`: absolute prompt index where a chunk must end so the caller can snapshot the
     /// cache (`onBoundary`, after that chunk is evaluated) — the cross-turn checkpoint.
     /// `restoredPrefix` > 0: the cache already holds that many prompt tokens (a restored entry)
-    /// and the remaining suffix carries no media placeholder; only the suffix is prefilled, at
-    /// the full prompt's M-RoPE positions (recomputed from token ids + media grids, no vision).
+    /// and only the suffix is prefilled at the full prompt's M-RoPE positions. By default the
+    /// suffix must be text-only; `dflash2SupportsRestoredMediaSuffix` opts into encoding new
+    /// media after a restored independent prefix.
     func dflash2MediaPrefill(
         _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
         restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
@@ -336,4 +341,8 @@ public protocol DFlash2MediaPrefillModel {
     /// Clear media position state left by an EARLIER request (text-only requests must not
     /// inherit another request's M-RoPE delta).
     func dflash2ResetPositionState()
+}
+
+public extension DFlash2MediaPrefillModel {
+    var dflash2SupportsRestoredMediaSuffix: Bool { false }
 }
