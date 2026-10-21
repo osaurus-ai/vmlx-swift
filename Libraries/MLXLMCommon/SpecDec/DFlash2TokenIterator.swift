@@ -1900,7 +1900,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Never persist a cache that still carries unverified draft rows.
         abandonInFlightVerify()
         MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count,
-                             detail: "dflash2 retained=\(retainedCheckpointTokenCounts)")
+                             detail: "dflash2 retained=\(retainedCheckpointTokenCounts) "
+                                + "widths=\(stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")) "
+                                + "acceptance=\(stats.acceptanceLength) arTokens=\(stats.autoregressiveFallbackTokens) "
+                                + "draftMs=\(stats.draftSeconds * 1000) verifyMs=\(stats.verifySeconds * 1000) "
+                                + "commitMs=\(stats.commitSeconds * 1000) arMs=\(stats.arSeconds * 1000)")
         defer {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
                                  detail: "dflash2")

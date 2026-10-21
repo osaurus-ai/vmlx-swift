@@ -17,7 +17,16 @@ The correction sizes the kernel register workspace for the selected tree. It lea
 
 - Kernel suite: 11 tests passed, including bit-exact tree/chain paths at 7/16/32 rows.
 - First cache suite: 9 of 10 passed; an asynchronous test incorrectly expected a writer to remain pending after initialization. It had already settled. Corrected the assertion to verify the relevant contract: no iterator-owned checkpoints, durable exact recurrent/KV restore, and no duplicate terminal write. Final cache suite: 10/10 passed; shared early-spill suite: 4/4 passed. Load-selection assertions passed except a URL trailing-slash fixture comparison, corrected before rerun. Broader settings suite: 44/45 passed; unchanged cache-size test expects 42GB and fails under current quota policy. Not counted as passing.
-- Rebuilt app: pending. Matched Auto/Off easy-code and prose throughput, TTFT, RAM and SSD latency are not yet measured.
+- Rebuilt Release app at engine c73225e9f / app 3f3f61d9 completed the formerly crashing adaptive 32-row path. Two visible Helper turns ended normally: code 970 tokens at 49.10 tok/s, follow-up 242 at 45.20 tok/s. Physical peaks 6.27 and 6.90 GB. Traced diagnostic rows, not a matched speedup claim.
+- First turn restored 2,642/3,815 prompt tokens; follow-up restored 3,814/6,087. Canonical checkpoint writes settled at 28/50 ms (247/303 MB); iterator retained no checkpoint at decode-end. The existing canonical-only policy reprocesses the prior answer on the next turn; post-answer reuse remains open.
+- Load selection rerun: 25 passed, 1 intentional skip, 0 failures. Resolver ownership tests: 3/3; cache regression rerun: 10/10. Resolver changes and aggregate telemetry below are not yet in this app binary.
+- Matched Auto/Off prose/code speed, long context and further app qualification remain pending.
 - JANGH2, DSpark/MiniCPM, Nemotron, concurrent/spawned slots, media, cancellation and full-quota eviction remain separate qualification rows. Shared source does not prove all families.
 
 Private evidence: `~/vmlx-private-evidence/ornith-dflash2-adaptive-20261020/LEDGER.md`, `baseline/` (two crash reports, process exit receipt, app logs, physical-footprint samples), focused test logs. No successful generation or speedup claim from the failed warm-up rows.
+
+## Concurrent drafter ownership
+
+Two simultaneous cache misses previously loaded separate full drafters. Loading now uses one in-flight record per canonical directory; unrelated directories can load concurrently. Eviction removes publication rights, so an older completion cannot repopulate the cache or replace a newer load. Existing request owners still receive and own their result. Focused tests cover same-path sharing, independent paths, eviction/evictAll during loading and failed-load retry.
+
+The diagnostic decode-end memory row now includes aggregate adaptive widths, acceptance, AR tokens, draft/verify/commit/AR time on ordinary stop, without requiring per-cycle tracing.

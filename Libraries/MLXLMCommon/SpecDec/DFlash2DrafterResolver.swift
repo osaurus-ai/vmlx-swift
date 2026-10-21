@@ -21,28 +21,54 @@ public final class DFlash2DrafterResolver: @unchecked Sendable {
 
     public static let shared = DFlash2DrafterResolver()
 
-    private let lock = NSLock()
+    private final class Load {
+        var result: Result<DFlash2DraftModel, Error>?
+    }
+
+    // The condition protects ownership only; model I/O for different paths remains parallel.
+    private let condition = NSCondition()
     private var cache: [String: DFlash2DraftModel] = [:]
+    private var loads: [String: Load] = [:]
+    private let loader: (URL) throws -> DFlash2DraftModel
 
-    public init() {}
+    public init() {
+        loader = DFlash2Loader.load(from:)
+    }
 
-    /// Load (or return the cached) drafter at `path`.
+    init(loader: @escaping (URL) throws -> DFlash2DraftModel) {
+        self.loader = loader
+    }
+
+    /// Concurrent callers for one directory share the same allocation, including load failures.
     public func drafter(at path: URL) throws -> DFlash2DraftModel {
         let key = path.resolvingSymlinksInPath().path
-        lock.lock()
-        let hit = cache[key]
-        lock.unlock()
-        if let hit { return hit }
+        condition.lock()
+        if let hit = cache[key] {
+            condition.unlock()
+            return hit
+        }
+        if let load = loads[key] {
+            while load.result == nil { condition.wait() }
+            let result = load.result!
+            condition.unlock()
+            return try result.get()
+        }
+        let load = Load()
+        loads[key] = load
+        condition.unlock()
 
-        // Loading happens outside the lock: it is seconds of disk I/O, and
-        // holding the lock across it would serialise unrelated requests
-        // behind the first one. A concurrent duplicate load is possible and
-        // harmless — the second one just replaces an identical entry.
-        let model = try DFlash2Loader.load(from: path)
-        lock.lock()
-        cache[key] = model
-        lock.unlock()
-        return model
+        let result = Result { try loader(path) }
+        condition.lock()
+        load.result = result
+        // Eviction invalidates publication, but callers already waiting still receive their result.
+        // A new load after eviction must not be removed or overwritten by this older completion.
+        if loads[key] === load {
+            loads.removeValue(forKey: key)
+            if case .success(let model) = result { cache[key] = model }
+        }
+        condition.broadcast()
+        condition.unlock()
+        return try result.get()
     }
 
     /// An optional acceleration artifact must not prevent ordinary generation.
@@ -94,14 +120,17 @@ public final class DFlash2DrafterResolver: @unchecked Sendable {
     }
 
     public func evict(path: URL) {
-        lock.lock()
-        defer { lock.unlock() }
-        cache.removeValue(forKey: path.resolvingSymlinksInPath().path)
+        let key = path.resolvingSymlinksInPath().path
+        condition.lock()
+        defer { condition.unlock() }
+        cache.removeValue(forKey: key)
+        loads.removeValue(forKey: key)
     }
 
     public func evictAll() {
-        lock.lock()
-        defer { lock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
         cache.removeAll()
+        loads.removeAll()
     }
 }
