@@ -79,3 +79,12 @@ One preceding CPU-sampled run is excluded from speed qualification: sampling sta
 Private evidence: `ornith-dflash2-adaptive-20261020/connected-results.json`, `chooser-live/current-speed.json`, `chooser-live/gpu-current-day-identity.json`, `LEDGER.md`, `SPEED-TRANSFER-MAP.md`; raw app/footprint/UI receipts under `ornith122b-claude-20261019/turns/DF2-G04-image2` through `DF2-G16-recall`, and `DF4-chooser-prose-clean` / `DF5-prose-off`.
 
 Still open: JANGH2 app and 128k qualification, delegated/concurrent requests and Off propagation, cancellation, active-chat protection under full quota, cross-family checkpoint ownership, and prose/code performance. No release or all-family/always-faster claim.
+
+
+## Routed JANGH2 lane classification (reproduced, live fix check pending)
+
+The first current-binary H2 app run exposed a separate classification bug: adaptive candidates were `[1,16,32]`. `LaneQMM.installForDFlash2Target` excluded opaque `JANGHDenseLinear` but not opaque routed expert banks. With no uint32 tensors exposed through their Module parameters, those banks incorrectly counted as lane-backed. Actual H2 trace costs were roughly 0.20 s at16rows and0.42 s at32, versus0.028 s forAR; the narrow candidate was absent.
+
+The correction includes `WeightedRoutedExpertLayer` in the existing non-lane classification. It preserves the dense Qwen27B handling, does not change weight layouts or kernels, and retains the ordinary adaptive `[1,5,16,32]` candidate set. No fixed width is selected. A regression installs real lane projections around an opaque routed-bank fixture: the pre-fix test fails both classification and missing-width assertions; the dense control stays flat. The chooser trace also now formats AR's expected1token as Double rather than passing an integer to `%f` (which logged0.00).
+
+Before-fix app receipt `DF8-h2-code`: cold3,835tokenprefill900.4tok/s,636generatedtokens32.4521app tok/s, physicalpeak7.31GB/end2.80GB,247.9MBcheckpoint36mspublication. The visible response stops normally but adds an unsolicited non-empty-input assertion, so this is not a perfect code-quality pass. A fresh rebuilt-app run is required to qualify the corrected selection and its performance. Private regression logs: lane-classification-before-registered.log, lane-classification-final.log. The initial test invocation registered no cases because Package.swift lists test sources explicitly; that no-op is not counted as a pass.

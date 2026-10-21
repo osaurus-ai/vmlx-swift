@@ -340,9 +340,11 @@ extension LaneQMM {
             {
                 continue
             }
-            // Dense JANGH codebook projections (Qwen3.8-27B JANGH2 MLPs) do not run on the lane; their bank
-            // tensors live outside module parameters, so the uint32 scan below cannot see them.
-            if m is JANGHDenseLinear {
+            // Dense and routed custom banks do not run on the lane. Their tensors can live outside
+            // Module.parameters, so the uint32 scan cannot establish lane coverage. Ornith JANGH2
+            // otherwise looked flat and lost the narrow adaptive candidate despite row-scaled expert
+            // verification cost. Keep the Qwen27B dense exception and include opaque routed banks.
+            if m is JANGHDenseLinear || m is any WeightedRoutedExpertLayer {
                 flat = false
                 break
             }

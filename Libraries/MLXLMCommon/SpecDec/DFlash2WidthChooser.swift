@@ -353,9 +353,11 @@ struct DFlash2WidthChooser {
         widths.map { w in
             let c = costOf(w)
             let measured = costs.isMeasured(width: w, bucket: costBucket) ? "" : "~"
+            // CVarArg context otherwise leaves the AR literal as an Int for a %f conversion.
+            let expected: Double = w > 1 ? expectedTokens(w) + bonusTokens : 1
             return String(
                 format: "%d:%@/%.2f/%@%@", w, rate(w).map { String(format: "%.0f", $0) } ?? "-",
-                w > 1 ? expectedTokens(w) + bonusTokens : 1, c == nil ? "" : measured,
+                expected, c == nil ? "" : measured,
                 c.map { String(format: "%.1f", $0 * 1000) } ?? "-")
         }.joined(separator: " ") + " next=\(width) bucket=\(costBucket)"
     }
