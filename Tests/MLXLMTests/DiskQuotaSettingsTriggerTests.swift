@@ -116,14 +116,14 @@ struct DiskQuotaSettingsTriggerTests {
         }
         let table = [
             Row(percent: nil, legacyGB: nil, capGB: 30),
-            Row(percent: nil, legacyGB: 50, capGB: 25),
-            Row(percent: 10, legacyGB: nil, capGB: 25),
-            Row(percent: 10, legacyGB: 50, capGB: 25),
+            Row(percent: nil, legacyGB: 50, capGB: 50),
+            Row(percent: 10, legacyGB: nil, capGB: 100),
+            Row(percent: 10, legacyGB: 50, capGB: 100),
             Row(percent: 0.01, legacyGB: nil, capGB: 0.1),
             Row(percent: 0.01, legacyGB: 50, capGB: 0.1),
             Row(percent: 0, legacyGB: nil, capGB: 30),
-            Row(percent: -5, legacyGB: 50, capGB: 25),
-            Row(percent: 100, legacyGB: nil, capGB: 25),
+            Row(percent: -5, legacyGB: 50, capGB: 50),
+            Row(percent: 100, legacyGB: nil, capGB: 1000),
             Row(percent: 1000, legacyGB: nil, capGB: 30),
         ]
         for row in table {
