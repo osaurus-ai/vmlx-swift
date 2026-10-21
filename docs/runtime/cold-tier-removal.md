@@ -5,3 +5,9 @@ Requested removal of JangPress / MLXPress is in progress. This change removes ro
 Do not merge this draft as full removal. Loader activation, policy/status APIs, probe/embed tiers, experimental prestacking and Mach storage, CLI products, downstream app settings and legacy tests still need removal or disentangling. AffineStreamingSwitchGLU uses the shard reader for actual weights; preserve that canonical reader separately. Safetensors alignment repair must retain its explicit authorization and byte checks.
 
 No speed or RAM improvement is claimed. Source parsing is separate from compilation and actual-app load/restore proof; those are pending on this draft. Production previously disabled the advisor by default, so the quota defect and unused KV checkpoints are separate fixes (#630/#631).
+
+## Product retirement
+
+The MLXPress library, mlxpress CLI and mlxpress-selfcheck products and their source directories are removed from the package, including the unused VMLX dependency. The package manifest validates with those products absent. This is a source/API removal: consumers of those retired products must migrate to the normal model/runtime APIs.
+
+Before merging, migrate the mixed historical source-contract suite so unrelated kernel/sampler assertions remain covered while retired CLI/readiness checks are removed. The old compare-cache-deviation.sh CLI harness also needs retirement or replacement. These are known unfinished dependencies, not passing tests. Remaining core probe/embed/prestack classes and old policy/status APIs still need disentangling from canonical weight readers and app migration.

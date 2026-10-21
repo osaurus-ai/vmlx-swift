@@ -331,7 +331,6 @@ let package = Package(
         .library(name: "MLXDistributedTransport", targets: ["MLXDistributedTransport"]),
         .library(name: "MLXDistributedJACCL", targets: ["MLXDistributedJACCL"]),
         .library(name: "MLXDistributedTP", targets: ["MLXDistributedTP"]),
-        .library(name: "MLXPress", targets: ["MLXPress"]),
         .library(name: "VMLX", targets: ["VMLX"]),
         // Native mFLUX image/video generation (vendored from jjang-ai/vmlx-flux).
         .library(name: "vMLXFluxKit", targets: ["vMLXFluxKit"]),
@@ -352,8 +351,6 @@ let package = Package(
         .executable(name: "OmniAudioLatencyBench", targets: ["OmniAudioLatencyBench"]),
         .executable(name: "OmniAudioChunkStabilityBench", targets: ["OmniAudioChunkStabilityBench"]),
         .executable(name: "Qwen35TPProofRunner", targets: ["Qwen35TPProofRunner"]),
-        .executable(name: "mlxpress", targets: ["MLXPressCLI"]),
-        .executable(name: "mlxpress-selfcheck", targets: ["MLXPressSelfCheck"]),
     ],
     dependencies: [
         // for Complex type
@@ -646,16 +643,7 @@ let package = Package(
             dependencies: ["MLXHuggingFaceMacros", "MLXLMCommon"],
             path: "Libraries/MLXHuggingFace"
         ),
-        .target(
-            name: "MLXPress",
-            dependencies: [
-                "MLXLLM",
-                "MLXLMCommon",
-                "MLXHuggingFace",
-                "VMLXTokenizers",
-            ],
-            path: "Sources/MLXPress"
-        ),
+
         .target(
             name: "VMLX",
             dependencies: [
@@ -680,23 +668,14 @@ let package = Package(
                 "MLXDistributedTransport",
                 "MLXDistributedJACCL",
                 "MLXDistributedTP",
-                "MLXPress",
             ],
             path: "Libraries/VMLX",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
-        .executableTarget(
-            name: "MLXPressCLI",
-            dependencies: ["MLXPress", "MLXLMCommon"],
-            path: "Sources/MLXPressCLI"
-        ),
-        .executableTarget(
-            name: "MLXPressSelfCheck",
-            dependencies: ["MLXPress"],
-            path: "Sources/MLXPressSelfCheck"
-        ),
+
+
         .executableTarget(
             name: "CompileBench",
             dependencies: ["MLX", "MLXNN", "MLXRandom"],
