@@ -5524,6 +5524,8 @@ extension Qwen35: RestoredPrefixPositionModel {
 }
 
 extension Qwen35: DFlash2MediaPrefillModel {
+    public var dflash2SupportsRestoredMediaSuffix: Bool { config.miniCPMCanvas == nil }
+
     public func dflash2MediaPrefill(
         _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
         restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
@@ -5553,11 +5555,14 @@ extension Qwen35: DFlash2MediaPrefillModel {
         let start = Swift.max(0, Swift.min(restoredPrefix, total - 1))
         let textEmbeds = languageModel.model.embedTokens(inputIds)
         let embeddings: MLXArray
-        if start > 0 {
+        let suffixTokens = inputIds[0..., start...].reshaped(-1).asArray(Int.self)
+        if start > 0, !input.cacheHitSuffixContainsMediaPlaceholder(suffixTokens) {
             // Restored prefix holds every media span: the suffix is text only.
             embeddings = textEmbeds
         } else {
-            // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+            // A restored text prefix can precede new media. Merge features exactly as in
+            // a cold prefill; only rows after `start` are forwarded below. Full-prompt
+            // M-RoPE positions must still include all previous image/video grids.
             let visionHidden = visionPath.features(pixels: concatenated(pixelParts), frames: frames)
             embeddings = try mergeInputIdsWithImageFeatures(
                 imageFeatures: visionHidden.asType(textEmbeds.dtype),

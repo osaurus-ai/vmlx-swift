@@ -131,6 +131,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let originalInput: LMInput
     private let cacheInitParameters: GenerateParameters
     private let mediaSalt: String?
+    private let cacheSaltPlan: CacheBoundarySaltPlan
     private var promptCacheSnapshot: [KVCache]?
 
     /// Index of the generation-suffix-stripped boundary in
@@ -482,6 +483,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
         self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.cacheSaltPlan = CacheBoundarySaltPlan.make(
+            requestSalt: self.mediaSalt, input: input, lookupTokenIds: self.promptTokenIds,
+            model: target, parameters: effectiveParameters)
         self.treeRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
         var treeFilter = SpeculativeTopKAcceptance.Filter(
             temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
@@ -511,7 +515,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Media: prefilled through the target's vision path. A restored (media-salted) entry is
         // continued at positions recomputed from the full prompt's token ids + media grids, so
         // the entry itself never needs to carry the M-RoPE delta. A suffix that carries a media
-        // placeholder (a new image this turn) resets to a full prefill below.
+        // placeholder may resume only when the target explicitly supports media suffixes
+        // and the shared boundary policy establishes an independent prefix.
         let mediaPrefill = input.hasMediaContent
         let mediaTarget = target as? DFlash2MediaPrefillModel
         if !mediaPrefill {
@@ -550,7 +555,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 tokens: lookupTokens,
                 mediaSalt: mediaSalt,
                 preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
-                chainId: parameters.cacheChainId)
+                chainId: parameters.cacheChainId,
+                mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
             if case .hit(
                 let matchedTokens, _, let detail, let blocks, let ssmStates,
                 let diskArrays) = result
@@ -591,7 +597,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         coordinator.reportDiskRestoreRejected(
                             tokens: tokensToPrefill, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "payload does not fit the runtime cache")
+                            reason: "payload does not fit the runtime cache",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
                 if restored,
@@ -603,7 +610,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         coordinator.reportDiskRestoreRejected(
                             tokens: tokensToPrefill, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "restored offsets do not match the boundary")
+                            reason: "restored offsets do not match the boundary",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                     restored = false
                 }
@@ -626,9 +634,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         remainingTokens.isEmpty
                         && (cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                             || self.cache.contains { !$0.isTrimmable })
-                    if unsafeFullHit
-                        || input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
-                    {
+                    let suffixHasMedia = input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    let unsafeMediaSuffix = suffixHasMedia && (
+                        mediaTarget?.dflash2SupportsRestoredMediaSuffix != true
+                        || cacheHitSuffixRequiresMediaRollback(
+                            input: input, remainingTokens: remainingTokens,
+                            matchedTokens: matchedTokens, plan: cacheSaltPlan))
+                    if unsafeFullHit || unsafeMediaSuffix {
                         self.cache = target.newCache(parameters: effectiveParameters)
                     } else if remainingTokens.isEmpty, let last = tokensToPrefill.last {
                         // A full hit still has to re-run the final token so
@@ -980,6 +992,18 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         return token
     }
 
+    private static let chooserTraceEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_CHOOSER_TRACE"] == "1"
+
+    /// Decision costs, distinct from acceptance totals. Opt-in diagnostics only;
+    /// ordinary app timings do not pay a per-cycle write.
+    private func traceWidthDecision(width: Int, tokens: Int) {
+        guard Self.chooserTraceEnabled, let widthChooser else { return }
+        let line = "[DFlash2 chooser] context=\(promptTokenIds.count + tokenCount)"
+            + " observedWidth=\(width) tokens=\(tokens) \(widthChooser.traceDescription)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
     /// One draft → verify → accept cycle. Returns false when nothing more
     /// can be produced.
     private mutating func runCycle() -> Bool {
@@ -1013,6 +1037,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     verifyWidth: 1, tokens: 1,
                     seconds: (Date.timeIntervalSinceReferenceDate - start) / Double(steps), count: steps)
                 stats.widthCycles[1, default: 0] += steps
+                traceWidthDecision(width: 1, tokens: steps)
             }
             return steps > 0
         }
@@ -1054,6 +1079,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 verifyWidth: bs, tokens: pendingTokens.count,
                 seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
             stats.widthCycles[bs, default: 0] += 1
+            traceWidthDecision(width: bs, tokens: pendingTokens.count)
         }
         return ok
     }
@@ -1551,6 +1577,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 verifyWidth: rows, tokens: emitted.count,
                 seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
             stats.widthCycles[rows, default: 0] += 1
+            traceWidthDecision(width: rows, tokens: emitted.count)
         }
         // Draft the NEXT lattice at the width the chooser now picks: the block-diffusion drafter
         // attends across its whole block, so drafting wider than needed changes (worsens) the
@@ -1885,7 +1912,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
               let snapshot = hybridStripSnapshot,
               storeCapturedHybridBoundary(
                 snapshot, tokens: Array(promptTokenIds.prefix(stripAt)),
-                coordinator: coordinator, mediaSalt: mediaSalt,
+                coordinator: coordinator, mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
                 chainId: cacheInitParameters.cacheChainId,
                 kvMode: .none, kvGroupSize: 64, quantizedKVStart: 0)
         else { return }
@@ -1939,7 +1966,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 perLayerData: extractLayerData(from: snapshot),
                 ssmStates: extractSSMStates(from: snapshot),
                 cache: snapshot,
-                mediaSalt: mediaSalt,
+                mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
                 chainId: cacheInitParameters.cacheChainId,
                 isResumeBoundary: true)
             return

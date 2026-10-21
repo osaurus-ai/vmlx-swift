@@ -77,7 +77,8 @@ struct Qwen35MediaPrefillTests {
                 tokens: MLXArray(tokens, [1, tokens.count]),
                 mask: mask ? MLXArray.ones([1, tokens.count], dtype: .int32) : nil),
             image: .init(pixels: pixels, frames: [THW(1, 4, 4)]),
-            video: videoFirst ? .init(pixels: videoPixels, frames: [THW(2, 2, 2)]) : nil)
+            video: videoFirst ? .init(pixels: videoPixels, frames: [THW(2, 2, 2)]) : nil,
+            mediaTokenIds: [98, 97])
     }
 
     private func logits(_ prepared: PrepareResult) throws -> MLXArray {
@@ -153,6 +154,40 @@ struct Qwen35MediaPrefillTests {
                     let next = MLXArray([token], [1, 1])
                     equal(chunked(next, cache: actualCache), reference(next, cache: expectedCache))
                 }
+            }
+        }
+    }
+
+    @Test("DFlash restored text prefix preserves new image/video features and positions",
+          arguments: [false, true])
+    func dflashRestoredMediaSuffix(videoFirst: Bool) throws {
+        try MLXMetalTestLock.withLock {
+            let cold = try model()
+            let warm = try model()
+            let input = input(videoFirst: videoFirst)
+            let coldCache = cold.newCache(parameters: nil)
+            let warmCache = warm.newCache(parameters: nil)
+            let taps: Set<Int> = [0, 3]
+            let prefix = input.text.tokens[0..., 0..<2]
+            MLX.eval(warm(prefix, cache: warmCache))
+            let expected = try cold.dflash2MediaPrefill(
+                input, cache: coldCache, captureLayerIDs: taps, stepSize: 4,
+                restoredPrefix: 0, boundary: nil, onBoundary: {}, onChunk: { _ in })
+            var forwarded = 0
+            let actual = try warm.dflash2MediaPrefill(
+                input, cache: warmCache, captureLayerIDs: taps, stepSize: 4,
+                restoredPrefix: 2, boundary: nil, onBoundary: {},
+                onChunk: { captured in forwarded += captured[0]!.dim(1) })
+            MLX.eval(expected, actual, coldCache, warmCache)
+            equal(actual, expected)
+            #expect(forwarded == input.text.tokens.dim(1) - 2)
+            for (lhs, rhs) in zip(warmCache, coldCache) {
+                #expect(lhs.offset == rhs.offset)
+                for (a, b) in zip(lhs.state, rhs.state) { equal(a, b) }
+            }
+            for token: Int32 in [31, 32] {
+                let ids = MLXArray([token], [1, 1])
+                equal(warm(ids, cache: warmCache), cold(ids, cache: coldCache))
             }
         }
     }
