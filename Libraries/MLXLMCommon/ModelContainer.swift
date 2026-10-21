@@ -685,8 +685,6 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
-        jangPressRuntime.recordPromptTokenActivity(
-            input.text.tokens.reshaped(-1).asArray(Int.self))
 
         let input = SendableBox(input)
         let coordinator = self.cacheCoordinator
