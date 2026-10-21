@@ -1,7 +1,11 @@
 # Explicit SSD cache quotas
 
-An explicit disk percentage was accepted up to100% but then limited to25% of free space plus indexed cache payloads. Automatic independently used30%, so editing the setting could reduce the effective limit below Automatic.
+Explicit percentages through 100% and legacy GB limits are honored. Automatic remains 30% of free space plus the cache's owned payloads. A quota is a ceiling, not a reservation; the app shows an advisory when the requested ceiling exceeds available space.
 
-Explicit percentages now use their requested share of total volume capacity without the host ceiling. Legacy GB choices are also honored. Automatic still uses30% of free plus owned payloads; filling the cache does not shrink that budget. A quota is a maximum, not a reservation. Low free space and a request above available space are advisory; real filesystem write errors remain errors. Unknown measurements preserve the existing fallback/previous-cap behavior. No allocation, cache format, SSD writer or eviction-order changes.
+## Validation
 
-Validation in progress: exact production-policy reproduction and32assertions pass, including high percentages, legacy sizes, growth stability, unknown measurements and overflow. Focused suites and built-app save/relaunch/runtime proof remain pending. See the paired Osaurus PR for UI behavior and subsequent evidence. This does not claim to fix duplicate RAM ownership across model families or remove MLXPress/JangPress.
+The production policy executable passed 32 assertions covering explicit high shares, legacy limits, precedence, stable quotas as owned bytes grow, unknown readings, full volumes, and overflow handling.
+
+Built Osaurus #3154 at15c41c01 with engine08e3097ad. In the actual isolated Release app, saved60% and80% on the external SSD; the loaded coordinator adopted80% without a quota-induced unload. Relaunch preserved the setting and restored6777 of7998 tokens from that SSD. Three connected tool/recall rows returned correct391 and483 totals and all four recalled inventory fields. Physical footprint peaks were6.99/6.46/6.09GB, cache-store returns3.0–6.4ms, and background writes42–93ms. These short rows are not a cross-family memory or speculative-speed qualification.
+
+Private receipts: `~/vmlx-private-evidence/ssd-quota-20261021/live-results.json`, per-turn captures, settings screenshots and launch manifests. GitHub proof comments on engine#630 and app#3154 summarize the same evidence. No writer, eviction-order, kernel, sampling, or speculative-depth changes.
