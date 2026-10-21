@@ -669,23 +669,31 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// Hosts should call this alongside ``resolvedMTPDraftStrategy`` so a real
     /// Qwen MTP bundle starts with the sidecar loaded, while non-MTP CRACK or
     /// metadata-only bundles keep the loader's MTP scrub path.
+    /// Pass the same bundle directory used for strategy selection. A compatible
+    /// external drafter replaces native MTP; its unused head must not be loaded.
     public func resolvedLoadConfiguration(
         base: LoadConfiguration = .default,
         configData: Data?,
         jangConfig: JangConfig?,
-        status: MTPBundleStatus?
+        status: MTPBundleStatus?,
+        bundleDirectory: URL? = nil
     ) -> LoadConfiguration {
         var resolved = base
         resolved.keepModelInMemory = memorySafety.keepModelInMemory
-        let launch = resolvedMTPLaunch(
+        let strategy = resolvedMTPDraftStrategy(
             configData: configData,
             jangConfig: jangConfig,
-            status: status)
-        resolved.nativeMTP = launch.launchMode == .speculative
+            status: status,
+            bundleDirectory: bundleDirectory)
+        if case .nativeMTP? = strategy {
+            resolved.nativeMTP = true
+        } else {
+            resolved.nativeMTP = false
+        }
         // Thread the manual depth into the load scope so the activation gate
         // accepts a tensor-complete head without a measured tuning artifact.
         resolved.nativeMTPManualDepth =
-            (mtp.mode == .forceOn && launch.launchMode == .speculative)
+            (mtp.mode == .forceOn && resolved.nativeMTP)
             ? mtp.explicitDepth : nil
         resolved.deepseekV4ActivationQAT =
             effectivePerformance.deepseekV4ActivationQAT

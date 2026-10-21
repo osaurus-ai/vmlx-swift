@@ -299,8 +299,52 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         }
     }
 
-    /// Turn 1 must forward the prompt exactly once — no replay to
-    /// reconstruct a boundary after the fact.
+    /// Publish the reusable boundary before decode without retaining either checkpoint.
+    func testCanonicalCheckpointIsStoredBeforeDecodeWithoutRetainedCopies() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let coordinator = makeCoordinator(usePagedCache: false)
+        let disk = try XCTUnwrap(coordinator.diskCache)
+        disk.writeBehind = true
+        var iterator = try DFlash2TokenIterator(
+            input: input(turn1User + genPromptSuffix), target: target,
+            drafter: makeDrafter(), blockSize: nil, parameters: parameters(),
+            cacheCoordinator: coordinator)
+
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [])
+        XCTAssertEqual(target.forwarded, turn1User + genPromptSuffix)
+        XCTAssertTrue(disk.waitForPendingWrites(timeout: 10))
+        let salt = computeCacheSalt(for: input(turn1User + genPromptSuffix), parameters: parameters())
+        let arrays = try XCTUnwrap(disk.fetch(tokens: turn1User, mediaSalt: salt))
+        var restored = target.newCache(parameters: parameters())
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored), turn1User.count)
+        XCTAssertEqual(restored.first?.state.first?.item(Float.self), Float(turn1User.reduce(0, +)))
+        let stores = disk.snapshotStats().stores
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(disk.snapshotStats().stores, stores, "terminal store must not enqueue the same boundary again")
+    }
+
+    func testRejectedEarlyPublicationKeepsOnlyCanonicalCheckpointForRetry() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let coordinator = makeCoordinator(usePagedCache: false)
+        let disk = try XCTUnwrap(coordinator.diskCache)
+        disk.publishFaultForTesting = { throw CocoaError(.fileWriteUnknown) }
+        var iterator = try DFlash2TokenIterator(
+            input: input(turn1User + genPromptSuffix), target: target,
+            drafter: makeDrafter(), blockSize: nil, parameters: parameters(),
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [turn1User.count])
+        let salt = computeCacheSalt(for: input(turn1User + genPromptSuffix), parameters: parameters())
+        XCTAssertFalse(coordinator.hasValidatedDiskEntry(tokens: turn1User, mediaSalt: salt))
+        disk.publishFaultForTesting = nil
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+        XCTAssertEqual(iterator.retainedCheckpointTokenCounts, [])
+        XCTAssertNotNil(disk.fetch(tokens: turn1User, mediaSalt: salt))
+    }
+
     func testPrefillForwardsEachPromptTokenExactlyOnce() throws {
         let lock = lockSerializedMLXTest()
         defer { lock.unlock() }

@@ -295,6 +295,41 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         XCTAssertNil(blockSize, "block size should default to the checkpoint's own")
     }
 
+    func testBundledDrafterDoesNotAlsoLoadUnusedNativeHead() throws {
+        var config = try JSONSerialization.jsonObject(with: targetConfig()) as! [String: Any]
+        config["model_type"] = "qwen4_exp"
+        config["mtp_num_hidden_layers"] = 1
+        config["quantization"] = ["bits": 4, "group_size": 64]
+        let data = try JSONSerialization.data(withJSONObject: config)
+        let status = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
+            mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
+        var settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
+        XCTAssertTrue(settings.resolvedLoadConfiguration(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root).nativeMTP)
+
+        let drafter = try makeDrafter(name: "dflash2")
+        guard case .dflash2(let path, let width)? = settings.resolvedMTPDraftStrategy(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root)
+        else { return XCTFail("compatible bundled drafter must win over native MTP") }
+        XCTAssertEqual(path.standardizedFileURL.path, drafter.standardizedFileURL.path)
+        XCTAssertNil(width, "default remains adaptive")
+        XCTAssertFalse(settings.resolvedLoadConfiguration(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root).nativeMTP)
+
+        settings.mtp.mode = .off
+        XCTAssertNil(settings.resolvedMTPDraftStrategy(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root))
+        XCTAssertFalse(settings.resolvedLoadConfiguration(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root).nativeMTP)
+
+        settings.mtp.mode = .auto
+        try FileManager.default.removeItem(at: drafter)
+        XCTAssertTrue(settings.resolvedLoadConfiguration(
+            configData: data, jangConfig: nil, status: status, bundleDirectory: root).nativeMTP,
+            "a removed drafter must restore native loading on the next load")
+    }
+
     func testOffDisablesSelectedDrafterWithoutDeletingSelection() throws {
         let dir = try makeDrafter()
         var settings = settings(drafter: dir, mode: .off)

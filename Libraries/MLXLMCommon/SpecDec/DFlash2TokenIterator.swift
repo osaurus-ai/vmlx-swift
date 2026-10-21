@@ -781,7 +781,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // matters for the committed-row accounting below.
         self.draftPositionBase = Swift.max(0, self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0)
 
-        self.promptCacheSnapshot = self.cache.map { $0.copy() }
+        // A canonical stripped boundary is the only checkpoint the terminal
+        // store consumes. Keeping an exact-prompt copy as well retains a full
+        // unused KV allocation throughout decode (including DSpark requests).
+        self.promptCacheSnapshot = hybridStripBoundary == nil
+            ? self.cache.map { $0.copy() } : nil
+        MemoryStageTrace.log("prompt-snapshot", tokens: promptTokenIds.count,
+                             detail: "dflash2 retained=\(retainedCheckpointTokenCounts)")
 
         let first = self.sampler.sample(logits: prefill.lastLogits)
         MLX.eval(first)
@@ -797,6 +803,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.pendingTokens = [firstToken]
         self.pendingIndex = 0
         self.stats.emittedTokens = 1
+        spillHybridStripBoundaryAfterPrefill()
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
         // MARK: compiled verify promotion
@@ -1864,12 +1871,40 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     var dflash2Stats: DFlash2GenerationStats { stats }
     var dflash2GenerationStats: DFlash2GenerationStats? { stats }
 
+    /// Iterator-owned checkpoints only; a queued SSD writer may still own its
+    /// admitted checkpoint until it settles. This is not a durability counter.
+    var retainedCheckpointTokenCounts: [Int] {
+        [promptCacheSnapshot?.first?.offset, hybridStripSnapshot?.first?.offset].compactMap { $0 }
+    }
+
+    private mutating func spillHybridStripBoundaryAfterPrefill() {
+        guard originalInput.cachePromptIntent != .auxiliary,
+              !originalInput.requiresPostPrepareCacheKey,
+              let coordinator = cacheCoordinator,
+              let stripAt = hybridStripBoundary,
+              let snapshot = hybridStripSnapshot,
+              storeCapturedHybridBoundary(
+                snapshot, tokens: Array(promptTokenIds.prefix(stripAt)),
+                coordinator: coordinator, mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                kvMode: .none, kvGroupSize: 64, quantizedKVStart: 0)
+        else { return }
+        hybridStripSnapshot = nil
+        MemoryStageTrace.log("strip-spilled", tokens: stripAt, detail: "dflash2 accepted")
+    }
+
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
         // Never persist a cache that still carries unverified draft rows.
         abandonInFlightVerify()
+        MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count,
+                             detail: "dflash2 retained=\(retainedCheckpointTokenCounts)")
+        defer {
+            MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
+                                 detail: "dflash2")
+        }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
         // Auxiliary (title/suggestion/summary) prompts never store a
         // boundary — see `CachePromptIntent.auxiliary`.

@@ -37,7 +37,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
         let jang = try? JangLoader.loadConfig(at: modelDir)
         let status = try? MTPBundleInspector.inspect(modelDirectory: modelDir, jangConfig: jang)
         loadConfiguration = settings.resolvedLoadConfiguration(
-            base: .osaurusProduction, configData: configData, jangConfig: jang, status: status)
+            base: .osaurusProduction, configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
         resolvedStrategy = settings.resolvedMTPDraftStrategy(
             configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
         print("K2MT_RESOLVED strategy=\(String(describing: resolvedStrategy)) nativeMTP=\(loadConfiguration.nativeMTP)")

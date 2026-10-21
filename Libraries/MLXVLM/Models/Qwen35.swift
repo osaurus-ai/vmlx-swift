@@ -1194,7 +1194,7 @@ private let vlmGatedDeltaTreeKernel: MLXFast.MLXFastKernel = {
         source: source)
 }()
 
-/// y `[1, W, Hv, Dv]` for a draft tree (B == 1, W ≤ 16). `state` `[1, Hv, Dv, Dk]` float32.
+/// y `[1, W, Hv, Dv]` for a draft tree (B == 1). `state` `[1, Hv, Dv, Dk]` float32.
 private func vlmGatedDeltaTree(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
     parents: [Int]
@@ -1204,11 +1204,13 @@ private func vlmGatedDeltaTree(
     let Dk = k.dim(3)
     let Hv = v.dim(2)
     let Dv = v.dim(3)
-    precondition(W <= 16 && Dk % 32 == 0)
+    // Size register storage for the actual tree, including the chooser's
+    // 32-row candidates. Keep the existing specialization for small trees.
+    precondition(W > 0 && parents.count == W && Dk % 32 == 0)
     let outputs = vlmGatedDeltaTreeKernel(
         [q, k, v, g, b, state, MLXArray(parents.map(Int32.init)), MLXArray([Int32(W)])],
         template: [
-            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", 16),
+            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", Swift.max(16, W)),
         ],
         grid: (32, Dv, Hv),
         threadGroup: (32, 4, 1),

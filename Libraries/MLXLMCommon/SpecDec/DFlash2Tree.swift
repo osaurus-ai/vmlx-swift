@@ -1,7 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 //
 // DFlash 2 draft TREES: one drafter forward → a candidate lattice → a best-first tree of up to
-// 15 nodes → ONE ≤16-row target verify with ancestor-path attention and a per-branch GatedDelta
+// the chosen width → ONE target verify with ancestor-path attention and a per-branch GatedDelta
 // recurrence → the longest accepted root path is committed (KV rows compacted, recurrent state
 // replayed along the kept path only).
 //

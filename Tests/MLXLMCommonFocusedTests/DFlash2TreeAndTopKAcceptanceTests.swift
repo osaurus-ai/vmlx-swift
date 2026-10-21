@@ -211,35 +211,38 @@ final class DFlash2TreeAndTopKAcceptanceTests: XCTestCase {
     func testTreeKernelMatchesChainKernelAlongEveryPath() throws {
         try FocusedMLXTestSupport.withLock {
             MLXRandom.seed(3)
-            let W = 7, Hk = 2, Hv = 4, Dk = 64, Dv = 32
-            let q = (MLXRandom.normal([1, W, Hk, Dk]) * 0.1).asType(.bfloat16)
-            let k = (MLXRandom.normal([1, W, Hk, Dk]) * 0.1).asType(.bfloat16)
-            let v = MLXRandom.normal([1, W, Hv, Dv]).asType(.bfloat16)
-            let g = MLXRandom.uniform(low: 0.5, high: 0.99, [1, W, Hv])
-            let b = MLXRandom.normal([1, W, Hv]).asType(.bfloat16)
-            let state = MLXRandom.normal([1, Hv, Dv, Dk]) * 0.1
+            // The adaptive ladder can select 32 rows, beyond the old 16-row workspace.
+            for W in [7, 16, 32] {
+                let Hk = 2, Hv = 4, Dk = 64, Dv = 32
+                let q = (MLXRandom.normal([1, W, Hk, Dk]) * 0.1).asType(.bfloat16)
+                let k = (MLXRandom.normal([1, W, Hk, Dk]) * 0.1).asType(.bfloat16)
+                let v = MLXRandom.normal([1, W, Hv, Dv]).asType(.bfloat16)
+                let g = MLXRandom.uniform(low: 0.5, high: 0.99, [1, W, Hv])
+                let b = MLXRandom.normal([1, W, Hv]).asType(.bfloat16)
+                let state = MLXRandom.normal([1, Hv, Dv, Dk]) * 0.1
 
-            let chainParents = Array(-1 ..< (W - 1))
-            let treeY = Qwen35DFlash2TreeKernelProbe.tree(
-                q: q, k: k, v: v, g: g, b: b, state: state, parents: chainParents)
-            let (chainY, _) = Qwen35DFlash2TreeKernelProbe.chain(
-                q: q, k: k, v: v, g: g, b: b, state: state)
-            XCTAssertEqual(
-                treeY.asType(.float32).asArray(Float.self), chainY.asType(.float32).asArray(Float.self))
-
-            let parents = [-1, 0, 0, 1, 2, 2, 4]
-            let plan = DFlash2TreePlan(tokens: Array(0 ..< W), parents: parents)
-            let branching = Qwen35DFlash2TreeKernelProbe.tree(
-                q: q, k: k, v: v, g: g, b: b, state: state, parents: parents)
-            for row in 0 ..< W {
-                let index = MLXArray(plan.paths[row].map(Int32.init))
-                func rows(_ x: MLXArray) -> MLXArray { take(x, index, axis: 1) }
-                let (pathY, _) = Qwen35DFlash2TreeKernelProbe.chain(
-                    q: rows(q), k: rows(k), v: rows(v), g: rows(g), b: rows(b), state: state)
-                let expected = pathY[0..., (plan.paths[row].count - 1)..., 0..., 0...]
+                let chainParents = Array(-1 ..< (W - 1))
+                let treeY = Qwen35DFlash2TreeKernelProbe.tree(
+                    q: q, k: k, v: v, g: g, b: b, state: state, parents: chainParents)
+                let (chainY, _) = Qwen35DFlash2TreeKernelProbe.chain(
+                    q: q, k: k, v: v, g: g, b: b, state: state)
                 XCTAssertEqual(
-                    branching[0..., row ..< (row + 1), 0..., 0...].asType(.float32).asArray(Float.self),
-                    expected.asType(.float32).asArray(Float.self), "row \(row)")
+                    treeY.asType(.float32).asArray(Float.self), chainY.asType(.float32).asArray(Float.self))
+
+                let parents = [-1] + (1 ..< W).map { ($0 - 1) / 2 }
+                let plan = DFlash2TreePlan(tokens: Array(0 ..< W), parents: parents)
+                let branching = Qwen35DFlash2TreeKernelProbe.tree(
+                    q: q, k: k, v: v, g: g, b: b, state: state, parents: parents)
+                for row in 0 ..< W {
+                    let index = MLXArray(plan.paths[row].map(Int32.init))
+                    func rows(_ x: MLXArray) -> MLXArray { take(x, index, axis: 1) }
+                    let (pathY, _) = Qwen35DFlash2TreeKernelProbe.chain(
+                        q: rows(q), k: rows(k), v: rows(v), g: rows(g), b: rows(b), state: state)
+                    let expected = pathY[0..., (plan.paths[row].count - 1)..., 0..., 0...]
+                    XCTAssertEqual(
+                        branching[0..., row ..< (row + 1), 0..., 0...].asType(.float32).asArray(Float.self),
+                        expected.asType(.float32).asArray(Float.self), "width \(W), row \(row)")
+                }
             }
         }
     }
