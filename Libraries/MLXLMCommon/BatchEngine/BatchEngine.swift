@@ -2899,7 +2899,7 @@ public actor BatchEngine {
         // snapshot. Retain one cache copy through decode, not two.
         slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
             from: slot.cache,
-            storageEnabled: cacheCoordinator != nil
+            storageEnabled: cacheCoordinator?.canPersistBoundaries == true
                 && slot.originalInput.cachePromptIntent != .auxiliary)
 
         let tokenID = firstToken.item(Int.self)

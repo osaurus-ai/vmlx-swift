@@ -681,7 +681,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Same boundary rule as TokenIterator, so both iterators agree on
         // what the canonical cross-turn checkpoint is (hybrid SSM and
         // standalone rotating/SWA topologies).
-        let storesPromptBoundary = cacheCoordinator != nil && input.cachePromptIntent != .auxiliary
+        let storesPromptBoundary = cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary
         self.hybridStripBoundary = storesPromptBoundary
             ? TokenIterator.hybridStripBoundaryIndex(
                 coordinator: cacheCoordinator,
