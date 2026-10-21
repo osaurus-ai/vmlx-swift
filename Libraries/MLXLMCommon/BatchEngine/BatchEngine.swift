@@ -2931,7 +2931,8 @@ public actor BatchEngine {
             // the prompt length and store it into the coordinator's
             // ``SSMStateCache``. This runs after the first token has been
             // yielded so TTFT does not pay the prompt-boundary bookkeeping.
-            if let coordinator = cacheCoordinator, coordinator.isHybrid {
+            if let coordinator = cacheCoordinator, coordinator.canPersistBoundaries,
+               slot.originalInput.cachePromptIntent != .auxiliary, coordinator.isHybrid {
                 // ZayaCCACache's `conv_state` + `prev_hs` are path-dependent
                 // and round-trip through extractSSMStates / restoreSSMStates
                 // (see CacheHelpers.swift:293-300). Include it here so the
@@ -3599,7 +3600,7 @@ public actor BatchEngine {
             // Auxiliary (title/suggestion/summary) prompts never store a
             // boundary — see `CachePromptIntent.auxiliary`.
             slot.originalInput.cachePromptIntent != .auxiliary,
-            let coordinator = cacheCoordinator
+            let coordinator = cacheCoordinator, coordinator.canPersistBoundaries
         {
             // Compiled rotating counters are device state. Publish their host
             // metadata before admission or any fallback live-cache snapshot.
