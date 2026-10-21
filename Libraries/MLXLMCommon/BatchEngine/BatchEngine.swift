@@ -2699,6 +2699,8 @@ public actor BatchEngine {
                     // the only forward pass.
                     let hybridBoundarySplit: Int? = {
                         guard cacheCoordinator?.isHybrid == true,
+                            cacheCoordinator?.canPersistBoundaries == true,
+                            slot.originalInput.cachePromptIntent != .auxiliary,
                             !slot.originalInput.hasMediaContent,
                             slot.diskSeedSnapshot == nil
                         else { return nil }
