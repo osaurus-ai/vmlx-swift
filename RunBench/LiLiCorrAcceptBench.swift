@@ -58,7 +58,7 @@ enum LiLiCorrAcceptBench {
         let context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
             loadConfiguration: .osaurusProduction
-        ).0
+        )
         print(String(
             format: "[LILICORR] target load: %.2fs model=%@", CFAbsoluteTimeGetCurrent() - loadStart,
             String(describing: type(of: context.model))))

@@ -4712,8 +4712,6 @@ public func generate(
     if parameters.jsonSchema != nil { parameters.draftStrategy = nil }
     _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let promptTail = _decodePromptTail(
         input: input, tokenizer: context.tokenizer, tokens: 64)
@@ -4905,8 +4903,6 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let iterator = try SpeculativeTokenIterator(
         input: input,
@@ -5104,8 +5100,6 @@ public func generateTokens(
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<TokenGeneration> {
     try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
@@ -5151,8 +5145,6 @@ public func generateTokens(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     let iterator = try SpeculativeTokenIterator(
         input: input,
@@ -5204,8 +5196,6 @@ public func generateTokensTask(
     try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
     var parameters = parameters
     if parameters.jsonSchema != nil { parameters.draftStrategy = nil }
-    context.jangPressRuntime.recordPromptTokenActivity(
-        input.text.tokens.reshaped(-1).asArray(Int.self))
 
     // Same ordering rule as `generate`: a selected DFlash 2 drafter
     // replaces native MTP rather than stacking with it.
@@ -5573,19 +5563,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
 
-            // Router-advice readback runs on its own Dispatch queue. Drain it
-            // after MLX synchronization so short-lived CLI runs and app unload
-            // paths do not tear down runtime state while the advisor is still
-            // applying mmap page advice.
-            MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()
             if genTailTrace {
-                let tailT4 = Date()
                 print(
                     "[vmlx][gen/tail] infoEmitted=early"
                         + " drain1=\(tailT1.timeIntervalSince(tailT0))s"
                         + " store=\(tailT2.timeIntervalSince(tailT1))s"
-                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s"
-                        + " advisor=\(tailT4.timeIntervalSince(tailT3))s")
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
             }
 
             // Finalize the stream — the serialization point for the next

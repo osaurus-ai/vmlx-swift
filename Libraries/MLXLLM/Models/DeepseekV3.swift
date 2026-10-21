@@ -345,7 +345,6 @@ class DeepseekV3MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         // Router scores are float32 for numerical stability; cast back
         // before applying so the f32 does not leak into the residual

@@ -1260,8 +1260,6 @@ public actor BatchEngine {
             soloParameters.kvMode = effMode
             soloParameters.maxKVSize = effMax
         }
-        context.jangPressRuntime.recordPromptTokenActivity(
-            input.text.tokens.reshaped(-1).asArray(Int.self))
 
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
         // Monotonic gate: a prompt-processing counter must never tick backward.
@@ -1865,8 +1863,6 @@ public actor BatchEngine {
     private func admitPendingRequests() {
         while activeSlots.count < maxBatchSize && !waitQueue.isEmpty {
             var request = waitQueue.removeFirst()
-            context.jangPressRuntime.recordPromptTokenActivity(
-                request.input.text.tokens.reshaped(-1).asArray(Int.self))
 
             // LONG-CTX (2026-04-21): apply the coordinator's KV-sizing
             // defaults before we allocate the slot's cache.

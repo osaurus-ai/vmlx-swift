@@ -14,7 +14,7 @@
     // Linux has no purgeable memory. Tiles become ordinary anonymous mappings that the kernel never
     // discards, so every tile reports itself as non-volatile and is never refaulted from disk.
 
-    // Public, unlike the rest: `JangPressMachError`'s public cases carry a `kern_return_t`.
+    // Mach-compatible return code for platform-neutral API declarations.
     public typealias kern_return_t = Int32
     typealias vm_address_t = UInt
     typealias vm_size_t = UInt

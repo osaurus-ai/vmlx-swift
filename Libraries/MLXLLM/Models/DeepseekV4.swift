@@ -896,8 +896,6 @@ class DeepseekV4MoE: Module, UnaryLayer {
             }
             let outs = ids.map { region([x, $0]) } ?? region([x])
             if outs.count == 2 {
-                JangPressCanonicalExpertAdvisor.shared.observe(
-                    layer: layerIdx, indices: outs[1])
                 return outs[0]
             }
             // Failed compiled evaluation returns empty — fall through to eager.
@@ -916,7 +914,6 @@ class DeepseekV4MoE: Module, UnaryLayer {
 
         let (indices, scores) = gate(x, inputIds: ids)
         finishStage("gate", [indices, scores])
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let routed = switchMLP(x, indices, preDownScores: scores)
         var y = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
         finishStage("routed", [y])
@@ -1254,8 +1251,6 @@ class DeepseekV4DecoderLayer: Module {
             let regionArgs = [attnOut, residualA, postA, combA] + (ids.map { [$0] } ?? [])
             let outs = region(regionArgs)
             if outs.count == 2 {
-                JangPressCanonicalExpertAdvisor.shared.observe(
-                    layer: layerIdx, indices: outs[1])
                 return outs[0]
             }
             // Failed compiled evaluation returns empty — fall through to eager.

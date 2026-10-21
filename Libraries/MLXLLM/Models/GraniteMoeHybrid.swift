@@ -318,7 +318,6 @@ class GraniteMoeHybridMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, gates) = router(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let expertOutputs = switchMLP(x, indices)
         return (expertOutputs * gates[.ellipsis, .newAxis]).sum(axis: -2)
     }

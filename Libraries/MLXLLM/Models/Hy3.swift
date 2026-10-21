@@ -464,7 +464,6 @@ class Hy3MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
 
         let routed: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
@@ -506,7 +505,6 @@ class Hy3AffineMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let y = switchMLP(x, indices)
         let routed = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)
         return routed + sharedExperts(x)
@@ -573,7 +571,6 @@ class Hy3DecoderLayer: Module {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
         let out = h + mlp(postAttentionLayerNorm(h))
-        MLXPressMmapColdSweep.afterLayer(layerIdx, materialized: out)
         return out
     }
 }

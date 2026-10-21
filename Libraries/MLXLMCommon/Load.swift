@@ -535,7 +535,7 @@ public func loadWeights(
         // Older pins ignore the env and fall back to the stock
         // pread/allocator path. `MmapSafetensorsLoader.swift` remains
         // a header/parser test utility, not the production tensor path.
-        let prestackedRoutedKeys = (try? JangPressPrestacker
+        let prestackedRoutedKeys = (try? LegacyRoutedTensorLayout
             .prestackedRoutedReplacementKeys(in: modelDirectory)) ?? []
         var skippedPrestackedSourceTensors = 0
         var skippedStreamingSourceTensors = 0
@@ -586,7 +586,7 @@ public func loadWeights(
                         excludedKeys.insert(key)
                         skippedStreamingSourceTensors += 1
                     } else if !isPrestackedShard,
-                        let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                        let replacementKey = LegacyRoutedTensorLayout.prestackedReplacementKey(
                             forPerExpertKey: key),
                         prestackedRoutedKeys.contains(replacementKey)
                     {
@@ -625,7 +625,7 @@ public func loadWeights(
                     continue
                 }
                 if !isPrestackedShard,
-                   let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                   let replacementKey = LegacyRoutedTensorLayout.prestackedReplacementKey(
                     forPerExpertKey: key),
                    prestackedRoutedKeys.contains(replacementKey)
                 {
@@ -656,11 +656,11 @@ public func loadWeights(
         }
         if skippedPrestackedSourceTensors > 0 {
             LoadDiagnostics.write(Data(
-                "[loadWeights] using MLXPress prestacked routed overlay; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
+                "[loadWeights] using existing stacked routed tensors; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
         }
         if skippedStreamingSourceTensors > 0 {
             LoadDiagnostics.write(Data(
-                "[loadWeights] using MLXPress active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
+                "[loadWeights] using active-expert streaming; skipped \(skippedStreamingSourceTensors) per-expert tensor(s) during weight load\n".utf8))
         }
         if skippedPreservedMTPTensors > 0 {
             LoadDiagnostics.write(Data(
@@ -1277,7 +1277,7 @@ public func loadWeights(
     //
     // For non-mmap JANGTQ loads, still convert non-TQ Mamba/attention/router
     // weights so resident decode avoids preventable fp16 AsType cascades. For
-    // mmap/JangPress loads, default to preserving file-backed tensor residency
+    // mmap loads, default to preserving file-backed tensor residency
     // unless the bundle has live proof that affine quant metadata must be
     // materialized to bf16 while raw TurboQuant tensors stay untouched.
     let mmapSafetensorsActive = envFlag("MLX_SAFETENSORS_MMAP")

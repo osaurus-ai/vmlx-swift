@@ -46,7 +46,7 @@ func runK2MultiturnBench(modelPath: String) async throws {
     if env["K2MT_NO_MMAP"] == "1" { loadConfiguration.useMmapSafetensors = false }
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: loadConfiguration
-    ).0
+    )
     if case .uno(let adapter, _)? = resolvedStrategy {
         let t0 = Date()
         let ms = try UnoWarmup.prepare(model: context.model, adapterDirectory: adapter)

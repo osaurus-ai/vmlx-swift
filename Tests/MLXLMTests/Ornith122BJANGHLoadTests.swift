@@ -17,7 +17,7 @@ final class Ornith122BJANGHLoadTests: XCTestCase {
             var load = LoadConfiguration.default
             load.nativeMTP = enabled
             load.nativeMTPManualDepth = enabled ? 1 : nil
-            let (context, _) = try await MLXLMCommon.loadModel(
+            let context = try await MLXLMCommon.loadModel(
                 from: URL(fileURLWithPath: path), using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: load)
             let model = try XCTUnwrap(context.model as? Qwen35MoE)

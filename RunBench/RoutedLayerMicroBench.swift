@@ -19,7 +19,7 @@ func runRoutedLayerMicroBench(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
         loadConfiguration: LoadConfiguration()
-    ).0
+    )
     let layers = context.model.namedModules()
         .compactMap { name, module -> (String, any WeightedRoutedExpertLayer)? in
             guard let routed = module as? any WeightedRoutedExpertLayer, !name.hasPrefix("mtp") else { return nil }

@@ -142,7 +142,6 @@ class PhiMoESparseMoeBlock: Module {
                 axis: -1
             )[.ellipsis, ..<k])
         let scores = MLX.softmax(MLX.takeAlong(gates, inds, axis: -1), axis: -1, precise: true)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
         let y = switchMLP(x, inds)
         return (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2)

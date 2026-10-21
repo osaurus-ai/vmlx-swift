@@ -1925,7 +1925,6 @@ public final class Glm5NextMoE: Module {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
         if let layer = routedAdviceLayerIndex {
             // Existing advisor policy is opt-in; disabled calls perform no readback.
-            JangPressCanonicalExpertAdvisor.shared.observe(layer: layer, indices: indices)
         }
 
         let combined = routedExperts.callRouted(x, indices: indices, scores: weights)

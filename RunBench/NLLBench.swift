@@ -20,7 +20,7 @@ enum NLLBench {
             from: modelDir,
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: .osaurusProduction)
-        let context = loaded.0
+        let context = loaded
         print(String(format: "NLL load: %.2fs model=%@", CFAbsoluteTimeGetCurrent() - loadStart,
             String(describing: type(of: context.model))))
 

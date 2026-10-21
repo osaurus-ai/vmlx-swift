@@ -39,7 +39,6 @@ final class JANGHLoadPolicyTests: XCTestCase {
                 XCTAssertEqual(facts.resolveMLXMemoryLimit(requested: cap), cap)
                 XCTAssertEqual(facts.resolveMLXAllocatorCacheLimit(requested: cap), cap)
             }
-            XCTAssertFalse(JangPressPolicy.disabled.resolve(facts: facts).enabled)
         }
     }
 

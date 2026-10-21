@@ -141,12 +141,10 @@ struct JangPressSafetensorsAlignmentTests {
         ])
         defer { Self.restore(saved) }
 
-        let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
-            originalURL: bundle, enabled: true)
+        SafetensorsStorageHealer.healBundleIfEligible(at: bundle)
 
         // Default: the original file is byte-for-byte untouched; MLX loads it
         // through its aligned-copy fallback instead. No storage mutation.
-        #expect(prepared.standardizedFileURL == bundle.standardizedFileURL)
         #expect(try Data(contentsOf: shard) == before)
         #expect(try Self.temporaryFiles(in: bundle).isEmpty)
     }
@@ -165,11 +163,9 @@ struct JangPressSafetensorsAlignmentTests {
         defer { Self.restore(saved) }
         setenv("MLXPRESS_HEAL_SAFETENSORS", "1", 1)
 
-        let prepared = try JangPressPrestacker.prepareBundleIfNeeded(
-            originalURL: bundle, enabled: true,
-            alignmentRepairAuthorization: .directUserSend)
+        SafetensorsStorageHealer.healBundleIfEligible(
+            at: bundle, authorization: .directUserSend)
 
-        #expect(prepared.standardizedFileURL == bundle.standardizedFileURL)
         #expect(try Self.readFixture(shard).unalignedCount == 0)
     }
 
@@ -207,16 +203,15 @@ struct JangPressSafetensorsAlignmentTests {
         #expect(after.contains("9.9999999999999995e-07"))
     }
 
-    @Test("resident/non-mmap loads do not mutate model storage")
-    func disabledMmapDoesNotHeal() throws {
+    @Test("unauthorized loads do not mutate model storage")
+    func disabledAuthorizationDoesNotHeal() throws {
         let bundle = try Self.makeDirectory()
         defer { try? FileManager.default.removeItem(at: bundle) }
         let shard = bundle.appendingPathComponent("model.safetensors")
         try Self.writeUnalignedFixture(shard)
         let before = try Data(contentsOf: shard)
 
-        _ = try JangPressPrestacker.prepareBundleIfNeeded(
-            originalURL: bundle, enabled: false)
+        SafetensorsStorageHealer.healBundleIfEligible(at: bundle, authorization: .disabled)
 
         #expect(try Data(contentsOf: shard) == before)
     }

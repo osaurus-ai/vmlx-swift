@@ -999,8 +999,7 @@ private func mlXPressStreamingMaterializeIfNeeded(
     force: Bool,
     layerIdx: Int,
     phase: String,
-    profileName: String,
-    releaseMachColdTiles: Bool = false
+    profileName: String
 ) {
     let pressureEval = force
         ? false
@@ -1016,9 +1015,6 @@ private func mlXPressStreamingMaterializeIfNeeded(
         force: force,
         layerIdx: layerIdx,
         phase: phase)
-    if releaseMachColdTiles {
-        JANGTQStreamingExpertStore.shared.releaseMachColdTiles()
-    }
 }
 
 private func mlXPressStreamingActiveOffsetFileURLs(
@@ -1237,113 +1233,14 @@ private func mlXPressStreamingUseFNoCache(for index: JANGTQStreamingExpertIndex?
     return index.totalTensorBytes > mlXPressStreamingNoCacheThresholdBytes()
 }
 
-private func mlXPressStreamingMachActiveTensorsEnabled() -> Bool {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_STREAMING_MACH_ACTIVE_TENSORS"]?
-        .lowercased()
-        ?? env["JANGPRESS_STREAMING_MACH_ACTIVE_TENSORS"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
 
-private func mlXPressStreamingMachOffsetSpansEnabled() -> Bool {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_STREAMING_MACH_OFFSET_SPANS"]?
-        .lowercased()
-        ?? env["JANGPRESS_STREAMING_MACH_OFFSET_SPANS"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
 
-private func mlXPressStreamingMachFullOffsetSpansEnabled() -> Bool {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_STREAMING_MACH_FULL_OFFSET_SPANS"]?
-        .lowercased()
-        ?? env["JANGPRESS_STREAMING_MACH_FULL_OFFSET_SPANS"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
 
-private func mlXPressStreamingMachPrewarmFullOffsetSpansEnabled() -> Bool {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_STREAMING_MACH_PREWARM_FULL_OFFSET_SPANS"]?
-        .lowercased()
-        ?? env["JANGPRESS_STREAMING_MACH_PREWARM_FULL_OFFSET_SPANS"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
 
-private func mlXPressStreamingMachFullOffsetLazyEnabled() -> Bool {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_STREAMING_MACH_FULL_OFFSET_LAZY"]?
-        .lowercased()
-        ?? env["JANGPRESS_STREAMING_MACH_FULL_OFFSET_LAZY"]?.lowercased()
-        ?? "0"
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-}
 
-private func mlXPressStreamingMachPrewarmMaxLayers() -> Int? {
-    let env = ProcessInfo.processInfo.environment
-    guard let raw =
-        env["MLXPRESS_STREAMING_MACH_PREWARM_MAX_LAYERS"]
-        ?? env["JANGPRESS_STREAMING_MACH_PREWARM_MAX_LAYERS"]
-    else { return nil }
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if trimmed.isEmpty || trimmed == "all" || trimmed == "none" || trimmed == "0" {
-        return nil
-    }
-    guard let value = Int(trimmed), value > 0 else { return nil }
-    return value
-}
 
-private func mlXPressStreamingMachPrewarmMaxBytes() -> UInt64? {
-    let env = ProcessInfo.processInfo.environment
-    if let raw =
-        env["MLXPRESS_STREAMING_MACH_PREWARM_MAX_GB"]
-        ?? env["JANGPRESS_STREAMING_MACH_PREWARM_MAX_GB"],
-        let gb = Double(raw),
-        gb > 0
-    {
-        return UInt64((gb * 1024.0 * 1024.0 * 1024.0).rounded(.down))
-    }
-    if let raw =
-        env["MLXPRESS_STREAMING_MACH_PREWARM_MAX_MB"]
-        ?? env["JANGPRESS_STREAMING_MACH_PREWARM_MAX_MB"],
-        let mb = Double(raw),
-        mb > 0
-    {
-        return UInt64((mb * 1024.0 * 1024.0).rounded(.down))
-    }
-    return nil
-}
 
-private func mlXPressStreamingMachOffsetSpanBudgetBytes() -> Int {
-    let env = ProcessInfo.processInfo.environment
-    if let raw =
-        env["MLXPRESS_STREAMING_MACH_OFFSET_SPAN_BUDGET_MB"]
-        ?? env["JANGPRESS_STREAMING_MACH_OFFSET_SPAN_BUDGET_MB"]
-    {
-        return max(0, Int(raw) ?? 0) * 1024 * 1024
-    }
-    return 0
-}
 
-private func mlXPressMachCompressPercent() -> Int {
-    let env = ProcessInfo.processInfo.environment
-    let raw =
-        env["MLXPRESS_MACH_COMPRESS_PCT"]
-        ?? env["JANGPRESS_MACH_COMPRESS_PCT"]
-        ?? env["MLXPRESS"]
-        ?? env["JANGPRESS"]
-        ?? "70"
-    guard let pct = Int(raw) else { return 70 }
-    return max(0, min(95, pct))
-}
 
 private enum StreamingProjection: String, CaseIterable {
     case gate = "gate_proj"
@@ -1569,11 +1466,6 @@ private struct StreamingResidentTensorEntry {
     var byteCount: Int
 }
 
-private struct StreamingMachTensorEntry {
-    var byteCount: Int
-    var lastUse: UInt64
-    var isOffsetSpan: Bool
-}
 
 private struct StreamingStackedSliceReadResult {
     var data: Data
@@ -2584,18 +2476,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     private let directStackedEnabled = mlXPressStreamingDirectStackedEnabled()
     private let offsetKernelsOverride = mlXPressStreamingOffsetKernelsOverride()
     private let mmapActiveTensorsOverride = mlXPressStreamingMmapActiveTensorsOverride()
-    private let machActiveTensorsEnabled = mlXPressStreamingMachActiveTensorsEnabled()
-    private let machOffsetSpansEnabled = mlXPressStreamingMachOffsetSpansEnabled()
-    private let machFullOffsetSpansEnabled = mlXPressStreamingMachFullOffsetSpansEnabled()
-    private let machPrewarmFullOffsetSpansEnabled =
-        mlXPressStreamingMachPrewarmFullOffsetSpansEnabled()
-    private let machFullOffsetLazyEnabled = mlXPressStreamingMachFullOffsetLazyEnabled()
-    private let machOffsetSpanBudgetBytes = mlXPressStreamingMachOffsetSpanBudgetBytes()
-    private let machCompressPercent = mlXPressMachCompressPercent()
-    private let machCache = JangPressMachCache(
-        config: JangPressMachConfig(
-            enableDiskRefault: true,
-            manualCompressPercent: mlXPressMachCompressPercent()))
     private var tensorCacheBytes = 0
     private var tensorCacheClock: UInt64 = 0
     private var tensorCache: [StreamingTensorCacheKey: StreamingTensorCacheEntry] = [:]
@@ -2623,16 +2503,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     private var offsetSpanCacheEvictions = 0
     private var residentTensorBytes = 0
     private var residentTensors: [StreamingTensorCacheKey: StreamingResidentTensorEntry] = [:]
-    private var machRegisteredTensors: [StreamingTensorCacheKey: StreamingMachTensorEntry] = [:]
-    private var machRegisteredTensorBytes = 0
-    private var machOffsetSpanRegisteredBytes = 0
-    private var machTensorHits = 0
-    private var machTensorMisses = 0
-    private var machTensorHitBytes: UInt64 = 0
-    private var machTensorMissBytes: UInt64 = 0
-    private var machTensorStores = 0
-    private var machTensorEvictions = 0
-    private var machOffsetBudgetSkips = 0
     private var directStackedTensorCache: [StreamingStackedTensorCacheKey: MLXArray] = [:]
     private var directStackedShardCache: [String: [String: MLXArray]] = [:]
     private var sliceCacheBytes = 0
@@ -2644,24 +2514,18 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     private var sliceCacheStores = 0
     private var sliceCacheEvictions = 0
     private var readPolicyLogged = false
-    private var didPrewarmFullOffsetSpans = false
     #if canImport(Darwin)
         private var cachedFileDescriptors: [String: Int32] = [:]
     #endif
 
     func configureModelDirectory(_ modelDirectory: URL) {
         let resolved = modelDirectory.resolvingSymlinksInPath()
-        var changed = false
         lock.lock()
         if configuredModelDirectory != resolved {
             configuredModelDirectory = resolved
             clearModelScopedCachesLocked()
-            changed = true
         }
         lock.unlock()
-        if changed {
-            machCache.removeAll()
-        }
     }
 
     func clearConfiguredModelDirectory() {
@@ -2669,7 +2533,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         configuredModelDirectory = nil
         clearModelScopedCachesLocked()
         lock.unlock()
-        machCache.removeAll()
     }
 
     func configuredModelDirectoryForDiagnostics() -> URL? {
@@ -2689,15 +2552,11 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         offsetSpanCacheBytes = 0
         residentTensors.removeAll(keepingCapacity: false)
         residentTensorBytes = 0
-        machRegisteredTensors.removeAll(keepingCapacity: false)
-        machRegisteredTensorBytes = 0
-        machOffsetSpanRegisteredBytes = 0
         directStackedTensorCache.removeAll(keepingCapacity: false)
         directStackedShardCache.removeAll(keepingCapacity: false)
         sliceCache.removeAll(keepingCapacity: false)
         sliceCacheBytes = 0
         readPolicyLogged = false
-        didPrewarmFullOffsetSpans = false
     }
 
     func index() -> JANGTQStreamingExpertIndex? {
@@ -2771,26 +2630,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             FileHandle.standardError.write(
                 Data("[MLXPressStreaming] offset-addressed active expert kernels auto-enabled for stacked Ultra layout\n".utf8))
         }
-        if machActiveTensorsEnabled {
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPressStreaming] Mach purgeable active tensor cache enabled compressPct=\(machCompressPercent)\n"
-                        .utf8))
-        }
-        if machOffsetSpansEnabled {
-            let budgetMB = machOffsetSpanBudgetBytes / (1024 * 1024)
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPressStreaming] Mach purgeable offset-span cache enabled compressPct=\(machCompressPercent) budget=\(budgetMB) MB\n"
-                        .utf8))
-            if machFullOffsetSpansEnabled {
-                FileHandle.standardError.write(
-                    Data(
-                        "[MLXPressStreaming] Mach full routed-span residency enabled prewarm=\(machPrewarmFullOffsetSpansEnabled) lazy=\(machFullOffsetLazyEnabled)\n"
-                            .utf8))
-            }
-        }
-        prewarmFullOffsetSpansIfNeeded(index: built)
         return built
     }
 
@@ -2798,104 +2637,9 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         lock.lock()
         residentTensors.removeAll(keepingCapacity: false)
         residentTensorBytes = 0
-        machRegisteredTensors.removeAll(keepingCapacity: false)
-        machRegisteredTensorBytes = 0
-        machOffsetSpanRegisteredBytes = 0
-        didPrewarmFullOffsetSpans = false
         lock.unlock()
-        machCache.removeAll()
     }
 
-    private func prewarmFullOffsetSpansIfNeeded(index: JANGTQStreamingExpertIndex) {
-        guard machOffsetSpansEnabled,
-            machFullOffsetSpansEnabled,
-            machPrewarmFullOffsetSpansEnabled
-        else { return }
-
-        lock.lock()
-        if didPrewarmFullOffsetSpans {
-            lock.unlock()
-            return
-        }
-        didPrewarmFullOffsetSpans = true
-        lock.unlock()
-
-        let maxLayers = mlXPressStreamingMachPrewarmMaxLayers()
-        let maxBytes = mlXPressStreamingMachPrewarmMaxBytes()
-        let layerIds = index.layers.keys.sorted()
-        let selectedLayerIds = maxLayers.map { Array(layerIds.prefix($0)) } ?? layerIds
-        var prewarmed = 0
-        var prewarmedBytes: UInt64 = 0
-        var stoppedByBudget = false
-        let start = Date.timeIntervalSinceReferenceDate
-
-        FileHandle.standardError.write(
-            Data(
-                "[MLXPressStreaming] Mach full routed-span prewarm start layers=\(selectedLayerIds.count)\n"
-                    .utf8))
-
-        outer: for layerIdx in selectedLayerIds {
-            for projection in StreamingProjection.allCases {
-                for suffix in StreamingSuffix.allCases {
-                    let descriptors = index.stackedOffsetDescriptors(
-                        layerIdx: layerIdx,
-                        projection: projection,
-                        suffix: suffix)
-                    for descriptor in descriptors {
-                        if let maxBytes, prewarmedBytes >= maxBytes {
-                            stoppedByBudget = true
-                            break outer
-                        }
-                        guard let elementByteSize = elementByteSize(from: descriptor.dtype),
-                            descriptor.spanByteCount % elementByteSize == 0
-                        else { continue }
-                        if let maxBytes,
-                            prewarmedBytes + UInt64(max(0, descriptor.spanByteCount)) > maxBytes
-                        {
-                            stoppedByBudget = true
-                            break outer
-                        }
-                        let elementCount = descriptor.spanByteCount / elementByteSize
-                        guard makeMachFullOffsetSpanArray(
-                            from: descriptor,
-                            shape: [elementCount]) != nil
-                        else { continue }
-                        let key = machFullOffsetKey(
-                            layerIdx: descriptor.layerIdx,
-                            projection: projection,
-                            suffix: suffix,
-                            descriptor: descriptor)
-                        machCache.release(
-                            layer: key.layerIdx,
-                            expert: key.expertIdx,
-                            components: [machComponentName(for: key)])
-                        prewarmed += 1
-                        prewarmedBytes += UInt64(max(0, descriptor.spanByteCount))
-                        MLXPressStreamingProfile.record(
-                            "tensor.mach_full_offset_prewarm",
-                            bytes: descriptor.spanByteCount)
-                    }
-                }
-            }
-        }
-
-        let seconds = Date.timeIntervalSinceReferenceDate - start
-        MLXPressStreamingProfile.record(
-            stoppedByBudget
-                ? "tensor.mach_full_offset_prewarm_budget_stop"
-                : "tensor.mach_full_offset_prewarm_done",
-            seconds: seconds,
-            bytes: Int(min(prewarmedBytes, UInt64(Int.max))))
-        FileHandle.standardError.write(
-            Data(
-                String(
-                    format: "[MLXPressStreaming] Mach full routed-span prewarm %@ spans=%d bytes=%.2fGB seconds=%.2f\n",
-                    stoppedByBudget ? "stopped" : "done",
-                    prewarmed,
-                    Double(prewarmedBytes) / (1024.0 * 1024.0 * 1024.0),
-                    seconds
-                ).utf8))
-    }
 
     func registerResidentTensor(
         layerIdx: Int,
@@ -3041,12 +2785,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             descriptor.spanByteCount % elementByteSize == 0
         else { return [] }
 
-        if machOffsetSpansEnabled,
-            machFullOffsetSpansEnabled,
-            let span = makeFullMachOffsetSpan(from: descriptor, elementByteSize: elementByteSize)
-        {
-            return [span]
-        }
 
         if activeExperts == nil {
             guard let span = makeOffsetSpanWindow(
@@ -3109,64 +2847,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         return windows
     }
 
-    private func makeFullMachOffsetSpan(
-        from descriptor: JANGTQStackedOffsetDescriptor,
-        elementByteSize: Int
-    ) -> StreamingOffsetSpan? {
-        guard descriptor.spanByteCount > 0,
-            descriptor.spanByteCount % elementByteSize == 0
-        else { return nil }
-        let selectedExperts = Set(
-            descriptor.expertByteOffsets.enumerated().compactMap { expertIdx, byteOffset in
-                byteOffset == UInt64.max ? nil : expertIdx
-            })
-        guard !selectedExperts.isEmpty else { return nil }
-        let cacheKey = StreamingOffsetSpanCacheKey(
-            fileURL: descriptor.fileURL,
-            offset: descriptor.spanOffset,
-            byteCount: descriptor.spanByteCount,
-            dtype: descriptor.dtype)
-        if let cached = cachedOffsetSpan(for: cacheKey) {
-            return cached
-        }
-
-        var elementOffsets: [UInt32] = []
-        elementOffsets.reserveCapacity(descriptor.expertByteOffsets.count)
-        var presentExperts = Set<Int>()
-        for (expertIdx, byteOffset) in descriptor.expertByteOffsets.enumerated() {
-            if byteOffset == UInt64.max {
-                elementOffsets.append(UInt32.max)
-                continue
-            }
-            guard byteOffset % UInt64(elementByteSize) == 0 else { return nil }
-            let elementOffset = byteOffset / UInt64(elementByteSize)
-            guard elementOffset <= UInt64(UInt32.max) else { return nil }
-            elementOffsets.append(UInt32(elementOffset))
-            presentExperts.insert(expertIdx)
-        }
-        guard !presentExperts.isEmpty else { return nil }
-
-        let elementCount = descriptor.spanByteCount / elementByteSize
-        let machKey = machFullOffsetKey(for: descriptor)
-        guard machFullOffsetLazyEnabled || isMachRegistered(key: machKey) else {
-            return nil
-        }
-        guard let array = makeMachFullOffsetSpanArray(
-            from: descriptor,
-            shape: [elementCount])
-        else { return nil }
-        MLXPressStreamingProfile.record(
-            "tensor.mach_full_offset_span.\(descriptor.storageLayout)",
-            bytes: descriptor.spanByteCount)
-        let span = StreamingOffsetSpan(
-            fileURL: descriptor.fileURL,
-            array: array,
-            offsets: MLXArray(elementOffsets),
-            byteCount: descriptor.spanByteCount,
-            storageLayout: "mach-full-\(descriptor.storageLayout)",
-            presentExperts: presentExperts)
-        return storeOffsetSpan(span, key: cacheKey)
-    }
 
     private func makeOffsetSpanWindow(
         from descriptor: JANGTQStackedOffsetDescriptor,
@@ -3185,10 +2865,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             offset: spanOffset,
             byteCount: spanByteCount,
             dtype: descriptor.dtype)
-        let machEligible = machOffsetSpansEnabled
-            && selectedExperts.count == 1
-            && spanByteCount == descriptor.expertByteCount
-        if !machEligible, let cached = cachedOffsetSpan(for: cacheKey) {
+        if let cached = cachedOffsetSpan(for: cacheKey) {
             return cached
         }
 
@@ -3213,14 +2890,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
 
         let elementCount = spanByteCount / elementByteSize
         let shape = [elementCount]
-        let machArray = machEligible
-            ? makeMachOffsetSpanArray(
-                from: descriptor,
-                spanOffset: spanOffset,
-                spanByteCount: spanByteCount,
-                expertIdx: presentExperts.first!,
-                shape: shape)
-            : nil
         let requiredProjections =
             StreamingProjection(rawValue: descriptor.projectionName).map { [$0] }
             ?? StreamingProjection.allCases
@@ -3228,7 +2897,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             index: index(),
             layerIdx: descriptor.layerIdx,
             requiredProjections: requiredProjections)
-        let array = machArray ?? MLXPressStreamingProfile.time(
+        let array = MLXPressStreamingProfile.time(
             "tensor.offset_span_mmap_array",
             bytes: spanByteCount
         ) { () -> MLXArray? in
@@ -3251,116 +2920,14 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             byteCount: spanByteCount,
             storageLayout: descriptor.storageLayout,
             presentExperts: presentExperts)
-        return machArray == nil ? storeOffsetSpan(span, key: cacheKey) : span
+        return storeOffsetSpan(span, key: cacheKey)
     }
 
-    private func makeMachOffsetSpanArray(
-        from descriptor: JANGTQStackedOffsetDescriptor,
-        spanOffset: UInt64,
-        spanByteCount: Int,
-        expertIdx: Int,
-        shape: [Int]
-    ) -> MLXArray? {
-        guard let projection = StreamingProjection(rawValue: descriptor.projectionName),
-            let suffix = StreamingSuffix(rawValue: descriptor.suffixName)
-        else { return nil }
-        let key = StreamingTensorCacheKey(
-            layerIdx: descriptor.layerIdx,
-            expertIdx: expertIdx,
-            projection: projection,
-            suffix: suffix)
-        let ref = StreamingTensorRef(
-            name: "\(descriptor.projectionName).\(descriptor.suffixName)#offset.\(expertIdx)",
-            fileURL: descriptor.fileURL,
-            offset: spanOffset,
-            byteCount: spanByteCount,
-            dtype: descriptor.dtype,
-            shape: shape)
-        return loadMachOffsetSpan(ref: ref, key: key, shape: shape)
-    }
 
-    private func makeMachFullOffsetSpanArray(
-        from descriptor: JANGTQStackedOffsetDescriptor,
-        shape: [Int]
-    ) -> MLXArray? {
-        guard let projection = StreamingProjection(rawValue: descriptor.projectionName),
-            let suffix = StreamingSuffix(rawValue: descriptor.suffixName)
-        else { return nil }
-        let key = machFullOffsetKey(
-            layerIdx: descriptor.layerIdx,
-            projection: projection,
-            suffix: suffix,
-            descriptor: descriptor)
-        let ref = StreamingTensorRef(
-            name: "\(descriptor.projectionName).\(descriptor.suffixName)#full-offset.\(descriptor.spanOffset)",
-            fileURL: descriptor.fileURL,
-            offset: descriptor.spanOffset,
-            byteCount: descriptor.spanByteCount,
-            dtype: descriptor.dtype,
-            shape: shape)
-        return loadMachBackedTensor(
-            ref: ref,
-            key: key,
-            shape: shape,
-            isOffsetSpan: true,
-            readProfileName: "tensor.mach_full_offset_read",
-            registerProfileName: "tensor.mach_full_offset_register",
-            hitProfileName: "tensor.mach_full_offset_hit",
-            arrayProfileName: "tensor.mach_full_offset_array",
-            useNoCacheForRegistration: false)
-    }
 
-    private func machFullOffsetKey(
-        for descriptor: JANGTQStackedOffsetDescriptor
-    ) -> StreamingTensorCacheKey {
-        guard let projection = StreamingProjection(rawValue: descriptor.projectionName),
-            let suffix = StreamingSuffix(rawValue: descriptor.suffixName)
-        else {
-            return StreamingTensorCacheKey(
-                layerIdx: descriptor.layerIdx,
-                expertIdx: machFullOffsetSyntheticExpertIndex(for: descriptor),
-                projection: .gate,
-                suffix: .packed)
-        }
-        return machFullOffsetKey(
-            layerIdx: descriptor.layerIdx,
-            projection: projection,
-            suffix: suffix,
-            descriptor: descriptor)
-    }
 
-    private func machFullOffsetKey(
-        layerIdx: Int,
-        projection: StreamingProjection,
-        suffix: StreamingSuffix,
-        descriptor: JANGTQStackedOffsetDescriptor
-    ) -> StreamingTensorCacheKey {
-        StreamingTensorCacheKey(
-            layerIdx: layerIdx,
-            expertIdx: machFullOffsetSyntheticExpertIndex(for: descriptor),
-            projection: projection,
-            suffix: suffix)
-    }
 
-    private func isMachRegistered(key: StreamingTensorCacheKey) -> Bool {
-        lock.lock()
-        let registered = machRegisteredTensors[key] != nil
-        lock.unlock()
-        return registered
-    }
 
-    private func machFullOffsetSyntheticExpertIndex(
-        for descriptor: JANGTQStackedOffsetDescriptor
-    ) -> Int {
-        let key = "\(descriptor.fileURL.path)#\(descriptor.spanOffset)#\(descriptor.spanByteCount)"
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in key.utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 1_099_511_628_211
-        }
-        let positive = Int(hash % UInt64(Int32.max - 1)) + 1
-        return -positive
-    }
 
     private func cachedOffsetSpan(for key: StreamingOffsetSpanCacheKey) -> StreamingOffsetSpan? {
         guard offsetSpanCacheBudgetBytes > 0 else { return nil }
@@ -3704,9 +3271,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         guard let layer = index()?.layers[layerIdx] else { return nil }
 
         if let ref = layer.experts[expertIdx]?.tensors[projection]?[suffix] {
-            if let machArray = loadMachTensor(ref: ref, key: cacheKey, shape: ref.shape) {
-                return machArray
-            }
             if let cached = cachedTensor(for: cacheKey, byteCount: ref.byteCount) {
                 MLXPressStreamingProfile.record("tensor.cache_hit", bytes: ref.byteCount)
                 return cached
@@ -3750,16 +3314,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         let expertOffset = ref.offset + UInt64(expertIdx * expertByteCount)
         let expertShape = Array(ref.shape.dropFirst())
         guard !expertShape.isEmpty else { return nil }
-        let expertRef = StreamingTensorRef(
-            name: "\(ref.name)#expert.\(expertIdx)",
-            fileURL: ref.fileURL,
-            offset: expertOffset,
-            byteCount: expertByteCount,
-            dtype: ref.dtype,
-            shape: expertShape)
-        if let machArray = loadMachTensor(ref: expertRef, key: cacheKey, shape: expertShape) {
-            return machArray
-        }
         if let cached = cachedTensor(for: cacheKey, byteCount: expertByteCount) {
             MLXPressStreamingProfile.record("tensor.cache_hit", bytes: expertByteCount)
             return cached
@@ -3800,279 +3354,13 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         return entry.array
     }
 
-    private func loadMachTensor(
-        ref: StreamingTensorRef,
-        key: StreamingTensorCacheKey,
-        shape: [Int]
-    ) -> MLXArray? {
-        guard machActiveTensorsEnabled else { return nil }
-        return loadMachBackedTensor(
-            ref: ref,
-            key: key,
-            shape: shape,
-            isOffsetSpan: false,
-            readProfileName: "tensor.mach_read",
-            registerProfileName: "tensor.mach_register",
-            hitProfileName: "tensor.mach_hit",
-            arrayProfileName: "tensor.mach_array")
-    }
 
-    private func loadMachOffsetSpan(
-        ref: StreamingTensorRef,
-        key: StreamingTensorCacheKey,
-        shape: [Int]
-    ) -> MLXArray? {
-        guard machOffsetSpansEnabled else { return nil }
-        return loadMachBackedTensor(
-            ref: ref,
-            key: key,
-            shape: shape,
-            isOffsetSpan: true,
-            readProfileName: "tensor.mach_offset_read",
-            registerProfileName: "tensor.mach_offset_register",
-            hitProfileName: "tensor.mach_offset_hit",
-            arrayProfileName: "tensor.mach_offset_array")
-    }
 
-    private func loadMachBackedTensor(
-        ref: StreamingTensorRef,
-        key: StreamingTensorCacheKey,
-        shape: [Int],
-        isOffsetSpan: Bool,
-        readProfileName: String,
-        registerProfileName: String,
-        hitProfileName: String,
-        arrayProfileName: String,
-        useNoCacheForRegistration: Bool = true
-    ) -> MLXArray? {
-        guard let dtype = dtype(from: ref.dtype) else { return nil }
 
-        let component = machComponentName(for: key)
-        if isOffsetSpan,
-           machOffsetSpanBudgetBytes > 0,
-           ref.byteCount > machOffsetSpanBudgetBytes
-        {
-            lock.lock()
-            machOffsetBudgetSkips += 1
-            lock.unlock()
-            MLXPressStreamingProfile.record("tensor.mach_offset_budget_skip", bytes: ref.byteCount)
-            return nil
-        }
 
-        lock.lock()
-        let alreadyRegistered: Bool
-        if var entry = machRegisteredTensors[key] {
-            tensorCacheClock &+= 1
-            entry.lastUse = tensorCacheClock
-            machRegisteredTensors[key] = entry
-            alreadyRegistered = true
-        } else {
-            alreadyRegistered = false
-        }
-        lock.unlock()
 
-        if !alreadyRegistered {
-            let evicted: [(StreamingTensorCacheKey, Int)]
-            lock.lock()
-            evicted = isOffsetSpan
-                ? evictMachOffsetSpansToBudgetLocked(pendingByteCount: ref.byteCount, protecting: key)
-                : []
-            if isOffsetSpan,
-               machOffsetSpanBudgetBytes > 0,
-               machOffsetSpanRegisteredBytes + ref.byteCount > machOffsetSpanBudgetBytes
-            {
-                machOffsetBudgetSkips += 1
-                lock.unlock()
-                recordMachEvictions(evicted)
-                MLXPressStreamingProfile.record(
-                    "tensor.mach_offset_budget_skip",
-                    bytes: ref.byteCount)
-                return nil
-            }
-            machTensorMisses += 1
-            machTensorMissBytes += UInt64(max(0, ref.byteCount))
-            lock.unlock()
-            recordMachEvictions(evicted)
 
-            guard registerMachBackedTensor(
-                ref: ref,
-                key: key,
-                component: component,
-                readProfileName: readProfileName,
-                useNoCache: useNoCacheForRegistration)
-            else {
-                return nil
-            }
-            lock.lock()
-            tensorCacheClock &+= 1
-            if let old = machRegisteredTensors[key] {
-                machRegisteredTensorBytes = max(0, machRegisteredTensorBytes - old.byteCount)
-                if old.isOffsetSpan {
-                    machOffsetSpanRegisteredBytes = max(
-                        0,
-                        machOffsetSpanRegisteredBytes - old.byteCount)
-                }
-            } else {
-                machTensorStores += 1
-            }
-            machRegisteredTensors[key] = StreamingMachTensorEntry(
-                byteCount: ref.byteCount,
-                lastUse: tensorCacheClock,
-                isOffsetSpan: isOffsetSpan)
-            machRegisteredTensorBytes += ref.byteCount
-            if isOffsetSpan {
-                machOffsetSpanRegisteredBytes += ref.byteCount
-            }
-            lock.unlock()
-            MLXPressStreamingProfile.record(registerProfileName, bytes: ref.byteCount)
-        } else {
-            lock.lock()
-            machTensorHits += 1
-            machTensorHitBytes += UInt64(max(0, ref.byteCount))
-            lock.unlock()
-            MLXPressStreamingProfile.record(hitProfileName, bytes: ref.byteCount)
-        }
 
-        let start = Date.timeIntervalSinceReferenceDate
-        do {
-            let array = try machCache.array(
-                layer: key.layerIdx,
-                expert: key.expertIdx,
-                component: component,
-                shape: shape,
-                dtype: dtype)
-            MLXPressStreamingProfile.record(
-                arrayProfileName,
-                seconds: Date.timeIntervalSinceReferenceDate - start,
-                bytes: ref.byteCount)
-            return array
-        } catch {
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPressStreaming] Mach tensor acquire failed layer=\(key.layerIdx) expert=\(key.expertIdx) component=\(component) error=\(error)\n"
-                        .utf8))
-            return nil
-        }
-    }
-
-    private func evictMachOffsetSpansToBudgetLocked(
-        pendingByteCount: Int,
-        protecting protectedKey: StreamingTensorCacheKey
-    ) -> [(StreamingTensorCacheKey, Int)] {
-        guard machOffsetSpanBudgetBytes > 0 else { return [] }
-        var evicted: [(StreamingTensorCacheKey, Int)] = []
-        while machOffsetSpanRegisteredBytes + pendingByteCount > machOffsetSpanBudgetBytes {
-            guard let victim = machRegisteredTensors
-                .filter({ $0.key != protectedKey && $0.value.isOffsetSpan })
-                .min(by: { lhs, rhs in
-                    if lhs.value.lastUse == rhs.value.lastUse {
-                        return machComponentName(for: lhs.key) < machComponentName(for: rhs.key)
-                    }
-                    return lhs.value.lastUse < rhs.value.lastUse
-                })
-            else { break }
-            machRegisteredTensors.removeValue(forKey: victim.key)
-            machRegisteredTensorBytes = max(0, machRegisteredTensorBytes - victim.value.byteCount)
-            machOffsetSpanRegisteredBytes = max(
-                0,
-                machOffsetSpanRegisteredBytes - victim.value.byteCount)
-            machTensorEvictions += 1
-            evicted.append((victim.key, victim.value.byteCount))
-        }
-        return evicted
-    }
-
-    private func recordMachEvictions(_ evicted: [(StreamingTensorCacheKey, Int)]) {
-        for (victim, bytes) in evicted {
-            _ = machCache.remove(
-                layer: victim.layerIdx,
-                expert: victim.expertIdx,
-                component: machComponentName(for: victim))
-            MLXPressStreamingProfile.record("tensor.mach_offset_evict", bytes: bytes)
-        }
-    }
-
-    private func registerMachBackedTensor(
-        ref: StreamingTensorRef,
-        key: StreamingTensorCacheKey,
-        component: String,
-        readProfileName: String,
-        useNoCache: Bool
-    ) -> Bool {
-        #if canImport(Darwin)
-            if let fd = cachedDarwinFileDescriptor(for: ref.fileURL, useNoCache: useNoCache) {
-                let start = Date.timeIntervalSinceReferenceDate
-                do {
-                    _ = try machCache.registerFilled(
-                        layer: key.layerIdx,
-                        expert: key.expertIdx,
-                        component: component,
-                        byteCount: ref.byteCount,
-                        diskURL: ref.fileURL,
-                        diskOffset: ref.offset
-                    ) { target, count in
-                        let ok = preadDarwinFully(
-                            fd: fd,
-                            into: target,
-                            count: count,
-                            offset: off_t(ref.offset))
-                        if !ok {
-                            throw JangPressMachError.mmapFailed(errno == 0 ? EIO : errno)
-                        }
-                    }
-                    MLXPressStreamingProfile.record(
-                        readProfileName,
-                        seconds: Date.timeIntervalSinceReferenceDate - start,
-                        bytes: ref.byteCount)
-                    return true
-                } catch {
-                    FileHandle.standardError.write(
-                        Data(
-                            "[MLXPressStreaming] Mach tensor direct registration failed layer=\(key.layerIdx) expert=\(key.expertIdx) component=\(component) error=\(error)\n"
-                                .utf8))
-                    return false
-                }
-            }
-        #endif
-
-        let data = MLXPressStreamingProfile.time(readProfileName, bytes: ref.byteCount) {
-            readBytes(from: ref.fileURL, offset: ref.offset, count: ref.byteCount)
-        }
-        guard let data else { return false }
-        do {
-            _ = try data.withUnsafeBytes {
-                try machCache.register(
-                    layer: key.layerIdx,
-                    expert: key.expertIdx,
-                    component: component,
-                    bytes: $0,
-                    diskURL: ref.fileURL,
-                    diskOffset: ref.offset)
-            }
-        } catch {
-            FileHandle.standardError.write(
-                Data(
-                    "[MLXPressStreaming] Mach tensor registration failed layer=\(key.layerIdx) expert=\(key.expertIdx) component=\(component) error=\(error)\n"
-                        .utf8))
-            return false
-        }
-        return true
-    }
-
-    private func machComponentName(for key: StreamingTensorCacheKey) -> String {
-        if key.expertIdx < 0 {
-            return "\(key.projection.rawValue).\(key.suffix.rawValue).full.\(-key.expertIdx)"
-        }
-        return "\(key.projection.rawValue).\(key.suffix.rawValue)"
-    }
-
-    func releaseMachColdTiles() {
-        guard machActiveTensorsEnabled || machOffsetSpansEnabled else { return }
-        let released = machCache.releaseColdTiles(compressPercent: machCompressPercent)
-        if released > 0 {
-            MLXPressStreamingProfile.record("tensor.mach_release_cold")
-        }
-    }
 
     private func cachedTensor(
         for key: StreamingTensorCacheKey,
@@ -4307,64 +3595,63 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
     func activeSliceResidencySnapshot() -> MLXPressActiveSliceResidencySnapshot {
         lock.lock()
         let totalHits = tensorCacheHits + sliceCacheHits + activeBankCacheHits
-            + offsetSpanCacheHits + machTensorHits
+            + offsetSpanCacheHits
         let totalMisses = tensorCacheMisses + sliceCacheMisses + activeBankCacheMisses
-            + offsetSpanCacheMisses + machTensorMisses
+            + offsetSpanCacheMisses
         let totalHitBytes = tensorCacheHitBytes + sliceCacheHitBytes + activeBankCacheHitBytes
-            + offsetSpanCacheHitBytes + machTensorHitBytes
+            + offsetSpanCacheHitBytes
         let totalMissBytes = tensorCacheMissBytes + sliceCacheMissBytes + activeBankCacheMissBytes
-            + offsetSpanCacheMissBytes + machTensorMissBytes
+            + offsetSpanCacheMissBytes
         let totalStores = tensorCacheStores + sliceCacheStores + activeBankCacheStores
-            + offsetSpanCacheStores + machTensorStores
+            + offsetSpanCacheStores
         let totalEvictions = tensorCacheEvictions + sliceCacheEvictions + activeBankCacheEvictions
-            + offsetSpanCacheEvictions + machTensorEvictions
+            + offsetSpanCacheEvictions
         let snapshot = MLXPressActiveSliceResidencySnapshot(
             budgetBytes: UInt64(max(
                 0,
-                tensorCacheBudgetBytes + bankCacheBudgetBytes + offsetSpanCacheBudgetBytes
-                    + machOffsetSpanBudgetBytes)),
+                tensorCacheBudgetBytes + bankCacheBudgetBytes + offsetSpanCacheBudgetBytes)),
             tensorBudgetBytes: UInt64(max(
                 0,
-                tensorCacheBudgetBytes + offsetSpanCacheBudgetBytes + machOffsetSpanBudgetBytes)),
+                tensorCacheBudgetBytes + offsetSpanCacheBudgetBytes)),
             bankBudgetBytes: UInt64(max(0, bankCacheBudgetBytes)),
             residentBytes: UInt64(max(
                 0,
-                tensorCacheBytes + residentTensorBytes + machRegisteredTensorBytes + sliceCacheBytes
+                tensorCacheBytes + residentTensorBytes + sliceCacheBytes
                     + activeBankCacheBytes + offsetSpanCacheBytes)),
             tensorResidentBytes: UInt64(max(
                 0,
-                tensorCacheBytes + residentTensorBytes + machRegisteredTensorBytes
+                tensorCacheBytes + residentTensorBytes
                     + offsetSpanCacheBytes)),
             sliceResidentBytes: UInt64(max(0, sliceCacheBytes)),
             bankResidentBytes: UInt64(max(0, activeBankCacheBytes)),
-            entries: tensorCache.count + residentTensors.count + machRegisteredTensors.count
+            entries: tensorCache.count + residentTensors.count
                 + sliceCache.count + activeBankCache.count + offsetSpanCache.count,
-            tensorEntries: tensorCache.count + residentTensors.count + machRegisteredTensors.count
+            tensorEntries: tensorCache.count + residentTensors.count
                 + offsetSpanCache.count,
             sliceEntries: sliceCache.count,
             bankEntries: activeBankCache.count,
             hits: totalHits,
-            tensorHits: tensorCacheHits + offsetSpanCacheHits + machTensorHits,
+            tensorHits: tensorCacheHits + offsetSpanCacheHits,
             sliceHits: sliceCacheHits,
             bankHits: activeBankCacheHits,
             misses: totalMisses,
-            tensorMisses: tensorCacheMisses + offsetSpanCacheMisses + machTensorMisses,
+            tensorMisses: tensorCacheMisses + offsetSpanCacheMisses,
             sliceMisses: sliceCacheMisses,
             bankMisses: activeBankCacheMisses,
             hitBytes: totalHitBytes,
-            tensorHitBytes: tensorCacheHitBytes + offsetSpanCacheHitBytes + machTensorHitBytes,
+            tensorHitBytes: tensorCacheHitBytes + offsetSpanCacheHitBytes,
             sliceHitBytes: sliceCacheHitBytes,
             bankHitBytes: activeBankCacheHitBytes,
             missBytes: totalMissBytes,
-            tensorMissBytes: tensorCacheMissBytes + offsetSpanCacheMissBytes + machTensorMissBytes,
+            tensorMissBytes: tensorCacheMissBytes + offsetSpanCacheMissBytes,
             sliceMissBytes: sliceCacheMissBytes,
             bankMissBytes: activeBankCacheMissBytes,
             stores: totalStores,
-            tensorStores: tensorCacheStores + offsetSpanCacheStores + machTensorStores,
+            tensorStores: tensorCacheStores + offsetSpanCacheStores,
             sliceStores: sliceCacheStores,
             bankStores: activeBankCacheStores,
             evictions: totalEvictions,
-            tensorEvictions: tensorCacheEvictions + offsetSpanCacheEvictions + machTensorEvictions,
+            tensorEvictions: tensorCacheEvictions + offsetSpanCacheEvictions,
             sliceEvictions: sliceCacheEvictions,
             bankEvictions: activeBankCacheEvictions)
         lock.unlock()
@@ -4448,9 +3735,6 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 if useNoCache, shouldUseFNoCacheForDarwinReads() {
                     // Kimi-scale bundles are larger than the RAM warming budget;
                     // keep fallback streaming from filling the OS file cache.
-                    // Full Mach routed-span residency uses a cached descriptor
-                    // because those reads are explicitly meant to become
-                    // compressible resident pages rather than one-shot direct I/O.
                     _ = Darwin.fcntl(opened, F_NOCACHE, 1)
                 }
 
@@ -5055,8 +4339,7 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
             force: evaluateEachLayer,
             layerIdx: layerIdx,
             phase: "down_offset_scored",
-            profileName: "down.offset_scored_eval",
-            releaseMachColdTiles: true)
+            profileName: "down.offset_scored_eval")
         return materialized
     }
 
@@ -5169,8 +4452,7 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
             force: evaluateEachLayer,
             layerIdx: layerIdx,
             phase: "down_slot_offsets_scored",
-            profileName: "down.slot_offsets_scored_eval",
-            releaseMachColdTiles: true)
+            profileName: "down.slot_offsets_scored_eval")
         MLXPressStreamingProfile.record("slot_offsets_decode_fast_path")
         return materialized
     }
@@ -5498,8 +4780,7 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
                 force: evaluateEachLayer,
                 layerIdx: layerIdx,
                 phase: "down",
-                profileName: "down.eval",
-                releaseMachColdTiles: true)
+                profileName: "down.eval")
             return materialized
         }
 
@@ -5527,8 +4808,7 @@ public final class StreamingTurboQuantSwitchGLU: TurboQuantSwitchGLU {
             force: evaluateEachLayer,
             layerIdx: layerIdx,
             phase: "down",
-            profileName: "down.eval",
-            releaseMachColdTiles: true)
+            profileName: "down.eval")
         return materialized
     }
 }

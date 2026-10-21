@@ -306,18 +306,14 @@ struct BatchEngineGrowingChatCacheSourceTests {
             range: preStoreSync.upperBound..<task.endIndex))
         let postStoreSync = try #require(task.range(
             of: "StreamOrDevice.default.stream.synchronize()", range: store.upperBound..<task.endIndex))
-        let advisorDrain = try #require(task.range(
-            of: "MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()",
-            range: postStoreSync.upperBound..<task.endIndex))
         let finish = try #require(task.range(
             of: "continuation.finish()",
-            range: advisorDrain.upperBound..<task.endIndex))
+            range: postStoreSync.upperBound..<task.endIndex))
 
         #expect(info.lowerBound < preStoreSync.lowerBound)
         #expect(preStoreSync.lowerBound < store.lowerBound)
         #expect(store.lowerBound < postStoreSync.lowerBound)
-        #expect(postStoreSync.lowerBound < advisorDrain.lowerBound)
-        #expect(advisorDrain.lowerBound < finish.lowerBound)
+        #expect(postStoreSync.lowerBound < finish.lowerBound)
     }
 
     @Test("token iterator materializes disk cache restores before prefill")

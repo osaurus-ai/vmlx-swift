@@ -75,19 +75,19 @@ func runSpeedProbe(modelPath: String) async throws {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
             loadConfiguration: defaultLoad
-        ).0
+        )
     } else if arm == "adaptive" {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(nativeMTP: true)
-        ).0
+        )
     } else {
         // Same load policy as the app (osaurus loads with a LoadConfiguration): wired-limit residency,
         // memory caps. The configuration-less overload skips them, which made "ar" arms measure a
         // different residency state than every "default" arm (91 GB GLM: 1.4-1.8 vs 25 tok/s at random).
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default
-        ).0
+        )
     }
     print(
         "[BENCH_SPEED_RESOLUTION] requested=\(arm) bundleDefault=\(String(describing: defaultStrategy))"

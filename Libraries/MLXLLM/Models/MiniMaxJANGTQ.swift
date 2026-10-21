@@ -202,7 +202,6 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
             gates, eScoreCorrectionBias,
         ])
         let inds = routed[0]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         let scores = routed[1].asType(x.dtype)
 
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
@@ -412,8 +411,7 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                         sanitized.removeValue(
                             forKey: "\(prefix).experts.\(e).\(orig).\(key)")!
                     }
-                    sanitized[target] = loadTimeMachBackedStacked(stacked, label: target)
-                        ?? loadTimeMaterializedStacked(stacked)
+                    sanitized[target] = loadTimeMaterializedStacked(stacked)
                 }
             }
         }

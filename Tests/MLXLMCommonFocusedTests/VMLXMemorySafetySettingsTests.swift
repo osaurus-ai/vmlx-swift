@@ -43,7 +43,6 @@ struct VMLXMemorySafetySettingsTests {
         #expect(plan.loadConfiguration.memoryLimit == .fraction(0.70))
         #expect(plan.loadConfiguration.maxResidentBytes == .absolute(128 << 20))
         #expect(plan.loadConfiguration.useMmapSafetensors)
-        #expect(plan.loadConfiguration.jangPress == .disabled)
         #expect(plan.cache.prefix.enabled)
         #expect(!plan.cache.pagedKV.enabled)
         #expect(plan.cache.blockDisk.enabled)
@@ -199,46 +198,14 @@ struct VMLXMemorySafetySettingsTests {
         #expect(overBudget.cache.defaultMaxKVSize == 16_384)
     }
 
-    @Test("memory safety does not make MLXPress the universal slider")
-    func memorySafetyDoesNotMakeMLXPressTheUniversalSlider() {
-        var settings = VMLXServerRuntimeSettings()
-        let denseGemma = LoadBundleFacts(
-            totalSafetensorsBytes: 30 << 30,
-            isRouted: false,
-            physicalMemory: 24 << 30,
-            modelType: "gemma4",
-            weightFormat: "mxfp4")
-        let routedJang = LoadBundleFacts(
-            totalSafetensorsBytes: 30 << 30,
-            isRouted: true,
-            physicalMemory: 24 << 30,
-            modelType: "mimo_v2",
-            weightFormat: "jangtq",
-            hasJangConfig: true,
-            hasJangTQRuntime: true,
-            numRoutedExperts: 64,
-            topK: 8)
-
-        let densePlan = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: .osaurusProduction,
-            bundleFacts: denseGemma)
-        var provenRoutedBase = LoadConfiguration.osaurusProduction
-        provenRoutedBase.jangPress = .auto(envFallback: true)
-        let routedWithoutOptIn = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: provenRoutedBase,
-            bundleFacts: routedJang)
-        settings.memorySafety.allowExperimentalMLXPress = true
-        let routedPlan = settings.resolvedMemorySafetyPlan(
-            baseLoadConfiguration: provenRoutedBase,
-            bundleFacts: routedJang)
-
-        #expect(densePlan.loadConfiguration.jangPress == .disabled)
-        #expect(densePlan.warnings.isEmpty)
-        #expect(routedWithoutOptIn.loadConfiguration.jangPress == .disabled)
-        #expect(routedWithoutOptIn.warnings.contains {
-            $0.contains("MLXPress/JangPress was not selected")
-        })
-        #expect(routedPlan.loadConfiguration.jangPress == .auto(envFallback: true))
+    @Test("retired cold-tier settings cannot re-enable it on migration")
+    func ignoresRetiredColdTierSetting() throws {
+        let data = Data(#"{"mode":"safe_auto","allowExperimentalMLXPress":true,"keepModelInMemory":false}"#.utf8)
+        let settings = try JSONDecoder().decode(VMLXMemorySafetySettings.self, from: data)
+        #expect(settings.mode == .safeAuto)
+        #expect(!settings.keepModelInMemory)
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? [String: Any]
+        #expect(encoded?["allowExperimentalMLXPress"] == nil)
     }
 
     @Test("near-RAM-scale packs materialize instead of mmap when they fit")

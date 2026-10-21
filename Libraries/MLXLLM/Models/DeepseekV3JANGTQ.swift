@@ -373,7 +373,6 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
         let (indices, scores) = MLXPressStreamingProfile.time("kimi.router_gate") {
             gate(routeInput)
         }
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
             y = MLXPressStreamingProfile.time("kimi.streaming_reduce") {
@@ -451,7 +450,6 @@ final class DeepseekV3JANGTQDecoderLayer: Module {
             }
             out = stopGradient(out)
         }
-        MLXPressMmapColdSweep.afterLayer(layerIdx, materialized: out)
         return out
     }
 }

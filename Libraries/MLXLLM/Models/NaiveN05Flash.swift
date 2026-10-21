@@ -203,7 +203,6 @@ final class NaiveN05FlashMoE: Module, UnaryLayer {
         let (indices, scores) = gate(x)
         if let layer = routedAdviceLayerIndex {
             // Preserve explicit advisor enablement and its bounded readback policy.
-            JangPressCanonicalExpertAdvisor.shared.observe(layer: layer, indices: indices)
         }
         // Custom format construction supplies its complete weighted operation.
         // The ordinary affine branch retains Naive-specific contribution rounding.

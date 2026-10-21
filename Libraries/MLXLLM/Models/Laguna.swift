@@ -598,7 +598,6 @@ internal final class LagunaMoE: Module, UnaryLayer {
             eScoreCorrectionBias.asType(.float32),
         ])
         let topkIdx = routed[0]                                       // (B, T, K)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: topkIdx)
         let topkW = routed[1]                                         // (B, T, K) — un-biased!
 
         // SwitchGLU dispatch: returns (B, T, K, H). `switchMLP` is

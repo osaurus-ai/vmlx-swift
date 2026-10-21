@@ -1,7 +1,7 @@
 // Copyright © 2026 Jinho Jang. All rights reserved.
 //
-// JangPressShardTests — verify the safetensors header parser, byte
-// range lookup, and madvise calls work without a real bundle.
+// MappedSafetensorsShardTests — verify the safetensors header parser, byte
+// range lookup, and exact reads work without a real bundle.
 //
 // We synthesize a minimal safetensors-format file with two tensors:
 //   "expert_0": F32, shape=[2, 4], 32 bytes
@@ -16,14 +16,13 @@
 //   1. Both tensors are discovered.
 //   2. byteRange returns offsets matching what we wrote.
 //   3. bytes(in:) returns the exact bytes we wrote.
-//   4. advise(.willNeed)/advise(.dontNeed) return success.
 
 import Foundation
 import Testing
 @testable import MLXLMCommon
 
-@Suite("JangPressShard")
-struct JangPressShardTests {
+@Suite("MappedSafetensorsShard")
+struct MappedSafetensorsShardTests {
 
     // MARK: - Helpers
 
@@ -66,7 +65,7 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let shard = try JangPressShard(path: tmp)
+        let shard = try MappedSafetensorsShard(path: tmp)
         #expect(shard.tensors.count == 2)
         #expect(shard.tensors["expert_0"] != nil)
         #expect(shard.tensors["expert_1"] != nil)
@@ -79,7 +78,7 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let shard = try JangPressShard(path: tmp)
+        let shard = try MappedSafetensorsShard(path: tmp)
         let r0 = try #require(shard.byteRange(for: "expert_0"))
         let r1 = try #require(shard.byteRange(for: "expert_1"))
 
@@ -101,7 +100,7 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let shard = try JangPressShard(path: tmp)
+        let shard = try MappedSafetensorsShard(path: tmp)
         let r0 = try #require(shard.byteRange(for: "expert_0"))
         let buf0 = shard.bytes(in: r0)
         #expect(buf0.count == 32)
@@ -120,29 +119,11 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let shard = try JangPressShard(path: tmp, noCacheIO: true)
+        let shard = try MappedSafetensorsShard(path: tmp, noCacheIO: true)
         #expect(shard.noCacheIOEnabled)
         let range = try #require(shard.byteRange(for: "expert_1"))
         let bytes = try shard.readBytes(range: range)
         #expect(Array(bytes) == (0..<32).map { UInt8($0 + 100) })
-    }
-
-    @Test("advise(.willNeed) and advise(.dontNeed) succeed")
-    func adviseCalls() throws {
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("mmap-shard-\(UUID().uuidString).safetensors")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        try Self.writeSyntheticSafetensors(at: tmp)
-
-        let shard = try JangPressShard(path: tmp)
-        let r0 = try #require(shard.byteRange(for: "expert_0"))
-
-        // willNeed should always succeed
-        #expect(shard.advise(.willNeed, range: r0))
-        // dontNeed too — even if range is small (madvise rounds to pages)
-        #expect(shard.advise(.dontNeed, range: r0))
-        // Whole data area
-        #expect(shard.adviseEntireDataArea(.random))
     }
 
     @Test("sniffTensorNames returns names without mmap'ing data")
@@ -152,7 +133,7 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let names = try #require(JangPressShard.sniffTensorNames(at: tmp))
+        let names = try #require(MappedSafetensorsShard.sniffTensorNames(at: tmp))
         #expect(names.count == 2)
         #expect(names.contains("expert_0"))
         #expect(names.contains("expert_1"))
@@ -167,7 +148,7 @@ struct JangPressShardTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Self.writeSyntheticSafetensors(at: tmp)
 
-        let shard = try JangPressShard(path: tmp)
+        let shard = try MappedSafetensorsShard(path: tmp)
         #expect(shard.byteRange(for: "nonexistent_tensor") == nil)
         #expect(shard.descriptor(for: "nonexistent_tensor") == nil)
     }

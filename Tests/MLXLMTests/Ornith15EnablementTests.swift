@@ -50,7 +50,7 @@ final class Ornith15EnablementTests: XCTestCase {
         // Deliberately NOT requesting native MTP: Ornith 1.5 ships MTP
         // METADATA with zero MTP tensors, so a forced-MTP load correctly
         // refuses. Serving must not depend on that sidecar.
-        let (context, _) = try await MLXLMCommon.loadModel(
+        let context = try await MLXLMCommon.loadModel(
             from: URL(fileURLWithPath: targetPath),
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration.default)

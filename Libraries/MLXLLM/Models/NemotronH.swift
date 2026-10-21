@@ -1343,7 +1343,6 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             MLX.eval(inds, scores)
             NemotronHLayerProfiler.shared.record("moe.gate", seconds: CFAbsoluteTimeGetCurrent() - gateStart)
         }
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         let fc1Start = profile ? CFAbsoluteTimeGetCurrent() : 0
         let expertInput = fc1LatentProj.map { NemotronHRowExact.project($0, x, site: "latent") } ?? x
         if profile {

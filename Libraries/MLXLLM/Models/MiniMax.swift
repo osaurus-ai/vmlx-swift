@@ -133,7 +133,6 @@ class MiniMaxSparseMoeBlock: Module {
 
         let k = numExpertsPerTok
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         scores = takeAlong(originalScores, inds, axis: -1)
 
         scores = scores / (scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype))

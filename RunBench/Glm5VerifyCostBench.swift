@@ -21,7 +21,7 @@ func runGlm5VerifyCostBench(modelPath: String) async throws {
     let capture: Set<Int> = [5, 14, 24, 33, 42]
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default
-    ).0
+    )
     let anyModel = context.model
     let glm = anyModel as? Glm5Next
     func forward(_ ids: MLXArray, _ cache: [KVCache]) -> MLXArray {
