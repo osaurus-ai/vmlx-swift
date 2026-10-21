@@ -698,22 +698,13 @@ public func loadModel(
     FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
     loadTiming.mark("memory_and_residency")
 
-    // 4. Optional disk-layout preparation. The permanent prestacked
-    //    safetensors overlay is now explicit opt-in via
-    //    MLXPRESS_PRESTACK=1 / JANGPRESS_PRESTACK=1. MLXPress's normal
-    //    low-RAM route is compression-first canonical mmap residency:
-    //    load routed tensors as regular model weights through the C++
-    //    whole-shard mmap loader, then use cold-page advice and OS
-    //    compression/reclaim instead of a large stacked cache overlay.
-    //    Active-expert pread streaming is an explicit fallback/diagnostic
-    //    path only. Before mmap, ordinary writable model directories are
-    //    healed only with direct-Send authorization AND explicit repair opt-in.
-    //    The older side-copy alignment overlay remains separately
-    //    gated by MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
-    let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
-        originalURL: directory,
-        enabled: useMmapSafetensors,
-        alignmentRepairAuthorization: loadConfiguration.alignmentRepairAuthorization)
+    // Load the canonical bundle directly. Experimental prestack/alignment
+    // overlays are retired; original-file repair retains its explicit consent.
+    if useMmapSafetensors {
+        SafetensorsStorageHealer.healBundleIfEligible(
+            at: directory, authorization: loadConfiguration.alignmentRepairAuthorization)
+    }
+    let loadDirectory = directory
     loadTiming.mark("bundle_preparation")
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
@@ -763,9 +754,6 @@ public func loadModel(
     //    `.none` so the caller still gets a uniform tuple shape.
     let runtime = JangPressActivation.activate(
         bundleURL: loadDirectory, options: resolvedOptions)
-    if JangPressPrestacker.cleanupEphemeralPrestackDirectory(loadDirectory) {
-        context.configuration.id = .directory(directory)
-    }
     context.jangPressRuntime = runtime
     context.residencyLease = residency.lease
     loadTiming.mark("runtime_activation")
