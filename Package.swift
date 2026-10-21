@@ -959,7 +959,6 @@ let package = Package(
                 "DFlash2DispatchReachabilityTests.swift",
                 "MixedGroupSizeQuantizationFocusedTests.swift",
                 "JangSamplingDefaultsTests.swift",
-                "MLXPressCLISourceContractsTests.swift",
                 "ChatTemplateResolutionTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
