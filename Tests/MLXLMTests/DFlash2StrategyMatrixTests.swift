@@ -67,7 +67,7 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
         // the MTP arm can run; base AR weights are unaffected.
         var loadConfig = LoadConfiguration.default
         loadConfig.nativeMTP = true
-        let (context, _) = try await MLXLMCommon.loadModel(
+        let context = try await MLXLMCommon.loadModel(
             from: URL(fileURLWithPath: targetPath),
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: loadConfig)

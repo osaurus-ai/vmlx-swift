@@ -39,7 +39,7 @@ final class DFlash2SampledRestoreCrashTests: XCTestCase {
             throw XCTSkip("No DFlash 2 drafter at \(Self.drafterURL.path)")
         }
 
-        let (context, _) = try await MLXLMCommon.loadModel(
+        let context = try await MLXLMCommon.loadModel(
             from: URL(fileURLWithPath: targetPath),
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration.default)
@@ -135,7 +135,7 @@ final class DFlash2SampledRestoreCrashTests: XCTestCase {
             throw XCTSkip("No DFlash 2 drafter at \(Self.drafterURL.path)")
         }
 
-        let (context, _) = try await MLXLMCommon.loadModel(
+        let context = try await MLXLMCommon.loadModel(
             from: URL(fileURLWithPath: targetPath),
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration.default)

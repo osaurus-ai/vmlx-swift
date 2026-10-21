@@ -50,7 +50,7 @@ final class CrossVersionOutputProbeTests: XCTestCase {
         guard let targetPath = Self.targetPath else {
             throw XCTSkip("Set VMLX_PROBE_TARGET")
         }
-        let (ctx, _) = try await MLXLMCommon.loadModel(
+        let ctx = try await MLXLMCommon.loadModel(
             from: URL(fileURLWithPath: targetPath),
             using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration.default)
