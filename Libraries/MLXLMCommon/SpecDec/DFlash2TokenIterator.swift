@@ -1938,7 +1938,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
                                  detail: "dflash2")
         }
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
+        guard let coordinator = cacheCoordinator, coordinator.canPersistBoundaries, !promptTokenIds.isEmpty else { return }
         // Auxiliary (title/suggestion/summary) prompts never store a
         // boundary — see `CachePromptIntent.auxiliary`.
         guard originalInput.cachePromptIntent != .auxiliary else { return }

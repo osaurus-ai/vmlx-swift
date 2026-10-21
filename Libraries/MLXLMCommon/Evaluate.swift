@@ -3483,7 +3483,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             canonicalStablePrefillCapture = nil
         }
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
+        guard let coordinator = cacheCoordinator, coordinator.canPersistBoundaries, !promptTokenIds.isEmpty else {
             return
         }
         // Auxiliary (title/suggestion/summary) prompts embed per-turn content

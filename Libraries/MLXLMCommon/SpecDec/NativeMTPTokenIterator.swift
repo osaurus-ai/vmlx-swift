@@ -1200,7 +1200,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
-        if let coordinator = cacheCoordinator,
+        if let coordinator = cacheCoordinator, coordinator.canPersistBoundaries,
            !promptTokenIds.isEmpty,
            // Auxiliary (title/suggestion/summary) prompts never store a
            // boundary — see `CachePromptIntent.auxiliary`.
