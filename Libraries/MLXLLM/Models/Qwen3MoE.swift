@@ -140,7 +140,6 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
 
         let k = topK
         let inds = MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(softGates, inds, axis: -1)
 
         if normTopkProb {

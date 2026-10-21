@@ -568,8 +568,6 @@ class Gemma4DecoderLayer: Module {
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(h)
-            JangPressCanonicalExpertAdvisor.shared.observe(
-                layer: layerIndex, indices: topKIndices)
             var h2 = preFeedforwardLayernorm2(h)
             h2 = experts(h2, indices: topKIndices, weights: topKWeights)
             h2 = postFeedforwardLayernorm2(h2)

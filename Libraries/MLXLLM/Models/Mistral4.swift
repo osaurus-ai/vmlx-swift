@@ -343,7 +343,6 @@ class Mistral4MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: inds)
         var y = switchMLP(x, inds)
         y = (y * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         if let sharedExperts {

@@ -272,7 +272,6 @@ class BailingMoeSparseMoeBlock: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate.groupSelect(x)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var out = switchMLP(x, inds)
         out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
         if let shared = sharedExperts {

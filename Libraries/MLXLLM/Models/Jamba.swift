@@ -361,7 +361,6 @@ class JambaSparseMoeBlock: Module {
         let gates = router(x)
         let k = numExpertsPerTok
         let inds = stopGradient(MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k])
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         scores = MLX.softmax(scores, axis: -1, precise: true)
 

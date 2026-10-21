@@ -333,7 +333,6 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         // different permutation changes low-precision score normalization
         // and weighted reduction.
         let indices = argPartition(selection, kth: -k, axis: -1)[.ellipsis, (-k)...]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var scores = takeAlong(probabilities, indices, axis: -1)
         if normTopKProb {
             scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-6)

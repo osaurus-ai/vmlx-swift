@@ -337,7 +337,6 @@ private enum Glm4vMoeLanguage {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             let (inds, scores) = gate(x)
-            JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
             var y = switchMLP(x, inds)
             y = (y * scores.asType(y.dtype)[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
             if let sharedExperts {

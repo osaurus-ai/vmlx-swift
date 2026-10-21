@@ -81,7 +81,6 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
     // See `DeepseekV4MoE`: request-scoped, must not be parked on `self`.
     func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: gate.isHashLayer ? inputIds : nil)
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
             y = streaming.reduced(x, indices: indices, scores: scores)

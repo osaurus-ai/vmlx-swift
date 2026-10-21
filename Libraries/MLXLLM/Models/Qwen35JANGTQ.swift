@@ -527,7 +527,6 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
         )([gates])
         let inds = routed[0]
         let scores = routed[1]
-        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
         let combined: MLXArray
         if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
