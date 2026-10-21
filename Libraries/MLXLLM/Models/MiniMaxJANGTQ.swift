@@ -411,8 +411,7 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                         sanitized.removeValue(
                             forKey: "\(prefix).experts.\(e).\(orig).\(key)")!
                     }
-                    sanitized[target] = loadTimeMachBackedStacked(stacked, label: target)
-                        ?? loadTimeMaterializedStacked(stacked)
+                    sanitized[target] = loadTimeMaterializedStacked(stacked)
                 }
             }
         }
