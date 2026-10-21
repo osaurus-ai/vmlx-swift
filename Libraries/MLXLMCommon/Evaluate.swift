@@ -1864,7 +1864,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 input: promptInput,
                 windowSize: parameters.prefillStepSize)
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -2685,7 +2685,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     windowSize: prefillStepSize)
             }
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// The cross-turn reuse boundary for path-dependent hybrid and standalone
@@ -3425,7 +3425,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Canonical hybrid prompts are never stored exactly, and their recurrent state
     // cannot be trimmed to a previous boundary. Keep only the captured boundary.
     var retainsPromptSnapshotForStores: Bool {
-        !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
+        guard cacheCoordinator != nil, originalInput.cachePromptIntent != .auxiliary else {
+            return false
+        }
+        return !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
             && !canTrimPromptCache(cache))
     }
 
