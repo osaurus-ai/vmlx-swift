@@ -132,8 +132,9 @@ struct QuotaPlan: Equatable {
 /// Vocabulary. A **chain** is every non-stable, non-legacy row sharing a
 /// `chainId` and model namespace; nil/empty model namespaces are equivalent.
 /// A row with `chainId == nil` is a chain of one. A chain's **tip**
-/// is its row with the greatest `tokenCount` (ties: greatest recency, then
-/// greatest `id`). **Chain recency** is the greatest recency among its rows.
+/// is its most recent marked resume boundary (ties: greatest `tokenCount`,
+/// then greatest `id`). With no marked boundary, the largest row remains
+/// the tip (ties: recency, then id). **Chain recency** is the greatest recency among its rows.
 /// The **active** chain is named by `activeChain` and `activeModelKey`; every other chain
 /// is **cold**. `low = Int64(Double(cap) * lowWatermarkFraction)`.
 ///
@@ -377,10 +378,15 @@ enum DiskQuotaPlanner {
     }
 
     /// `max(by:)` order for a chain's tip: a resume boundary over any other
-    /// row, then tokens, then recency, then id.
+    /// row. Marked boundaries prefer recency: editing an earlier turn can
+    /// produce a shorter current branch than the abandoned history. Unmarked
+    /// rows retain the legacy tokens-first order. Ties always end on id.
     private static func tipOrder(_ a: QuotaRow, _ b: QuotaRow) -> Bool {
         if a.isCanonicalCheckpoint != b.isCanonicalCheckpoint { return a.isCanonicalCheckpoint }
         if a.isResumeBoundary != b.isResumeBoundary { return !a.isResumeBoundary }
+        if a.isResumeBoundary && b.isResumeBoundary && a.recency != b.recency {
+            return a.recency < b.recency
+        }
         if a.tokenCount != b.tokenCount { return a.tokenCount < b.tokenCount }
         if a.recency != b.recency { return a.recency < b.recency }
         return a.id < b.id

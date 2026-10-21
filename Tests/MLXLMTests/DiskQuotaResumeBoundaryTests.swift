@@ -13,6 +13,53 @@ import Testing
 @Suite("Disk quota planner: resume boundaries")
 struct DiskQuotaResumeBoundaryTests {
 
+    @Test
+    func editingToAShorterBranchKeepsItsNewResumeBoundary() {
+        let rows = [
+            row("abandoned", tokens: 25_035, bytes: 100, recency: 1, resume: true),
+            row("edited", tokens: 21_112, bytes: 90, recency: 2, resume: true),
+        ]
+        for input in [rows, Array(rows.reversed())] {
+            let plan = DiskQuotaPlanner.plan(rows: input, capBytes: 100, activeChain: "A")
+            #expect(plan.evict == ["abandoned"])
+            #expect(DiskQuotaPlanner.resumePoint(of: input)?.id == "edited")
+            #expect(plan.totalAfter == 90)
+            #expect(plan.event?.kind == .activeChainTrimmed)
+            #expect(plan.event?.tipBytes == 90)
+        }
+    }
+
+    @Test
+    func editedPostAnswerKeepsItsNewHistoryFallbackUnderPressure() {
+        let rows = [
+            row("old-history", tokens: 25_000, bytes: 100, recency: 1, resume: true),
+            row("old-post", tokens: 25_035, bytes: 100, recency: 2, resume: true, post: true),
+            row("edited-history", tokens: 21_112, bytes: 90, recency: 3, resume: true),
+            row("edited-post", tokens: 21_200, bytes: 95, recency: 4, resume: true, post: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 185, activeChain: "A")
+        #expect(Set(plan.evict) == ["old-history", "old-post"])
+        #expect(DiskQuotaPlanner.resumePoint(of: rows)?.id == "edited-post")
+        // If only one fits, retain the edited history boundary: the next
+        // prompt may re-render the post-answer tokens.
+        let tight = DiskQuotaPlanner.plan(rows: rows, capBytes: 95, activeChain: "A")
+        #expect(Set(tight.evict) == ["old-history", "old-post", "edited-post"])
+        #expect(tight.totalAfter == 90)
+    }
+
+    @Test
+    func anInactiveEditedChatsNewestResumePointSurvivesItsOldBranch() {
+        let rows = [
+            row("cold-old", tokens: 250, bytes: 100, recency: 1, chain: "C", resume: true),
+            row("cold-edited", tokens: 210, bytes: 90, recency: 2, chain: "C", resume: true),
+            row("active", tokens: 100, bytes: 100, recency: 3, resume: true),
+        ]
+        let plan = DiskQuotaPlanner.plan(rows: rows, capBytes: 200, activeChain: "A")
+        #expect(plan.evict == ["cold-old"])
+        #expect(plan.totalAfter == 190)
+        #expect(plan.event == nil)
+    }
+
     private func row(
         _ id: String, tokens: Int, bytes: Int64? = nil, recency: Double, chain: String? = "A",
         stable: Bool = false, resume: Bool = false, post: Bool = false
