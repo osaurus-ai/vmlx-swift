@@ -1136,8 +1136,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     }
 
     /// Effective cap shared by runtime, settings and diagnostics. Explicit
-    /// percentages keep their total-volume units and existing host ceiling;
-    /// both that ceiling and Automatic add owned payload bytes back to free.
+    /// percentages use total-volume units without a free-space clamp.
+    /// Automatic adds owned payload bytes back to free before taking its share.
     public static func resolveDiskCacheMaxGB(
         percent: Double?, legacyGB: Double?, directory: URL?
     ) -> Double {
