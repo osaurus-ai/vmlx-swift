@@ -1142,6 +1142,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private var retainsPromptSnapshotForStores: Bool {
+        guard cacheCoordinator?.canPersistBoundaries == true, originalInput.cachePromptIntent != .auxiliary else {
+            return false
+        }
         guard let coordinator = cacheCoordinator, coordinator.isHybrid,
               !canTrimPromptCache(cache) else { return true }
         return TokenIterator.hybridStripBoundaryIndex(
@@ -1197,7 +1200,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
-        if let coordinator = cacheCoordinator,
+        if let coordinator = cacheCoordinator, coordinator.canPersistBoundaries,
            !promptTokenIds.isEmpty,
            // Auxiliary (title/suggestion/summary) prompts never store a
            // boundary — see `CachePromptIntent.auxiliary`.

@@ -681,11 +681,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Same boundary rule as TokenIterator, so both iterators agree on
         // what the canonical cross-turn checkpoint is (hybrid SSM and
         // standalone rotating/SWA topologies).
-        self.hybridStripBoundary = TokenIterator.hybridStripBoundaryIndex(
-            coordinator: cacheCoordinator,
-            promptTokenIds: self.promptTokenIds,
-            input: input,
-            cache: self.cache)
+        let storesPromptBoundary = cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary
+        self.hybridStripBoundary = storesPromptBoundary
+            ? TokenIterator.hybridStripBoundaryIndex(
+                coordinator: cacheCoordinator,
+                promptTokenIds: self.promptTokenIds,
+                input: input,
+                cache: self.cache) : nil
         // The boundary index is absolute; prefill only sees the suffix a
         // cache hit left over. A boundary inside the restored prefix needs
         // no capture — a stored boundary at least that long already exists
@@ -796,7 +798,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // A canonical stripped boundary is the only checkpoint the terminal
         // store consumes. Keeping an exact-prompt copy as well retains a full
         // unused KV allocation throughout decode (including DSpark requests).
-        self.promptCacheSnapshot = hybridStripBoundary == nil
+        self.promptCacheSnapshot = storesPromptBoundary && hybridStripBoundary == nil
             ? self.cache.map { $0.copy() } : nil
         MemoryStageTrace.log("prompt-snapshot", tokens: promptTokenIds.count,
                              detail: "dflash2 retained=\(retainedCheckpointTokenCounts)")
@@ -1936,7 +1938,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count,
                                  detail: "dflash2")
         }
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
+        guard let coordinator = cacheCoordinator, coordinator.canPersistBoundaries, !promptTokenIds.isEmpty else { return }
         // Auxiliary (title/suggestion/summary) prompts never store a
         // boundary — see `CachePromptIntent.auxiliary`.
         guard originalInput.cachePromptIntent != .auxiliary else { return }

@@ -208,6 +208,7 @@ public func captureCleanSSMStateInline(
     }
 
     guard enableSSMReDerive else { log("skip/disabled"); return }
+    guard coordinator.canPersistBoundaries else { log("skip/storage-disabled"); return }
     guard coordinator.isHybrid else { log("skip/not-hybrid"); return }
     guard genPromptLen > 0 else { log("skip/no-gen-prompt"); return }
     guard promptTokenIds.count > genPromptLen else {

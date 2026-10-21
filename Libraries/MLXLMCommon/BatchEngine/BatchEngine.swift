@@ -2699,6 +2699,8 @@ public actor BatchEngine {
                     // the only forward pass.
                     let hybridBoundarySplit: Int? = {
                         guard cacheCoordinator?.isHybrid == true,
+                            cacheCoordinator?.canPersistBoundaries == true,
+                            slot.originalInput.cachePromptIntent != .auxiliary,
                             !slot.originalInput.hasMediaContent,
                             slot.diskSeedSnapshot == nil
                         else { return nil }
@@ -2898,7 +2900,9 @@ public actor BatchEngine {
         // The captured DSV4 N-1 seed replaces the unusable exact-prompt
         // snapshot. Retain one cache copy through decode, not two.
         slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: slot.cache)
+            from: slot.cache,
+            storageEnabled: cacheCoordinator?.canPersistBoundaries == true
+                && slot.originalInput.cachePromptIntent != .auxiliary)
 
         let tokenID = firstToken.item(Int.self)
         try error.check()
@@ -2929,7 +2933,8 @@ public actor BatchEngine {
             // the prompt length and store it into the coordinator's
             // ``SSMStateCache``. This runs after the first token has been
             // yielded so TTFT does not pay the prompt-boundary bookkeeping.
-            if let coordinator = cacheCoordinator, coordinator.isHybrid {
+            if let coordinator = cacheCoordinator, coordinator.canPersistBoundaries,
+               slot.originalInput.cachePromptIntent != .auxiliary, coordinator.isHybrid {
                 // ZayaCCACache's `conv_state` + `prev_hs` are path-dependent
                 // and round-trip through extractSSMStates / restoreSSMStates
                 // (see CacheHelpers.swift:293-300). Include it here so the
@@ -3597,7 +3602,7 @@ public actor BatchEngine {
             // Auxiliary (title/suggestion/summary) prompts never store a
             // boundary — see `CachePromptIntent.auxiliary`.
             slot.originalInput.cachePromptIntent != .auxiliary,
-            let coordinator = cacheCoordinator
+            let coordinator = cacheCoordinator, coordinator.canPersistBoundaries
         {
             // Compiled rotating counters are device state. Publish their host
             // metadata before admission or any fallback live-cache snapshot.
@@ -3776,12 +3781,12 @@ public actor BatchEngine {
                     tokens: tokens, fullPromptTokenIds: promptTokens) else { return nil }
                 let keepsMedia = !slot.originalInput.hasMediaContent || mediaBoundaryInput.hasMediaContent
                 let trimCount = storageSnapshotTokenCount - tokens.count
-                let trimmed = storageTopologySnapshot.map { $0.copy() }
-                if keepsMedia, canTrimPromptCache(trimmed),
-                   trimPromptCache(trimmed, numTokens: trimCount) == trimCount
-                {
-                    MLX.eval(trimmed)
-                    return trimmed
+                if keepsMedia, canTrimPromptCache(storageTopologySnapshot) {
+                    let trimmed = storageTopologySnapshot.map { $0.copy() }
+                    if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
+                        MLX.eval(trimmed)
+                        return trimmed
+                    }
                 }
 
                 // Hybrid fast path: only the recurrent layers make the trim

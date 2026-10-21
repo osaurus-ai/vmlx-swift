@@ -74,7 +74,7 @@ final class SSMReDeriveParityTests: XCTestCase {
         let fullPrompt = promptOnly + generationPrompt
 
         let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
-            usePagedCache: false,
+            usePagedCache: true,
             enableDiskCache: false,
             modelKey: "tiny-hybrid|reasoning=off"))
         coordinator.setHybrid(true)
@@ -95,6 +95,31 @@ final class SSMReDeriveParityTests: XCTestCase {
 
         assertStatesEqual(captured, rederived)
         XCTAssertEqual(coordinator.ssmStateCache.reDerives, 1)
+    }
+
+    func testDisabledStorageDoesNotRetainInlineCompanion() throws {
+        let model = TinyHybridSSMModel()
+        let promptOnly = [101, 102, 103, 104, 105]
+        let generationPrompt = [201, 202]
+        let fullPrompt = promptOnly + generationPrompt
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: false,
+            modelKey: "tiny-hybrid|reasoning=off"))
+        coordinator.setHybrid(true)
+
+        let liveCache = model.newCache(parameters: nil)
+        try runWarmPass(model: model, cache: liveCache, tokens: promptOnly, prefillStepSize: 2)
+        captureCleanSSMStateInline(
+            coordinator: coordinator,
+            liveCache: liveCache,
+            promptTokenIds: fullPrompt,
+            genPromptLen: generationPrompt.count,
+            enableSSMReDerive: true)
+
+        XCTAssertNil(coordinator.ssmStateCache.fetch(tokens: promptOnly, boundary: promptOnly.count))
+        XCTAssertEqual(coordinator.ssmStateCache.reDerives, 0)
     }
 
     func testPromptBoundaryStoreMatchesWarmPassAtExactBoundary() throws {

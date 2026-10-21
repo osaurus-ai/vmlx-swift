@@ -1864,7 +1864,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 input: promptInput,
                 windowSize: parameters.prefillStepSize)
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -2685,7 +2685,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     windowSize: prefillStepSize)
             }
         }
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        // This initializer has no storage coordinator; retain only the live cache.
     }
 
     /// The cross-turn reuse boundary for path-dependent hybrid and standalone
@@ -2866,6 +2866,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     private func prefillBoundaryCapture(
         of input: LMInput
     ) -> (kind: PrefillBoundaryCapture, head: LMInput?, tail: LMInput)? {
+        guard cacheCoordinator?.canPersistBoundaries == true,
+              originalInput.cachePromptIntent != .auxiliary else { return nil }
         if let boundary = hybridStripBoundary,
            hybridStripSnapshot == nil,
            let split = boundarySplit(of: input, at: boundary)
@@ -3425,7 +3427,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Canonical hybrid prompts are never stored exactly, and their recurrent state
     // cannot be trimmed to a previous boundary. Keep only the captured boundary.
     var retainsPromptSnapshotForStores: Bool {
-        !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
+        guard cacheCoordinator?.canPersistBoundaries == true, originalInput.cachePromptIntent != .auxiliary else {
+            return false
+        }
+        return !(cacheCoordinator?.isHybrid == true && hybridStripBoundary != nil
             && !canTrimPromptCache(cache))
     }
 
@@ -3478,7 +3483,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             canonicalStablePrefillCapture = nil
         }
-        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
+        guard let coordinator = cacheCoordinator, coordinator.canPersistBoundaries, !promptTokenIds.isEmpty else {
             return
         }
         // Auxiliary (title/suggestion/summary) prompts embed per-turn content
