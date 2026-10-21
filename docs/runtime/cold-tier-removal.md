@@ -8,8 +8,8 @@ The runtime's typed `loadModel(...loadConfiguration:)` now returns `ModelContext
 
 ## Validation and boundaries
 
-- MLXVLM and RunBench compiled after activation/API/overlay removal. Subsequent Mach-copy removal is undergoing its own compile and focused tests.
-- Focused coverage includes legacy-setting migration, load configuration, canonical shard reads and explicitly authorized storage repair. Tests of deleted cold-tier behavior are retired with those APIs; quantized compute/cache tests are retained.
+- The complete removal builds through the runtime and benchmark clients. 102 focused loader, settings and storage tests pass (49 loader/storage plus 53 settings/capability tests).
+- Focused coverage includes legacy-setting migration, load configuration, canonical shard reads and explicitly authorized storage repair. Tests of deleted cold-tier behavior are retired with those APIs; quantized compute/cache tests are retained. The mixed source-contract suite retains an unrelated stale AttentionUtils string expectation on unchanged code; full-suite green is not claimed.
 - Final Osaurus build, affine/JANGH connected chat and SSD restore checks remain pending. Do not merge this draft until that evidence is attached.
 - No speed or RAM reduction is claimed from deletion alone. Most production paths already disabled cold-tier activation. The explicit disk-quota defect (#630) and consumerless KV checkpoint defect (#631) are independent, evidenced fixes.
 - This does not claim all model families hold no transient RAM. Active KV, recurrent state, speculative verification and bounded asynchronous write ownership still need RAM. Remaining cache-enabled long-context retention and process-wide write budget accounting are tracked separately.

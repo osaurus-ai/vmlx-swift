@@ -57,7 +57,7 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(!factory.contains("adviseCanonicalMmapRoutedExpertsIfAvailable"))
         #expect(factory.contains("MLX_SAFETENSORS_MMAP"))
         #expect(factory.contains("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"))
-        #expect(factory.contains("MLXPRESS_MMAP_TENSOR_BUFFERS"))
+        #expect(!factory.contains("MLXPRESS_MMAP_TENSOR_BUFFERS"))
         #expect(streamingExperts.contains("cachedDarwinFileDescriptor(for url: URL, useNoCache: Bool)"))
         #expect(streamingExperts.contains(#"let cacheKey = "\(useNoCache ? "nocache" : "cache"):\(key)""#))
         #expect(streamingExperts.contains("let readCount = min(count - total, 64 * 1024 * 1024)"))
