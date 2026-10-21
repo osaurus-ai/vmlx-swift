@@ -54,6 +54,79 @@ func runRowCostBench(modelPath: String) async throws {
     MLX.eval(base)
     print("[ROWCOST] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) tokens")
 
+    if env["BENCH_ROWCOST_COMPARE_TREE"] == "1",
+        let treeModel = model as? DFlash2TreeVerifyModel,
+        let target = model as? any DFlash2Target
+    {
+        // Numeric diagnosis only: compare each tree row with a single-row forward over its
+        // exact ancestor path. No generation, sampler override or width-policy change.
+        for rows in rowsList {
+            for branching in [false, true] {
+                let tokens = (0 ..< rows).map { 1000 + $0 * 7 }
+                let parents = (0 ..< rows).map { $0 == 0 ? -1 : (branching ? ($0 - 1) / 2 : $0 - 1) }
+                let scope = DFlash2TreeScope(plan: DFlash2TreePlan(tokens: tokens, parents: parents))
+                let treeCache = base.map { $0.copy() }
+                let capture = env["BENCH_ROWCOST_TREE_LAYERS"] == "1"
+                Qwen4ExpRowExactCapture.partLayer = Int(env["BENCH_ROWCOST_TREE_LAYER"] ?? "0") ?? 0
+                Qwen4ExpRowExactCapture.layers = []; Qwen4ExpRowExactCapture.parts = []
+                Qwen4ExpRowExactCapture.enabled = capture
+                let (treeLogits, _) = treeModel.dflash2TreeForward(
+                    MLXArray(tokens.map(Int32.init)).reshaped(1, rows), cache: treeCache,
+                    captureLayerIDs: [1, 7], scope: scope)
+                MLX.eval(treeLogits)
+                let treeLayers = Qwen4ExpRowExactCapture.layers
+                let treeParts = Qwen4ExpRowExactCapture.parts
+                MLX.eval(treeLayers)
+                Qwen4ExpRowExactCapture.enabled = false
+                var exact = 0, matching = 0
+                var worst: Float = 0
+                var leafReferenceCache: [KVCache] = []
+                for row in 0 ..< rows {
+                    var path: [Int] = [], at = row
+                    while at >= 0 { path.append(at); at = parents[at] }
+                    let referenceCache = base.map { $0.copy() }
+                    var reference: MLXArray?
+                    Qwen4ExpRowExactCapture.layers = []; Qwen4ExpRowExactCapture.parts = []
+                    Qwen4ExpRowExactCapture.enabled = capture && row == 0
+                    for node in path.reversed() {
+                        let (logits, _) = target.callAsFunction(
+                            MLXArray([Int32(tokens[node])]).reshaped(1, 1), cache: referenceCache,
+                            captureLayerIDs: [1, 7], recordPrefixCommitStates: false)
+                        MLX.eval(logits)
+                        reference = logits[0, -1].asType(.float32)
+                    }
+                    if capture && row == 0 {
+                        for (layer, pair) in zip(treeLayers, Qwen4ExpRowExactCapture.layers).enumerated() {
+                            let difference = abs(pair.0[0, 0].asType(.float32) - pair.1[0, 0].asType(.float32)).max().item(Float.self)
+                            print("[TREE-LAYER] layer=\(layer) row0diff=\(difference)")
+                        }
+                        for (name, expected) in Qwen4ExpRowExactCapture.parts {
+                            if let got = treeParts.first(where: { $0.0 == name })?.1 {
+                                let difference = abs(got[0, 0].asType(.float32) - expected[0, 0].asType(.float32)).max().item(Float.self)
+                                print("[TREE-PART] name=\(name) row0diff=\(difference)")
+                            }
+                        }
+                    }
+                    Qwen4ExpRowExactCapture.enabled = false
+                    if row == rows - 1 { leafReferenceCache = referenceCache }
+                    let got = treeLogits[0, row].asType(.float32)
+                    let difference = abs(got - reference!).max().item(Float.self)
+                    if difference == 0 { exact += 1 }
+                    if argMax(got).item(Int.self) == argMax(reference!).item(Int.self) { matching += 1 }
+                    worst = max(worst, difference)
+                }
+                print("[TREE-PARITY] rows=\(rows) branching=\(branching) exact=\(exact) argmax=\(matching) maxdiff=\(worst)")
+                let committed = treeModel.dflash2CommitTree(cache: treeCache, scope: scope, keptRows: scope.plan.paths[rows - 1])
+                let next = MLXArray([Int32(2048)]).reshaped(1, 1)
+                let (committedLogits, _) = target.callAsFunction(next, cache: treeCache, captureLayerIDs: [], recordPrefixCommitStates: false)
+                let (referenceLogits, _) = target.callAsFunction(next, cache: leafReferenceCache, captureLayerIDs: [], recordPrefixCommitStates: false)
+                let commitDiff = abs(committedLogits.asType(.float32) - referenceLogits.asType(.float32)).max().item(Float.self)
+                print("[TREE-COMMIT] rows=\(rows) branching=\(branching) committed=\(committed) nextLogitDiff=\(commitDiff)")
+            }
+        }
+        return
+    }
+
     for mode in (env["BENCH_ROWCOST_MODES"] ?? "exact,plain").split(separator: ",").map(String.init)
     {
         for rows in rowsList {

@@ -4,6 +4,14 @@
 public enum RoutedExpertVerificationScope {
     @TaskLocal private static var rows = 0
 
+    public static func withTreeVerification<Result>(
+        inputShape: [Int], operation: () throws -> Result
+    ) rethrows -> Result {
+        let admitted = inputShape.count == 2 && inputShape[0] == 1 && inputShape[1] > 1
+            ? inputShape[1] : 0
+        return try $rows.withValue(admitted, operation: operation)
+    }
+
     public static func withVerification<Result>(
         inputShape: [Int], operation: () throws -> Result
     ) rethrows -> Result {

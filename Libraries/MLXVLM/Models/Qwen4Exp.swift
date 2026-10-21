@@ -90,7 +90,19 @@ enum Qwen4ExpRowExactProjection {
 
 /// Uses the qualified affine route only inside actual Flash target verification.
 func qwen4ExpProjection(_ module: Linear, _ x: MLXArray) -> MLXArray {
-    Qwen4ExpRowExactProjection.q8Projection(module, x)
+    if x.ndim == 3, x.dim(1) > 8,
+        FlashVerificationScope.usesRowExactVerification(inputShape: x.shape)
+    {
+        // Tree verification can exceed the qualified fused projection's 8-row tile.
+        // Partition independent projections, not the draft tree or adaptive width.
+        return concatenated(stride(from: 0, to: x.dim(1), by: 8).map { start in
+            let end = min(start + 8, x.dim(1))
+            return FlashVerificationScope.withVerification(inputShape: [1, end - start]) {
+                qwen4ExpProjection(module, x[0..., start..<end, 0...])
+            }
+        }, axis: 1)
+    }
+    return Qwen4ExpRowExactProjection.q8Projection(module, x)
         ?? Qwen4ExpRowExactProjection.affineRowsProjection(module, x) ?? module(x)
 }
 

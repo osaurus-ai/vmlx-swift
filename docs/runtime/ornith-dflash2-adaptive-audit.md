@@ -30,3 +30,13 @@ Private evidence: `~/vmlx-private-evidence/ornith-dflash2-adaptive-20261020/LEDG
 Two simultaneous cache misses previously loaded separate full drafters. Loading now uses one in-flight record per canonical directory; unrelated directories can load concurrently. Eviction removes publication rights, so an older completion cannot repopulate the cache or replace a newer load. Existing request owners still receive and own their result. Focused tests cover same-path sharing, independent paths, eviction/evictAll during loading and failed-load retry.
 
 The diagnostic decode-end memory row now includes aggregate adaptive widths, acceptance, AR tokens, draft/verify/commit/AR time on ordinary stop, without requiring per-cycle tracing.
+
+## Full-model tree verification correction
+
+The live crash correction was necessary but insufficient. An actual-weight diagnostic compared every tree row with a single-token target forward over that row's exact ancestor path. The former routed Qwen tree path differed at widths4/16/32 (chain argmax3/4,12/16,25/32; branching also differed). A coherent sampled app answer did not detect this.
+
+Routed Qwen3.5 tree verification now uses its existing row-exact projection/expert routes and GDN tail. Wide trees partition independent projection/MLP operations into the existing qualified8row tiles; the draft tree and adaptive width remain unchanged. Attention uses AR's single-query computation over precisely the prefix and ancestors. Contiguous paths use views; branched-path KV temporaries settle one row at a time so they cannot accumulate across the tree. This has a copy/launch cost that still needs long-context app measurement. Dense Qwen tree routes, native-MTP width admission and ordinary prefill are unchanged.
+
+Actual bundles: Ornith1.5-122B JANG_4M and JANGH2 each match104/104 logits rows bit-exactly at widths4/16/32, chain and branching. All six post-commit next-token comparisons match exactly for each bundle. Scope tests6/6 and kernel tests11/11 pass. `RunBench/RowCostBench.swift` exposes the diagnostic via `BENCH_ROWCOST_COMPARE_TREE=1`; this is numeric verification, never app speed proof.
+
+Artifacts: `tree-target-parity.log` (before), `tree-target-exact-v1.log` (insufficient projection/tail correction), `tree-layer-parity.log` (first divergence at attention layer3), `tree-attention-parity.log`, `tree-target-exact-v2.log` (4M), `tree-target-h2-exact.log`, `tree-correction-tests.log`. The earlier app speed numbers predate this correctness correction and cannot qualify its speed.

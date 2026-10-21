@@ -432,6 +432,23 @@ extension NativeMTPDepthExecutionTests {
 
 /// Shape/scope checks only: no MLX arrays, model loading, or GPU work.
 final class FlashVerificationScopeAdmissionTests: XCTestCase {
+    func testTreeRowsDoNotWidenOrdinaryVerificationAndNestedTilesRestoreScope() {
+        for rows in [16, 32] {
+            FlashVerificationScope.withVerification(inputShape: [1, rows]) {
+                XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 3072]))
+            }
+            FlashVerificationScope.withTreeVerification(inputShape: [1, rows]) {
+                XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 3072]))
+                FlashVerificationScope.withVerification(inputShape: [1, 8]) {
+                    XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, 8, 3072]))
+                    XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 3072]))
+                }
+                XCTAssertTrue(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 3072]))
+            }
+            XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 3072]))
+        }
+    }
+
     func testOrdinaryCallsAreNotAdmitted() {
         for rows in 1...9 {
             XCTAssertFalse(FlashVerificationScope.usesRowExactVerification(inputShape: [1, rows, 2560]))
