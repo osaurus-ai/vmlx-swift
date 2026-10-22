@@ -218,6 +218,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
+    // Staging is safe with ordinary caches; compilation requires the explicit
+    // opt-in AND the graph-visible cache promotion below. Never infer it from
+    // a warmed staging slot: KVCacheSimple offsets are host-side values.
+    private var useCompiledVerify = false
     /// Greedy requests on targets that require it verify with one-token
     /// forwards (bit-identical to AR) and stop at the first rejection.
     /// Sampled requests always verify in one batched forward: rejection
@@ -859,7 +863,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 return layer
             }
             MLX.eval(self.cache)
-            self.useStagedVerify = true
+            self.useCompiledVerify = true
+        }
+        if Self.traceEnabled {
+            FileHandle.standardError.write(Data(
+                "[DFlash2] verify-mode staged=\(useStagedVerify) compiled=\(useCompiledVerify)\n".utf8))
         }
     }
 
@@ -1219,7 +1227,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 targetLayerIDs: orderedLayerIDs)
             stats.sequentialVerificationSteps += verifyRows
         } else if stagedCycle {
-            if !stagedWarmedSizes.contains(bs) {
+            if !useCompiledVerify || !stagedWarmedSizes.contains(bs) {
                 // Eager warm-up under the staged mode: allocates the
                 // fixed staging slots the compile trace will track.
                 let (l, captured) = NativeMTPVerifierStatePolicy.withVerifierMode(
@@ -1635,6 +1643,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
         stagedWarmedSizes.removeAll(keepingCapacity: true)
+        // Replaced staging arrays invalidate every trace that captured them.
+        compiledVerify.removeAll(keepingCapacity: true)
         // The drafter cache also advanced for the abandoned block.
         let expectedDraftOffset = committedDraftRows
         for c in draftCache where c.offset > expectedDraftOffset {
