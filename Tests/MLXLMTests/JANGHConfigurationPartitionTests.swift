@@ -31,6 +31,42 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
         ["format": "jangtq2", "format_version": 2, "jangtq": config["jangtq"]!]
     }
 
+    func testFlintCalibrationSidecarPreservesAuthoritativePlan() throws {
+        var config = configuration()
+        config["model_type"] = "flint"
+        let summary: [String: Any] = [
+            "format": "jangtq2", "format_version": 2,
+            "quantization": [
+                "routed_experts": "Hadamard-32 codebook experts",
+                "non_experts": "affine 8-bit g64",
+                "gptq_vs_rtn": ["non_expert_gptq": 344],
+                "awq_moe_in": [prefix + "gate_proj": ["alpha_gu": 0.0, "pow2": true]],
+                "awq_attn": ["L00": ["attn_in": ["alpha": 0.3]]],
+                "expert_units_jangh": 3,
+            ],
+        ]
+        let plain = try JANGHConfigurationPartition(configuration: data(config))
+        let prepared = try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary))
+        XCTAssertEqual(plain.customConfiguration, prepared.customConfiguration)
+        XCTAssertEqual(plain.ordinaryConfiguration, prepared.ordinaryConfiguration)
+        XCTAssertNoThrow(try JSONDecoder().decode(BaseConfiguration.self, from: prepared.ordinaryConfiguration))
+
+        var invalid = summary
+        invalid["quantization_config"] = config["quantization"]
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(invalid)))
+        invalid = summary
+        invalid["quantization"] = [prefix + "gate_proj": ["mode": "affine", "bits": 2]]
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(invalid)))
+        invalid = summary
+        invalid["quantization"] = ["awq_attn": ["L00": ["mode": "affine"]]]
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(invalid)))
+        invalid = summary
+        var conflicting = config["jangtq"] as! [String: Any]
+        conflicting["rotation"] = "none"
+        invalid["jangtq"] = conflicting
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(invalid)))
+    }
+
     private func denseQwenConfiguration() -> [String: Any] {
         var config = configuration()
         config["model_type"] = "qwen3_5"

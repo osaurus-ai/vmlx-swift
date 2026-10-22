@@ -55,7 +55,33 @@ struct JANGHConfigurationPartition: Sendable {
             let other = try Self.object(sidecar)
             // MiniCPM-V 4.7 JANGH2 is produced by the same converter: authoritative header in config.json, sidecar
             // with chat/runtime metadata and a scalar summary.
-            if modelType == "lfm2_moe", let authoritative = header,
+            if modelType == "flint", let authoritative = header {
+                // Flint keeps its executable plan/header in config.json. The
+                // converter sidecar contains descriptions and AWQ/GPTQ statistics.
+                guard other["format"] as? String == "jangtq2",
+                    let version = other["format_version"],
+                    try Self.encode(["v": version]) == Self.encode(["v": 2]),
+                    other["quantization_config"] == nil
+                else { throw Failure.invalid("unsupported Flint JANGH sidecar contract") }
+                if let declared = try Self.optionalObject(other, "jangtq"),
+                    try Self.encode(authoritative) != Self.encode(declared)
+                {
+                    throw Failure.invalid("conflicting Flint config and sidecar JANGH headers")
+                }
+                if let summary = try Self.optionalObject(other, "quantization") {
+                    let descriptions: Set<String> = [
+                        "routed_experts", "non_experts", "router", "embed_tokens", "lm_head", "norms_sinks",
+                    ]
+                    let statistics: Set<String> = [
+                        "gptq_vs_rtn", "awq_moe_in", "awq_attn", "expert_units_jangh",
+                    ]
+                    guard Set(summary.keys).isSubset(of: descriptions.union(statistics)),
+                        summary.allSatisfy({ key, value in
+                            descriptions.contains(key) ? value is String : Self.isNumericCalibrationMetadata(value)
+                        })
+                    else { throw Failure.invalid("Flint sidecar quantization must be calibration metadata") }
+                }
+            } else if modelType == "lfm2_moe", let authoritative = header,
                 other["format"] as? String == "jang", other["format_version"] as? String == "2.0"
             {
                 // The LFM converter stores the executable plan/header in config.json.
@@ -252,6 +278,15 @@ struct JANGHConfigurationPartition: Sendable {
             let object = try JANGHHeaderAdapter.validateJSON(data) as? [String: Any]
         else { throw Failure.invalid("invalid or oversized metadata object") }
         return object
+    }
+
+    private static func isNumericCalibrationMetadata(_ value: Any) -> Bool {
+        if let number = value as? NSNumber { return number.doubleValue.isFinite }
+        if let values = value as? [String: Any] {
+            return values.values.allSatisfy(isNumericCalibrationMetadata)
+        }
+        if let values = value as? [Any] { return values.allSatisfy(isNumericCalibrationMetadata) }
+        return false
     }
 
     private static func optionalObject(_ owner: [String: Any], _ name: String) throws

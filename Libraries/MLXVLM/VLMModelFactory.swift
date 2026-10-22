@@ -492,6 +492,13 @@ public final class VLMModelFactory: ModelFactory {
             throw ModelFactoryError.configurationFileError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
+        // Flint is text-only and its custom banks belong to the LLM factory.
+        // Do not let an unrelated generic quantization error mask its admission error.
+        if let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            root["model_type"] as? String == "flint"
+        {
+            throw ModelFactoryError.unsupportedModelType("flint")
+        }
         // Custom packed banks are admitted before the strict generic quantization
         // decoder. Only their validated entries are removed from its ordinary view.
         let jangHPreparation = try Glm5NextJANGHPreparation.loadIfDeclared(
