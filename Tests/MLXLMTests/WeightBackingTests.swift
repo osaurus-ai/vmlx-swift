@@ -51,7 +51,7 @@ struct WeightBackingTests {
         try file.write(to: url)
     }
 
-    @Test func mappedShardWindowsAreNotReplaceableAndOwnedArraysAre() throws {
+    @Test func legacyMmapEnvironmentCannotRetainSourceShards() throws {
         try MLXMetalTestLock.withLock {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("weight-backing-\(UUID().uuidString)")
@@ -66,19 +66,26 @@ struct WeightBackingTests {
                 let loaded = try MLX.loadArrays(url: url)
                 let mapped = try #require(loaded["a.weight"])
                 #expect(mapped.asArray(UInt32.self)[300] == 300)
-                #expect(WeightBacking.sharesMappedShard(mapped))
-                #expect(!WeightBacking.copyWouldReplace([mapped]))
+                #expect(!WeightBacking.sharesMappedShard(mapped))
+                #expect(WeightBacking.copyWouldReplace([mapped]))
 
-                // A materialized copy owns its allocation.
+                // Ordinary transformations also own their allocations.
                 let owned = mapped + 0
                 eval(owned)
                 #expect(!WeightBacking.sharesMappedShard(owned))
                 #expect(WeightBacking.copyWouldReplace([owned]))
-                #expect(!WeightBacking.copyWouldReplace([owned, mapped]))
+                #expect(WeightBacking.copyWouldReplace([owned, mapped]))
 
                 setenv("VMLX_COPY_MAPPED_WEIGHTS", "1", 1)
                 #expect(WeightBacking.copyWouldReplace([mapped]))
             }
+            // Positive control: the explicit diagnostic mapper really does share
+            // a shard. Retiring production mmap must not turn the classifier into
+            // an always-false answer or hide retained source storage.
+            let (diagnostic, _) = try MmapSafetensorsLoader.loadArraysAndMetadata(url: url)
+            let fileBacked = try #require(diagnostic["a.weight"])
+            #expect(WeightBacking.sharesMappedShard(fileBacked))
+            #expect(!WeightBacking.copyWouldReplace([fileBacked]))
             // A non-mapped load owns every tensor.
             let resident = try #require(try MLX.loadArrays(url: url)["a.weight"])
             #expect(!WeightBacking.sharesMappedShard(resident))

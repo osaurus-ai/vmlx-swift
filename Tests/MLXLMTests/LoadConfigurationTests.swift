@@ -55,7 +55,7 @@ struct LoadConfigurationTests {
         let cfg = LoadConfiguration.default
         #expect(cfg.maxResidentBytes == .fraction(0.70))
         #expect(cfg.memoryLimit == .fraction(0.70))
-        #expect(cfg.useMmapSafetensors == true)
+        #expect(cfg.useMmapSafetensors == false)
         #expect(cfg.deepseekV4ActivationQAT == nil)
     }
 
@@ -97,7 +97,7 @@ struct LoadConfigurationTests {
         #expect(!explicitlyOff)
     }
 
-    @Test("JANGTQ load keeps tq tensors raw and protects mmap residency")
+    @Test("JANGTQ load keeps raw tensors and dtype policy independent of storage")
     func jangtqLoadDoesNotSkipWholeModelBFloat16Conversion() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -105,15 +105,9 @@ struct LoadConfigurationTests {
             contentsOf: repository.appendingPathComponent("Libraries/MLXLMCommon/Load.swift"),
             encoding: .utf8)
 
-        #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))
-        // `RuntimeEnvironment.flag` replaced the raw `envFlag` here and names only the current
-        // spelling; the legacy `VMLINUX_` name is still honoured, derived centrally by
-        // `RuntimeEnvironment.legacyName(of:)`. See `RuntimeEnvironmentSourceCoverageTests`.
-        #expect(source.contains(
-            "let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag(\"VMLX_JANGTQ_BF16_MMAP\")"))
-        #expect(source.contains("let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)"))
-        #expect(source.contains("!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
-        #expect(source.contains("|| autoJANGTQMmapBFloat16"))
+        #expect(!source.contains("let mmapSafetensorsActive"))
+        #expect(source.contains("let preserveJANGAffineDtypes = !isJANGTQNative"))
+        #expect(source.contains("(!isJANGTQNative || autoJANGTQMmapBFloat16)"))
         #expect(source.contains("func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool"))
         #expect(source.contains("modelType == \"nemotron_h\""))
         #expect(source.contains("modelType == \"qwen3_5_moe\""))

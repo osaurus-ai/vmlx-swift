@@ -19,7 +19,7 @@ public final class MixedQuantizedSwitchGLU: Module, SwitchGLULayer {
     private let sortPrefill = RuntimeEnvironment.value("VMLX_MIMO_SORT_PREFILL") != "0"
 
     public init(catalog: MixedQuantizedExpertCatalog, layer: Int, inputDimensions: Int,
-                storage: MixedQuantizedExpertCatalog.Storage = .mapped) throws {
+                storage: MixedQuantizedExpertCatalog.Storage = .resident) throws {
         if storage == .resident && RuntimeEnvironment.value("VMLX_MIMO_RESIDENT_ROUTING") != "host" {
             self.resident = try catalog.loadResidentLayer(layer: layer)
             self.experts = []
