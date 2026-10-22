@@ -828,14 +828,17 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // Safe Auto owns its default scheduling allowance. All families use
         // the same bounded owned-weight headroom as the loader. A user
         // fraction, an explicit base cap, and stricter profiles remain explicit.
+        // Without a measured working-set ceiling, preserve the existing plan;
+        // resolving the base config would reset near-RAM headroom to 70%.
         if memorySafety.mode == .safeAuto,
             memorySafety.customPhysicalMemoryFraction == nil,
             !baseLoadConfiguration.memoryLimitWasExplicit,
+            let workingSet = host?.recommendedWorkingSetBytes, workingSet > 0,
             var facts = bundleFacts
         {
             facts.physicalMemory = physicalMemory
             loadConfiguration.memoryLimit = baseLoadConfiguration.resolvedSchedulingMemoryLimit(
-                facts: facts, recommendedWorkingSetBytes: host?.recommendedWorkingSetBytes)
+                facts: facts, recommendedWorkingSetBytes: workingSet)
         }
         if memorySafety.keepModelInMemory, let facts = bundleFacts,
            let workingSet = host?.recommendedWorkingSetBytes,

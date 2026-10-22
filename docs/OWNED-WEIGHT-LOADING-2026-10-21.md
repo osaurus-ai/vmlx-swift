@@ -24,3 +24,26 @@ Storage does not determine numerical precision. Existing exact affine metadata a
 ## Open findings
 
 A growing Flint app turn rebuilt roughly 21k tokens after decoding to recreate a prompt-minus-one checkpoint, costing about 14 seconds. This is a separate boundary-storage defect, not solved by this loader change. Cache-store comments about shared copies also disagree with the current deep-copy helper and need a peak-memory audit. Real-app proof of the new loading path is pending.
+
+## Follow-up policy and telemetry corrections
+
+App CI exposed a missing-host path: Safe Auto replaced the existing near-RAM
+allowance with the base 70% limit when no Metal working-set ceiling was supplied.
+The shared scheduling override now requires a measured positive ceiling. It
+preserves the prior plan otherwise. `JANGHLoadPolicyTests` covers absent host,
+absent ceiling and a known ceiling; all 11 tests pass through explicit XCTest.
+The app's existing `bundleSpecificPlanReportsItsActualRaisedLoadBudget` remains
+the independent consumer regression; app CI must pass after re-pinning.
+
+The Allosaurus n-gram ready log incorrectly reported `warm=true` despite the
+actual default-off branch. It now reports the decision actually used, including
+F_NOCACHE suppression. No row-reader or warm-up policy changed. Updated live-log
+confirmation is pending the rebuilt app.
+
+On engine 1747b2bdb, actual app Auto/Off controls reached native MTP and AR.
+Allosaurus code decode measured 39.5 vs 40.9 tok/s, respectively; prose measured
+41.1 vs 40.0 tok/s, with substantially different reasoning lengths and a tool
+call in the Off run. These single samples establish routing and disclose a
+code loss; they do not establish an adaptive speedup or matched end-to-end gain.
+Fused GDN and hyper projection routes remained active. Other speculative
+families and concurrent/delegated requests are still under qualification.

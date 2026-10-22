@@ -199,6 +199,23 @@ final class JANGHLoadPolicyTests: XCTestCase {
         }
     }
 
+    func testMissingWorkingSetDoesNotResetExistingNearRAMBudget() {
+        let facts = LoadBundleFacts(totalSafetensorsBytes: 94 << 30, isRouted: true,
+            physicalMemory: 128 << 30, modelType: "hy_v3", weightFormat: "jang-affine-mixed")
+        let settings = VMLXServerRuntimeSettings()
+        let unknown = MemoryStatus(memoryLimit: 0, cacheLimit: 0,
+            recommendedWorkingSetBytes: nil, physicalMemory: 128 << 30, currentRSS: 0)
+        for host in [nil, unknown] {
+            let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+            XCTAssertEqual(plan.loadConfiguration.memoryLimit, .fraction(94.0 / 128.0 + 0.06))
+            XCTAssertFalse(plan.loadConfiguration.useMmapSafetensors)
+        }
+        let known = MemoryStatus(memoryLimit: 0, cacheLimit: 0,
+            recommendedWorkingSetBytes: 107 << 30, physicalMemory: 128 << 30, currentRSS: 0)
+        XCTAssertEqual(settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: known)
+            .loadConfiguration.memoryLimit, .absolute(98 << 30))
+    }
+
     func testResidencyPreferencePersistsAndReachesBothLoadResolvers() throws {
         let defaults = try JSONDecoder().decode(VMLXMemorySafetySettings.self, from: Data("{}".utf8))
         XCTAssertTrue(defaults.keepModelInMemory)
