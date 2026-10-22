@@ -372,7 +372,16 @@ extension LaneQMM {
     }
 
     /// Module paths whose packed `.weight` is read directly by fused S=1 kernels (never tiled by default).
-    static let directWeightReaderPaths = ["linear_attn.in_proj", "linear_attn.out_proj"]
+    // Qwen3.5/MiniCPM's compiled shared expert and quantized router also
+    // read .weight directly. Owned loading makes tiling eligible; permuting
+    // these weights would feed the fused AR/probe path a different matrix,
+    // corrupt its cache, and make subsequent DSpark tokens repeat.
+    // Retain lane dispatch with MLX packing for these modules; other eligible
+    // projections still tile. Do not disable the fused reader or speculation.
+    static let directWeightReaderPaths = [
+        "linear_attn.in_proj", "linear_attn.out_proj",
+        "mlp.shared_expert.", "mlp.gate",
+    ]
 
     /// Below this many rows an UNTILED lane module runs MLX's quantized matmul (qmv), which is faster
     /// there (27B JANG_4D 1-row forward: qmv 48.9 ms vs lane 61.4 ms). VMLX_LANE_QMM_MIN_ROWS overrides.
