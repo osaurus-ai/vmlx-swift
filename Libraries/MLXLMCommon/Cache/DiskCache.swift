@@ -596,16 +596,19 @@ public final class DiskCache: @unchecked Sendable {
         let tokenCount: Int
         let bytes: Int
         let geometry: RecurrentGeometry
+        let payloadReservation: DiskWriterPayloadBudget.Reservation?
         // Read and written under the owning DiskCache lock.
         var invalidated = false
         var chainId: String?
         var rowKind: Int64
-        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry, chainId: String?, rowKind: Int64) {
+        init(arrays: [String: MLXArray], tensors: [SafetensorsByteWriter.Tensor], tokenCount: Int, bytes: Int, geometry: RecurrentGeometry, chainId: String?, rowKind: Int64,
+             payloadReservation: DiskWriterPayloadBudget.Reservation? = nil) {
             self.arrays = arrays
             self.tensors = tensors
             self.tokenCount = tokenCount
             self.bytes = bytes
             self.geometry = geometry
+            self.payloadReservation = payloadReservation
             self.chainId = chainId
             self.rowKind = rowKind
         }
@@ -1243,11 +1246,20 @@ public final class DiskCache: @unchecked Sendable {
         // wait for room BEFORE taking their locks (`waitForWriteBehindRoom()`); if the budget is still
         // full at this point the store is written synchronously instead of queued.
         var behind = writesBehind && allowWriteBehind
-        if behind, !hasWriteBehindRoom {
-            behind = false
-            lock.lock()
-            writeBehindBudgetFallbacks += 1
-            lock.unlock()
+        var payloadReservation: DiskWriterPayloadBudget.Reservation?
+        if behind {
+            let bytes = arrays.values.reduce(0) { partial, array in
+                let (sum, overflow) = partial.addingReportingOverflow(array.nbytes)
+                return overflow ? Int.max : sum
+            }
+            payloadReservation = DiskWriterPayloadBudget.shared.reserve(
+                bytes: bytes, limit: Self.inflightByteBudget)
+            if payloadReservation == nil {
+                behind = false
+                lock.lock()
+                writeBehindBudgetFallbacks += 1
+                lock.unlock()
+            }
         }
         let rowKind = Self.rowKind(
             stableRoot: isStableRoot, resumeBoundary: isResumeBoundary, postAnswer: isPostAnswer)
@@ -1417,7 +1429,7 @@ public final class DiskCache: @unchecked Sendable {
             let geometry = Self.recurrentGeometry(arrays)
             let entry = InflightWrite(
                 arrays: arrays, tensors: tensors, tokenCount: tokenCount, bytes: bytes, geometry: geometry,
-                chainId: chainId, rowKind: rowKind)
+                chainId: chainId, rowKind: rowKind, payloadReservation: payloadReservation)
             entry.startScreen()
             inflight[hash] = entry
             inflightBytes += bytes
