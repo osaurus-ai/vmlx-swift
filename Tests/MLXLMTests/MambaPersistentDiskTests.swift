@@ -63,6 +63,10 @@ struct MambaPersistentDiskTests {
         disk.store(tokens: tokens, arrays: complete)
         #expect(disk.hasValidatedEntry(tokens: tokens))
         #expect(reopened.hasDurableEntry(tokens: tokens))
+        // A fresh cache can suppress duplicate production without falsely
+        // claiming that it has already deserialized this native state.
+        #expect(!reopened.hasValidatedEntry(tokens: tokens, requireNativeRecurrent: true))
+        #expect(reopened.hasDurableEntry(tokens: tokens, requireNativeRecurrent: true))
         let migrated = try #require(disk.fetch(tokens: tokens))
         var restored: [any KVCache] = [KVCacheSimple(), MambaCache(slots: 6, persistentSlotCount: 4)]
         #expect(restoreFromDiskArrays(migrated, into: &restored) == 8)
