@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import Cmlx
 import MLX
 import MLXNN
 
 #if canImport(Darwin)
 import Darwin
-
-@_silgen_name("proc_regionfilename")
-private func vmlxProcRegionFilename(
-    _ pid: Int32, _ address: UInt64, _ buffer: UnsafeMutableRawPointer?, _ bufferSize: UInt32
-) -> Int32
 #endif
 
 /// Where a weight's bytes live, and therefore whether a runtime re-layout of it costs memory.
 ///
-/// The shipped memory-safety loader (`LoadConfiguration.useMmapSafetensors`, `MLX_SAFETENSORS_MMAP=1`)
-/// maps each safetensors shard once and makes every tensor a window into that one mapping. Releasing
+/// The retired mmap loader made tensors windows into a shared shard mapping. Releasing
 /// a single tensor frees nothing while any other tensor from its shard is alive, so a runtime
 /// transform that builds a re-laid-out copy of mapped weights (fused decode projections, lane-tiled
 /// weights) ADDS the copy to resident memory for the life of the model — memory the host's RAM
@@ -37,29 +32,26 @@ public enum WeightBacking {
     public static func sharesMappedShard(_ array: MLXArray) -> Bool {
         #if canImport(Darwin)
         guard array.size > 0 else { return false }
-        let backing = array.asData(access: .noCopy)
-        return backing.data.withUnsafeBytes { raw -> Bool in
-            guard let base = raw.baseAddress else { return false }
+        // Foundation Data may inline small values even with bytesNoCopy. Query
+        // the actual MLX address, not temporary Data storage on the Swift stack.
+        guard let base = try? withError({
+            _ = mlx_array_eval(array.ctx)
+            return mlx_array_data_uint8(array.ctx)
+        }) else { return false }
+        return withExtendedLifetime(array) {
             let pointer = UInt64(UInt(bitPattern: base))
-            var path = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
-            let length = path.withUnsafeMutableBytes { buffer in
-                vmlxProcRegionFilename(getpid(), pointer, buffer.baseAddress, UInt32(buffer.count))
-            }
-            guard length > 0 else { return false }  // anonymous: the array owns its allocation
-            var address = mach_vm_address_t(pointer)
-            var size: mach_vm_size_t = 0
-            var info = vm_region_basic_info_data_64_t()
-            var count = mach_msg_type_number_t(
-                MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<natural_t>.size)
-            var object: mach_port_t = 0
-            let kr = withUnsafeMutablePointer(to: &info) {
-                $0.withMemoryRebound(to: Int32.self, capacity: Int(count)) {
-                    mach_vm_region(
-                        mach_task_self_, &address, &size, VM_REGION_BASIC_INFO_64, $0, &count, &object)
-                }
-            }
-            guard kr == KERN_SUCCESS, address <= pointer else { return false }
-            return Int(size) > 2 * array.nbytes + Int(getpagesize())
+            var region = proc_regionwithpathinfo()
+            let expected = MemoryLayout<proc_regionwithpathinfo>.size
+            let count = proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, pointer, &region, Int32(expected))
+            guard count == expected else { return false }
+            let start = region.prp_prinfo.pri_address
+            let length = region.prp_prinfo.pri_size
+            // The kernel can return the NEXT file-backed region. Its pathname
+            // is not evidence about this array unless that same region contains it.
+            guard pointer >= start, pointer - start < length else { return false }
+            let hasPath = withUnsafeBytes(of: region.prp_vip.vip_path) { $0.first != 0 }
+            guard hasPath else { return false }
+            return length > UInt64(array.nbytes) * 2 + UInt64(getpagesize())
         }
         #else
         return false

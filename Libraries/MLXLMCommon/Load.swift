@@ -528,13 +528,8 @@ public func loadWeights(
             }
         }
 
-        // Canonical loader entry. On patched osaurus mlx-swift pins,
-        // `loadArraysAndMetadata(url:)` honors the safetensors mmap
-        // environment set by `ModelFactory.withMmapSafetensorsEnv`,
-        // returning MLX arrays backed by whole-shard file mappings.
-        // Older pins ignore the env and fall back to the stock
-        // pread/allocator path. `MmapSafetensorsLoader.swift` remains
-        // a header/parser test utility, not the production tensor path.
+        // Read packed tensor bytes directly into their final allocator-owned buffers.
+        // Neither source shard mappings nor a tensor-sized staging Data survives load.
         let prestackedRoutedKeys = (try? LegacyRoutedTensorLayout
             .prestackedRoutedReplacementKeys(in: modelDirectory)) ?? []
         var skippedPrestackedSourceTensors = 0
@@ -559,13 +554,13 @@ public func loadWeights(
         // A model requesting owned compute weights must not also retain a
         // complete filesystem-backed copy while loading them. Model-owned
         // auxiliary tensors remain excluded by the existing key contract.
-        let uncachedResidentRead = ResidentSafetensorsReader.shouldUse(
-            requiresOwnedCompute: modelKeyExcluder?.requiresResidentSafetensorsWeights == true,
-            readerOverride: RuntimeEnvironment.value("VMLX_FLASH_RESIDENT_READER"))
-        if uncachedResidentRead {
-            LoadDiagnostics.write(Data(
-                "[loadWeights] resident_reader=uncached_owned source_files_unchanged=true\n".utf8))
-        }
+        #if canImport(Darwin)
+        let uncachedResidentRead = true
+        #else
+        let uncachedResidentRead = false
+        #endif
+        LoadDiagnostics.write(Data(
+            "[loadWeights] weight_storage=owned resident_reader=direct source_files_unchanged=true\n".utf8))
         for url in allShardURLs {
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
@@ -1275,47 +1270,28 @@ public func loadWeights(
     // `tq_norms`, and casting those norms to bf16 breaks routed projections
     // (verified on MiniMax M2.7 JANGTQ_2L). Keep the JANGTQ tensors raw.
     //
-    // For non-mmap JANGTQ loads, still convert non-TQ Mamba/attention/router
-    // weights so resident decode avoids preventable fp16 AsType cascades. For
-    // mmap loads, default to preserving file-backed tensor residency
-    // unless the bundle has live proof that affine quant metadata must be
-    // materialized to bf16 while raw TurboQuant tensors stay untouched.
-    let mmapSafetensorsActive = envFlag("MLX_SAFETENSORS_MMAP")
-        || RuntimeEnvironment.flag("VMLX_MMAP_SAFETENSORS")
-    let allowJANGTQMmapBFloat16 = RuntimeEnvironment.flag("VMLX_JANGTQ_BF16_MMAP")
-        || envFlag("MLX_JANGTQ_BF16_MMAP")
+    // Storage ownership must not change the model's numerical contract. Keep
+    // the established exact F16 affine metadata for these families, even though
+    // its bytes now live in owned buffers. The model controls activation dtype.
+    // JANGTQ kernels keep raw packed/norm tensors; only the families with an
+    // established BF16 affine requirement convert their remaining parameters.
     let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
-    // Gemma 4 and Qwen4-exp JANG affine bundles carry F16 scales/biases whose
-    // checkpoint values must remain exact and file-backed. MLX's production
-    // quantized kernels accept BF16 activations with F16 affine metadata; do
-    // not turn Qwen's 61+ GiB packed bank plus 7+ GiB metadata into anonymous
-    // resident allocations merely to align storage dtypes. Validated
-    // pre-stacked DSV4 affine bundles have the same constraint at larger scale.
-    // Recasting zero-points to BF16 both materializes a second bank and can
-    // alter logits; activation dtype is owned by each model runtime.
-    // Split DSV4 bundles intentionally remain on the resident conversion path.
-    // SPEED-CRITICAL (Flash-Next / Allosaurus MTP, 2026-10-14): preserving the f16 affine metadata
-    // file-backed here is correct, but it means every runtime "copy must replace" gate must look at
-    // the packed WEIGHTS only (`WeightBacking.storage(of:)`). Counting this mapped metadata there
-    // disabled the fused GDN verify path for every qwen4_exp load and Allosaurus fell from ~100 to
-    // 27-35 tok/s in the app. Changing this mmap/dtype policy needs a matched Allosaurus adaptive
-    // RunBench AND an in-app code turn before and after — record both in the commit.
-    let preserveJANGAffineMmapDtypes = mmapSafetensorsActive
-        && !isJANGTQNative
+    // SPEED-CRITICAL: keep exact affine metadata and GDN fused-row replacement.
+    // The Oct 14 Allosaurus/Flash-Next regression disabled fusion when metadata
+    // was counted as a nonreplaceable bank. Storage changes need matched app
+    // adaptive-MTP code/prose timings; a loader test alone is insufficient.
+    let preserveJANGAffineDtypes = !isJANGTQNative
         && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
-            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(
-                modelDirectory: modelDirectory)
-            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
-                modelDirectory: modelDirectory))
+            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(modelDirectory: modelDirectory))
     // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
     // state projections and signs. Preserve that contract independent of
     // mmap; recasting it is not the stock Qwen/JANG dtype policy.
     let materialiseBFloat16 =
         hadamardContract == nil
         && !model.preservesCheckpointParameterDTypes
-        && !preserveJANGAffineMmapDtypes
-        && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
-            || autoJANGTQMmapBFloat16)
+        && !preserveJANGAffineDtypes
+        && (!isJANGTQNative || autoJANGTQMmapBFloat16)
     if materialiseBFloat16 {
         convertToBFloat16(
             model: model,
@@ -1340,23 +1316,23 @@ public func loadWeights(
         let summary = histogram.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
         LoadDiagnostics.write(Data(
-            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) mmap=\(mmapSafetensorsActive) "
-                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineMmapDtypes) "
+            ("[Load] dtype-materialisation bf16=\(materialiseBFloat16) weight_storage=owned "
+                + "jangtqNative=\(isJANGTQNative) preserveJANGAffine=\(preserveJANGAffineDtypes) "
                 + "preserveCheckpointDTypes=\(model.preservesCheckpointParameterDTypes) "
-                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) allowJANGTQBF16=\(allowJANGTQMmapBFloat16) "
+                + "autoJANGTQBF16=\(autoJANGTQMmapBFloat16) "
                 + "params[\(summary)]\n").utf8))
     }
 
     // The Gemma-4 / DSV4-prestacked preserve branches keep f16 affine
-    // metadata file-backed (correct: materializing the scale banks costs
+    // metadata exact (recasting the scale banks costs
     // gigabytes and can alter logits), but `dequantized` types embedding
     // output from the SCALES dtype — so the quantized EMBEDDING seeded f16
     // into a bf16 stream and the first mixed op promoted the whole
     // activation path to fp32 (doubled KV caches, refused fused-decode
     // gates). Pin only the embedding OUTPUT to bf16: the dequant math still
-    // reads the exact file-backed f16 metadata; qwen4_exp bundles are
+    // reads the exact f16 metadata; qwen4_exp bundles are
     // excluded because their native-module swap already handles this.
-    if hadamardContract == nil, preserveJANGAffineMmapDtypes,
+    if hadamardContract == nil, preserveJANGAffineDtypes,
         !shouldUseQwen4ExpNativeBF16Affine(modelDirectory: modelDirectory)
     {
         let pinned = pinPreservedAffineEmbeddingOutputDTypes(model)

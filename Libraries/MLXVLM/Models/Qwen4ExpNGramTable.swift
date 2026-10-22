@@ -230,7 +230,6 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     // turn a whole-table page-cache warm or a resident copy on by default to "speed up" decode — it
     // is the difference between Allosaurus fitting a 48 GB Mac or not, and decode rows are tiny
     // pread()s (2.9 KB per token) that never limited tok/s in any measured run.
-    static var warmEnabled: Bool { warmOverride ?? true }
 
     /// AUTOMATIC WARM = only when the whole bundle comfortably fits in RAM (bundle bytes <= 60 % of physical).
     ///
@@ -475,7 +474,9 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         self.noCacheFileCount = Self.uncachedReads ? openedFiles.count : 0
         self.dimensions = commonDimensions ?? 0
         self.rowCount = nextStart
-        if Self.shouldWarm(modelDirectory: modelDirectory) {
+        let warmRequested = Self.shouldWarm(modelDirectory: modelDirectory)
+        let warmEnabled = warmRequested && !Self.uncachedReads
+        if warmEnabled {
             Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
         }
         Self.log(
@@ -483,7 +484,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 format:
                     "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
                 Self.uncachedReads
-                    ? "pread-fnocache cache=F_NOCACHE" : "pread-pagecache warm=\(Self.warmEnabled)",
+                    ? "pread-fnocache cache=F_NOCACHE warm=false" : "pread-pagecache warm=\(warmEnabled)",
                 Self.parallelRows ? "parallel" : "sequential-opt-out",
                 backingFileCount,
                 Double(backingFileBytes) / 1_073_741_824.0,

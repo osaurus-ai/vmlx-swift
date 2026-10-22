@@ -497,8 +497,6 @@ public func loadModel(
     var loadTiming = ModelLoadTiming(scope: "runtime")
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
     loadTiming.mark("bundle_inspection")
-    let useMmapSafetensors = facts.resolveMmapSafetensors(
-        requested: loadConfiguration.useMmapSafetensors)
     let memoryLimit = loadConfiguration.resolvedSchedulingMemoryLimit(
         facts: facts, recommendedWorkingSetBytes: MLX.GPU.maxRecommendedWorkingSetBytes())
     let nativeResidentPoolCeiling =
@@ -506,12 +504,6 @@ public func loadModel(
             facts: facts,
             allocatorCacheLimit: loadConfiguration.maxResidentBytes
                 .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory))
-    if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
-        let reason = "Resident affine bundle selected materialized safetensors for production decode"
-        FileHandle.standardError.write(
-            Data(
-                "[Load] \(reason)\n".utf8))
-    }
     if loadConfiguration.memoryLimit != memoryLimit {
         FileHandle.standardError.write(
             Data(
@@ -583,22 +575,14 @@ public func loadModel(
     FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
     loadTiming.mark("memory_and_residency")
 
-    // Load the canonical bundle directly. Experimental prestack/alignment
-    // overlays are retired; original-file repair retains its explicit consent.
-    if useMmapSafetensors {
-        SafetensorsStorageHealer.healBundleIfEligible(
-            at: directory, authorization: loadConfiguration.alignmentRepairAuthorization)
-    }
+    // Load original packed bytes into owned allocations; alignment repair and
+    // mapped/prestacked overlays are no longer part of the production factory.
     let loadDirectory = directory
     loadTiming.mark("bundle_preparation")
 
-    // 5. Load the model normally. Patched osaurus mlx-swift pins honor
-    //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
-    //    making the canonical weight storage mmap-backed instead of a
-    //    pread() copy. Older pins ignore the env knob.
-    var context = try await withMmapSafetensorsEnv(
-        enabled: useMmapSafetensors
-    ) {
+    // Owned tensor storage is the single model-loading path. No process-wide
+    // mmap environment mutation around an async factory operation.
+    var context = try await {
         try await DeepseekV4ActivationQAT.withExplicitRequest(
             loadConfiguration.deepseekV4ActivationQAT
         ) {
@@ -615,7 +599,7 @@ public func loadModel(
                 }
             }
         }
-    }
+    }()
     loadTiming.mark("factory_load")
 
     context.residencyLease = residency.lease
@@ -712,78 +696,7 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
     }
 }
 
-private func withMmapSafetensorsEnv<R>(
-    enabled: Bool,
-    _ body: () async throws -> R
-) async throws -> R {
-    #if canImport(Darwin) || canImport(Glibc)
-        let mmapKey = "MLX_SAFETENSORS_MMAP"
-        let vmlxMmapKey = "VMLX_MMAP_SAFETENSORS"
-        // The consumer is `mmap_safetensors_enabled` in the MLX C++ submodule, which reads
-        // MLX_SAFETENSORS_MMAP or the LEGACY spelling — not this one. Writing only the new name
-        // made this a dead write; mmap kept working solely because MLX_SAFETENSORS_MMAP is set
-        // beside it. Write both until the submodule reads the new name too.
-        let legacyVmlxMmapKey = RuntimeEnvironment.legacyName(of: vmlxMmapKey)!
-        let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
-        let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
-        let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
-        let priorMmap = getenv(mmapKey).map { String(cString: $0) }
-        let priorVmlxMmap = getenv(vmlxMmapKey).map { String(cString: $0) }
-        let priorLegacyVmlxMmap = getenv(legacyVmlxMmapKey).map { String(cString: $0) }
-        let priorTensor = getenv(tensorKey).map { String(cString: $0) }
-        let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
-        let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
-        if enabled {
-            setenv(mmapKey, "1", 1)
-            setenv(vmlxMmapKey, "1", 1)
-            setenv(legacyVmlxMmapKey, "1", 1)
-            // Retired cold-tier flags must not re-enable parallel tensor mappings
-            // or start-cold advice when inherited from an older launch profile.
-            setenv(tensorKey, "0", 1)
-            setenv(startColdKey, "0", 1)
-            setenv(coldPctKey, "0", 1)
-        } else {
-            unsetenv(mmapKey)
-            unsetenv(vmlxMmapKey)
-            unsetenv(tensorKey)
-            unsetenv(startColdKey)
-            unsetenv(coldPctKey)
-        }
-        defer {
-            if let priorMmap {
-                setenv(mmapKey, priorMmap, 1)
-            } else {
-                unsetenv(mmapKey)
-            }
-            if let priorVmlxMmap {
-                setenv(vmlxMmapKey, priorVmlxMmap, 1)
-            } else {
-                unsetenv(vmlxMmapKey)
-            }
-            if let priorLegacyVmlxMmap {
-                setenv(legacyVmlxMmapKey, priorLegacyVmlxMmap, 1)
-            } else {
-                unsetenv(legacyVmlxMmapKey)
-            }
-            if let priorTensor {
-                setenv(tensorKey, priorTensor, 1)
-            } else {
-                unsetenv(tensorKey)
-            }
-            if let priorStartCold {
-                setenv(startColdKey, priorStartCold, 1)
-            } else {
-                unsetenv(startColdKey)
-            }
-            if let priorColdPct {
-                setenv(coldPctKey, priorColdPct, 1)
-            } else {
-                unsetenv(coldPctKey)
-            }
-        }
-    #endif
-    return try await body()
-}
+
 
 /// Protocol for types that can provide ModelFactory instances.
 ///

@@ -743,7 +743,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         loadConfiguration.memoryLimit = loadCap
         loadConfiguration.keepModelInMemory = memorySafety.keepModelInMemory
         loadConfiguration.maxResidentBytes = allocatorCap
-        loadConfiguration.useMmapSafetensors = true
+        loadConfiguration.useMmapSafetensors = false
 
 
         var resolvedConcurrency = concurrency
@@ -810,7 +810,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 loadConfiguration.memoryLimit = .fraction(needFraction)
             }
             warnings.append(
-                "Weights (\(facts.gpuResidentWeightBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
+                "Weights (\(facts.gpuResidentWeightBytes / 1_073_741_824) GiB) approach physical memory; using owned weights; load and workspace must fit available memory."
             )
         }
         // Plain affine DSV4 must advertise the same limits the loader will
@@ -825,17 +825,20 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             loadConfiguration.useMmapSafetensors = facts.resolveMmapSafetensors(
                 requested: loadConfiguration.useMmapSafetensors)
         }
-        // Safe Auto owns its default scheduling allowance. Keep JANGH mapped
-        // and use the same bounded mapped-weight headroom as the loader. A user
+        // Safe Auto owns its default scheduling allowance. All families use
+        // the same bounded owned-weight headroom as the loader. A user
         // fraction, an explicit base cap, and stricter profiles remain explicit.
+        // Without a measured working-set ceiling, preserve the existing plan;
+        // resolving the base config would reset near-RAM headroom to 70%.
         if memorySafety.mode == .safeAuto,
             memorySafety.customPhysicalMemoryFraction == nil,
             !baseLoadConfiguration.memoryLimitWasExplicit,
-            var facts = bundleFacts, facts.customRoutedFormat == .janghV2
+            let workingSet = host?.recommendedWorkingSetBytes, workingSet > 0,
+            var facts = bundleFacts
         {
             facts.physicalMemory = physicalMemory
             loadConfiguration.memoryLimit = baseLoadConfiguration.resolvedSchedulingMemoryLimit(
-                facts: facts, recommendedWorkingSetBytes: host?.recommendedWorkingSetBytes)
+                facts: facts, recommendedWorkingSetBytes: workingSet)
         }
         if memorySafety.keepModelInMemory, let facts = bundleFacts,
            let workingSet = host?.recommendedWorkingSetBytes,

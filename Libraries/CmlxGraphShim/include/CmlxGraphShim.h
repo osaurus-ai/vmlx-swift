@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include "VMLXMappedFile.h"
+#include "VMLXResidentFile.h"
 
 #ifdef __cplusplus
 extern "C" {

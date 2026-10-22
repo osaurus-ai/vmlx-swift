@@ -10,22 +10,9 @@ import MLXNN
 #endif
 
 public enum JANGTQStreamingExperts {
-    public static var explicitStreamingEnabled: Bool? {
-        let env = ProcessInfo.processInfo.environment
-        guard let rawValue = env["MLXPRESS_STREAMING_EXPERTS"]
-            ?? env["JANGPRESS_STREAMING_EXPERTS"]
-        else {
-            return nil
-        }
-        let raw = rawValue.lowercased()
-        if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
-            return true
-        }
-        if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
-            return false
-        }
-        return nil
-    }
+    /// Retired production mechanism. Legacy environment variables must not select
+    /// an alternate weight owner or a second per-expert RAM cache.
+    public static var explicitStreamingEnabled: Bool? { false }
 
     public static var isEnabled: Bool {
         explicitStreamingEnabled == true
@@ -156,15 +143,7 @@ public enum JANGTQStreamingExperts {
         return nil
     }
 
-    public static var residentExpertsEnabled: Bool {
-        let env = ProcessInfo.processInfo.environment
-        let raw =
-            env["MLXPRESS_RESIDENT_EXPERTS"]?
-            .lowercased()
-            ?? env["JANGPRESS_RESIDENT_EXPERTS"]?.lowercased()
-            ?? "0"
-        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-    }
+    public static var residentExpertsEnabled: Bool { false }
 
     public static var usesActiveExpertModule: Bool {
         isEnabled || residentExpertsEnabled

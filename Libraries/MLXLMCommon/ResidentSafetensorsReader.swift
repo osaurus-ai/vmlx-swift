@@ -1,19 +1,14 @@
 import Foundation
 import MLX
+import Cmlx
+import CmlxGraphShim
 #if canImport(Darwin)
 import Darwin
 #endif
 
-/// Uncached reads for models that already require owned compute weights.
+/// Direct uncached reads into owned packed compute weights for every model family.
 /// Does not modify the source file or manufacture model/dtype defaults.
 enum ResidentSafetensorsReader {
-    static func shouldUse(requiresOwnedCompute: Bool, readerOverride: String?) -> Bool {
-        #if canImport(Darwin)
-        return requiresOwnedCompute && readerOverride != "mmap"
-        #else
-        return false
-        #endif
-    }
     struct InvalidFile: LocalizedError {
         let detail: String
         var errorDescription: String? { "Resident safetensors reader: \(detail)" }
@@ -53,38 +48,49 @@ enum ResidentSafetensorsReader {
         "BOOL": .bool, "U8": .uint8, "U16": .uint16, "U32": .uint32, "U64": .uint64,
         "I8": .int8, "I16": .int16, "I32": .int32, "I64": .int64,
         "F16": .float16, "BF16": .bfloat16, "F32": .float32, "F64": .float64,
+        "C64": .complex64, "F8_E4M3": .uint8, "F8_E8M0": .uint8,
     ]
 
-    /// Read an already validated tensor span into owned MLX storage. This keeps
-    /// native packed weights intact and avoids retaining a second mapped copy.
+    /// One owned MLX allocation, filled directly from the verified descriptor.
+    static func loadRegion(file: FileHandle, offset: UInt64, length: Int,
+                           shape: [Int], dtype: DType) throws -> MLXArray {
+        try Task.checkCancellation()
+        guard length > 0, shape.count <= 32,
+              shape.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }) else {
+            throw InvalidFile(detail: "invalid tensor span or shape")
+        }
+        var raw = mlx_array_new()
+        var dimensions = shape.map(Int32.init)
+        do {
+            let status = try withError {
+                vmlx_resident_file_array(&raw.ctx, file.fileDescriptor, offset, length,
+                    &dimensions, Int32(dimensions.count), Int32(dtype.cmlxDtype.rawValue))
+            }
+            guard status == 0 else { throw InvalidFile(detail: "owned tensor read failed") }
+        } catch {
+            mlx_array_free(raw)
+            throw error
+        }
+        let result = MLXArray(raw)
+        try Task.checkCancellation()
+        return result
+    }
+
     static func loadRegion(url: URL, offset: UInt64, length: Int,
                            shape: [Int], dtype: DType) throws -> MLXArray {
-        func read() throws -> MLXArray {
-            try Task.checkCancellation()
-            guard url.isFileURL else { throw InvalidFile(detail: "not a file URL") }
-            let file = try FileHandle(forReadingFrom: url)
-            defer { try? file.close() }
-            #if canImport(Darwin)
-            guard fcntl(file.fileDescriptor, F_NOCACHE, 1) == 0 else {
-                throw InvalidFile(detail: "uncached I/O unavailable (errno \(errno))")
-            }
-            #endif
-            let fileSize = try file.seekToEnd()
-            guard fileSize <= UInt64(Int.max), offset <= fileSize, length > 0,
-                UInt64(length) <= fileSize - offset else {
-                throw InvalidFile(detail: "tensor region outside file")
-            }
-            try file.seek(toOffset: offset)
-            let data = try readExactly(file, count: length, fileSize: Int(fileSize))
-            let array = MLXArray(data, shape, dtype: dtype)
-            MLX.eval(array)
-            return array
-        }
+        guard url.isFileURL else { throw InvalidFile(detail: "not a file URL") }
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        return try loadRegion(file: file, offset: offset, length: length, shape: shape, dtype: dtype)
+    }
+
+    /// Shared by base models and speculative companion models. Linux keeps the
+    /// stock allocator-owned loader; Darwin also avoids duplicate filesystem cache.
+    static func loadWeights(url: URL, excludingKeys: Set<String> = []) throws -> ([String: MLXArray], [String: String]) {
         #if canImport(Darwin)
-        // Drain Foundation buffers per tensor, not after the full async load.
-        return try autoreleasepool(invoking: read)
+        return try load(url: url, excludingKeys: excludingKeys)
         #else
-        return try read()
+        return try MLX.loadArraysAndMetadata(url: url, excludingKeys: excludingKeys)
         #endif
     }
 
@@ -152,16 +158,23 @@ enum ResidentSafetensorsReader {
         for (name, entry) in ordered where !excludingKeys.contains(name) {
             try Task.checkCancellation()
             try autoreleasepool {
-                try file.seek(toOffset: UInt64(dataStart + entry.data_offsets[0]))
-                let data = try readExactly(file, count: entry.data_offsets[1] - entry.data_offsets[0], fileSize: Int(status.st_size))
-                // Empty tensors are legal safetensors entries. Avoid the Data
-                // initializer's forced baseAddress unwrap for a zero-byte buffer.
-                let array = data.isEmpty
+                let count = entry.data_offsets[1] - entry.data_offsets[0]
+                let array = count == 0
                     ? MLXArray.zeros(entry.shape, dtype: dtypes[entry.dtype]!)
-                    : MLXArray(data, entry.shape, dtype: dtypes[entry.dtype]!)
-                MLX.eval(array)
+                    : try loadRegion(file: file, offset: UInt64(dataStart + entry.data_offsets[0]),
+                                     length: count, shape: entry.shape, dtype: dtypes[entry.dtype]!)
                 arrays[name] = array
             }
+        }
+        var finalStatus = stat()
+        guard fstat(file.fileDescriptor, &finalStatus) == 0,
+              finalStatus.st_dev == status.st_dev, finalStatus.st_ino == status.st_ino,
+              finalStatus.st_size == status.st_size,
+              finalStatus.st_mtimespec.tv_sec == status.st_mtimespec.tv_sec,
+              finalStatus.st_mtimespec.tv_nsec == status.st_mtimespec.tv_nsec,
+              finalStatus.st_ctimespec.tv_sec == status.st_ctimespec.tv_sec,
+              finalStatus.st_ctimespec.tv_nsec == status.st_ctimespec.tv_nsec else {
+            throw InvalidFile(detail: "source changed while loading shard")
         }
         return (arrays, header.metadata)
         #else

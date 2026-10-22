@@ -238,28 +238,10 @@ public final class JANGHModelPreparation {
     }
 
     /// Call only after strict ordinary quantization decoding succeeds. All banks
-    /// share the mapped owner; no dense expert placeholders are constructed.
+    /// own their packed storage; no dense expert placeholders are constructed.
     public func makeRoutedExperts(activationLimit: Float?) throws
         -> [Int: any WeightedRoutedExpertLayer]
     {
-        // Explicit diagnostic only. Defaults retain the proven whole-bank route.
-        if ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1" {
-            guard source.contract.trellis.isEmpty else {
-                throw JANGHFormatContract.ValidationError.invalid(
-                    "the selected-expert diagnostic does not cover JANGT trellis layers")
-            }
-            let cacheBytes = try Self.selectedDiagnosticCacheBytes(
-                environment: ProcessInfo.processInfo.environment)
-            let env = ProcessInfo.processInfo.environment
-            guard !(env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1" &&
-                    env["VMLX_JANGH_STABLE_FILE_MAPPINGS"] == "1") else {
-                throw JANGHFormatContract.ValidationError.invalid("conflicting JANGH mapping diagnostics")
-            }
-            let storage: JANGHExpertMappedBanks.Storage = env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1"
-                ? .wholeBankViews : (env["VMLX_JANGH_STABLE_FILE_MAPPINGS"] == "1" ? .stableFileMappings : .independentMappings)
-            return try makeSelectedRoutedExperts(activationLimit: activationLimit, cacheByteLimit: cacheBytes,
-                                                storage: storage)
-        }
         let banks = try mapBanks()
         let trellis = source.contract.trellis
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in

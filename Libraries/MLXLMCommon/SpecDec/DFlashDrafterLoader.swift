@@ -57,7 +57,7 @@ public enum DFlashDrafterLoader {
         if let enumerator {
             for case let url as URL in enumerator
             where url.pathExtension == "safetensors" {
-                let (w, _) = try loadArraysAndMetadata(url: url)
+                let (w, _) = try ResidentSafetensorsReader.loadWeights(url: url)
                 for (k, v) in w { weights[k] = v }
             }
         }
