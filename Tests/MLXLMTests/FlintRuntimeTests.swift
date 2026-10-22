@@ -103,13 +103,17 @@ struct FlintRuntimeTests {
             #expect(allClose(full, joined, rtol: 0.02, atol: 0.02).item(Bool.self),
                     "BF16 chunk difference: \(abs(full - joined).max().item(Float.self))")
             let serialized = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
-            var restored = m.newCache(parameters: nil)
-            #expect(restoreFromDiskArrays(serialized, into: &restored, requirePromptBoundary: true) == 13)
-            #expect(restored[0] is AttentionSinkKVCache)
-            let next = MLXArray([Int32(14)]).reshaped(1, 1)
-            let expected = m(next, cache: cache)
-            let actual = m(next, cache: restored)
-            #expect(arrayEqual(expected, actual).item(Bool.self))
+            for suffix: [Int32] in [[14], [14, 15, 16]] {
+                var restored = m.newCache(parameters: nil)
+                #expect(restoreFromDiskArrays(serialized, into: &restored, requirePromptBoundary: true) == 13)
+                #expect(restored[0] is AttentionSinkKVCache)
+                #expect(!requiredToolSelectionSkipsDiskBackedRestore(
+                    model: m, cache: restored, restorePolicy: .freshRequiredToolSelection))
+                let next = MLXArray(suffix).reshaped(1, suffix.count)
+                let expected = m(next, cache: cache.map { $0.copy() })
+                let actual = m(next, cache: restored)
+                #expect(arrayEqual(expected, actual).item(Bool.self))
+            }
         }
     }
 

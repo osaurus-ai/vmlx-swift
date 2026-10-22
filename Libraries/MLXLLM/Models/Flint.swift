@@ -179,7 +179,7 @@ final class FlintBackbone: Module {
     }
 }
 
-public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding {
+public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding, PrefixCacheInvariantModel {
     private var customTensorNames: Set<String> = []
     let configuration: FlintConfiguration
     let model: FlintBackbone
@@ -190,6 +190,11 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, Safet
     public var preservesCheckpointParameterDTypes: Bool { true }
     public var cacheStorageDTypeIdentity: String? { "flint-bf16-sinks-v1" }
     public var supportsWholeForwardCompilation: Bool { false }
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { false }
+    // Text-only causal attention. Serialized prefix state (including wrapped
+    // SWA rings and learned sinks) is exact for each subsequent suffix; see
+    // FlintRuntimeTests.chunkedAndDiskRestore before broadening this contract.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
 
     public init(_ c: FlintConfiguration) throws {
         try c.validate()
