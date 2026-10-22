@@ -60,6 +60,9 @@ final class LaneQMMTargetClassificationTests: XCTestCase {
             let growth = Memory.peakMemory - before
             print("lane-install packedBytes=\(packedBytes) peakGrowth=\(growth)")
             XCTAssertEqual(report.tiled, 8)
+            XCTAssertTrue(target.projections.allSatisfy {
+                ($0 as? LaneQuantizedLinear)?.laneTiled == true
+            }, "Partial module updates must preserve every earlier accelerated projection")
             XCTAssertLessThan(growth, packedBytes / 2,
                               "A bounded tiling batch must not retain the entire original bank")
             for (projection, reference) in zip(target.projections, expected) {
