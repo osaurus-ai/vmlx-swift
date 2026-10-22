@@ -42,7 +42,7 @@ struct VMLXMemorySafetySettingsTests {
         #expect(plan.allowed)
         #expect(plan.loadConfiguration.memoryLimit == .fraction(0.70))
         #expect(plan.loadConfiguration.maxResidentBytes == .absolute(128 << 20))
-        #expect(plan.loadConfiguration.useMmapSafetensors)
+        #expect(!plan.loadConfiguration.useMmapSafetensors)
         #expect(plan.cache.prefix.enabled)
         #expect(!plan.cache.pagedKV.enabled)
         #expect(plan.cache.blockDisk.enabled)
@@ -208,7 +208,7 @@ struct VMLXMemorySafetySettingsTests {
         #expect(encoded?["allowExperimentalMLXPress"] == nil)
     }
 
-    @Test("near-RAM-scale packs materialize instead of mmap when they fit")
+    @Test("owned loading preserves near-RAM allowance and explicit safety limits")
     func nearRAMScalePacksMaterializeInsteadOfMmapWhenTheyFit() {
         var settings = VMLXServerRuntimeSettings()
         let hy3Scale = LoadBundleFacts(
@@ -223,25 +223,26 @@ struct VMLXMemorySafetySettingsTests {
             bundleFacts: hy3Scale)
         #expect(!plan.loadConfiguration.useMmapSafetensors)
         #expect(plan.loadConfiguration.memoryLimit == .fraction(94.0 / 128.0 + 0.06))
-        #expect(plan.warnings.contains { $0.contains("materialized instead of mmap") })
+        #expect(plan.warnings.contains { $0.contains("using owned weights") })
 
         // A user-pinned load fraction wins: the rule must not override it.
         settings.memorySafety.customPhysicalMemoryFraction = 0.75
         let pinned = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: hy3Scale)
-        #expect(pinned.loadConfiguration.useMmapSafetensors)
+        #expect(!pinned.loadConfiguration.useMmapSafetensors)
         #expect(pinned.loadConfiguration.memoryLimit == .fraction(0.75))
 
-        // Strict mode never opts in.
+        // Strict keeps its original cap; ownership is independent of the safety profile.
         settings.memorySafety.customPhysicalMemoryFraction = nil
         settings.memorySafety.mode = .strict
         let strict = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: hy3Scale)
-        #expect(strict.loadConfiguration.useMmapSafetensors)
+        #expect(!strict.loadConfiguration.useMmapSafetensors)
+        #expect(strict.loadConfiguration.memoryLimit == .fraction(0.60))
 
-        // A pack that cannot fit in RAM keeps mmap streaming.
+        // An oversized pack must not silently gain a larger allowance or mmap fallback.
         settings.memorySafety.mode = .safeAuto
         let cannotFit = LoadBundleFacts(
             totalSafetensorsBytes: 30 << 30,
@@ -252,8 +253,9 @@ struct VMLXMemorySafetySettingsTests {
         let oversized = settings.resolvedMemorySafetyPlan(
             baseLoadConfiguration: .osaurusProduction,
             bundleFacts: cannotFit)
-        #expect(oversized.loadConfiguration.useMmapSafetensors)
-        #expect(!oversized.warnings.contains { $0.contains("materialized instead of mmap") })
+        #expect(!oversized.loadConfiguration.useMmapSafetensors)
+        #expect(oversized.loadConfiguration.memoryLimit == .fraction(0.70))
+        #expect(!oversized.warnings.contains { $0.contains("using owned weights") })
     }
 
     @Test("memory safety preserves hybrid SSM and engine selected cache topology")

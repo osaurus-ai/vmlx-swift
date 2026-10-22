@@ -234,7 +234,7 @@ struct VMLXServerRuntimeSettingsTests {
 
         #expect(resolved.maxResidentBytes == .default)
         #expect(resolved.memoryLimit == .default)
-        #expect(resolved.useMmapSafetensors)
+        #expect(!resolved.useMmapSafetensors)
         #expect(!resolved.nativeMTP)
         #expect(resolved.deepseekV4ActivationQAT == false)
     }

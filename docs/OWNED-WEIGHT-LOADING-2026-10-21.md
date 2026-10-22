@@ -47,3 +47,15 @@ call in the Off run. These single samples establish routing and disclose a
 code loss; they do not establish an adaptive speedup or matched end-to-end gain.
 Fused GDN and hyper projection routes remained active. Other speculative
 families and concurrent/delegated requests are still under qualification.
+
+Compatibility follow-up: 53 Swift Testing cases across
+`VMLXMemorySafetySettingsTests`, `MemorySafetyLevelTests` and
+`VMLXServerRuntimeSettingsTests` pass. They retain profile/default/custom caps,
+Strict unknown/over-budget refusals, persisted cache opt-outs, sampler inheritance,
+legacy policy migration and DFlash2 precedence/Off checks. Assertions that formerly
+required mmap now require owned loading, the explicitly requested storage change;
+Strict and custom limits were not relaxed. Local test signing initially failed
+because an older diagnostic copied metallibs outside `Contents/Resources`; those
+generated duplicates were moved out of the test bundle. Failures and final raw
+results remain in the private evidence ledger. No product signing workaround was
+added.
