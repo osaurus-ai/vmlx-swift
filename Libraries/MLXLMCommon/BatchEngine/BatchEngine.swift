@@ -2908,10 +2908,37 @@ public actor BatchEngine {
         // safe for paged and L2 disk storage under the prompt-token key.
         // The captured DSV4 N-1 seed replaces the unusable exact-prompt
         // snapshot. Retain one cache copy through decode, not two.
-        slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: slot.cache,
-            storageEnabled: cacheCoordinator?.canPersistBoundaries == true
-                && slot.originalInput.cachePromptIntent != .auxiliary)
+        let retainsPrompt = cacheCoordinator?.canPersistBoundaries == true
+            && slot.originalInput.cachePromptIntent != .auxiliary
+        // Disk-only self-contained caches need a checkpoint, not a second
+        // resident KV bank for the entire answer. Recurrent companion/paged
+        // topologies keep their current contract until their complete state
+        // has the same disk-owned lifetime proof.
+        if retainsPrompt, let coordinator = cacheCoordinator,
+           coordinator.pagedCache == nil, !coordinator.isHybrid,
+           !cacheRequiresPrefillCapturedDiskSeed(slot.cache),
+           DiskPromptSnapshot.supports(slot.cache),
+           let disk = coordinator.diskCache {
+            let start = Date()
+            do {
+                slot.promptDiskSnapshot = try DiskPromptSnapshot.capture(
+                    cache: slot.cache, tokenCount: slot.cachePromptTokenIds.count,
+                    directory: disk.cacheDir)
+                slot.promptCacheSnapshot = nil
+                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                    FileHandle.standardError.write(Data(
+                        "[vmlx][cache/prompt-spill] stored tokens=\(slot.cachePromptTokenIds.count) bytes=\(slot.promptDiskSnapshot?.byteCount ?? 0) ms=\(Date().timeIntervalSince(start) * 1000) retainedPromptArrays=false\n".utf8))
+                }
+            } catch {
+                // Disk failures retain the existing checkpoint behavior; do
+                // not mislabel a failed spill as SSD-owned or lose cache safety.
+                Self.logger.error("Prompt checkpoint spill failed: \(error.localizedDescription, privacy: .public)")
+                slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: slot.cache)
+            }
+        } else {
+            slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
+                from: slot.cache, storageEnabled: retainsPrompt)
+        }
 
         let tokenID = firstToken.item(Int.self)
         try error.check()
@@ -3577,6 +3604,7 @@ public actor BatchEngine {
             // snapshot as soon as they finish instead of holding it until the
             // scheduler's next completed-slot cleanup pass.
             liveSlot.promptCacheSnapshot = nil
+            liveSlot.promptDiskSnapshot = nil
             liveSlot.diskSeedSnapshot = nil
             liveSlot.prefillReplaySeed?.discard()
             liveSlot.prefillReplaySeed = nil
@@ -3618,8 +3646,19 @@ public actor BatchEngine {
             synchronizeCompiledRotatingCacheMetadataForStorage(slot.cache)
             let promptTokens = slot.cachePromptTokenIds
             let hasHybridPool = slot.cache.contains { $0 is HybridPoolCache }
-            let promptCacheSnapshot = slot.promptCacheSnapshot
-                ?? (hasHybridPool ? nil : makePromptBoundaryCacheSnapshot(from: slot.cache))
+            let promptCacheSnapshot: [KVCache]?
+            if let diskSnapshot = slot.promptDiskSnapshot {
+                do {
+                    promptCacheSnapshot = try diskSnapshot.restore(
+                        into: context.model.newCache(parameters: slot.parameters))
+                } catch {
+                    Self.logger.error("Prompt checkpoint restore failed; refusing stale prompt store: \(error.localizedDescription, privacy: .public)")
+                    promptCacheSnapshot = nil
+                }
+            } else {
+                promptCacheSnapshot = slot.promptCacheSnapshot
+                    ?? (hasHybridPool ? nil : makePromptBoundaryCacheSnapshot(from: slot.cache))
+            }
             let capturedDiskSeed = slot.diskSeedSnapshot
             if let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed {
                 let storageSnapshotTokenCount = promptCacheSnapshot == nil

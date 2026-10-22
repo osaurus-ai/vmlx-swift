@@ -79,6 +79,9 @@ struct BatchSlot {
     /// not the live decode cache, because coordinator keys are prompt-only.
     var promptCacheSnapshot: [KVCache]?
 
+    /// Disk-owned prompt state; no full prompt arrays retained during decode.
+    var promptDiskSnapshot: DiskPromptSnapshot?
+
     /// Exact prompt-minus-one cache state captured during prefill for typed
     /// disk-only topologies (currently DSV4 SWA + compressor/indexer pools)
     /// that cannot be losslessly trimmed after their rotating window wraps.

@@ -100,6 +100,17 @@ enum ResidentSafetensorsReader {
         guard url.isFileURL else { throw InvalidFile(detail: "not a file URL") }
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
+        return try load(file: file, excludingKeys: excludingKeys)
+        #else
+        return try MLX.loadArraysAndMetadata(url: url, excludingKeys: excludingKeys)
+        #endif
+    }
+
+    /// Caller-owned descriptor, including an unlinked transient SSD checkpoint.
+    static func load(file: FileHandle, excludingKeys: Set<String> = []) throws -> ([String: MLXArray], [String: String]) {
+        #if canImport(Darwin)
+        try Task.checkCancellation()
+        try file.seek(toOffset: 0)
         guard fcntl(file.fileDescriptor, F_NOCACHE, 1) == 0 else {
             throw InvalidFile(detail: "uncached I/O unavailable (errno \(errno))")
         }
@@ -178,7 +189,8 @@ enum ResidentSafetensorsReader {
         }
         return (arrays, header.metadata)
         #else
-        throw InvalidFile(detail: "uncached owned reader requires Darwin")
+        return try MLX.loadArraysAndMetadata(
+            url: URL(fileURLWithPath: "/proc/self/fd/\(file.fileDescriptor)"), excludingKeys: excludingKeys)
         #endif
     }
 

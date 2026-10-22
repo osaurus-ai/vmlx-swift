@@ -331,21 +331,30 @@ enum SafetensorsByteWriter {
     /// 103 -> 57 ms (5 rounds). The writer thread finishes each queued store sooner, so the write-behind
     /// queue (and the payload memory it holds) drains sooner.
     @discardableResult
-    static func write(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
+    static func write(_ tensors: [Tensor], metadata: [String: String], to url: URL, uncached: Bool = false) throws -> Int {
         if gatheredWrites {
-            return try writeGathered(tensors, metadata: metadata, to: url)
+            return try writeGathered(tensors, metadata: metadata, to: url, uncached: uncached)
         }
-        return try writePerTensor(tensors, metadata: metadata, to: url)
+        return try writePerTensor(tensors, metadata: metadata, to: url, uncached: uncached)
+    }
+
+    private static func configureUncachedWrite(_ fd: Int32, enabled: Bool) throws {
+        #if canImport(Darwin)
+        if enabled, fcntl(fd, F_NOCACHE, 1) != 0 {
+            throw GatheredWriteError.openFailed(errno)
+        }
+        #endif
     }
 
     /// One `write` per tensor (per strided run) through `FileHandle`.
-    static func writePerTensor(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
+    static func writePerTensor(_ tensors: [Tensor], metadata: [String: String], to url: URL, uncached: Bool = false) throws -> Int {
         let header = try header(for: tensors, metadata: metadata)
         guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
             throw WriteError.cannotCreate(url.lastPathComponent)
         }
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
+        try configureUncachedWrite(handle.fileDescriptor, enabled: uncached)
         try handle.write(contentsOf: header)
         var size = header.count
         for tensor in tensors where tensor.byteCount > 0 {
@@ -370,11 +379,12 @@ enum SafetensorsByteWriter {
     /// split segments and multi-call files.
     nonisolated(unsafe) static var maxGatheredCallBytes = 1 << 30
 
-    static func writeGathered(_ tensors: [Tensor], metadata: [String: String], to url: URL) throws -> Int {
+    static func writeGathered(_ tensors: [Tensor], metadata: [String: String], to url: URL, uncached: Bool = false) throws -> Int {
         let header = try header(for: tensors, metadata: metadata)
         let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
         guard fd >= 0 else { throw GatheredWriteError.openFailed(errno) }
         defer { close(fd) }
+        try configureUncachedWrite(fd, enabled: uncached)
         // Every segment points into memory that outlives this call: the header `Data` (kept below),
         // contiguous tensor `Data`, or a strided run of an MLX buffer the caller keeps alive.
         var segments: [(UnsafeRawPointer, Int)] = []
