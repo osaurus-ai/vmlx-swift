@@ -2563,12 +2563,12 @@ public actor BatchEngine {
     private func storePrefillCapturedDiskSeed(
         _ snapshot: [KVCache],
         for slot: BatchSlot
-    ) {
+    ) -> Bool {
         guard slot.originalInput.cachePromptIntent != .auxiliary,
             let coordinator = cacheCoordinator,
             slot.cachePromptTokenIds.count > 1,
             CacheStoreBudget.canStore(snapshot)
-        else { return }
+        else { return false }
 
         let tokens = Array(slot.cachePromptTokenIds.dropLast())
         let diskStoreCache = makeDiskStoreCache(
@@ -2583,11 +2583,16 @@ public actor BatchEngine {
             ssmStates: nil,
             cache: diskStoreCache,
             mediaSalt: slot.cacheSalt(forBoundary: tokens.count),
-            chainId: slot.parameters.cacheChainId)
+            chainId: slot.parameters.cacheChainId,
+            isResumeBoundary: true)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
         }
+        // This includes admitted in-flight stores; durability is reported by
+        // the writer separately. A rejected store must retain the finalization path.
+        return coordinator.hasValidatedDiskEntry(
+            tokens: tokens, mediaSalt: slot.cacheSalt(forBoundary: tokens.count))
     }
 
     private func stepPrefillAfterCacheLookup(
@@ -2631,6 +2636,10 @@ public actor BatchEngine {
                 let prepared = try PrefillProgressReporter.withHandler({
                     progressAccumulator.report(completedInPrepare: $0)
                 }) {
+                    // Standalone rotating/SWA caches (including Flint's sinks)
+                    // also need this exact N-1 checkpoint: a wrapped ring cannot
+                    // be trimmed after decode, and rebuilding it made each tool
+                    // turn replay ~21k tokens before the tool could execute.
                     // DSV4's typed disk cache contains every SWA/CSA/HSA state,
                     // but after its 128-token local ring wraps it cannot produce a
                     // lossless N-1 checkpoint by trimming the completed prompt.
@@ -2642,7 +2651,8 @@ public actor BatchEngine {
                         slot.originalInput.cachePromptIntent != .auxiliary
                         && cacheCoordinator?.canPersistBoundaries == true
                         && slot.diskSeedSnapshot == nil
-                        && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
+                        && (cacheRequiresPrefillCapturedDiskSeed(slot.cache)
+                            || cacheHasStandaloneRotatingWindowState(slot.cache))
                         && !slot.originalInput.hasMediaContent
                         && !slot.originalInput.requiresPostPrepareCacheKey
                         && !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)
@@ -2670,8 +2680,9 @@ public actor BatchEngine {
                         try error.check()
                         let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
                             from: slot.cache)
-                        storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
-                        // The synchronous store above owns the N-1 boundary now.
+                        slot.prefillStoredDiskSeed = storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
+                        // The store call transfers the N-1 boundary to the coordinator.
+                        // The writer may still be in flight; keep only its admission receipt.
                         // Do not keep the duplicate SWA/pool state through decode.
                         slot.diskSeedSnapshot = nil
                         progressAccumulator.report(
@@ -2803,7 +2814,8 @@ public actor BatchEngine {
                 let chunkSize = max(1, slot.prefillStepSize)
                 let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
                 let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
-                if slot.originalInput.cachePromptIntent != .auxiliary,
+                if !slot.prefillStoredDiskSeed,
+                    slot.originalInput.cachePromptIntent != .auxiliary,
                     slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
                     cacheCoordinator?.canPersistBoundaries == true,
                     !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
@@ -3988,6 +4000,7 @@ public actor BatchEngine {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
                 if !usesCanonicalHybridBoundary,
+                   !slot.prefillStoredDiskSeed,
                    !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
@@ -4032,6 +4045,9 @@ public actor BatchEngine {
                         ? boundary - 1
                         : boundary
                     let boundaryTokens = Array(promptTokens.prefix(storeBoundary))
+                    if slot.prefillStoredDiskSeed, storeBoundary == promptTokens.count - 1 {
+                        continue
+                    }
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
