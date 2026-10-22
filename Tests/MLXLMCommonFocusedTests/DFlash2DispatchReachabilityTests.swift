@@ -33,6 +33,23 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
         return try String(contentsOf: url, encoding: .utf8)
     }
 
+    func testStagedVerificationDoesNotEnableCompilationWithoutPromotedCaches() throws {
+        let text = try source("Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift")
+        let promotionStart = try XCTUnwrap(text.range(of: "if useStagedVerify, HardwareInfo.isCompiledDecodeSupported"))
+        let promotionEnd = try XCTUnwrap(text.range(of: "self.useCompiledVerify = true"))
+        let promotion = text[promotionStart.lowerBound..<promotionEnd.upperBound]
+        XCTAssertTrue(promotion.contains("VMLX_DFLASH2_COMPILED_VERIFY"))
+        XCTAssertTrue(promotion.contains("CompilableKVCache(from: layer"))
+        XCTAssertTrue(text.contains("if !useCompiledVerify || !stagedWarmedSizes.contains(bs) {"),
+                      "Default eager staging must not build a compiled forward on cycle two")
+        XCTAssertEqual(text.components(separatedBy: "self.useCompiledVerify = true").count - 1, 1)
+        let abandonStart = try XCTUnwrap(text.range(of: "private mutating func abandonInFlightVerify("))
+        let abandonEnd = try XCTUnwrap(text.range(of: "private mutating func buildCompiledVerify("))
+        XCTAssertTrue(text[abandonStart.lowerBound..<abandonEnd.lowerBound]
+            .contains("compiledVerify.removeAll(keepingCapacity: true)"),
+            "Replacing staging slots must release traces that captured the old arrays")
+    }
+
     /// `BatchEngine.generate` is what the host chat window calls. Missing
     /// here means speculation silently never runs in the product, which is
     /// exactly the bug this file was written for.
