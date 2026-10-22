@@ -5,17 +5,6 @@ import Testing
 
 @Suite(.serialized)
 struct ResidentSafetensorsReaderTests {
-    @Test func ownedComputeSelectsUncachedWithoutChangingOtherModels() {
-        #if canImport(Darwin)
-        #expect(ResidentSafetensorsReader.shouldUse(requiresOwnedCompute: true, readerOverride: nil))
-        #expect(ResidentSafetensorsReader.shouldUse(requiresOwnedCompute: true, readerOverride: "uncached"))
-        #expect(!ResidentSafetensorsReader.shouldUse(requiresOwnedCompute: true, readerOverride: "mmap"))
-        for override in [nil, "uncached", "mmap"] as [String?] {
-            #expect(!ResidentSafetensorsReader.shouldUse(requiresOwnedCompute: false, readerOverride: override))
-        }
-        #endif
-    }
-
     @Test func cancellationPreventsAnyReadOrAllocation() async {
         let task = Task {
             while !Task.isCancelled { await Task.yield() }
@@ -34,13 +23,51 @@ struct ResidentSafetensorsReaderTests {
         try MLXMetalTestLock.withLock {
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-chunks-\(UUID()).safetensors")
             defer { try? FileManager.default.removeItem(at: url) }
-            // A little over the 4-MiB physical read chunk, with a partial EOF page.
-            let expected = MLXArray((0..<(1024 * 1024 + 3)).map { UInt32($0) })
+            // A little over the 8-MiB physical read chunk, with a partial EOF page.
+            let expected = MLXArray((0..<(2 * 1024 * 1024 + 3)).map { UInt32($0) })
             try MLX.save(arrays: ["w": expected], url: url)
             let (loaded, _) = try ResidentSafetensorsReader.load(url: url, excludingKeys: [])
             let actual = try #require(loaded["w"])
             #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
             #expect(MLX.all(actual .== expected).item(Bool.self))
+        }
+    }
+
+    @Test func directRegionsOwnBytesAfterSourceMutation() throws {
+        try MLXMetalTestLock.withLock {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-regions-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let original = (0..<(96 * 1024 + 19)).map { UInt8(truncatingIfNeeded: $0 * 17 + 3) }
+            try Data(original).write(to: url)
+            let file = try FileHandle(forReadingFrom: url)
+            var loaded: [(Int, Int, MLXArray)] = []
+            for (offset, count) in [(0, 1), (1, 33), (8191, 32777), (16384, 32768), (65537, 32786)] {
+                let array = try ResidentSafetensorsReader.loadRegion(file: file,
+                    offset: UInt64(offset), length: count, shape: [count], dtype: .uint8)
+                #expect(!WeightBacking.sharesMappedShard(array))
+                loaded.append((offset, count, array))
+            }
+            try file.close()
+            let writer = try FileHandle(forWritingTo: url)
+            try writer.write(contentsOf: Data(repeating: 0, count: original.count))
+            try writer.close()
+            for (offset, count, array) in loaded {
+                #expect(array.asArray(UInt8.self) == Array(original[offset..<(offset + count)]))
+            }
+        }
+    }
+
+    @Test func directRegionsRejectInvalidSpans() throws {
+        try MLXMetalTestLock.withLock {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("resident-bounds-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try Data(repeating: 42, count: 32).write(to: url)
+            for (offset, length, shape) in [(UInt64.max, 4, [1]), (31, 4, [1]), (0, 8, [1]), (0, 4, [-1])] {
+                #expect(throws: (any Error).self) {
+                    _ = try ResidentSafetensorsReader.loadRegion(url: url, offset: offset,
+                        length: length, shape: shape, dtype: .uint32)
+                }
+            }
         }
     }
 

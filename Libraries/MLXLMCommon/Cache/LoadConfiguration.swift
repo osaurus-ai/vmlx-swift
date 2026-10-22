@@ -61,17 +61,8 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// Explicit initializer values and subsequent assignments are never auto-raised.
     public private(set) var memoryLimitWasExplicit: Bool
 
-    /// Use MLX's mmap-backed safetensors loader when the pinned
-    /// `mlx-swift` build supports it. The
-    /// Osaurus MLX fork maps safetensors tensors as page-aligned
-    /// no-copy Metal buffers and creates MLX tensor views into those
-    /// buffers, avoiding the stock `pread()` copy into anonymous
-    /// allocator storage. Older MLX pins ignore the environment knobs,
-    /// so this is source- and runtime-compatible during the pin rollout.
-    ///
-    /// Default `true` because this is the part that makes cold weights
-    /// file-backed and reclaimable under pressure. Set `false` for
-    /// strict pre-mmap loader parity.
+    /// Legacy source-compatibility field. Model weights always use owned storage;
+    /// true no longer enables file-backed mappings.
     public var useMmapSafetensors: Bool
 
     /// Load preserved native-MTP tensors and instantiate model-owned MTP
@@ -105,7 +96,7 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// and reloading the model.
     public var deepseekV4ActivationQAT: Bool?
 
-    /// Canonical mmap loading with the existing allocator and memory policies.
+    /// Canonical owned-weight loading with the existing allocator and memory policies.
     public static let `default` = LoadConfiguration()
     public static let osaurusProduction = LoadConfiguration.default
 
@@ -120,7 +111,7 @@ public struct LoadConfiguration: Sendable, Equatable {
     public init(
         maxResidentBytes: ResidentCap = .default,
         memoryLimit: ResidentCap? = nil,
-        useMmapSafetensors: Bool = true,
+        useMmapSafetensors: Bool = false,
         nativeMTP: Bool = false,
         deepseekV4ActivationQAT: Bool? = nil
     ) {
@@ -132,16 +123,15 @@ public struct LoadConfiguration: Sendable, Equatable {
         self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
     }
 
-    /// A scheduling budget, not a physical-footprint limit. Mapped weights remain
-    /// charged by MLX even when their pages are cold. Do not endlessly drain GPU
-    /// work for an automatically admitted JANGH bundle larger than the generic cap.
-    /// Explicit limits, unsupported formats and oversized bundles remain unchanged.
+    /// A scheduling budget, not a physical-footprint limit. Every family owns
+    /// its packed weights; an automatic allowance below them would repeatedly
+    /// drain GPU work and reusable buffers. Explicit limits and oversized or
+    /// unknown bundles remain admission decisions, never silently raised.
     func resolvedSchedulingMemoryLimit(
         facts: LoadBundleFacts, recommendedWorkingSetBytes: Int?
     ) -> ResidentCap {
         let ordinary = facts.resolveMLXMemoryLimit(requested: memoryLimit)
-        guard !memoryLimitWasExplicit, facts.customRoutedFormat == .janghV2,
-            facts.isRouted, facts.gpuResidentWeightBytes > 0,
+        guard !memoryLimitWasExplicit, facts.gpuResidentWeightBytes > 0,
             let recommendedWorkingSetBytes, recommendedWorkingSetBytes > 0,
             let base = ordinary.resolve(physicalMemory: facts.physicalMemory)
         else { return ordinary }
@@ -661,7 +651,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     }
 
     public func resolveMmapSafetensors(requested: Bool) -> Bool {
-        requested && !requiresResidentSafetensors
+        false // File-backed model-weight ownership is retired.
     }
 
     /// A resident affine DSV4 load cannot use `MLX.Memory.memoryLimit` as a

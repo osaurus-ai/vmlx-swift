@@ -172,7 +172,7 @@ public final class MiMoV26TextModel: Module, LLMModel, KVCacheDimensionProvider,
     // Owned weights are the normal path. The explicit mapped override exists
     // for controlled residency comparisons, never as an automatic low-RAM fallback.
     private let expertStorage: MixedQuantizedExpertCatalog.Storage =
-        RuntimeEnvironment.value("VMLX_MIMO_EXPERT_STORAGE") == "mapped" ? .mapped : .resident
+        .resident
     public var requiresResidentSafetensorsWeights: Bool { expertStorage == .resident }
     private var exactExpertRegions = false
     // Retain eager rotating-cache semantics until whole-forward

@@ -33,7 +33,7 @@ final class JANGHLoadPolicyTests: XCTestCase {
             XCTAssertFalse(facts.isGlm5NextAffineJANG)
             XCTAssertFalse(facts.requiresResidentSafetensors)
             XCTAssertFalse(facts.requiresUncappedResidentPools)
-            XCTAssertTrue(facts.resolveMmapSafetensors(requested: true))
+            XCTAssertFalse(facts.resolveMmapSafetensors(requested: true))
             XCTAssertFalse(facts.resolveMmapSafetensors(requested: false))
             for cap in [ResidentCap.fraction(0.7), .absolute(12345678), .unlimited] {
                 XCTAssertEqual(facts.resolveMLXMemoryLimit(requested: cap), cap)
@@ -78,7 +78,7 @@ final class JANGHLoadPolicyTests: XCTestCase {
             XCTAssertFalse(automatic.memoryLimitWasExplicit)
             XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
                 recommendedWorkingSetBytes: 107 << 30), .absolute(100 << 30))
-            XCTAssertTrue(facts.resolveMmapSafetensors(requested: true))
+            XCTAssertFalse(facts.resolveMmapSafetensors(requested: true))
             XCTAssertFalse(facts.requiresUncappedResidentPools)
             for limit in [ResidentCap.fraction(0.7), .absolute(4 << 30), .unlimited] {
                 var explicit = LoadConfiguration(memoryLimit: limit)
@@ -138,7 +138,7 @@ final class JANGHLoadPolicyTests: XCTestCase {
         let ordinary = LoadBundleFacts(totalSafetensorsBytes: 96 << 30, isRouted: true,
             physicalMemory: 128 << 30, modelType: "naive_n05_flash")
         XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: ordinary,
-            recommendedWorkingSetBytes: 107 << 30), .default)
+            recommendedWorkingSetBytes: 107 << 30), .absolute(100 << 30))
     }
 
     func testSafeAutoHostPlanKeepsJANGHMappedAndResolvesSchedulingHeadroom() throws {
@@ -152,18 +152,18 @@ final class JANGHLoadPolicyTests: XCTestCase {
             var settings = VMLXServerRuntimeSettings()
             let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
             XCTAssertEqual(plan.loadConfiguration.memoryLimit, .absolute(100 << 30))
-            XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+            XCTAssertFalse(plan.loadConfiguration.useMmapSafetensors)
             XCTAssertEqual(plan.loadConfiguration.maxResidentBytes, .absolute(128 << 20))
             XCTAssertFalse(plan.warnings.contains { $0.contains("loading materialized") })
             settings.memorySafety.customPhysicalMemoryFraction = 0.65
             let explicit = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
             XCTAssertEqual(explicit.loadConfiguration.memoryLimit, .fraction(0.65))
-            XCTAssertTrue(explicit.loadConfiguration.useMmapSafetensors)
+            XCTAssertFalse(explicit.loadConfiguration.useMmapSafetensors)
             settings.memorySafety.customPhysicalMemoryFraction = nil
             settings.memorySafety.mode = .strict
             let strict = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
             XCTAssertEqual(strict.loadConfiguration.memoryLimit, .fraction(0.60))
-            XCTAssertTrue(strict.loadConfiguration.useMmapSafetensors)
+            XCTAssertFalse(strict.loadConfiguration.useMmapSafetensors)
         }
     }
 
@@ -176,13 +176,26 @@ final class JANGHLoadPolicyTests: XCTestCase {
         let settings = VMLXServerRuntimeSettings()
         let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
         XCTAssertEqual(plan.loadConfiguration.memoryLimit, .default)
-        XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+        XCTAssertFalse(plan.loadConfiguration.useMmapSafetensors)
         for mode in [VMLXMemorySafetyMode.balanced, .performance] {
             var settings = settings
             settings.memorySafety.mode = mode
             let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
-            XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+            XCTAssertFalse(plan.loadConfiguration.useMmapSafetensors)
             XCTAssertFalse(plan.warnings.contains { $0.contains("loading materialized") })
+        }
+    }
+
+    func testOwnedWeightSchedulingIsSharedAcrossFamilies() {
+        for family in ["qwen3_5_moe", "nemotron_h", "minicpmv", "flint", "llama"] {
+            let facts = LoadBundleFacts(totalSafetensorsBytes: 96 << 30, isRouted: family != "llama",
+                physicalMemory: 128 << 30, modelType: family)
+            XCTAssertEqual(LoadConfiguration().resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: 107 << 30), .absolute(100 << 30))
+            let explicit = LoadConfiguration(memoryLimit: .absolute(64 << 30))
+            XCTAssertEqual(explicit.resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: 107 << 30), .absolute(64 << 30))
+            XCTAssertFalse(facts.resolveMmapSafetensors(requested: true))
         }
     }
 

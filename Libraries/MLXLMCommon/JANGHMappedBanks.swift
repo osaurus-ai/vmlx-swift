@@ -7,9 +7,8 @@ import Darwin
 import Glibc
 #endif
 
-/// Owns ready mapped packed banks. No factory uses this experimental component.
-/// The MLX arrays retain the core mmap owners; no Swift raw-pointer array bridge,
-/// tensor evaluation, dequantization, stacking or contiguous bank copy is used.
+/// Owns packed banks in independent MLX allocations. Reads use leased source
+/// descriptors, with no retained file mappings or dequantized weight copy.
 final class JANGHMappedBanks {
     struct Projection {
         let packed: MLXArray
@@ -124,9 +123,8 @@ final class JANGHMappedBanks {
         guard try JANGHHeaderAdapter.identity(index) == metadata.indexIdentity else {
             throw JANGHFormatContract.ValidationError.invalid("JANGH index lease became stale before mapping")
         }
-        // `named` banks register per-expert regions in the core (codebook banks only); JANGT tensors use the plain
-        // region mapping, which is the same zero-copy mmap view.
-        func map(_ location: JANGHTensorIndexPlan.Location, named: Bool = true) throws -> MLXArray {
+        // Copy packed banks once into their final compute allocations.
+        func read(_ location: JANGHTensorIndexPlan.Location) throws -> MLXArray {
             guard let file = files[location.shard],
                 let header = metadata.shards[location.shard]?.tensors[location.tensor],
                 header.shape.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) })
@@ -139,51 +137,21 @@ final class JANGHMappedBanks {
             case "I32": dtype = .int32
             default: throw JANGHFormatContract.ValidationError.invalid("invalid JANGH mapped bank dtype")
             }
-            let page = Int(getpagesize())
-            let span = location.byteCount.addingReportingOverflow(location.fileOffset % page)
-            // Current core region helper represents its byte base with one
-            // ShapeElem dimension. Refuse overflow instead of wrapping it.
-            guard !span.overflow, span.partialValue <= Int(Int32.max) else {
-                throw JANGHFormatContract.ValidationError.invalid(
-                    "JANGH bank exceeds current mapped-region span support")
-            }
-            let path = "/dev/fd/\(file.fileDescriptor)"
-            var shape = header.shape.map(Int32.init)
-            var array = mlx_array_new()
-            do {
-                let status = try withError {
-                    path.withCString { name in
-                        named
-                            ? location.tensor.withCString { tensorName in
-                                mlx_array_new_mmap_file_region_named(
-                                    &array, name, UInt64(location.fileOffset), location.byteCount,
-                                    &shape, Int32(shape.count), dtype.cmlxDtype, tensorName)
-                            }
-                            : mlx_array_new_mmap_file_region(
-                                &array, name, UInt64(location.fileOffset), location.byteCount,
-                                &shape, Int32(shape.count), dtype.cmlxDtype)
-                    }
-                }
-                guard status == 0 else {
-                    throw JANGHFormatContract.ValidationError.invalid("JANGH mapped-region creation failed")
-                }
-            } catch {
-                mlx_array_free(array)
-                throw error
-            }
-            let result = MLXArray(array)
+            let result = try ResidentSafetensorsReader.loadRegion(
+                file: file, offset: UInt64(location.fileOffset), length: location.byteCount,
+                shape: header.shape, dtype: dtype)
             try JANGHBankLayout.requireReadyRowContiguous(result, role: location.tensor)
             return result
         }
         var mapped: [String: Projection] = [:]
         for (module, locations) in plan.projections where modules == nil || modules!.contains(module) {
-            mapped[module] = try Projection(packed: map(locations.packed), scales: map(locations.scales))
+            mapped[module] = try Projection(packed: read(locations.packed), scales: read(locations.scales))
         }
         var trellisMapped: [String: JANGTProjection] = [:]
         if modules == nil {
             for (module, t) in plan.trellis {
                 func plain(_ location: JANGHTensorIndexPlan.Location) throws -> MLXArray {
-                    try map(location, named: false)
+                    try read(location)
                 }
                 trellisMapped[module] = try JANGTProjection(
                     k: source.contract.trellis[module]!, packed: plain(t.packed), scale: plain(t.scale),
@@ -191,10 +159,8 @@ final class JANGHMappedBanks {
                     outlierWeights: plain(t.outlierWeights), columnScales: t.columnScales.map(plain))
             }
         }
-        // The C++ mapper opens /dev/fd/N while these descriptors stay alive, so
-        // pathname replacement cannot redirect a bank into a different inode.
-        // In-place writers remain forbidden for the model's mapped lifetime;
-        // before/after identity checks detect metadata-time changes, not future writes.
+        // Reads used the leased descriptors; validate the complete bank set
+        // before publication. The resulting arrays no longer depend on the files.
         for (name, file) in files {
             guard try JANGHHeaderAdapter.identity(file) == metadata.identities[name] else {
                 throw JANGHFormatContract.ValidationError.invalid("JANGH shard changed while mapping")
