@@ -54,12 +54,21 @@ final class LaneQMMTargetClassificationTests: XCTestCase {
 
 // Mirrors the Qwen3.5/MiniCPM compiled shared expert: it consumes the
 // projection's raw packed weights rather than invoking its module override.
+private final class SharedExpertProjection: Module {
+    @ModuleInfo(key: "gate_proj") var projection: QuantizedLinear
+    init(_ projection: QuantizedLinear) { _projection.wrappedValue = projection }
+}
+private final class SharedExpertMLP: Module {
+    @ModuleInfo(key: "shared_expert") var shared: SharedExpertProjection
+    init(_ projection: QuantizedLinear) { _shared.wrappedValue = SharedExpertProjection(projection) }
+}
 private final class RawSharedExpertReader: Module {
-    @ModuleInfo(key: "mlp.shared_expert.gate_proj") var projection: QuantizedLinear
-    @ModuleInfo(key: "self_attn.q_proj") var attention: QuantizedLinear
+    @ModuleInfo(key: "mlp") var mlp: SharedExpertMLP
+    @ModuleInfo(key: "attention") var attention: QuantizedLinear
+    var projection: QuantizedLinear { mlp.shared.projection }
 
     init(_ projection: QuantizedLinear, _ attention: QuantizedLinear) {
-        _projection.wrappedValue = projection
+        _mlp.wrappedValue = SharedExpertMLP(projection)
         _attention.wrappedValue = attention
     }
 
@@ -77,13 +86,17 @@ extension LaneQMMTargetClassificationTests {
             func projection() -> QuantizedLinear {
                 // Nonuniform deterministic values expose a tile permutation;
                 // zero weights would let the old bug pass.
-                let values = MLXArray((0..<(256 * 256)).map { Float(($0 * 17 + $0 / 256) % 113 - 56) / 113 })
-                    .reshaped(256, 256).asType(.bfloat16)
+                let data: [Float] = (0..<(256 * 256)).map { index in
+                    let value = (index * 17 + index / 256) % 113 - 56
+                    return Float(value) / Float(113)
+                }
+                let values = MLXArray(data).reshaped(256, 256).asType(.bfloat16)
                 let (w, s, b) = MLX.quantized(values, groupSize: 64, bits: 8)
                 return QuantizedLinear(weight: w, scales: s, biases: b!, groupSize: 64, bits: 8)
             }
             let target = RawSharedExpertReader(projection(), projection())
-            let input = MLXArray((0..<256).map { Float($0 % 19 - 9) / 19 }).reshaped(1, 256).asType(.bfloat16)
+            let inputData: [Float] = (0..<256).map { Float($0 % 19 - 9) / Float(19) }
+            let input = MLXArray(inputData).reshaped(1, 256).asType(.bfloat16)
             let expected = target.rawForward(input)
             eval(expected)
             LaneQMM.installForDFlash2Target(target)
