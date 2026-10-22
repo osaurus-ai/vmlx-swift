@@ -324,7 +324,7 @@ extension LaneQMM {
         let report = install(
             model: module, tile: tiling != "0",
             tileFilter: { path in
-                tiling == "1" || !directWeightReaderPaths.contains { path.contains($0) }
+                tiling == "1" || !readsRawPackedWeight(path)
             },
             untiledMinRows: policy?.laneQMMUntiledMinRows ?? minRows,
             // SPEED-CRITICAL (Qwen3.8-27B DFlash2): the 27B keeps the PACKED scale copy — reading
@@ -380,8 +380,15 @@ extension LaneQMM {
     // projections still tile. Do not disable the fused reader or speculation.
     static let directWeightReaderPaths = [
         "linear_attn.in_proj", "linear_attn.out_proj",
-        "mlp.shared_expert.", "mlp.gate",
+        "mlp.shared_expert.",
     ]
+
+    static func readsRawPackedWeight(_ path: String) -> Bool {
+        // Router `mlp.gate` is a module name, not a prefix: dense `mlp.gate_proj`
+        // must remain eligible for tiling (notably Qwen 27B DFlash2).
+        path == "mlp.gate" || path.hasSuffix(".mlp.gate")
+            || directWeightReaderPaths.contains { path.contains($0) }
+    }
 
     /// Below this many rows an UNTILED lane module runs MLX's quantized matmul (qmv), which is faster
     /// there (27B JANG_4D 1-row forward: qmv 48.9 ms vs lane 61.4 ms). VMLX_LANE_QMM_MIN_ROWS overrides.

@@ -79,7 +79,40 @@ private final class RawSharedExpertReader: Module {
     }
 }
 
+private final class DenseGateMLP: Module {
+    @ModuleInfo(key: "gate_proj") var gate: QuantizedLinear
+    init(_ projection: QuantizedLinear) { _gate.wrappedValue = projection }
+}
+
+private final class DenseGateTarget: Module {
+    @ModuleInfo(key: "mlp") var mlp: DenseGateMLP
+    init(_ projection: QuantizedLinear) { _mlp.wrappedValue = DenseGateMLP(projection) }
+}
+
 extension LaneQMMTargetClassificationTests {
+    func testDenseGateRemainsTiledAfterRawRouterProtection() throws {
+        try FocusedMLXTestSupport.withLock {
+            guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
+            let values = MLXArray.ones([256, 256], dtype: .bfloat16)
+            let (w, s, b) = MLX.quantized(values, groupSize: 64, bits: 8)
+            let target = DenseGateTarget(QuantizedLinear(
+                weight: w, scales: s, biases: b!, groupSize: 64, bits: 8))
+            LaneQMM.installForDFlash2Target(target)
+            let lane = try XCTUnwrap(target.mlp.gate as? LaneQuantizedLinear)
+            XCTAssertTrue(lane.laneTiled, "Dense gate_proj must retain the tiled DFlash2 path")
+        }
+    }
+
+    func testRawRouterMatchDoesNotExcludeDenseGateProjection() {
+        XCTAssertTrue(LaneQMM.readsRawPackedWeight("mlp.gate"))
+        XCTAssertTrue(LaneQMM.readsRawPackedWeight("language_model.model.layers.0.mlp.gate"))
+        XCTAssertTrue(LaneQMM.readsRawPackedWeight("model.layers.0.mlp.shared_expert.gate_proj"))
+        XCTAssertTrue(LaneQMM.readsRawPackedWeight("model.layers.0.linear_attn.in_proj_qkv"))
+        XCTAssertFalse(LaneQMM.readsRawPackedWeight("model.layers.0.mlp.gate_proj"))
+        XCTAssertFalse(LaneQMM.readsRawPackedWeight("language_model.model.layers.0.mlp.gate_proj"))
+        XCTAssertFalse(LaneQMM.readsRawPackedWeight("model.layers.0.mlp.up_proj"))
+    }
+
     func testInstallingLanePreservesRawSharedExpertWeightLayout() throws {
         try FocusedMLXTestSupport.withLock {
             guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
