@@ -1,6 +1,6 @@
 # Owned model-weight loading: review checkpoint
 
-Status: implementation under validation; not ready to merge or release.
+Status: owned-loading and reproduced MiniCPM loop fixes qualified by the bounded app matrix below. App integration still requires CI; no release is requested.
 
 ## Problem and change
 
@@ -23,7 +23,7 @@ Storage does not determine numerical precision. Existing exact affine metadata a
 
 ## Open findings
 
-A growing Flint app turn rebuilt roughly 21k tokens after decoding to recreate a prompt-minus-one checkpoint, costing about 14 seconds. This is a separate boundary-storage defect, not solved by this loader change. Cache-store comments about shared copies also disagree with the current deep-copy helper and need a peak-memory audit. Real-app proof of the new loading path is pending.
+A growing Flint app turn rebuilt roughly 21k tokens after decoding to recreate a prompt-minus-one checkpoint, costing about 14 seconds. This is a separate boundary-storage defect, not solved by this loader change. Cache-store comments about shared copies also disagree with the current deep-copy helper and need a peak-memory audit. The app matrix below covers owned loading; the broader checkpoint/writer findings remain separate follow-ups.
 
 ## Follow-up policy and telemetry corrections
 
@@ -59,3 +59,48 @@ because an older diagnostic copied metallibs outside `Contents/Resources`; those
 generated duplicates were moved out of the test bundle. Failures and final raw
 results remain in the private evidence ledger. No product signing workaround was
 added.
+
+## Current app qualification and integration correction
+
+Release app ed10b0af886a22adb9a771f8a9f274cd998a0000 pins engine
+4561f961d4cdb2ba10b9dfd3251e2dd26c171489 and core
+169ba206ac423da4a2fa9cba2e2c036430f3c2ce. Core PR #27 has merged.
+
+Owned allocations exposed a previously ineligible lane-tiling path. Qwen shared
+expert/router fused readers read raw affine weights; tiling these matrices
+corrupted MiniCPM Auto output into repeated numbers. Their layouts now remain
+ordinary affine, alongside the existing raw linear-attention reader exclusions.
+Lane dispatch, other eligible tiling, fused compute and adaptive widths remain
+active. A numerical raw-reader test fails before the fix and passes afterward.
+A separate verifier correction requires explicit opt-in before compiled staged
+verification; default eager staged verification remains enabled. That correction
+alone did not fix looping, as recorded in the failed controls.
+
+Actual Osaurus MiniCPM 35B JANG_4M checks on the final code:
+
+| App action | Result | Rate | Process peak, decimal GB |
+| --- | --- | --- | --- |
+| Auto bicycle explanation | 1,043 tokens, normal stop, no loop | 64.68 tok/s | 28.34 |
+| Connected Auto explanation + calculate | Tool returns 391; final answer 391 | 68.72 / 78.15 tok/s | 28.38 |
+| UI Off bicycle control | 985 tokens, normal stop, no loop | 62.67 tok/s | 28.96 |
+
+The follow-up restored 5,296/7,584 then 7,583/7,859 tokens from SSD.
+Checkpoint writes of 173–225 MB completed in 52–60ms. Activity Monitor showed
+23.89 GB for the actual Osaurus PID; packed base weights are 24.14 decimal GB
+plus a 0.533 GB drafter. Live KV/workspace/app allocations remain necessary.
+These single sampled rows establish routing and coherency, not a general speedup.
+
+Earlier bounded owned-loader app rows also cover Ornith affine and JANGH2,
+Allosaurus JANGHT, load/unload/reload, tools and SSD restore. Inspected Activity
+Monitor readings were model-scale (Ornith affine 70.20 GB settled, H2 41.88 GB,
+Allosaurus 28.37 GB). MiniCPM Strict/Keep-in-memory Off controls preserved the
+explicit cap and disabled pinning. The earlier Allosaurus code Auto row lost
+about 3.4% versus Off; it remains disclosed above.
+
+Evidence: `~/vmlx-private-evidence/resident-weight-ownership-20261021/`, especially
+`MINICPM-FINAL-APP-PROOF.md`, `ACTIVITY-MONITOR-RAM.md`, `SETTINGS-COMPATIBILITY.md`,
+and `turns/S17-auto-layout-fixed`, `S18-auto-layout-followup`, `S19-off-layout-control`.
+No diagnostic lane/staging overrides were set in the final app run. No seeds or
+samplers were changed. Missing coverage remains explicit: calibrated Flint app
+runs, broad concurrent/delegated family matrix, and long-context/media memory
+qualification are separate work, not implied by these bounded receipts.

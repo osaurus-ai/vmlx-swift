@@ -1,6 +1,6 @@
 # Flint runtime integration
 
-Status: draft implementation, not release-qualified.
+Status: bounded runtime/app qualification below; long-context and performance limits remain open.
 
 Flint is a text-only mixture-of-experts model with plain RMSNorm, learned
 attention sinks, QK normalization, and mixed full/sliding attention. RoPE is
@@ -26,15 +26,16 @@ attention needs in RAM.
 
 ## Qualification ledger
 
-- Header/index validation of development RTN bundle: passed locally.
-- Independent tiny Python full/chunked reference: identical; fixture retained.
-- Swift fixture, chunk/ring/disk serialization restore, mixed-length batching: 8 focused tests passed. The deterministic tiny BF16 logits match the independent Python reference exactly.
-- Real Osaurus loading, connected tool turns, SSD hit, unload and host/process
-  memory attribution: pending.
-- Calibrated affine and final JANGH2: pending separate bundle qualification.
+- Independent tiny Python full/chunked fixture: deterministic BF16 logits match exactly.
+- Nine focused Swift graph/cache tests pass: full/chunked execution, wrapped sliding state, sink-cache disk serialization, one- and three-token suffix continuation, mixed-length batching and forced-tool prefix policy.
+- Twelve metadata-partition cases pass; one optional local-fixture case is skipped. Flint calibration metadata is not an executable quantization plan, and competing plans/headers remain rejected.
+- Calibrated affine 4M: actual Osaurus connected tool turns return391 then420, each normal stop, about80–81tok/s on the current integrated build. Peak process footprint25.52decimalGB for23.37GB base weights. The forced-tool follow-up restores5153/6519 then6519/6632tokens. Earlier~30k app proof records tool/code recall, new-token prefill and checkpoint storage separately.
+- Calibrated H2: final bundle loads through the actual app. Connected tools/SSD restore,~29k input and a real Helper delegation complete normally; free prose completes2044tokens at63.30tok/s, peak15.41decimalGB for13.19GB base weights. During delegation the42.60GB Ornith child is also resident by the selected keep-parent policy; total peak62.22GB falls to15.88GB after child cleanup.
+- Calibrated affine 6M: two connected app tool turns return 391 then 420 with normal stops, about 73–77 tok/s. Peak process footprint is 35.05 decimal GB for 32.83 GB base weights. Actual Activity Monitor shows 31.34 GB for PID 90009 after the follow-up; the numeric process capture and UI units remain separate.
+- The H2 sidecar admission failure and forced-tool restore omission were reproduced in the app before their fixes. No bundle, seed or sampler was edited. A later stale staging-path reload failure was external folder movement; final-path reload succeeds without a resolver change.
 
-Development RTN weights establish implementation compatibility only, not final
-model quality. Process footprint, host wired/compressed/swap, MLX active/cache,
-queued writes and on-disk bytes must be reported separately. Model-file size is
-not a total-memory accounting formula. No all-family cache-memory claim follows
-from this integration.
+Runtime source598994d44b80c365020d47f7ea94b9b78d58fd71 is built into app786085ff2f4ef32ba75f391c8f21958de1a92a32, binary SHA256 f90d91610ddebc45b3aa3f317eede6eac120abb5dfa686dae2ee1fb2805605c9. Evidence: `~/vmlx-private-evidence/resident-weight-ownership-20261021/`, `FLINT-CALIBRATED-PROGRESS.md`, final-path launch identity and turns/F11–F18 receipts/screens/raw logs. These are actual Release-app results, not RunBench substitution.
+
+Limits: H2 prefill is slower than4M here; no100+tok/s, optimal-kernel or universal speedup claim. One H2 explanation miscounts repeated additions while the calculator/result391 is correct; another prose answer under-delivers requested length. These are recorded quality limitations, not hidden or attributed to runtime without a numeric comparison.128k, aggregate concurrent writer/checkpoint memory and broader API/media qualification are separate gates. Flint is text-only; no media or speculative capability is invented.
+
+Development RTN weights establish implementation compatibility only, not final model quality. Process footprint, host wired/compressed/swap, MLX active/cache, queued writes and on-disk bytes must be reported separately. Model-file size is not a total-memory accounting formula. No all-family cache-memory claim follows from this integration.
