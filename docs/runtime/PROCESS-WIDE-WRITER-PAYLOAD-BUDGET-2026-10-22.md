@@ -25,3 +25,10 @@ also pass (nonfinite/corrupt/duplicate/quota/publication/deadlock paths).
 Not yet qualified in a newly pinned Osaurus app. Do not call this an all-model
 memory/speed fix. #643's fresh app proof is a separate scope. No sampler, kernel,
 model weights, adaptive speculation or configured RAM-safety ceiling changes.
+
+App F26/F27 inspection found that #643's deferred native N−1 save used the
+terminal store label, whose resume classification omitted that boundary. The
+prefill save had set isResumeBoundary=true. Preserve that flag in terminal
+storage too so a new N−1 record protects the current chat under quota. F26/F27
+prove memory/restore but not the corrected quota-kind flag; fresh app proof must
+show kind2, with the same chain owner, for the N−1 record.
