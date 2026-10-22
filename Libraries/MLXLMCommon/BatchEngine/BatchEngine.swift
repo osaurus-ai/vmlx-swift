@@ -4049,13 +4049,18 @@ public actor BatchEngine {
                     if slot.prefillStoredDiskSeed, storeBoundary == promptTokens.count - 1 {
                         continue
                     }
+                    // Producing a missing checkpoint can replay thousands of
+                    // tokens. A durable entry remains usable across an idle
+                    // unload/reload even before this coordinator deserializes it.
+                    // Preserve native/sidecar completeness and rejected-entry
+                    // checks through the coordinator's durable-entry contract.
                     if isStableBoundary,
-                       coordinator.hasValidatedDiskEntry(
+                       coordinator.hasDurableDiskEntry(
                         tokens: boundaryTokens,
                         mediaSalt: slot.cacheSalt(forBoundary: boundaryTokens.count))
                     {
                         Self.logger.debug(
-                            "Skipped already-validated stable system/tool cache boundary for slot \(slot.id.description, privacy: .public): \(boundary, privacy: .public) tokens"
+                            "Skipped durable stable system/tool cache boundary for slot \(slot.id.description, privacy: .public): \(boundary, privacy: .public) tokens"
                         )
                         continue
                     }
