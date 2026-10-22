@@ -17,6 +17,18 @@ private final class DenseLaneTarget: Module {
     init(_ projection: QuantizedLinear) { _proj.wrappedValue = projection }
 }
 
+private final class ManyLaneProjections: Module {
+    @ModuleInfo var projections: [QuantizedLinear]
+    init(_ count: Int) {
+        _projections.wrappedValue = (0..<count).map { index in
+            let values = MLXArray.ones([1024, 2048], dtype: .bfloat16) * Float(index + 1)
+            let (w, s, b) = MLX.quantized(values, groupSize: 64, bits: 8)
+            eval(w, s, b!)
+            return QuantizedLinear(weight: w, scales: s, biases: b!, groupSize: 64, bits: 8)
+        }
+    }
+}
+
 private final class RoutedLaneTarget: Module {
     @ModuleInfo(key: "proj") var proj: QuantizedLinear
     @ModuleInfo(key: "experts") var experts: OpaqueRoutedBank
@@ -27,6 +39,35 @@ private final class RoutedLaneTarget: Module {
 }
 
 final class LaneQMMTargetClassificationTests: XCTestCase {
+    func testTilingReleasesOldLayoutsBetweenBatches() throws {
+        try FocusedMLXTestSupport.withLock {
+            guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
+            let target = ManyLaneProjections(8)
+            let input = MLXArray.ones([1, 2048], dtype: .bfloat16)
+            let expected = target.projections.map { projection in
+                let result = projection(input)
+                eval(result)
+                return result
+            }
+            let packedBytes = target.projections.reduce(0) { $0 + $1.weight.nbytes }
+            Memory.clearCache()
+            let before = Memory.activeMemory
+            Memory.peakMemory = 0
+            let report = LaneQMM.install(
+                model: target, tile: true, tileFilter: { _ in true },
+                untiledMinRows: LaneQMM.minRows, packedScales: true,
+                evaluationBatchBytes: 4 << 20)
+            let growth = Memory.peakMemory - before
+            print("lane-install packedBytes=\(packedBytes) peakGrowth=\(growth)")
+            XCTAssertEqual(report.tiled, 8)
+            XCTAssertLessThan(growth, packedBytes / 2,
+                              "A bounded tiling batch must not retain the entire original bank")
+            for (projection, reference) in zip(target.projections, expected) {
+                XCTAssertTrue(arrayEqual(projection(input), reference).item(Bool.self))
+            }
+        }
+    }
+
     func testOpaqueRoutedBankKeepsNarrowAdaptiveCandidate() throws {
         try FocusedMLXTestSupport.withLock {
             guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }

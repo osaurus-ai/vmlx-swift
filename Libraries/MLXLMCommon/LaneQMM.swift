@@ -402,16 +402,32 @@ extension LaneQMM {
         model: Module, tile: Bool = true, tileFilter: (String) -> Bool = { _ in true },
         untiledMinRows: Int = minRows, packedScales policyPacked: Bool = true
     ) -> InstallReport {
+        install(model: model, tile: tile, tileFilter: tileFilter,
+                untiledMinRows: untiledMinRows, packedScales: policyPacked,
+                evaluationBatchBytes: 2 << 30)
+    }
+
+    static func install(
+        model: Module, tile: Bool, tileFilter: (String) -> Bool,
+        untiledMinRows: Int, packedScales policyPacked: Bool,
+        evaluationBatchBytes: Int
+    ) -> InstallReport {
         let packedScales = packedScalesOverride ?? policyPacked
         var report = InstallReport()
         guard available() else { return report }
         var updates: [(String, Module)] = []
         var pending: [MLXArray] = []
         var pendingBytes = 0
-        let leaves = model.leafModules().flattened()
+        // Consume each strong leaf reference after visiting it. Otherwise this
+        // traversal itself keeps the complete original bank alive, even after
+        // replacing modules and evaluating the new layouts in bounded batches.
+        var leaves = model.leafModules().flattened().map { ($0.0, Optional($0.1)) }
         // Language model only (as in Python): vision towers keep MLX.
         let languageOnly = leaves.contains { $0.0.hasPrefix("language_model.") }
-        for (path, m) in leaves {
+        for index in leaves.indices {
+            let path = leaves[index].0
+            guard let m = leaves[index].1 else { continue }
+            defer { leaves[index].1 = nil }
             if languageOnly && !path.hasPrefix("language_model.") { continue }
             guard let q = m as? QuantizedLinear, !(q is LaneQuantizedLinear) else { continue }
             guard takes(q), let qb = q.biases else {
@@ -449,10 +465,15 @@ extension LaneQMM {
                 pendingBytes += sbt.nbytes
             }
             report.lane += 1
-            if pendingBytes >= 2 << 30 {
+            if pendingBytes >= evaluationBatchBytes {
                 eval(pending)
                 pending.removeAll()
                 pendingBytes = 0
+                // Evaluation alone does not release the original modules.
+                // Install this batch now, before allocating the next one.
+                model.update(modules: ModuleChildren.unflattened(updates))
+                updates.removeAll()
+                Memory.clearCache()
             }
         }
         if !pending.isEmpty { eval(pending) }
