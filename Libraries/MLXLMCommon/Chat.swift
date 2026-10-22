@@ -144,6 +144,7 @@ public enum Chat {
         }
 
         public enum Role: String, Sendable {
+            case developer
             case user
             case assistant
             case system

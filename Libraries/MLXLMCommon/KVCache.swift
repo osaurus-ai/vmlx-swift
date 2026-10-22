@@ -2340,7 +2340,7 @@ public func maybeQuantizeKVCache(
             4 + TurboQuantKVCache.defaultResidualTokens
                 + TurboQuantKVCache.minimumCompressedTokens)
         let hasEligibleLayer = cache.contains { layer in
-            if let simple = layer as? KVCacheSimple {
+            if let simple = layer as? KVCacheSimple, !(layer is NonQuantizableKVCache) {
                 return simple.offset > tqMinStart
                     && TurboQuantKVCache.hasCompressibleMiddle(tokenCount: simple.offset)
             }
@@ -2354,6 +2354,7 @@ public func maybeQuantizeKVCache(
         guard hasEligibleLayer else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
             if cache[i] is QSAKVCache {
                 // TurboQuant promotion would replace the QSAKVCache with a
                 // cache that has no indexer lane (and `fromSimpleCache`
@@ -2386,12 +2387,13 @@ public func maybeQuantizeKVCache(
 
     case .affine(let bits, let groupSize):
         // Affine cache quantization remains limited to top-level simple KV.
-        let firstSimple = cache.first { $0 is KVCacheSimple }
+        let firstSimple = cache.first { $0 is KVCacheSimple && !($0 is NonQuantizableKVCache) }
         guard !cache.contains(where: { $0 is QuantizedKVCache }),
               let ref = firstSimple, ref.offset > quantizedKVStart
         else { return }
 
         for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
             if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
@@ -2404,7 +2406,7 @@ public func maybeQuantizeKVCache(
     }
 
     // Legacy path: use kvBits if set
-    let firstSimple = cache.first { $0 is KVCacheSimple }
+    let firstSimple = cache.first { $0 is KVCacheSimple && !($0 is NonQuantizableKVCache) }
     guard let kvBits = kvBits,
         !cache.contains(where: { $0 is QuantizedKVCache }),
         let ref = firstSimple, ref.offset > quantizedKVStart
@@ -2413,6 +2415,7 @@ public func maybeQuantizeKVCache(
     }
 
     for i in 0..<cache.count {
+            if cache[i] is NonQuantizableKVCache { continue }
         if cache[i] is QSAKVCache { continue }  // osaurus#2525: keep the indexer lane
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)

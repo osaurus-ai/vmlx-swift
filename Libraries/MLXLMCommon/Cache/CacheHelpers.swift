@@ -983,6 +983,12 @@ private func restoreFromV2Arrays(
             if case .qkv = entry.data { return 0 }
             continue
         }
+        if cache[entry.index] is NonQuantizableKVCache {
+            switch entry.data {
+            case .tq, .qkv: return 0
+            default: break
+            }
+        }
         switch entry.data {
         case .qsaKV(let component):
             guard let qsa = cache[entry.index] as? QSAKVCache,
