@@ -213,7 +213,22 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, Safet
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool { customTensorNames.contains(key) }
 
+    /// Full-position logits remain available for numerical parity and teacher forcing.
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        head(model.norm(hiddenStates(inputs, cache: cache)))
+    }
+
+    /// Generation consumes only the last prompt position. Project that row instead
+    /// of allocating [batch, prompt, vocabulary] logits, as REC's prefill does.
+    /// Cache updates still process every input position; no token is skipped.
+    public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        -> LMOutput
+    {
+        let hidden = hiddenStates(input.tokens, cache: cache)
+        return LMOutput(logits: head(model.norm(hidden[0..., (hidden.dim(1) - 1)..<hidden.dim(1), 0...])))
+    }
+
+    private func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // FP16 affine embedding metadata does not define the activation dtype.
         // Super experts overflow FP16; preserve stored weights and cast activations only.
         var h = model.embeddings(inputs).asType(.bfloat16)
@@ -224,7 +239,7 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, Safet
                     ? configuration.slidingWindow : nil)
             h = layer(h, mask: mask, cache: slot)
         }
-        return head(model.norm(h))
+        return h
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

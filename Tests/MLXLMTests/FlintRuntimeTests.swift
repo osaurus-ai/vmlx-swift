@@ -46,6 +46,23 @@ struct FlintRuntimeTests {
         }
     }
 
+    @Test func generationProjectsOnlyLastRowWithoutChangingCache() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try Self.model()
+            let tokens = MLXArray(Array(0..<13)).reshaped(1, 13)
+            let fullCache = m.newCache(parameters: nil)
+            let generationCache = m.newCache(parameters: nil)
+            let full = m(tokens, cache: fullCache)
+            let generated = m(LMInput.Text(tokens: tokens), cache: generationCache, state: nil).logits
+            eval(full, generated, fullCache, generationCache)
+            #expect(generated.shape == [1, 1, m.vocabularySize])
+            #expect(allClose(generated, full[0..., (full.dim(1) - 1)..<full.dim(1), 0...], rtol: 0.02, atol: 0.02).item(Bool.self))
+            #expect(fullCache.map(\.offset) == generationCache.map(\.offset))
+            let next = MLXArray([Int32(14)]).reshaped(1, 1)
+            #expect(arrayEqual(m(next, cache: fullCache), m(next, cache: generationCache)).item(Bool.self))
+        }
+    }
+
     @Test func developerRoleAndReasoningHistorySurvive() {
         MLXMetalTestLock.withLock {
             let generator = DefaultMessageGenerator()

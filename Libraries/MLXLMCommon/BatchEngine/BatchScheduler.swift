@@ -84,6 +84,10 @@ struct BatchSlot {
     /// that cannot be losslessly trimmed after their rotating window wraps.
     var diskSeedSnapshot: [KVCache]?
 
+    /// The exact N-1 boundary was accepted by the disk coordinator during
+    /// prefill. Keep only this receipt, not a second full cache through decode.
+    var prefillStoredDiskSeed = false
+
     /// Sealed, already-computed chunk boundary for this request's rotating
     /// finalization replay. Bounded to one snapshot and cleared at completion.
     var prefillReplaySeed: BatchPrefillReplaySeed?
