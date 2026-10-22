@@ -110,6 +110,24 @@ struct FlintRuntimeTests {
         }
     }
 
+    @Test func ordinaryCacheStillQuantizesAndCannotRestoreIntoSinkCache() {
+        MLXMetalTestLock.withLock {
+            let sink = AttentionSinkKVCache(headCount: 2, headDimension: 64)
+            let ordinary = KVCacheSimple()
+            let values = MLXArray.ones([1,2,64,64], dtype: .bfloat16)
+            _ = sink.update(keys: values, values: values)
+            _ = ordinary.update(keys: values, values: values)
+            var mixed: [KVCache] = [sink, ordinary]
+            maybeQuantizeKVCache(cache: &mixed, kvBits: 4, kvGroupSize: 32)
+            #expect(mixed[0] is AttentionSinkKVCache)
+            #expect(mixed[1] is QuantizedKVCache)
+            let record = TQDiskSerializer.serialize(cache: [mixed[1]])
+            var destination: [KVCache] = [AttentionSinkKVCache(headCount: 2, headDimension: 64)]
+            #expect(restoreFromDiskArrays(record, into: &destination, requirePromptBoundary: true) == 0)
+            #expect(destination[0].offset == 0)
+        }
+    }
+
     @Test func routerBiasSelectsButDoesNotWeight() throws {
         try MLXMetalTestLock.withLock {
             let c = try Self.config(), router = FlintRouter(c)

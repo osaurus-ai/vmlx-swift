@@ -28,7 +28,7 @@ attention needs in RAM.
 
 - Header/index validation of development RTN bundle: passed locally.
 - Independent tiny Python full/chunked reference: identical; fixture retained.
-- Swift fixture, chunk/ring/disk serialization restore, mixed-length batching: 7 focused tests passed. The deterministic tiny BF16 logits match the independent Python reference exactly.
+- Swift fixture, chunk/ring/disk serialization restore, mixed-length batching: 8 focused tests passed. The deterministic tiny BF16 logits match the independent Python reference exactly.
 - Real Osaurus loading, connected tool turns, SSD hit, unload and host/process
   memory attribution: pending.
 - Calibrated affine and final JANGH2: pending separate bundle qualification.
