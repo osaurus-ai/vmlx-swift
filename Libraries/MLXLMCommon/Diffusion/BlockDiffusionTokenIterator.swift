@@ -122,7 +122,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.cacheInitParameters = parameters
         self.randomKey = parameters.randomSeed.map { MLX.key($0) }
-        self.mediaSalt = computeCacheSalt(for: input, parameters: parameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: parameters, model: model)
         self.stopper = StableConfidentStopper(
             stabilityThreshold: options.stabilityThreshold,
             confidenceThreshold: options.confidenceThreshold)

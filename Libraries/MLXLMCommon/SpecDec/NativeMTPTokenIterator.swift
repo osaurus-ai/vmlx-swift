@@ -700,7 +700,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.restoredPrefixStart = input.cachePrefixTokenCounts.contains { $0 > 0 }
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
-        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters, model: model)
         self.materializeSyncTime += promptTokenElapsed
 
         if usesHybridMambaCache,

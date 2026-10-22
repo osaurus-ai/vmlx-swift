@@ -195,6 +195,10 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider, Safet
     // SWA rings and learned sinks) is exact for each subsequent suffix; see
     // FlintRuntimeTests.chunkedAndDiskRestore before broadening this contract.
     public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+    // Both full learned-sink attention and architecture-fixed SWA ignore
+    // maxKVSize. Do not invalidate their identical state when an automatic
+    // coordinator cap first appears on a long prompt.
+    public var maximumKVSizeIsCacheStateInvariant: Bool { true }
 
     public init(_ c: FlintConfiguration) throws {
         try c.validate()

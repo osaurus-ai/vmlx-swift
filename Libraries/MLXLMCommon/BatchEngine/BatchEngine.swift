@@ -1984,7 +1984,8 @@ public actor BatchEngine {
                 }
             }
 
-            var slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
+            var slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs,
+                                 model: context.model)
             if let schema = request.parameters.jsonSchema {
                 do {
                     slot.processor = try JSONSchemaLogitProcessor(

@@ -237,7 +237,8 @@ extension BatchSlot {
     ///   - request: The pending request to activate.
     ///   - cache: Per-layer KV caches allocated by the model's `newCache()`.
     ///   - stopTokenIDs: Set of EOS token IDs for this model.
-    init(from request: BatchPendingRequest, cache: [KVCache], stopTokenIDs: Set<Int>) {
+    init(from request: BatchPendingRequest, cache: [KVCache], stopTokenIDs: Set<Int>,
+         model: (any LanguageModel)? = nil) {
         self.id = request.id
         self.continuation = request.continuation
         self.parameters = request.parameters
@@ -262,7 +263,7 @@ extension BatchSlot {
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize
-        self.mediaSalt = computeCacheSalt(for: request.input, parameters: request.parameters)
+        self.mediaSalt = computeCacheSalt(for: request.input, parameters: request.parameters, model: model)
         self.compiledForward = nil
     }
 }

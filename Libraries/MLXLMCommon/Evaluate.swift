@@ -1958,7 +1958,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Compute a stable fingerprint of request-scope/media content plus
         // effective cache policy once at init, so both the pre-prepare fetch
         // below and the post-generation store see the same salt.
-        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters, model: model)
 
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.

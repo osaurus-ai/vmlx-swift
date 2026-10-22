@@ -27,7 +27,7 @@ attention needs in RAM.
 ## Qualification ledger
 
 - Independent tiny Python full/chunked fixture: deterministic BF16 logits match exactly.
-- Nine focused Swift graph/cache tests pass: full/chunked execution, wrapped sliding state, sink-cache disk serialization, one- and three-token suffix continuation, mixed-length batching and forced-tool prefix policy.
+- Eleven focused Swift graph/cache/identity tests pass: full/chunked execution, wrapped sliding state, sink-cache disk serialization, one- and three-token suffix continuation, mixed-length batching and forced-tool prefix policy.
 - Twelve metadata-partition cases pass; one optional local-fixture case is skipped. Flint calibration metadata is not an executable quantization plan, and competing plans/headers remain rejected.
 - Calibrated affine 4M: actual Osaurus connected tool turns return391 then420, each normal stop, about80–81tok/s on the current integrated build. Peak process footprint25.52decimalGB for23.37GB base weights. The forced-tool follow-up restores5153/6519 then6519/6632tokens. Earlier~30k app proof records tool/code recall, new-token prefill and checkpoint storage separately.
 - Calibrated H2: final bundle loads through the actual app. Connected tools/SSD restore,~29k input and a real Helper delegation complete normally; free prose completes2044tokens at63.30tok/s, peak15.41decimalGB for13.19GB base weights. During delegation the42.60GB Ornith child is also resident by the selected keep-parent policy; total peak62.22GB falls to15.88GB after child cleanup.
@@ -39,3 +39,6 @@ Runtime source598994d44b80c365020d47f7ea94b9b78d58fd71 is built into app786085ff
 Limits: H2 prefill is slower than4M here; no100+tok/s, optimal-kernel or universal speedup claim. One H2 explanation miscounts repeated additions while the calculator/result391 is correct; another prose answer under-delivers requested length. These are recorded quality limitations, not hidden or attributed to runtime without a numeric comparison.128k, aggregate concurrent writer/checkpoint memory and broader API/media qualification are separate gates. Flint is text-only; no media or speculative capability is invented.
 
 Development RTN weights establish implementation compatibility only, not final model quality. Process footprint, host wired/compressed/swap, MLX active/cache, queued writes and on-disk bytes must be reported separately. Model-file size is not a total-memory accounting formula. No all-family cache-memory claim follows from this integration.
+
+
+Longer live checkpoint: H2 grows from~29k to63,234 then129,022 and134,915 actual tokens. It recalls segment markers and totals; an explicit new calculation beyond134k actually calls the tool and returns4056. Peak process footprint reaches29.06decimalGB and falls to17.13GB after storage. Actual prefill progress was visually inspected. The automatic maxKV threshold caused a reproduced unnecessary full prefill because Flint ignores that parameter; see FLINT-CACHE-IDENTITY-2026-10-21.md for the targeted identity patch and completed post-fix app replay. These rows do not qualify every affine/H2 variant, model-quality prompt or concurrent128k load.
