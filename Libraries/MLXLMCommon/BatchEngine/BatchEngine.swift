@@ -4033,18 +4033,6 @@ public actor BatchEngine {
                 }
             }
 
-            if let promptCacheSnapshot {
-                if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
-                    storeCacheEntry(
-                        tokens: promptTokens,
-                        snapshot: promptCacheSnapshot,
-                        label: "prompt-boundary")
-                } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
-                    Self.logger.info(
-                        "Skipped exact recurrent warmup boundary for slot \(slot.id.description, privacy: .public); retaining processor-proven safe prefix seeds only"
-                    )
-                }
-            }
 
             if !slot.cachePromptUsesPostPrepareKey {
                 let requiresDiskBackedRestore =
@@ -4076,6 +4064,27 @@ public actor BatchEngine {
                         "Skipped disk-backed tool prompt seed boundary for \(self.context.configuration.name, privacy: .public): required-tool restore is not proven safe for this topology"
                     )
                 }
+                let hasReusableNativeSWAPromptSeed =
+                    !isReusablePrefixWarmup && slot.appendOnlyPromptCheckpoint != nil
+                    && cacheHasStandaloneRotatingWindowState(storageTopologySnapshot)
+                    && promptTokens.count > 1
+                    && coordinator.hasDurableDiskEntry(
+                        tokens: Array(promptTokens.dropLast()),
+                        mediaSalt: slot.cacheSalt(forBoundary: promptTokens.count - 1))
+            if let promptCacheSnapshot {
+                if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt,
+                   !hasReusableNativeSWAPromptSeed {
+                    storeCacheEntry(
+                        tokens: promptTokens,
+                        snapshot: promptCacheSnapshot,
+                        label: "prompt-boundary")
+                } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
+                    Self.logger.info(
+                        "Skipped exact recurrent warmup boundary for slot \(slot.id.description, privacy: .public); retaining processor-proven safe prefix seeds only"
+                    )
+                }
+            }
+
                 for boundary in Set(slot.originalInput.cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokens.count {
                     let isStableBoundary = slot.originalInput
@@ -4176,9 +4185,17 @@ public actor BatchEngine {
                     }
                 }
             } else if !slot.originalInput.cachePrefixTokenCounts.isEmpty {
+                if let promptCacheSnapshot, !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
+                    storeCacheEntry(tokens: promptTokens, snapshot: promptCacheSnapshot, label: "prompt-boundary")
+                }
                 Self.logger.debug(
                     "Skipped history-boundary cache entries for slot \(slot.id.description, privacy: .public): input prefix counts are pre-pruned but cache key is post-prepare"
                 )
+            }
+
+            if slot.cachePromptUsesPostPrepareKey, slot.originalInput.cachePrefixTokenCounts.isEmpty,
+               let promptCacheSnapshot, !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
+                storeCacheEntry(tokens: promptTokens, snapshot: promptCacheSnapshot, label: "prompt-boundary")
             }
 
             // A normal EOS stop means the last visible assistant token has
