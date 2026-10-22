@@ -1817,6 +1817,8 @@ public actor BatchEngine {
         guard settled, activeSlots.isEmpty, waitQueue.isEmpty else { return }
         Memory.clearCache()
         stepsSinceMemoryPurge = 0
+        MemoryStageTrace.log("batch-idle-payloads-released", tokens: 0,
+                             detail: "slots=0 writerPayloadsReleased=true")
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/idle-purge] slots=0 writerPayloadsReleased=true\n".utf8))
@@ -2947,6 +2949,8 @@ public actor BatchEngine {
             cache: slot.cache, tokenCount: slot.cachePromptTokenIds.count) {
             slot.appendOnlyPromptCheckpoint = checkpoint
             slot.promptCacheSnapshot = nil
+            MemoryStageTrace.log("batch-prompt-checkpoint", tokens: checkpoint.tokenCount,
+                                 detail: "appendOnlyKV=deferred mutableState=sealed")
         } else {
             slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
                 from: slot.cache, storageEnabled: storesPrompt)
