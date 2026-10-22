@@ -701,6 +701,15 @@ public final class DiskCache: @unchecked Sendable {
     }
 
 
+    /// Called off the generation owner. The group leaves inside the writer
+    /// closure; a serial queue barrier additionally proves its captured payload
+    /// owners have returned before the idle allocator purge is requested.
+    func waitForPendingPayloadRelease() -> Bool {
+        guard waitForPendingWrites() else { return false }
+        writerQueue.sync {}
+        return true
+    }
+
     /// OFF by default; `VMLX_CACHE_READAHEAD=1` enables it (A/B only).
     ///
     /// Measured 2026-10-11 (RunBench `K2MT_IOBENCH=1`, files proven cold with `mincore` = 0 % resident,

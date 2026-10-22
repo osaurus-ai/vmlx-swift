@@ -78,6 +78,8 @@ struct BatchSlot {
     /// any generated token is fed back into the model. Cache stores use this,
     /// not the live decode cache, because coordinator keys are prompt-only.
     var promptCacheSnapshot: [KVCache]?
+    var appendOnlyPromptCheckpoint: AppendOnlyPromptCheckpoint?
+    var appendOnlyDiskSeed: AppendOnlyPromptCheckpoint?
 
     /// Exact prompt-minus-one cache state captured during prefill for typed
     /// disk-only topologies (currently DSV4 SWA + compressor/indexer pools)

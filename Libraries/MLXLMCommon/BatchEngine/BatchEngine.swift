@@ -1801,6 +1801,28 @@ public actor BatchEngine {
     }
 
     /// Main scheduling loop. Runs until all work is complete.
+    private var idlePayloadPurge: Task<Void, Never>?
+
+    private func requestIdlePayloadPurge() {
+        guard idlePayloadPurge == nil, activeSlots.isEmpty, waitQueue.isEmpty,
+              let disk = cacheCoordinator?.diskCache else { return }
+        idlePayloadPurge = Task { [weak self] in
+            let settled = await Task.detached { disk.waitForPendingPayloadRelease() }.value
+            await self?.purgeReleasedPayloadsIfIdle(settled: settled)
+        }
+    }
+
+    private func purgeReleasedPayloadsIfIdle(settled: Bool) {
+        idlePayloadPurge = nil
+        guard settled, activeSlots.isEmpty, waitQueue.isEmpty else { return }
+        Memory.clearCache()
+        stepsSinceMemoryPurge = 0
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/idle-purge] slots=0 writerPayloadsReleased=true\n".utf8))
+        }
+    }
+
     private func schedulingLoop() async {
         while !Task.isCancelled {
             // Exit when no work remains
@@ -1821,13 +1843,14 @@ public actor BatchEngine {
             //    clearing inside `finishSlot` is too early and lets successive
             //    short media turns accumulate the allocator's released working
             //    set until the generic 256-step purge.
-            let finishedMediaSlot = activeSlots.contains {
-                $0.isFinished && $0.originalInput.hasMediaContent
+            let finishedLargeSlot = activeSlots.contains {
+                $0.isFinished && ($0.originalInput.hasMediaContent || $0.promptTokenCount >= 4096)
             }
             activeSlots.removeAll { $0.isFinished }
-            if finishedMediaSlot {
+            if finishedLargeSlot {
                 Memory.clearCache()
                 stepsSinceMemoryPurge = 0
+                requestIdlePayloadPurge()
             }
 
             // 4. Periodic memory cleanup
@@ -2561,6 +2584,13 @@ public actor BatchEngine {
     /// also the boundary a reusable-prefix warmup must publish: DSV4 deliberately
     /// rejects an exact post-prefill restore, so excluding warmups here causes the
     /// immediately following visible request to prefill the same prefix again.
+    private func canDeferAppendOnlyCheckpoint(_ slot: BatchSlot) -> Bool {
+        slot.parameters.kvBits == nil && slot.parameters.kvMode == .none
+            && (!slot.parameters.enableCompiledBatchDecode || compiledDecodeDeniedForModel)
+            && cacheCoordinator?.pagedCache == nil
+            && cacheCoordinator?.isHybrid == false
+    }
+
     private func storePrefillCapturedDiskSeed(
         _ snapshot: [KVCache],
         for slot: BatchSlot
@@ -2679,12 +2709,14 @@ public actor BatchEngine {
                         }
                         MLX.eval(slot.cache)
                         try error.check()
-                        let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
-                            from: slot.cache)
-                        slot.prefillStoredDiskSeed = storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
-                        // The store call transfers the N-1 boundary to the coordinator.
-                        // The writer may still be in flight; keep only its admission receipt.
-                        // Do not keep the duplicate SWA/pool state through decode.
+                        if canDeferAppendOnlyCheckpoint(slot),
+                           let checkpoint = AppendOnlyPromptCheckpoint.capture(
+                            cache: slot.cache, tokenCount: slot.cachePromptTokenIds.count - 1) {
+                            slot.appendOnlyDiskSeed = checkpoint
+                        } else {
+                            let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(from: slot.cache)
+                            slot.prefillStoredDiskSeed = storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
+                        }
                         slot.diskSeedSnapshot = nil
                         progressAccumulator.report(
                             completedInPrepare: remainingPromptUnits - 1)
@@ -2815,7 +2847,7 @@ public actor BatchEngine {
                 let chunkSize = max(1, slot.prefillStepSize)
                 let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
                 let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
-                if !slot.prefillStoredDiskSeed,
+                if !slot.prefillStoredDiskSeed, slot.appendOnlyDiskSeed == nil,
                     slot.originalInput.cachePromptIntent != .auxiliary,
                     slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
                     cacheCoordinator?.canPersistBoundaries == true,
@@ -2908,10 +2940,17 @@ public actor BatchEngine {
         // safe for paged and L2 disk storage under the prompt-token key.
         // The captured DSV4 N-1 seed replaces the unusable exact-prompt
         // snapshot. Retain one cache copy through decode, not two.
-        slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
-            from: slot.cache,
-            storageEnabled: cacheCoordinator?.canPersistBoundaries == true
-                && slot.originalInput.cachePromptIntent != .auxiliary)
+        let storesPrompt = cacheCoordinator?.canPersistBoundaries == true
+            && slot.originalInput.cachePromptIntent != .auxiliary
+        if storesPrompt, canDeferAppendOnlyCheckpoint(slot),
+           let checkpoint = AppendOnlyPromptCheckpoint.capture(
+            cache: slot.cache, tokenCount: slot.cachePromptTokenIds.count) {
+            slot.appendOnlyPromptCheckpoint = checkpoint
+            slot.promptCacheSnapshot = nil
+        } else {
+            slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
+                from: slot.cache, storageEnabled: storesPrompt)
+        }
 
         let tokenID = firstToken.item(Int.self)
         try error.check()
@@ -3577,6 +3616,8 @@ public actor BatchEngine {
             // snapshot as soon as they finish instead of holding it until the
             // scheduler's next completed-slot cleanup pass.
             liveSlot.promptCacheSnapshot = nil
+            liveSlot.appendOnlyPromptCheckpoint = nil
+            liveSlot.appendOnlyDiskSeed = nil
             liveSlot.diskSeedSnapshot = nil
             liveSlot.prefillReplaySeed?.discard()
             liveSlot.prefillReplaySeed = nil
@@ -3618,9 +3659,15 @@ public actor BatchEngine {
             synchronizeCompiledRotatingCacheMetadataForStorage(slot.cache)
             let promptTokens = slot.cachePromptTokenIds
             let hasHybridPool = slot.cache.contains { $0 is HybridPoolCache }
-            let promptCacheSnapshot = slot.promptCacheSnapshot
-                ?? (hasHybridPool ? nil : makePromptBoundaryCacheSnapshot(from: slot.cache))
-            let capturedDiskSeed = slot.diskSeedSnapshot
+            let promptCacheSnapshot: [KVCache]?
+            if let checkpoint = slot.appendOnlyPromptCheckpoint {
+                promptCacheSnapshot = checkpoint.materialize(from: slot.cache)
+            } else {
+                promptCacheSnapshot = slot.promptCacheSnapshot
+                    ?? (hasHybridPool ? nil : makePromptBoundaryCacheSnapshot(from: slot.cache))
+            }
+            let capturedDiskSeed = slot.appendOnlyDiskSeed?.materialize(from: slot.cache)
+                ?? slot.diskSeedSnapshot
             if let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed {
                 let storageSnapshotTokenCount = promptCacheSnapshot == nil
                     ? max(0, promptTokens.count - 1)
@@ -3779,7 +3826,7 @@ public actor BatchEngine {
                     return nil
                 }
                 if tokens.count == storageSnapshotTokenCount {
-                    return storageTopologySnapshot.map { $0.copy() }
+                    return storageTopologySnapshot
                 }
                 if canReuseBoundaryReplay, let seed = boundaryReplaySeed,
                    seed.tokens == tokens, CacheStoreBudget.canStore(seed.cache)
@@ -3791,9 +3838,7 @@ public actor BatchEngine {
                 let keepsMedia = !slot.originalInput.hasMediaContent || mediaBoundaryInput.hasMediaContent
                 let trimCount = storageSnapshotTokenCount - tokens.count
                 if keepsMedia, canTrimPromptCache(storageTopologySnapshot) {
-                    let trimmed = storageTopologySnapshot.map { $0.copy() }
-                    if trimPromptCache(trimmed, numTokens: trimCount) == trimCount {
-                        MLX.eval(trimmed)
+                    if let trimmed = compactPromptPrefix(storageTopologySnapshot, count: tokens.count) {
                         return trimmed
                     }
                 }
@@ -4054,8 +4099,7 @@ public actor BatchEngine {
                     // unload/reload even before this coordinator deserializes it.
                     // Preserve native/sidecar completeness and rejected-entry
                     // checks through the coordinator's durable-entry contract.
-                    if isStableBoundary,
-                       coordinator.hasDurableDiskEntry(
+                    if coordinator.hasDurableDiskEntry(
                         tokens: boundaryTokens,
                         mediaSalt: slot.cacheSalt(forBoundary: boundaryTokens.count))
                     {
@@ -4111,7 +4155,7 @@ public actor BatchEngine {
                    let stripAt = sharedPromptStripBoundary
                 {
                     let strippedTokens = Array(promptTokens.prefix(stripAt))
-                    if coordinator.hasValidatedDiskEntry(
+                    if coordinator.hasDurableDiskEntry(
                         tokens: strippedTokens,
                         mediaSalt: slot.cacheSalt(forBoundary: strippedTokens.count))
                     {
