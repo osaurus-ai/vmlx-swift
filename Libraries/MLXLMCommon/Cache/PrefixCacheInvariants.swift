@@ -40,6 +40,17 @@ public protocol PrefixCacheInvariantModel: AnyObject {
     /// ordinary longest-prefix restore for this model's disk-backed topology
     /// instead of skipping the cache fetch and prefilling the whole prompt.
     var exactPrefixRestoreIsSuffixIndependent: Bool { get }
+
+    /// Changing `GenerateParameters.maxKVSize` cannot change this model's
+    /// cache geometry, forward state, or attention semantics. Its cache
+    /// factory uses only architecture-owned windows. This allows the cache
+    /// key to omit an otherwise inert parameter, not the runtime to remove
+    /// or alter any requested memory-safety setting.
+    var maximumKVSizeIsCacheStateInvariant: Bool { get }
+}
+
+public extension PrefixCacheInvariantModel {
+    var maximumKVSizeIsCacheStateInvariant: Bool { false }
 }
 
 /// A model whose prefill positions depend on the WHOLE prompt (M-RoPE: media placeholders occupy
@@ -213,18 +224,18 @@ public struct CacheBoundarySaltPlan: Sendable, Equatable {
                 segments.append(Segment(
                     lower: spans[k - 1].tokenRange.upperBound,
                     upper: spans[k].tokenRange.lowerBound,
-                    salt: computeCacheSalt(for: earlier, parameters: parameters)))
+                    salt: computeCacheSalt(for: earlier, parameters: parameters, model: model)))
             }
             return CacheBoundarySaltPlan(
                 requestSalt: requestSalt,
-                mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false),
+                mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false, model: model),
                 mediaIndependentTokenCount: first,
                 segments: segments,
                 itemSpans: spans)
         }
         return CacheBoundarySaltPlan(
             requestSalt: requestSalt,
-            mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false),
+            mediaIndependentSalt: computeCacheSalt(for: input, parameters: parameters, includingMedia: false, model: model),
             mediaIndependentTokenCount: first)
     }
 

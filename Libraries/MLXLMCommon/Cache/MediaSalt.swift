@@ -241,15 +241,26 @@ public func computeCacheSalt(for input: LMInput, includingMedia: Bool) -> String
 /// disk/paged entries created with TurboQuant KV, affine KV, rotating-window
 /// caps, or a previous serializer contract must not be restored into a request
 /// using different cache semantics.
-public func computeCacheSalt(for input: LMInput, parameters: GenerateParameters) -> String? {
-    computeCacheSalt(for: input, parameters: parameters, includingMedia: true)
+public func computeCacheSalt(
+    for input: LMInput, parameters: GenerateParameters, model: (any LanguageModel)? = nil
+) -> String? {
+    computeCacheSalt(for: input, parameters: parameters, includingMedia: true, model: model)
 }
 
 /// See `computeCacheSalt(for:includingMedia:)`: with `includingMedia: false`
 /// the result equals the salt of the same request without its media.
 public func computeCacheSalt(
-    for input: LMInput, parameters: GenerateParameters, includingMedia: Bool
+    for input: LMInput, parameters: GenerateParameters, includingMedia: Bool,
+    model: (any LanguageModel)? = nil
 ) -> String? {
+    // Normalize identity only. The actual request, coordinator policy,
+    // memory admission and cache construction continue to receive the
+    // original parameters. Every undeclared model stays conservative.
+    let requestedMaxKVSize = parameters.maxKVSize
+    var parameters = parameters
+    if (model as? PrefixCacheInvariantModel)?.maximumKVSizeIsCacheStateInvariant == true {
+        parameters.maxKVSize = nil
+    }
     let base = computeCacheSalt(for: input, includingMedia: includingMedia)
     let policy = cachePolicySalt(for: parameters)
 
@@ -276,6 +287,9 @@ public func computeCacheSalt(
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
                 + "scope=\(scopeDesc) media=\(mediaDesc)"
+                + (requestedMaxKVSize != parameters.maxKVSize
+                    ? " requestedMaxKV=\(requestedMaxKVSize.map(String.init) ?? "none") maxKVStateInvariant=true"
+                    : "")
                 + (includingMedia ? mediaComponentTrace(for: input) : "") + "\n").utf8))
     }
     return salt

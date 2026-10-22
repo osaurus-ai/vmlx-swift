@@ -5,6 +5,16 @@ import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
 
+private final class UnmarkedCacheIdentityModel: Module, LanguageModel, PrefixCacheInvariantModel {
+    var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+    var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray { inputs }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [KVCacheSimple()] }
+}
+
 @Suite("Flint architecture and SSD cache contract", .serialized)
 struct FlintRuntimeTests {
     static func config() throws -> FlintConfiguration {
@@ -85,6 +95,59 @@ struct FlintRuntimeTests {
             let cache = m.newCache(parameters: nil)
             #expect(cache[0] is AttentionSinkKVCache)
             #expect(cache[1].maxSize == 5)
+        }
+    }
+
+    @Test func maximumKVSizeDoesNotChangeFlintStateOrSalt() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try Self.model()
+            let tokens = MLXArray(Array(0..<13)).reshaped(1, 13)
+            let input = LMInput(text: LMInput.Text(tokens: tokens))
+            let plain = GenerateParameters()
+            let capped = GenerateParameters(maxKVSize: 2)
+            let a = m.newCache(parameters: plain), b = m.newCache(parameters: capped)
+            let left = m(tokens, cache: a), right = m(tokens, cache: b)
+            eval(left, right, a, b)
+            #expect(arrayEqual(left, right).item(Bool.self))
+            #expect(a[0].offset == 13 && b[0].offset == 13)
+            #expect(a[0].state[0].dim(2) == 13 && b[0].state[0].dim(2) == 13)
+            for (x, y) in zip(a, b) {
+                #expect(x.metaState == y.metaState)
+                for (xs, ys) in zip(x.state, y.state) {
+                    #expect(arrayEqual(xs, ys).item(Bool.self))
+                }
+            }
+            #expect(computeCacheSalt(for: input, parameters: plain, model: m)
+                    == computeCacheSalt(for: input, parameters: capped, model: m))
+            #expect(capped.maxKVSize == 2, "Identity normalization must not mutate request settings")
+            // Unknown models and the legacy API retain conservative identity.
+            let unmarked = UnmarkedCacheIdentityModel()
+            #expect(!unmarked.maximumKVSizeIsCacheStateInvariant)
+            #expect(computeCacheSalt(for: input, parameters: plain, model: unmarked)
+                    != computeCacheSalt(for: input, parameters: capped, model: unmarked))
+            #expect(computeCacheSalt(for: input, parameters: plain)
+                    != computeCacheSalt(for: input, parameters: capped))
+            let quantized = GenerateParameters(kvMode: .turboQuant(keyBits: 4, valueBits: 4))
+            #expect(computeCacheSalt(for: input, parameters: plain, model: m)
+                    != computeCacheSalt(for: input, parameters: quantized, model: m))
+        }
+    }
+
+    @Test func automaticWindowThresholdKeepsFlintIdentityWithoutChangingPolicy() throws {
+        try MLXMetalTestLock.withLock {
+            let m = try Self.model()
+            let input = LMInput(text: LMInput.Text(tokens: MLXArray([Int32(1), 2, 3])))
+            let coordinator = CacheCoordinatorConfig(defaultMaxKVSize: 65536)
+            let before = coordinator.resolveKVPolicy(kvMode: .none, maxKVSize: nil,
+                                                      promptTokenCount: 131072)
+            let after = coordinator.resolveKVPolicy(kvMode: .none, maxKVSize: nil,
+                                                     promptTokenCount: 131073)
+            #expect(before.maxKVSize == nil)
+            #expect(after.maxKVSize == 65536, "Preserve coordinator memory-safety policy")
+            let a = GenerateParameters(maxKVSize: before.maxKVSize)
+            let b = GenerateParameters(maxKVSize: after.maxKVSize)
+            #expect(computeCacheSalt(for: input, parameters: a, model: m)
+                    == computeCacheSalt(for: input, parameters: b, model: m))
         }
     }
 

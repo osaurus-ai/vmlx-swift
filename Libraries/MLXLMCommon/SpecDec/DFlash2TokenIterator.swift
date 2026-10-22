@@ -486,7 +486,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.cachePrefixTokenCounts = input.cachePrefixTokenCounts
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
-        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters, model: target)
         self.cacheSaltPlan = CacheBoundarySaltPlan.make(
             requestSalt: self.mediaSalt, input: input, lookupTokenIds: self.promptTokenIds,
             model: target, parameters: effectiveParameters)
