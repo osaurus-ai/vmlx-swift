@@ -1,6 +1,7 @@
 # Sentry, RAM parity and Allosaurus investigation — 2026-10-24
 
-Status: **PARTIAL. No merge or model-performance clearance.**
+Status: **Audit PARTIAL. Scoped diagnostic/mixer fixes locally qualified;
+remaining crash and hardware-performance rows are not cleared.**
 
 The investigation starts at vMLX `b9a1afaeb` and Osaurus `c5fabeea4`.
 All builds, loads, reproductions, tests and visual proof now run locally on
@@ -152,7 +153,7 @@ multi-turn generation with token/s, cache restore and lifecycle/resource proof.
 Do not merge this investigation based on inventory, source inspection or unit
 tests alone.
 
-The focused baseline currently passes 108 cases, covering the residency/sink
+The focused baseline passes 108 cases, covering the residency/sink
 fix, checked host access following MLX failure, failure transport, resident
 reader validation, weight backing, writer reservations and write-behind
 failure/ownership, append-only checkpoints, native-MTP priming/boundaries,
@@ -192,8 +193,11 @@ No current universal 11 tok/s cap was reproduced on this M5 Max.
 Physical footprint is sampled at 50 Hz using `proc_pid_rusage`, with actual
 Activity Monitor screenshots and PID identity. v0.1 settles around 38.5 GB
 (decimal), v0.2 around 30.5 GB. Activity Monitor shows v0.2 at 28.30 GiB.
-Strict v0.1→v0.2→v0.1 handoffs remain within a 41.11 GB lifetime peak in the
-exact-pin process, rather than retaining both weight banks. Idle unload drops
+Strict v0.1→v0.2→v0.1 text handoffs peak at 41.11 GB in the
+exact-pin process, rather than retaining both weight banks. The later real-image
+prefill raises the full-process lifetime peak to 46.10 GB at 21:39:20 UTC,
+settling back to about 38.8 GB. That media transient remains a separate RAM
+row; the text/handoff peak must not be presented as the full-run maximum. Idle unload drops
 the still-running app to 936.8 MiB in Activity Monitor (about 0.982 GB sampled
 physical footprint). Cancelling a subsequent load returns below 1 GB and
 unlocks the composer; retry loads successfully and answers 65 for 37+28.
@@ -201,9 +205,10 @@ These observations support parity with GPU weight payload plus runtime state;
 they do not claim that total process footprint equals file size exactly.
 
 Real-image fresh-process history restore answers correctly. Effective cache
-mode is fp16 hybrid rotating KV with disk-backed restore, 48 layers (12 KV,
+mode is fp16 hybrid KV with disk-backed restore, 48 layers (12 KV,
 36 Mamba), prefix and disk L2 enabled, paged RAM disabled, and zero TurboQuant
-KV layers. Media follow-up restored boundary 101 and reprocessed the image;
+KV layers. The latest topology reports 12 ordinary KV layers and zero
+rotating KV/wrapper layers; do not substitute an earlier load topology. Media follow-up restored boundary 101 and reprocessed the image;
 this is not a full-image checkpoint hit or an SSM-pool hit. Separate SSM-pool
 counters remained zero hits. No video row has been cleared.
 
@@ -225,3 +230,8 @@ queued. Local runtime regression and fresh Release app evidence are recorded
 separately from those unavailable runners. App required checks include
 `test-core`, `test-cli`, `swiftlint`, and `shellcheck`; do not merge the app
 until those pass.
+
+Growing tool history accepted disk-backed restore boundaries 4318, 4412 and
+4621, with all 48 cache layers restored and correct continuation to 1200.
+These are full hybrid checkpoint restores; the separate SSM-pool counters
+still show zero hits and must be reported separately.
