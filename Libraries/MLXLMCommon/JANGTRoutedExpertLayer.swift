@@ -42,6 +42,10 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     /// establish a gain. The geometry gates bound threadgroup memory and keep
     /// large prefills on their existing route.
     static let fusedRotationEnabled = RuntimeEnvironment.flag("VMLX_JANGT_FUSED_ROTATION")
+    /// The shared-memory prototype regressed full-model AR despite a hot-bank
+    /// microbenchmark win. This second candidate retains the original 64-thread
+    /// dot geometry and rotates inside SIMD registers instead.
+    static let simdRotationEnabled = RuntimeEnvironment.value("VMLX_JANGT_FUSED_ROTATION") == "simd"
     private let intermediateSize: Int
     /// The gate/up outlier columns when they are layer-wide (the same real columns for every expert, gate and up):
     /// the fused prefill epilogue needs one column list per tile.
@@ -160,7 +164,11 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let hidden: MLXArray
             switch gateUp {
             case .trellis(let gate, let up, let signs):
-                if Self.fusedRotationEnabled, x.dim(0) <= 8,
+                if Self.simdRotationEnabled, x.dim(0) <= 8 {
+                    hidden = JANGTKernels.gateUpWithSIMDRotation(
+                        x: x, signs: signs, indices: ids, gate: gate, up: up,
+                        limit: limit, outputDType: .float32)
+                } else if Self.fusedRotationEnabled, x.dim(0) <= 8,
                     gate.outputs.isMultiple(of: 32), hiddenSize * 4 <= 32768
                 {
                     hidden = JANGTKernels.gateUpWithRotation(
@@ -180,7 +188,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let y: MLXArray
             switch down {
             case .trellis(let projection, let signs):
-                if Self.fusedRotationEnabled, x.dim(0) <= 8,
+                if Self.simdRotationEnabled, x.dim(0) <= 8 {
+                    y = JANGTKernels.downWithSIMDRotation(
+                        h: hidden, signs: signs, indices: ids, weights: weights,
+                        projection: projection
+                    ).asType(input.dtype)
+                } else if Self.fusedRotationEnabled, x.dim(0) <= 8,
                     projection.outputs.isMultiple(of: 32), routes * intermediateSize * 4 <= 32768
                 {
                     y = JANGTKernels.downWithRotation(

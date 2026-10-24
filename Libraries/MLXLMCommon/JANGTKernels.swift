@@ -371,6 +371,113 @@ enum JANGTKernels {
 
     static func kname(_ k: Double) -> String { String(k).replacingOccurrences(of: ".", with: "p") }
 
+    /// H128 in the dot kernel's existing 16-values-per-lane layout. The
+    /// butterfly still visits global bit positions 0...6 in order: four
+    /// register stages followed by three shuffles inside each eight-lane
+    /// subgroup. No threadgroup allocation or barrier is needed, including
+    /// the masked 128/256/384-value tail of a 512-value dot block.
+    private static var inlineRotationLoad: String {
+        var stages: [String] = []
+        for distance in [1, 2, 4, 8] {
+            for i in 0 ..< 16 where i & distance == 0 {
+                stages.append(
+                    "{ float a = xt[\(i)], b = xt[\(i + distance)]; xt[\(i)] = a + b; xt[\(i + distance)] = a - b; }"
+                )
+            }
+        }
+        return JANGTKernelSource.xload.replacingOccurrences(
+            of: "xt[i] = xp[i];",
+            with: """
+                xt[i] = float(xp[i]) * sp[i];
+                \(stages.joined(separator: "\n"))
+                for (uint rd = 1u; rd < 8u; rd <<= 1) {
+                  bool upper = (lane & rd) != 0u;
+                  \(JANGTKernelSource.unroll) for (uint ri = 0; ri < 16u; ri++) {
+                    float other = simd_shuffle_xor(xt[ri], rd);
+                    xt[ri] = upper ? (other - xt[ri]) : (xt[ri] + other);
+                  }
+                }
+                \(JANGTKernelSource.unroll) for (uint ri = 0; ri < 16u; ri++) xt[ri] *= 0.08838834764831845f;
+                """)
+    }
+
+    static func gateUpWithSIMDRotation(
+        x: MLXArray, signs: MLXArray, indices: MLXArray,
+        gate: JANGTProjection, up: JANGTProjection, limit: Float, outputDType: DType
+    ) -> MLXArray {
+        let tokens = x.dim(0), kin = x.dim(1), slots = indices.dim(1), n = gate.outputs
+        precondition(kin % 128 == 0 && n % 8 == 0)
+        let outliers = gate.outlierColumns
+        let name =
+            "jt_simdrot_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_\(metalType(x.dtype))_\(metalType(outputDType))_lim\(kname(Double(limit)))"
+        var names = ["x", "signs", "idx", "kslots", "wg", "sg", "wu", "su_"]
+        if outliers > 0 { names += ["ocol", "woutg", "woutu"] }
+        let k = kernel(name, inputs: names, outputs: ["out"]) {
+            var source = JANGTKernelSource.gateUp(
+                kin: kin, n: n, k: gate.k, l: JANGTCode.stateBits,
+                outliers: outliers, words: gate.words, xdt: metalType(x.dtype),
+                odt: metalType(outputDType), limit: limit)
+            let pointer = "const device float* xp = xr + (size_t)t * \(kin)u + lane * 16u;"
+            precondition(source.contains(pointer) && source.contains(JANGTKernelSource.xload))
+            source = source.replacingOccurrences(
+                of: pointer,
+                with:
+                    "const device \(metalType(x.dtype))* xp = x + (size_t)t * \(kin)u + lane * 16u; const device float* sp = signs + lane * 16u;"
+            )
+            return source.replacingOccurrences(
+                of: JANGTKernelSource.xload, with: inlineRotationLoad
+            )
+            .replacingOccurrences(of: "xp += 512u;", with: "xp += 512u; sp += 512u;")
+        }
+        var inputs = [
+            contiguous(x), contiguous(signs), contiguous(indices.flattened().asType(.uint32)),
+            MLXArray([UInt32(slots)]), gate.packed, gate.scale, up.packed, up.scale,
+        ]
+        if outliers > 0 {
+            inputs += [gate.outlierColumnIndices, gate.outlierWeights, up.outlierWeights]
+        }
+        return k(
+            inputs, grid: (64, n / 8, tokens * slots), threadGroup: (64, 1, 1),
+            outputShapes: [[tokens * slots, n]], outputDTypes: [outputDType])[0]
+    }
+
+    static func downWithSIMDRotation(
+        h: MLXArray, signs: MLXArray, indices: MLXArray,
+        weights: MLXArray, projection: JANGTProjection
+    ) -> MLXArray {
+        let tokens = indices.dim(0), slots = indices.dim(1), kin = h.dim(1), n = projection.outputs
+        precondition(kin % 128 == 0 && n % 8 == 0)
+        let outliers = projection.outlierColumns
+        let name =
+            "jt_simdrot_dn_k\(kin)_n\(n)_K\(kname(projection.k))_o\(outliers)_s\(slots)_\(metalType(h.dtype))"
+        var names = ["h", "signs", "idx", "rw", "wd", "sd"]
+        if outliers > 0 { names += ["ocol", "wout"] }
+        let k = kernel(name, inputs: names, outputs: ["out"]) {
+            var source = JANGTKernelSource.down(
+                kin: kin, n: n, k: projection.k, l: JANGTCode.stateBits,
+                outliers: outliers, slots: slots, words: projection.words)
+            let pointer = "const device float* xp = hr + (size_t)ts * \(kin)u + lane * 16u;"
+            precondition(source.contains(pointer) && source.contains(JANGTKernelSource.xload))
+            source = source.replacingOccurrences(
+                of: pointer,
+                with:
+                    "const device \(metalType(h.dtype))* xp = h + (size_t)ts * \(kin)u + lane * 16u; const device float* sp = signs + size_t(e) * \(kin)u + lane * 16u;"
+            )
+            return source.replacingOccurrences(
+                of: JANGTKernelSource.xload, with: inlineRotationLoad
+            )
+            .replacingOccurrences(of: "xp += 512u;", with: "xp += 512u; sp += 512u;")
+        }
+        var inputs = [
+            contiguous(h), contiguous(signs), contiguous(indices.flattened().asType(.uint32)),
+            contiguous(weights.flattened().asType(.float32)), projection.packed, projection.scale,
+        ]
+        if outliers > 0 { inputs += [projection.outlierColumnIndices, projection.outlierWeights] }
+        return k(
+            inputs, grid: (64, n / 8, tokens), threadGroup: (64, 1, 1),
+            outputShapes: [[tokens, n]], outputDTypes: [.float32])[0]
+    }
+
     /// Experimental decode candidate. Eight SIMD groups share the rotated
     /// activation across 32 output rows. This repeats rotation per output tile,
     /// so dispatch reduction alone is not evidence that it is faster.

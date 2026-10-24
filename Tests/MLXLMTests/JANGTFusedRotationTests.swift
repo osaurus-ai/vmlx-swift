@@ -141,12 +141,18 @@ final class JANGTFusedRotationTests: XCTestCase {
                                 let fused = JANGTKernels.gateUpWithRotation(
                                     x: x, signs: guSigns, indices: ids, gate: gate, up: up,
                                     limit: limit, outputDType: .float32)
-                                MLX.eval(reference, fused)
+                                let simd = JANGTKernels.gateUpWithSIMDRotation(
+                                    x: x, signs: guSigns, indices: ids, gate: gate, up: up,
+                                    limit: limit, outputDType: .float32)
+                                MLX.eval(reference, fused, simd)
                                 let label =
                                     "K=\(width) outliers=\(withOutliers) dtype=\(dtype) rows=\(tokens) limit=\(limit)"
                                 XCTAssertEqual(
                                     reference.asArray(Float.self).map(\.bitPattern),
                                     fused.asArray(Float.self).map(\.bitPattern), label)
+                                XCTAssertEqual(
+                                    reference.asArray(Float.self).map(\.bitPattern),
+                                    simd.asArray(Float.self).map(\.bitPattern), "SIMD " + label)
                                 let expected = JANGTKernels.down(
                                     hr: JANGTKernels.rotateRows(
                                         reference, signs: downSigns, rowExperts: ids.flattened()),
@@ -154,10 +160,16 @@ final class JANGTFusedRotationTests: XCTestCase {
                                 let actual = JANGTKernels.downWithRotation(
                                     h: reference, signs: downSigns, indices: ids, weights: weights,
                                     projection: down)
-                                MLX.eval(expected, actual)
+                                let simdDown = JANGTKernels.downWithSIMDRotation(
+                                    h: reference, signs: downSigns, indices: ids, weights: weights,
+                                    projection: down)
+                                MLX.eval(expected, actual, simdDown)
                                 XCTAssertEqual(
                                     expected.asArray(Float.self).map(\.bitPattern),
                                     actual.asArray(Float.self).map(\.bitPattern), label)
+                                XCTAssertEqual(
+                                    expected.asArray(Float.self).map(\.bitPattern),
+                                    simdDown.asArray(Float.self).map(\.bitPattern), "SIMD " + label)
                             }
                         }
                     }
