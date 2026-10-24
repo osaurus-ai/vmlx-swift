@@ -23,7 +23,7 @@ enum SafetensorsStorageHealer {
         var checkCancellation: () throws -> Void = { try Task.checkCancellation() }
         var progress: (AlignmentRepairProgress) -> Void = { AlignmentRepairProgress.observer?($0) }
         var logger: (String) -> Void = { message in
-            fputs("[SafetensorsStorageHealer] \(message)\n", stderr)
+            RuntimeDiagnostics.write(Data("[SafetensorsStorageHealer] \(message)\n".utf8))
         }
     }
 

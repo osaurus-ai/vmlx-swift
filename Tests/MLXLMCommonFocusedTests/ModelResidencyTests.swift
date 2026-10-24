@@ -151,6 +151,12 @@ final class ModelResidencyTests: XCTestCase {
             withExtendedLifetime(lease) {}
             lease = nil
             RuntimeDiagnostics.write(Data("[Runtime] disconnected diagnostic sink\n".utf8))
+            // The healer's default diagnostic used C stdio rather than FileHandle;
+            // that path terminated with SIGPIPE even though no repair was enabled.
+            let repair = SafetensorsStorageHealer.healBundle(
+                at: URL(fileURLWithPath: "/unused-healer-diagnostic-probe"),
+                configuration: .init(environment: [:]))
+            XCTAssertEqual(repair.scannedShards, 0)
             // Both acquire and deinit must finish even when diagnostic output cannot.
             _ = dup2(saved, STDERR_FILENO)
             XCTAssertEqual(backend.limits.count, 2)
