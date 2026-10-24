@@ -371,6 +371,114 @@ enum JANGTKernels {
 
     static func kname(_ k: Double) -> String { String(k).replacingOccurrences(of: ".", with: "p") }
 
+    /// Experimental decode candidate. Eight SIMD groups share the rotated
+    /// activation across 32 output rows. This repeats rotation per output tile,
+    /// so dispatch reduction alone is not evidence that it is faster.
+    private static func sharedRotation(width: Int, slots: Int, input: String, expertSigns: Bool)
+        -> String
+    {
+        let blocks = width / 128
+        let row = expertSigns ? "t * \(slots)u + rotSlot" : "t"
+        let signOffset = expertSigns ? "size_t(idx[rotRow]) * \(width)u" : "0u"
+        return """
+            threadgroup float rotated[\(width * slots)];
+            for (uint rot = sgi; rot < \(blocks * slots)u; rot += 8u) {
+              uint rotSlot = rot / \(blocks)u, blk = rot % \(blocks)u;
+              uint rotRow = \(row);
+              size_t base = size_t(rotRow) * \(width)u + blk * 128u + lane * 4u;
+              const device float* sv = signs + \(signOffset);
+              float v[4];
+              for (uint i = 0; i < 4u; i++) v[i] = float(\(input)[base + i]) * sv[blk * 128u + lane * 4u + i];
+              { float a = v[0], b = v[1]; v[0] = a + b; v[1] = a - b; a = v[2]; b = v[3]; v[2] = a + b; v[3] = a - b; }
+              { float a = v[0], b = v[2]; v[0] = a + b; v[2] = a - b; a = v[1]; b = v[3]; v[1] = a + b; v[3] = a - b; }
+              for (uint d = 1u; d < 32u; d <<= 1) {
+                bool upper = (lane & d) != 0u;
+                for (uint i = 0; i < 4u; i++) { float o = simd_shuffle_xor(v[i], d); v[i] = upper ? (o - v[i]) : (v[i] + o); }
+              }
+              for (uint i = 0; i < 4u; i++) rotated[rotSlot * \(width)u + blk * 128u + lane * 4u + i] = v[i] * 0.08838834764831845f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+    }
+
+    static func gateUpWithRotation(
+        x: MLXArray, signs: MLXArray, indices: MLXArray,
+        gate: JANGTProjection, up: JANGTProjection, limit: Float, outputDType: DType
+    ) -> MLXArray {
+        let tokens = x.dim(0), kin = x.dim(1), slots = indices.dim(1), n = gate.outputs
+        precondition(kin % 128 == 0 && n % 32 == 0 && kin * 4 <= 32768)
+        let outliers = gate.outlierColumns
+        let name =
+            "jt_fusedrot_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_\(metalType(x.dtype))_\(metalType(outputDType))_lim\(kname(Double(limit)))"
+        var names = ["x", "signs", "idx", "kslots", "wg", "sg", "wu", "su_"]
+        if outliers > 0 { names += ["ocol", "woutg", "woutu"] }
+        let k = kernel(name, inputs: names, outputs: ["out"]) {
+            var source = JANGTKernelSource.gateUp(
+                kin: kin, n: n, k: gate.k, l: JANGTCode.stateBits,
+                outliers: outliers, words: gate.words, xdt: metalType(x.dtype),
+                odt: metalType(outputDType), limit: limit)
+            source = source.replacingOccurrences(
+                of: "threadgroup_position_in_grid.y * 8u",
+                with: "threadgroup_position_in_grid.y * 32u")
+            let anchor = "const uint lb = lane"
+            let at = source.range(of: anchor)!
+            source.insert(
+                contentsOf: sharedRotation(width: kin, slots: 1, input: "x", expertSigns: false)
+                    + "\n", at: at.lowerBound)
+            source = source.replacingOccurrences(
+                of: "const device float* xp = xr + (size_t)t * \(kin)u + lane * 16u;",
+                with: "const threadgroup float* xp = rotated + lane * 16u;")
+            return source
+        }
+        var inputs = [
+            contiguous(x), contiguous(signs), contiguous(indices.flattened().asType(.uint32)),
+            MLXArray([UInt32(slots)]), gate.packed, gate.scale, up.packed, up.scale,
+        ]
+        if outliers > 0 {
+            inputs += [gate.outlierColumnIndices, gate.outlierWeights, up.outlierWeights]
+        }
+        return k(
+            inputs, grid: (256, n / 32, tokens * slots), threadGroup: (256, 1, 1),
+            outputShapes: [[tokens * slots, n]], outputDTypes: [outputDType])[0]
+    }
+
+    static func downWithRotation(
+        h: MLXArray, signs: MLXArray, indices: MLXArray,
+        weights: MLXArray, projection: JANGTProjection
+    ) -> MLXArray {
+        let tokens = indices.dim(0), slots = indices.dim(1), kin = h.dim(1), n = projection.outputs
+        precondition(kin % 128 == 0 && n % 32 == 0 && slots * kin * 4 <= 32768)
+        let outliers = projection.outlierColumns
+        let name =
+            "jt_fusedrot_dn_k\(kin)_n\(n)_K\(kname(projection.k))_o\(outliers)_s\(slots)_\(metalType(h.dtype))"
+        var names = ["h", "signs", "idx", "rw", "wd", "sd"]
+        if outliers > 0 { names += ["ocol", "wout"] }
+        let k = kernel(name, inputs: names, outputs: ["out"]) {
+            var source = JANGTKernelSource.down(
+                kin: kin, n: n, k: projection.k, l: JANGTCode.stateBits,
+                outliers: outliers, slots: slots, words: projection.words)
+            source = source.replacingOccurrences(
+                of: "threadgroup_position_in_grid.y * 8u",
+                with: "threadgroup_position_in_grid.y * 32u")
+            let at = source.range(of: "const uint lb = lane")!
+            source.insert(
+                contentsOf: sharedRotation(width: kin, slots: slots, input: "h", expertSigns: true)
+                    + "\n", at: at.lowerBound)
+            source = source.replacingOccurrences(
+                of: "const device float* xp = hr + (size_t)ts * \(kin)u + lane * 16u;",
+                with: "const threadgroup float* xp = rotated + sl * \(kin)u + lane * 16u;")
+            return source
+        }
+        var inputs = [
+            contiguous(h), contiguous(signs), contiguous(indices.flattened().asType(.uint32)),
+            contiguous(weights.flattened().asType(.float32)), projection.packed, projection.scale,
+        ]
+        if outliers > 0 { inputs += [projection.outlierColumnIndices, projection.outlierWeights] }
+        return k(
+            inputs, grid: (256, n / 32, tokens), threadGroup: (256, 1, 1),
+            outputShapes: [[tokens, n]], outputDTypes: [.float32])[0]
+    }
+
     /// x (R, K) -> f32 H128(x * s); s (K,) or (E, K) with `rowExperts` (R,) selecting the signs row.
     static func rotateRows(_ x: MLXArray, signs: MLXArray, rowExperts: MLXArray? = nil) -> MLXArray {
         let rows = x.dim(0), width = x.dim(1)
