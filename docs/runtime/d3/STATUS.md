@@ -44,3 +44,11 @@ All nine bundles completed the seven-row smoke check: exact prompt IDs and image
 The new uint8 image path initially returned HWC instead of the NCHW consumed by patchification. All nine failed image rows from f49a4d2d2 are preserved; ae5ab4bb95 corrects the frame axis/channel order. A nonsquare known-colour regression now checks actual processor patch layout and channels.
 
 Initial endpoint scope is choice/noul/score, state-level images/videos and Turbo image boxes. Extended vendor asset composition/video-at/track and StateOnce are explicit follow-ups; unsupported endpoint fields must fail rather than be silently ignored. This does not qualify those extensions.
+
+## Corrections and current qualification run
+
+`5fdc30d34c` selects D3's declared GELU-tanh vision MLP and bounds attention by exact 2048-query chunks. The failed Flash-4M image decision now agrees with the independently corrected Python reference (Swift p=0.63524, Python p=0.64040); the NFC long document completes. Turbo image-box and long-text/media targeted rows complete. The full nine-bundle fixture suite is running from this revision. Flash-4M completes 195/195 with no non-near-tie decision mismatches, one near-tie flip, median max probability difference 0.00227. Do not interpret incomplete rows from the other bundles as a pass.
+
+The focused suite now executes 19 XCTest cases with zero failures, including actual known-colour nonsquare patchification and NFC token-boundary lookup. One optional metadata fixture was skipped in this run; it passed separately earlier. A missing test-runner metallib and two source-modified-during-build failures are retained as failed infrastructure/build attempts, not counted as passing tests.
+
+This branch preserves generic generative defaults. Their shared timestamped-video position path and declared vision activation still need a separate regression lane; the D3 correction is opt-in. API scope/extensions and the bundle minimum-version nuance must be disclosed in the app PR. No current app, memory-safety, cancellation or merge-ready claim follows from diagnostic-only results.

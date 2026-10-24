@@ -27,8 +27,12 @@ public struct DecisionBundle: Sendable {
         public let validatedLength: Int?
         public let systemone: JSONValue?
         enum CodingKeys: String, CodingKey {
-            case formatID = "format_id", formatVersion = "format_version", attentionMode = "attention_mode"
-            case tokenIDs = "token_ids", maxLength = "max_length", validatedLength = "validated_length"
+            case formatID = "format_id"
+            case formatVersion = "format_version"
+            case attentionMode = "attention_mode"
+            case tokenIDs = "token_ids"
+            case maxLength = "max_length"
+            case validatedLength = "validated_length"
             case prompt, pooling, codes, temperature, systemone
         }
     }
@@ -38,12 +42,14 @@ public struct DecisionBundle: Sendable {
     public let readoutURL: URL
 
     public static func isDecisionModel(at directory: URL) -> Bool {
-        FileManager.default.fileExists(atPath: directory.appendingPathComponent("decision/decision_config.json").path)
+        FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("decision/decision_config.json").path)
             && declaresDecisionModel(at: directory)
     }
 
     public static func declaresDecisionModel(at directory: URL) -> Bool {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("jang_config.json")),
+        guard
+            let data = try? Data(contentsOf: directory.appendingPathComponent("jang_config.json")),
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let decision = root["decision"] as? [String: Any]
         else { return false }
@@ -54,16 +60,25 @@ public struct DecisionBundle: Sendable {
         guard Self.isDecisionModel(at: directory) else {
             throw DecisionRuntimeError.invalid("Bundle does not declare a decision runtime")
         }
-        configuration = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf:
-            directory.appendingPathComponent("decision/decision_config.json")))
+        configuration = try JSONDecoder().decode(
+            Configuration.self,
+            from: Data(
+                contentsOf:
+                    directory.appendingPathComponent("decision/decision_config.json")))
         guard configuration.formatID == "d3-code-readout-v1", configuration.formatVersion == 1,
             configuration.prompt == "d3", configuration.pooling == "last",
             configuration.codes.count == 255, Set(configuration.codes).count == 255,
             configuration.tokenIDs.count == 255, Set(configuration.tokenIDs).count == 255,
             configuration.temperature.isFinite, configuration.temperature > 0
-        else { throw DecisionRuntimeError.invalid("Unsupported or inconsistent D3 decision configuration") }
-        let root = try JSONSerialization.jsonObject(with: Data(contentsOf:
-            directory.appendingPathComponent("jang_config.json"))) as? [String: Any]
+        else {
+            throw DecisionRuntimeError.invalid(
+                "Unsupported or inconsistent D3 decision configuration")
+        }
+        let root =
+            try JSONSerialization.jsonObject(
+                with: Data(
+                    contentsOf:
+                        directory.appendingPathComponent("jang_config.json"))) as? [String: Any]
         guard let decision = root?["decision"] as? [String: Any],
             let readout = decision["readout"] as? [String: Any],
             readout["path"] as? String == "decision/readout.safetensors",

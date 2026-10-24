@@ -17,8 +17,10 @@ enum D3VideoReader {
         guard duration.isFinite, duration > 0 else { throw VLMError.videoNotDecodable }
         let total = max(1, Int((duration * fps).rounded()))
         let count = min(total, min(32, max(4, Int(duration * 2))))
-        let indices = (0..<count).map { i in
-            count == 1 ? 0 : Int((Double(i) * Double(total - 1) / Double(count - 1)).rounded(.toNearestOrEven))
+        let indices = (0 ..< count).map { i in
+            count == 1
+                ? 0
+                : Int((Double(i) * Double(total - 1) / Double(count - 1)).rounded(.toNearestOrEven))
         }
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
