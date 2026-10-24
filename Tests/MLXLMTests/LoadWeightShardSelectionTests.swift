@@ -69,4 +69,66 @@ final class LoadWeightShardSelectionTests: XCTestCase {
         XCTAssertFalse(requiresJANGTQMmapBFloat16(config: ["model_type": "llama"]))
         XCTAssertFalse(requiresJANGTQMmapBFloat16(config: [:]))
     }
+
+    /// bottlecapai/ThinkingCap-Qwen3.8-27B-MLX-4bit-DWQ ships a separate MTP
+    /// drafter in `mtp-drafter/`, with its own config.json. The recursive glob
+    /// merged its prefix-free keys (`fc`, `layers`, `norm`, `pre_fc_norm_*`)
+    /// into the target, and `model.update()` rejected them as unhandled. A
+    /// directory with its own config.json is another model; a weights-only
+    /// subdirectory, and anything the root index names, stay eligible.
+    func testNestedModelBundleShardsAreExcluded() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nested-bundle-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        func touch(_ path: String) throws {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: url)
+        }
+        for path in [
+            "config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+            "model-vision.safetensors", "mtp.safetensors",
+            "mtp-drafter/config.json", "mtp-drafter/model.safetensors",
+            "weights/extra.safetensors",
+            "drafters/config.json",
+            "awq-calibration.safetensors",
+        ] {
+            try touch(path)
+        }
+        // A Hugging Face cache stores every snapshot file as a symlink into `blobs/`, outside the
+        // bundle, so resolving the FILE would lose its place in the bundle.
+        let blob = root.appendingPathExtension("blob")
+        defer { try? FileManager.default.removeItem(at: blob) }
+        try Data().write(to: blob)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("drafters/b"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("drafters/b/model.safetensors"), withDestinationURL: blob)
+        let base = root.standardizedFileURL.resolvingSymlinksInPath().path
+        func candidates() -> [String] {
+            candidateShardURLs(in: root, skipDSV4Sidecar: false)
+                .map { url in
+                    let parent = url.deletingLastPathComponent().standardizedFileURL
+                        .resolvingSymlinksInPath().path
+                    return String((parent + "/" + url.lastPathComponent).dropFirst(base.count + 1))
+                }
+                .sorted()
+        }
+
+        XCTAssertEqual(candidates(), [
+            "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+            "model-vision.safetensors", "mtp.safetensors", "weights/extra.safetensors",
+        ])
+
+        // A root index that names the nested file keeps it eligible.
+        try JSONSerialization.data(withJSONObject: [
+            "weight_map": ["a": "model-00001-of-00002.safetensors", "b": "mtp-drafter/model.safetensors"]
+        ]).write(to: root.appendingPathComponent("model.safetensors.index.json"))
+        XCTAssertEqual(candidates(), [
+            "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+            "model-vision.safetensors", "mtp-drafter/model.safetensors", "mtp.safetensors",
+            "weights/extra.safetensors",
+        ])
+    }
 }
