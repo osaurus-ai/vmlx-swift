@@ -280,7 +280,7 @@ public enum VLMProcessorTypeRegistry {
         "Qwen2_5_VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
-            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+            Qwen3VLProcessorConfiguration.self, { Qwen3VLProcessor($0, tokenizer: $1) }),
         "MiniCPMV47Processor": create(
             MiniCPMV47ProcessorConfiguration.self, MiniCPMV47Processor.init),
         "Idefics3Processor": create(
@@ -481,6 +481,10 @@ public final class VLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
+        if DecisionBundle.declaresDecisionModel(at: modelDirectory) {
+            throw DecisionRuntimeError.invalid("This is a decision model; use the System One decision runtime, not chat generation")
+        }
+
         var loadTiming = ModelLoadTiming(scope: "vlm")
 
         // Load config.json once and decode for both base config and model-specific config

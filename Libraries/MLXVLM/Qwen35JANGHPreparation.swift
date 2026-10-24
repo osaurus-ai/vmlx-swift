@@ -50,12 +50,12 @@ struct Qwen35JANGHPreparation {
 
     /// Construct the ordinary model (custom modules are `false` in the ordinary plan, so they stay plain
     /// Linear placeholders), then replace every dense JANGH projection BEFORE weights load.
-    func construct(configurationData: Data, requesting: Set<ModelRuntimeRequestModality>?) throws
+    func construct(configurationData: Data, requesting: Set<ModelRuntimeRequestModality>?, decisionBackbone: Bool = false) throws
         -> Qwen35
     {
         let config = try JSONDecoder.json5().decode(
             Qwen35Configuration.self, from: configurationData)
-        let model = try Qwen35(config, requesting: requesting)
+        let model = try decisionBackbone ? Qwen35(decisionConfiguration: config) : Qwen35(config, requesting: requesting)
         let projections = try dense.makeProjectionsByPath()
         let leaves = Set(model.leafModules().flattened().map(\.0))
         var updates: [(String, Module)] = []

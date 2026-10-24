@@ -1807,7 +1807,8 @@ enum Qwen35Language {
             _ x: MLXArray,
             mask: MLXArray?,
             cache: KVCache?,
-            positionIds: MLXArray?
+            positionIds: MLXArray?,
+            decisionStateTokenCount: Int? = nil
         ) -> MLXArray {
             if let scope = DFlash2TreeScope.current, let cache, x.dim(0) == 1 {
                 return treeAttention(x, cache: cache, scope: scope)
@@ -1903,7 +1904,33 @@ enum Qwen35Language {
 
             let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             let attended: MLXArray
-            if B == 1, (2...8).contains(L), !hadamard, let simple = cache,
+            if let split = decisionStateTokenCount {
+                // Zero selects noncausal full attention; a positive value selects prefix-bidir.
+                // Only the explicit cache-free decision forward supplies this parameter.
+                precondition(cache == nil && split >= 0 && split < L)
+                func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> MLXArray {
+                    let count = q.dim(2)
+                    var pieces: [MLXArray] = []
+                    // Match the reference query-only chunking. Every row still sees ALL keys;
+                    // this bounds fallback head-256 score allocation without windowing/truncation.
+                    for start in stride(from: 0, to: count, by: 2048) {
+                        let piece = MLXFast.scaledDotProductAttention(
+                            queries: q[0..., 0..., start..<min(start + 2048, count), 0...],
+                            keys: k, values: v, scale: scale, mask: .none)
+                        eval(piece)
+                        pieces.append(piece)
+                    }
+                    return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 2)
+                }
+                if split == 0 {
+                    attended = attend(queries, keys, values)
+                } else {
+                    let state = attend(queries[0..., 0..., 0..<split, 0...],
+                        keys[0..., 0..., 0..<split, 0...], values[0..., 0..., 0..<split, 0...])
+                    let question = attend(queries[0..., 0..., split..., 0...], keys, values)
+                    attended = concatenated([state, question], axis: 2)
+                }
+            } else if B == 1, (2...8).contains(L), !hadamard, let simple = cache,
                 type(of: simple) == KVCacheSimple.self,
                 FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
                 L >= 3 || Self.vectorSDPAKeyClassChanges(lastRowKeys: simple.offset + L)
@@ -3373,7 +3400,8 @@ enum Qwen35Language {
             ssmMask: MLXArray?,
             cache: KVCache?,
             positionIds: MLXArray?,
-            recordPrefixCommitStates: Bool = false
+            recordPrefixCommitStates: Bool = false,
+            decisionStateTokenCount: Int? = nil
         ) -> MLXArray {
             let r: MLXArray
             if NativeMTPPhaseDiagnostics.enabled {
@@ -3388,7 +3416,7 @@ enum Qwen35Language {
                 } else {
                     r = selfAttn!(
                         inputLayerNorm(x), mask: attentionMask, cache: cache,
-                        positionIds: positionIds)
+                        positionIds: positionIds, decisionStateTokenCount: decisionStateTokenCount)
                 }
                 MLX.eval(r)
                 NativeMTPPhaseDiagnostics.record(
@@ -3408,7 +3436,7 @@ enum Qwen35Language {
                 let normed = inputLayerNorm(x)
                 Qwen4ExpRowExactCapture.part(layerIndex, "input_norm", normed)
                 r = selfAttn!(
-                    normed, mask: attentionMask, cache: cache, positionIds: positionIds)
+                    normed, mask: attentionMask, cache: cache, positionIds: positionIds, decisionStateTokenCount: decisionStateTokenCount)
             }
             Qwen4ExpRowExactCapture.part(layerIndex, "mixer_out", r)
 
@@ -3744,7 +3772,7 @@ enum Qwen35Language {
             }
         }
 
-        init(_ config: Qwen35Configuration) {
+        init(_ config: Qwen35Configuration, headless: Bool = false) {
             self.config = config
             self.textConfig = config.textConfiguration
             self.modelType = config.textConfiguration.modelType
@@ -3754,13 +3782,13 @@ enum Qwen35Language {
                 count: config.textConfiguration.hiddenLayers
             )
 
-            if !config.textConfiguration.tieWordEmbeddings {
+            if !headless && !config.textConfiguration.tieWordEmbeddings {
                 _lmHead.wrappedValue = Linear(
                     config.textConfiguration.hiddenSize,
                     config.textConfiguration.vocabularySize,
                     bias: false)
             }
-            if config.textConfiguration.mtpNumHiddenLayers > 0 {
+            if !headless && config.textConfiguration.mtpNumHiddenLayers > 0 {
                 _mtp.wrappedValue = MTPModule(config.textConfiguration)
             }
             super.init()
@@ -4261,7 +4289,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// optimized inherited convenience initialization can allocate a Qwen35 rather
     /// than its Qwen35MoE subclass, bypassing the MoE sanitizer through LanguageModel.
     /// External callers still use the public initializers and resolveConstruction.
-    init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan) {
+    init(_ config: Qwen35Configuration, plan: ResolvedConstructionPlan, decisionBackbone: Bool = false) {
         self.plan = plan
         self.config = config
         // Built first, so the capability report can be COLLECTED from what actually exists rather
@@ -4270,7 +4298,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // the report cannot claim a lane the instance lacks.
         var tower: (any ModelCapabilityProviding)?
         if let vision = config.visionConfiguration, plan.builds(.visionTower) {
-            let built = Qwen3VLVision.VisionModel(vision)
+            // D3's trained vision MLP declares GELU-tanh, not the legacy sigmoid approximation.
+            // Preserve the existing generative constructor until its separate regression lane.
+            let built = Qwen3VLVision.VisionModel(vision,
+                mlpActivation: decisionBackbone ? (vision.hiddenAct == "gelu" ? .none : .tanh) : .fast)
             tower = built
             _visionModel.wrappedValue = built
         } else if let vision = config.miniCPMVisionConfiguration, plan.builds(.visionTower) {
@@ -4280,7 +4311,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
             tower = built
             _visionModel.wrappedValue = built
         }
-        _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+        _languageModel.wrappedValue = Qwen35Language.LanguageModel(config, headless: decisionBackbone)
 
         // The components declare their own contribution; `.video` is added here because it needs
         // this model's video token id, which the encoder knows nothing about. MiniCPM-V 4.7's tower
@@ -4297,6 +4328,45 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     /// What was actually built. Kept so `prepare` and `sanitize` can ask about MODULES rather than
     /// re-deriving them from lanes.
     public let plan: ResolvedConstructionPlan
+
+    convenience init(decisionConfiguration config: Qwen35Configuration) throws {
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: nil), decisionBackbone: true)
+    }
+
+    /// Cache-free decision forward. GDN remains causal, full attention does not.
+    /// This path never projects vocabulary logits or allocates a conversation KV cache.
+    func decisionHidden(input: LMInput, stateTokenCount: Int?) throws -> MLXArray {
+        let ids = input.text.tokens
+        var hidden = languageModel.model.embedTokens(ids)
+        let imageFrames = input.image?.frames
+        let videoFrames = input.video?.frames
+        let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+        var pixels: [MLXArray] = []
+        if let image = input.image { pixels.append(image.pixels) }
+        if let video = input.video { pixels.append(video.pixels) }
+        if !pixels.isEmpty {
+            guard let visionPath else { throw VLMError.processing("Decision media requires the vision tower") }
+            let features = visionPath.features(
+                pixels: concatenated(pixels).asType(visionPath.visionDType), frames: frames)
+            (hidden, _) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: features.asType(hidden.dtype), imageRowCount: mergedRowCount(for: imageFrames),
+                inputEmbeds: hidden, inputIds: ids, imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex)
+        }
+        let axes = try D3MRoPE.positions(tokens: ids.asArray(Int32.self).map(Int.init),
+            images: imageFrames ?? [], videos: videoFrames ?? [],
+            merge: config.visionConfiguration?.spatialMergeSize ?? 1,
+            imageToken: config.imageTokenId, videoToken: config.videoTokenId ?? -1)
+        let positions = stacked(axes.map { MLXArray($0) }).expandedDimensions(axis: 1)
+        for layer in languageModel.model.layers {
+            try Task.checkCancellation()
+            hidden = layer(hidden, attentionMask: nil, ssmMask: nil, cache: nil,
+                positionIds: positions, decisionStateTokenCount: stateTokenCount ?? 0)
+            // Bound activation ownership to one block rather than the entire eager graph.
+            eval(hidden)
+        }
+        return languageModel.model.norm(hidden)
+    }
 
     public var vocabularySize: Int { config.vocabSize }
 

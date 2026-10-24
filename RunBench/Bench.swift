@@ -44,6 +44,15 @@ struct Bench {
         // executable serves any model. Defaults preserve historical Qwen3.5 behavior.
         let env = ProcessInfo.processInfo.environment
         let modelPath = env["BENCH_MODEL"] ?? homePath("models/Qwen3.5-35B-A3B-4bit")
+        if env["BENCH_D3"] == "1" {
+            do {
+                try await D3DecisionProbe.run(directory: URL(fileURLWithPath: modelPath))
+            } catch {
+                FileHandle.standardError.write(Data("D3_ERROR: \(error.localizedDescription)\n".utf8))
+                exit(1)
+            }
+            return
+        }
         let tokensPath = env["BENCH_TOKENS"] ?? "/tmp/qwen35_multiturn_tokens.json"
         let maxNew = Int(env["BENCH_MAX_TOKENS"] ?? "256") ?? 256
         let compileDecode = (env["BENCH_COMPILE_DECODE"] ?? "0") == "1"
