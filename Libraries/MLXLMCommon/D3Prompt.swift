@@ -106,12 +106,15 @@ public enum D3Prompt {
             switch item { case .bytes(let b): bytes += b; case .literal(let s): bytes += s.utf8; case .ignored: break }
             ends.append(bytes.count)
         }
-        let marker = Array(("State:\n" + stateText(state) + "\n\nQuestion:\n").utf8)
+        // The declared Qwen2 tokenizer NFC-normalizes before byte-level splitting.
+        // Locate boundaries in those normalized bytes, including decomposed source documents.
+        let normalizedState = stateText(state).precomposedStringWithCanonicalMapping
+        let marker = Array(("State:\n" + normalizedState + "\n\nQuestion:\n").utf8)
         guard marker.count <= bytes.count,
             let start = (0...(bytes.count - marker.count)).first(where: { bytes[$0..<($0 + marker.count)].elementsEqual(marker) }) else {
             throw DecisionRuntimeError.invalid("Decision prompt has no state/question boundary")
         }
-        let end = start + "State:\n".utf8.count + stateText(state).utf8.count
+        let end = start + "State:\n".utf8.count + normalizedState.utf8.count
         let count = ends.prefix(while: { $0 <= end }).count
         guard count > 0, count < ids.count else { throw DecisionRuntimeError.invalid("Invalid D3 state split") }
         return count

@@ -1,4 +1,6 @@
+import CoreImage
 import Foundation
+import MLX
 import XCTest
 @testable import MLXLMCommon
 @testable import MLXVLM
@@ -28,6 +30,26 @@ final class D3DecisionTests: XCTestCase {
         XCTAssertThrowsError(try D3Question(DecisionJSON.parse(Data(#"{"type":"score","criteria":["same","same"]}"#.utf8))))
     }
 
+    func testNFCStateBoundaryMatchesTokenBytes() throws {
+        let state = DecisionJSON.string("e\u{301}")
+        let text = "prefix State:\né\n\nQuestion:\nChoose."
+        let ids = text.utf8.map(Int.init)
+        XCTAssertEqual(try D3Prompt.stateTokenCount(ids: ids, state: state, tokenizer: D3ByteTokenizer()),
+            "prefix State:\né".utf8.count)
+    }
+
+    func testDecisionImageUsesNCHWPatchLayout() throws {
+        let config = try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self, from: Data(#"{"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"merge_size":2,"patch_size":16,"temporal_patch_size":2,"image_processor_type":"Qwen3VLImageProcessor","size":{"min_pixels":2048,"max_pixels":2048}}"#.utf8))
+        let processor = Qwen3VLProcessor(config, tokenizer: D3ByteTokenizer(), decisionMediaProcessing: true)
+        let image = CIImage(color: CIColor(red: 1, green: 0, blue: 0)).cropped(to: CGRect(x: 0, y: 0, width: 64, height: 32))
+        let (pixels, grid) = try processor.preprocess(images: [image], processing: nil)
+        XCTAssertEqual([grid.t, grid.h, grid.w], [1, 2, 4])
+        XCTAssertEqual(pixels.shape, [8, 1536])
+        let first = pixels[0].asArray(Float.self)
+        XCTAssertTrue(first[0..<512].allSatisfy { abs($0 - 1) < 1e-5 })
+        XCTAssertTrue(first[512..<1536].allSatisfy { abs($0 + 1) < 1e-5 })
+    }
+
     func testTimestampSeparatedVideoPositionGroups() throws {
         // Text, one 2x2 merged video grid, timestamp text, next 2x2 grid, final text.
         let positions = try D3MRoPE.positions(tokens: [7,9,9,9,9,8,9,9,9,9,6], images: [],
@@ -46,4 +68,19 @@ final class D3DecisionTests: XCTestCase {
         XCTAssertEqual(positions[1], [0,1,1,3,4,5,6])
         XCTAssertEqual(positions[2], [0,1,2,3,4,4,6])
     }
+}
+
+private struct D3ByteTokenizer: Tokenizer {
+    var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? {
+        { .bytes([UInt8($0)]) }
+    }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { text.utf8.map(Int.init) }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { String(decoding: tokenIds.map(UInt8.init), as: UTF8.self) }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?) throws -> [Int] { [] }
 }

@@ -36,3 +36,11 @@ The first implementation adds strict decision metadata/readout admission, ordere
 - Whole-repository Release tests hit pre-existing test build issues (`Testing` absent with CLT; `MLXArray.withEvalLockForTesting` absent in Release with Xcode). A focused package compiles the unchanged affected test sources against the actual production libraries. These failed builds are not counted as passing tests.
 
 Corrected module build: `swift build -c release --target MLXVLM` passed. Focused Release XCTest package: 17 tests executed, zero failures, one optional generic-Qwen metadata fixture skipped in the first run. The package compiles the repository's unchanged D3DecisionTests and JANGHConfigurationPartitionTests against production MLXVLM/MLXLMCommon, avoiding unrelated test-target compilation failures. The same-weight runtime sweep is being rerun after these corrections; no corrected-family result is claimed from the compile/unit result alone.
+
+## Expanded parity findings (ae5ab4bb95)
+
+All nine bundles completed the seven-row smoke check: exact prompt IDs and image/video grids, 63/63 identical top decisions on those rows. This is not complete qualification. The expanded Flash-4M suite found a substantial image probability/decision difference and stopped at a decomposed-Unicode long document because boundary lookup used raw bytes instead of the tokenizer's declared NFC normalization. The latter is corrected in source and has a focused regression test; the image tensor comparison is still under investigation. The stale-source full runner was stopped after this common failure, preserving completed rows rather than repeatedly running the known failure on every quant.
+
+The new uint8 image path initially returned HWC instead of the NCHW consumed by patchification. All nine failed image rows from f49a4d2d2 are preserved; ae5ab4bb95 corrects the frame axis/channel order. A nonsquare known-colour regression now checks actual processor patch layout and channels.
+
+Initial endpoint scope is choice/noul/score, state-level images/videos and Turbo image boxes. Extended vendor asset composition/video-at/track and StateOnce are explicit follow-ups; unsupported endpoint fields must fail rather than be silently ignored. This does not qualify those extensions.

@@ -1,3 +1,4 @@
+import CoreImage
 import Foundation
 import MLX
 import MLXHuggingFace
@@ -9,6 +10,18 @@ import VMLXTokenizers
 enum D3DecisionProbe {
     static func run(directory: URL) async throws {
         let env = ProcessInfo.processInfo.environment
+        if let image = env["D3_DUMP_IMAGE"], let destination = env["D3_DUMP_PIXELS"] {
+            let configuration = try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self,
+                from: Data(contentsOf: directory.appendingPathComponent("preprocessor_config.json")))
+            guard let input = CIImage(contentsOf: URL(fileURLWithPath: image)) else {
+                throw DecisionRuntimeError.invalid("Diagnostic image could not be decoded")
+            }
+            let tokenizer = try await #huggingFaceTokenizerLoader().load(from: directory)
+            let processor = Qwen3VLProcessor(configuration, tokenizer: tokenizer, decisionMediaProcessing: true)
+            let (pixels, _) = try processor.preprocess(images: [input], processing: nil)
+            try save(arrays: ["pixels": pixels], url: URL(fileURLWithPath: destination))
+            if env["D3_PIXELS_ONLY"] == "1" { return }
+        }
         let rowsURL = URL(fileURLWithPath: env["D3_ROWS"]!)
         let outputURL = URL(fileURLWithPath: env["D3_OUTPUT"]!)
         let rows = try String(contentsOf: rowsURL, encoding: .utf8).split(separator: "\n")
