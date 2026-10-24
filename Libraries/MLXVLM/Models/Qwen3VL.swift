@@ -18,10 +18,12 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
+    private let videoTimestampGroups: Bool
 
-    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
+    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer, videoTimestampGroups: Bool = false) {
         self.config = config
         self.tokenizer = tokenizer
+        self.videoTimestampGroups = videoTimestampGroups
     }
 
     /// Frames are rendered without colour management (`asMLXArrayUnmanaged`), so the stored,
@@ -133,12 +135,21 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        try await prepare(input: input, assistantSuffix: "")
+    }
+
+    /// D3 Box marker suffix, appended to the vendor's rendered assistant rail before tokenization.
+    func prepare(input: UserInput, assistantSuffix: String) async throws -> LMInput {
         let messages = Qwen3VLMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext
         )
+        if !assistantSuffix.isEmpty {
+            let rendered = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+            promptTokens = tokenizer.encode(text: rendered + assistantSuffix, addSpecialTokens: false)
+        }
         var cacheBoundaries = canonicalChatCacheBoundaries(
             tokenizer: tokenizer, messages: messages, tools: input.tools,
             additionalContext: input.additionalContext, promptTokens: promptTokens,
@@ -191,6 +202,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         var processedVideo: LMInput.ProcessedVideo?
         if !input.videos.isEmpty {
             var accumulatedFrames: [[MLXArray]] = []
+            var videoTimes: [[Double]] = []
 
             for video in input.videos {
                 let sequence = try await MediaProcessing.asProcessedVideoFrames(
@@ -215,6 +227,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     minPixels: config.videoMinPixels,
                     maxPixels: config.videoMaxPixels)
                 let resizedSize = CGSize(width: width, height: height)
+                videoTimes.append(sequence.frames.map { $0.timeStamp.seconds })
                 accumulatedFrames.append(
                     sequence.frames.map {
                         MediaProcessing.asMLXArrayUnmanaged(
@@ -234,6 +247,32 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             processedVideo = .init(pixels: concatenated, frames: videoFrames.map { $0.1 })
 
             if let frames = processedVideo?.frames {
+                if videoTimestampGroups {
+                    guard let pad = tokenizer.convertTokenToId("<|video_pad|>") else {
+                        throw VLMError.processing("Missing video padding token")
+                    }
+                    var cursor = 0
+                    for (videoIndex, grid) in frames.enumerated() {
+                        guard let at = promptTokens[cursor...].firstIndex(of: pad) else {
+                            throw VLMError.processing("Missing video placeholder")
+                        }
+                        var expanded: [Int] = []
+                        let times = videoTimes[videoIndex]
+                        for group in 0..<grid.t {
+                            let lo = min(group * config.temporalPatchSize, times.count - 1)
+                            let hi = min(lo + config.temporalPatchSize, times.count)
+                            let seconds = times[lo..<hi].reduce(0, +) / Double(hi - lo)
+                            let timestamp = String(format: "<%.1f seconds><|vision_start|>", locale: Locale(identifier: "en_US_POSIX"), seconds)
+                            expanded += tokenizer.encode(text: timestamp, addSpecialTokens: false)
+                            expanded += Array(repeating: pad, count: grid.h * grid.w / (config.mergeSize * config.mergeSize))
+                            expanded += tokenizer.encode(text: "<|vision_end|>", addSpecialTokens: false)
+                        }
+                        promptTokens.replaceSubrange(at...at, with: expanded)
+                        cursor = at + expanded.count
+                    }
+                    // Decision requests do not publish chat-cache boundaries.
+                    cacheBoundaries = CanonicalChatCacheBoundaries(all: [], stable: [])
+                } else {
                 let expanded = try QwenVL.expandPaddingTokens(
                     in: promptTokens,
                     frames: frames,
@@ -242,6 +281,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     tokenizer: tokenizer, boundaries: cacheBoundaries)
                 promptTokens = expanded.tokens
                 cacheBoundaries = expanded.boundaries
+                }
             }
         }
 
