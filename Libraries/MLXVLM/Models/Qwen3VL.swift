@@ -42,7 +42,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let mean = config.imageMean.map(Float.init), std = config.imageStd.map(Float.init)
         var values = [Float](repeating: 0, count: resized.data.count)
         for i in values.indices { values[i] = (Float(resized.data[i]) * (1 / 255) - mean[i % 3]) / std[i % 3] }
-        return MLXArray(values, [height, width, 3])
+        // Qwen patchification consumes NCHW, including the singleton frame axis.
+        return MLXArray(values, [1, height, width, 3]).transposed(0, 3, 1, 2)
     }
 
     static func videoTargetSize(
