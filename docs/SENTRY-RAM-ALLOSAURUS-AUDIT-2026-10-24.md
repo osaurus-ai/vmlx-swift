@@ -248,11 +248,12 @@ flows does not clear the full app. Promotion was held when this surfaced.
 The expanded candidate adds public `RuntimeDiagnostics` for runtime/host callers:
 on Darwin it emits private-field unified logs and never writes stderr or
 changes signals/descriptors; non-Darwin keeps its existing stderr behavior.
-The 242 call replacements in 63 runtime files are mechanically verified; the
+The initial 242 call replacements in 63 runtime files are mechanically verified; the
 image-model target declares its already-transitive MLXLMCommon dependency
 explicitly. Six host diagnostic writers are being routed through it too.
-Compiler-plugin output and Linux logging compatibility are outside the macOS
-host migration. This is diagnostic routing, not suppression of typed errors.
+The tokenizer integration macro also emits 16 runtime diagnostic writes;
+those now call the qualified shared sink. Linux logging compatibility keeps
+its existing stderr behavior. This is diagnostic routing, not suppression of typed errors.
 
 After the expansion, 112 distinct focused cases pass, including three sink
 cases (errno preservation adds one), actual-registry disconnected-stderr
@@ -269,3 +270,18 @@ It remains default-off and is rejected for promotion. Adaptive rows differ in
 reasoning length even at the same seed and do not support a matched speedup
 claim. A second SIMD-register candidate retains 64-thread dot geometry, passes
 120 bit-exact parity configurations, and is under separate app qualification.
+
+The second SIMD-register prototype also fails promotion: a counterbalanced
+control/SIMD/SIMD/control series has identical answer, reasoning and token
+counts in all 16 rows. Combined generation-time ratios per case are about
+0.93, 0.98, 0.99 and 1.01; the unchanged control itself drifts substantially.
+There is no reliable full-model gain. Both prototypes stay default-off and
+outside the crash/RAM PR. Raw epoch outputs and usage stay private.
+
+Apple explicitly lists Neural Accelerators on both M5 Pro and M5 Max in its
+[Metal documentation](https://developer.apple.com/metal/whats-new/). Treating
+M5 Pro as inherently lacking NAX would be incorrect. The current runtime
+also checks OS availability and its actual architecture string; the reported
+M5 Pro's effective backend remains unobserved. The missing non-NAX JANGT
+matrix prefill is relevant to M3, but is not a measured root cause of the
+reported equal 11 tok/s figures.

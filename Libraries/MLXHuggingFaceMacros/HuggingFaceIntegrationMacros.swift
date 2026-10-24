@@ -191,7 +191,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         if hasLagunaSentinel
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: LagunaMinimal\\n"
                                         .data(using: .utf8)!)
                             }
@@ -214,7 +214,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -236,7 +236,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -269,7 +269,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -303,7 +303,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             )
                         if step37NeedsFallback {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
                                         .data(using: .utf8)!)
                             }
@@ -336,7 +336,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            upstream.bosToken == "]~!b[",
                            upstream.eosToken == "[e~[" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: MiniMaxM2Minimal (enable_thinking=false)\\n"
                                         .data(using: .utf8)!)
                             }
@@ -400,7 +400,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            upstream.eosToken == dsv4Eos,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] DSV4 native chat encoder engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -416,7 +416,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>"),
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> NemotronMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -441,7 +441,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                                 if hasLagunaSentinel {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> LagunaMinimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -458,7 +458,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.bosToken == "]~!b[",
                                    upstream.eosToken == "[e~[" {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> MiniMaxM2Minimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -474,7 +474,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 }
                                 if upstream.bosToken == "<bos>" {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> Gemma4 fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -493,7 +493,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.bosToken == "<s>",
                                    (upstream.convertTokenToId("<|im_end|>").flatMap { upstream.convertIdToToken($0) } == "<|im_end|>") {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template missing -> NemotronMinimal fallback engaged\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -574,7 +574,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         tools: chatTemplateTools,
                                         additionalContext: additionalContext)
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
+                                        MLXLMCommon.RuntimeDiagnostics.write(
                                             "[vmlx] chat-template fallback engaged: \\(candidate.label)\\n"
                                                 .data(using: .utf8)!)
                                     }
@@ -667,7 +667,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                            hasLFM2NativeToolSentinels,
                            (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> LFM2ToolMinimal fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -717,7 +717,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1"
                         if gemmaToolSchemasPresent {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template tools -> Gemma4WithTools fallback engaged\\n"
                                         .data(using: .utf8)!)
                             }
@@ -751,7 +751,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             )
                         if step37NeedsFallback {
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                FileHandle.standardError.write(
+                                MLXLMCommon.RuntimeDiagnostics.write(
                                     "[vmlx] chat-template auto-correction engaged: Step37Minimal\\n"
                                         .data(using: .utf8)!)
                             }
