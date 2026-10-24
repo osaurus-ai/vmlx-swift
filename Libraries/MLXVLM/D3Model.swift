@@ -338,7 +338,7 @@ public actor D3Model {
         let ids = prepared.text.tokenIds ?? prepared.text.tokens.asArray(Int32.self).map(Int.init)
         let split = try D3Prompt.stateTokenCount(ids: ids, state: state, tokenizer: tokenizer)
         if let length = bundle.configuration.validatedLength, ids.count > length {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[D3] validated_length_exceeded tokens=\(ids.count) validated=\(length); proceeding without truncation\n"
                         .utf8))

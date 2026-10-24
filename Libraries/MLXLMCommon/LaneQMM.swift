@@ -279,7 +279,7 @@ extension LaneQMM {
         lock.unlock()
         guard fresh else { return }
         let report = install(model: module, tile: true, untiledMinRows: minRows)
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[LaneQMM] drafter lane=\(report.lane) tiled=\(report.tiled) skipped=\(report.skipped)\n".utf8))
     }
 
@@ -358,7 +358,7 @@ extension LaneQMM {
         laneFlatTargets[id] = flat
         lock.unlock()
         if ProcessInfo.processInfo.environment["VMLX_LANE_QMM_LOG"] == "1" {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[LaneQMM] DFlash2 target: \(report.lane) projections (\(report.tiled) tiled), skipped \(report.skipped), \(String(format: "%.2f", Date().timeIntervalSince(start)))s\n"
                         .utf8))

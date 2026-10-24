@@ -1190,7 +1190,7 @@ public class BailingHybridLanguageModel: Module {
         if trace {
             let emb = h.asType(.float32)
             let nonFinite = (1 - MLX.isFinite(emb).asType(.int32)).sum().item(Int32.self)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][bailing-hybrid-trace] embedding dtype=\(h.dtype) shape=\(h.shape) maxAbs=\(MLX.abs(emb).max().item(Float.self)) nonFinite=\(nonFinite) offset=\(offset)\n".utf8))
         }
         var firstBadLayer: Int? = nil
@@ -1203,11 +1203,11 @@ public class BailingHybridLanguageModel: Module {
                 let nonFinite = (1 - MLX.isFinite(hf).asType(.int32)).sum().item(Int32.self)
                 if nonFinite > 0 {
                     firstBadLayer = i
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][bailing-hybrid-trace] FIRST non-finite at layer \(i) (\(layers[i].isGlobal ? "MLA" : "GLA")) "
                             + "dtype=\(h.dtype) nonFinite=\(nonFinite)/\(h.size) L=\(h.dim(1)) offset=\(offset)\n").utf8))
                 } else if i == 0 || i == firstGlobalIdx {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         "[vmlx][bailing-hybrid-trace] layer \(i) (\(layers[i].isGlobal ? "MLA" : "GLA")) dtype=\(h.dtype) maxAbs=\(MLX.abs(hf).max().item(Float.self)) finite\n".utf8))
                 }
             }

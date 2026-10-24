@@ -474,18 +474,18 @@ public enum LLMTypeRegistry {
         {
             let configuration = try JSONDecoder().decode(
                 BailingHybridConfiguration.self, from: data)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[LLMModelFactory] bailing_hybrid → Ling 2.6 runtime (BailingHybridModel, GLA) \(markers)\n".utf8))
             return BailingHybridModel(configuration)
         }
         do {
             let configuration = try JSONDecoder().decode(
                 BailingMoeV3Configuration.self, from: data)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[LLMModelFactory] bailing_hybrid → Ling 3.0 runtime (BailingMoeV3Model, KDA) \(markers)\n".utf8))
             return BailingMoeV3Model(configuration)
         } catch {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[LLMModelFactory] bailing_hybrid config does not decode as Ling 3.0 (BailingMoeV3Configuration): "
                     + "\(error). The Ling 2.6 GLA runtime is reached only by a config naming the "
                     + "BailingMoeV2 architecture; it is not a fallback (it produces garbage for Ling 3 bundles). \(markers)\n").utf8))
@@ -1528,7 +1528,7 @@ public final class LLMModelFactory: ModelFactory {
             || (priorFormat.lowercased() == "jangtq4")
         if !isMxtqStampAlready {
             configDict["weight_format"] = "mxtq"
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's startup metadata\n".utf8))
         }
         if configDict["mxtq_bits"] == nil {
@@ -1777,7 +1777,7 @@ public final class LLMModelFactory: ModelFactory {
                     || (priorFormat.lowercased() == "jangtq4")
                 if !isMxtqStampAlready {
                     configDict["weight_format"] = "mxtq"
-                    FileHandle.standardError.write(
+                    RuntimeDiagnostics.write(
                         Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's jang_config.json\n".utf8))
                 }
                 if configDict["mxtq_bits"] == nil {

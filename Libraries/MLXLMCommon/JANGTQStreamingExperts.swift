@@ -614,7 +614,7 @@ private final class MLXPressStreamingProfileState: @unchecked Sendable {
         }
         lock.unlock()
         if let output {
-            FileHandle.standardError.write(Data(output.utf8))
+            RuntimeDiagnostics.write(Data(output.utf8))
         }
     }
 
@@ -623,7 +623,7 @@ private final class MLXPressStreamingProfileState: @unchecked Sendable {
         lock.lock()
         let output = summaryLocked(reason: reason)
         lock.unlock()
-        FileHandle.standardError.write(Data(output.utf8))
+        RuntimeDiagnostics.write(Data(output.utf8))
     }
 
     func snapshot(maxRows: Int? = nil) -> MLXPressStreamingProfileSnapshot {
@@ -749,7 +749,7 @@ private final class MLXPressActiveExpertTraceState: @unchecked Sendable {
         }.joined(separator: " | ")
         let output =
             "[MLXPressActiveExpertTrace] \(reason) calls=\(snapshot.totalCalls) tokens=\(snapshot.totalTokens) slots=\(snapshot.totalRoutedSlots) uniqueTouches=\(snapshot.totalUniqueExpertTouches) consecutiveReuse=\(snapshot.totalConsecutiveReuseTouches) reuseRate=\(String(format: "%.3f", snapshot.consecutiveReuseRate)) \(layerSummary)\n"
-        FileHandle.standardError.write(Data(output.utf8))
+        RuntimeDiagnostics.write(Data(output.utf8))
     }
 
     func snapshot(
@@ -2575,17 +2575,17 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         let noCache = mlXPressStreamingUseFNoCache(for: built)
         let streamableGB = Double(built.totalTensorBytes) / (1024 * 1024 * 1024)
         let thresholdGB = Double(mlXPressStreamingNoCacheThresholdBytes()) / (1024 * 1024 * 1024)
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 "[MLXPressStreaming] indexed active-expert JANGTQ tensors layers=\(layers) experts=\(experts) stackedLayers=\(stacked)\n"
                     .utf8))
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[MLXPressStreaming] active-expert tensor cache budget=\(cacheMB) MB\n".utf8))
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[MLXPressStreaming] active-expert bank cache budget=\(bankCacheMB) MB\n".utf8))
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[MLXPressStreaming] offset-span cache budget=\(offsetSpanCacheMB) MB\n".utf8))
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 String(
                     format: "[MLXPressStreaming] active-expert read cache policy=%@ streamable=%.2fGB threshold=%.2fGB\n",
@@ -2594,11 +2594,11 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                     thresholdGB
                 ).utf8))
         if directStackedEnabled {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[MLXPressStreaming] direct stacked mmap dispatch enabled\n".utf8))
         }
         if offsetKernelsOverride == true {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[MLXPressStreaming] offset-addressed active expert kernels enabled\n".utf8))
         }
         if offsetKernelsOverride == nil,
@@ -2606,7 +2606,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 built.shouldAutoUseOffsetDispatch(layerIdx: $0, requiredProjections: [.up, .down])
             })
         {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[MLXPressStreaming] offset-addressed active expert kernels auto-enabled for stacked Ultra layout\n".utf8))
         }
         return built
@@ -3169,7 +3169,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 try MLX.loadArrays(url: ref.fileURL)
             }
         } catch {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[MLXPressStreaming] direct stacked mmap load failed file=\(path) error=\(error)\n"
                         .utf8))
@@ -3739,7 +3739,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
             }
             lock.unlock()
             if shouldLog, built == nil {
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         "[MLXPressStreaming] active-expert read cache policy=F_NOCACHE streamable=unknown\n"
                             .utf8))

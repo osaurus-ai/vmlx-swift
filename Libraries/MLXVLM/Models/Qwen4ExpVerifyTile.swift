@@ -50,7 +50,7 @@ enum Qwen4ExpVerifyTile {
             !raw.isEmpty, raw != "off", raw != "0"
         else { return nil }
         guard let value = Int(raw), (2 ... 64).contains(value) else {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     ("[Qwen4Exp] verify_tile: ignoring VMLX_MTP_VERIFY_TILE=\(raw) "
                         + "(expected 2-64, or off)\n").utf8))
@@ -66,7 +66,7 @@ enum Qwen4ExpVerifyTile {
         activationLogLock.lock()
         defer { activationLogLock.unlock() }
         guard reportedFamilies.insert(family).inserted else { return }
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 "[\(family)] verify_tile=\(tile) path=m-pad\n".utf8))
     }

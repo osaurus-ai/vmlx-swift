@@ -596,6 +596,6 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             wall,
             options.maxDenoisingSteps,
             options.entropyBound)
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 }

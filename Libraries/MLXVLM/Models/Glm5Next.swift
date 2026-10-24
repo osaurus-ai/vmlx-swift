@@ -66,7 +66,7 @@ enum Glm5NextPrefillMemoryProbe {
             }
         }
         let g = 1024.0 * 1024.0 * 1024.0
-        FileHandle.standardError.write(Data(String(
+        RuntimeDiagnostics.write(Data(String(
             format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
             tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
             Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
@@ -2382,7 +2382,7 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, Canoni
         do {
             return try callAsFunction(inputs, mask: nil, caches: cache, inputEmbedding: nil)
         } catch {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[glm5_next] forward failed: \(error)\n".utf8))
             return MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize])
         }

@@ -42,7 +42,7 @@ enum Qwen4ExpQSA {
             """)
 
     private static let reportDecodeMask: Void = {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Qwen4Exp] qsa_decode_mask=active score_math=unchanged selection=unchanged\n".utf8))
     }()
     #endif

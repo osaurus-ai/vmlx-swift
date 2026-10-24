@@ -144,7 +144,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_input_projection=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType)\n"
                         .utf8))
@@ -198,7 +198,7 @@ enum Qwen4ExpCompiledGDNInputs {
                 diag += " conv_state=\(convState.shape):\(convState.dtype)"
                 diag += " scales=\(metadataDType) biases=\(biases.dtype)"
                 diag += " conv_weight=\(convWeight.dtype)\n"
-                FileHandle.standardError.write(Data(diag.utf8))
+                RuntimeDiagnostics.write(Data(diag.utf8))
             }
             lock.unlock()
             return nil
@@ -255,7 +255,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_front=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType) conv_state=\(convState.dtype) recurrence=float32\n"
                         .utf8))
@@ -305,7 +305,7 @@ enum Qwen4ExpCompiledGDNInputs {
             lock.lock()
             if output.dim(1) == 1, !didReportTailRejection {
                 didReportTailRejection = true
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         ("[Qwen4Exp] compiled_gdn_tail=rejected"
                             + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
@@ -348,7 +348,7 @@ enum Qwen4ExpCompiledGDNInputs {
         }
         if !didReportTail {
             didReportTail = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_gdn_tail=active gate_mode=\(sigmoidGate ? "sigmoid" : "silu") recurrence_output=\(output.dtype) gate=\(gate.dtype) metadata=\(metadataDType) shared_weight_inputs=true\n"
                         .utf8))
@@ -446,7 +446,7 @@ enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_router=active shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))
@@ -495,7 +495,7 @@ enum Qwen4ExpCompiledMoE {
         }
         if !didReportRouter {
             didReportRouter = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true input_dtype=\(x.dtype) weight_dtype=\(weight.dtype)\n"
                         .utf8))
@@ -661,7 +661,7 @@ enum Qwen4ExpCompiledMoE {
         }
         if !didReportShared {
             didReportShared = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))
@@ -1283,7 +1283,7 @@ private enum QwenGatedDeltaDTypeTrace {
         defer { lock.unlock() }
         guard !didReport else { return }
         didReport = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 "[QwenGDN] live_dtype_boundaries q=\(q.dtype) k=\(k.dtype) v=\(v.dtype) a=\(a.dtype) b=\(b.dtype) beta=fused_from_\(b.dtype) decay=\(decay.dtype) recurrent_state=\(state.dtype) output=\(q.dtype)\n"
                     .utf8))
@@ -2125,7 +2125,7 @@ enum Qwen35Language {
             defer { fusionDiagnosticLock.unlock() }
             guard !didReportFusionSkipped else { return }
             didReportFusionSkipped = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[Qwen4Exp] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
         }
 
@@ -2183,7 +2183,7 @@ enum Qwen35Language {
                 Self.fusionDiagnosticLock.lock()
                 if !Self.didReportDecodeInputFusion {
                     Self.didReportDecodeInputFusion = true
-                    FileHandle.standardError.write(
+                    RuntimeDiagnostics.write(
                         Data(
                             "[Qwen4Exp] fused_gdn_decode_input_projections=active dtype=\(inputs.dtype)\n"
                                 .utf8))
@@ -2350,7 +2350,7 @@ enum Qwen35Language {
                     if case .fused(let members, _, _) = segment { return members.count }
                     return nil
                 }
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         "[Qwen4Exp] fused_gdn_decode_input_projections=active groups=\(fusedCounts) dtype=\(inputs.dtype)\n"
                             .utf8))
@@ -2916,7 +2916,7 @@ enum Qwen35Language {
                 }
                 let diff = abs(prefixState - chained!).max().item(Float.self)
                 let scale = abs(chained!).max().item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         String(
                             format:
@@ -3171,7 +3171,7 @@ enum Qwen35Language {
             defer { Self.rowIsolationLogLock.unlock() }
             guard !Self.didReportRowIsolation else { return }
             Self.didReportRowIsolation = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=\(switchMLP is SwitchGLU ? "q4g64" : String(describing: type(of: switchMLP)))\n"
                         .utf8))
@@ -5022,7 +5022,7 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
     public func installNativeMTPProposalHead(
         bits: Int, calibratedDraft: ProposalHeadCalibratedDraft?
     ) {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
                 + "routing is not implemented for this family yet; drafting stays "
                 + "on the full head\n").utf8))

@@ -181,7 +181,7 @@ private final class NemotronHLayerProfiler: @unchecked Sendable {
         for key in snapshot.keys.sorted() {
             guard let value = snapshot[key], value.count > 0 else { continue }
             let avg = value.totalMs / Double(value.count)
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 String(
                     format: "NEMOTRON_LAYER_PROFILE label=%@ count=%d total_ms=%.3f avg_ms=%.3f\n",
                     key, value.count, value.totalMs, avg
@@ -2223,7 +2223,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         }
 
         if tqStackedCount > 0 {
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[NemotronH.sanitize] stacked \(tqStackedCount) JANGTQ tensor groups (per-expert tq_packed/tq_norms → switch_mlp.{fc1,fc2}.{tq_*})\n".utf8))
         }
         _ = tqStackedCount  // silence unused warning when log is gated

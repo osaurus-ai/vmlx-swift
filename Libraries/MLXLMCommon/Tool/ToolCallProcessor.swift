@@ -127,7 +127,7 @@ public class ToolCallProcessor {
             "[vMLX tool-envelope] phase=\(phase) parsed=\(parsed.count)"
             + " names=\(names.debugDescription) raw=\(raw.debugDescription)\n"
         guard let data = line.data(using: .utf8) else { return }
-        FileHandle.standardError.write(data)
+        RuntimeDiagnostics.write(data)
     }
 
     /// Registered tool names from the request's tool schemas.

@@ -120,7 +120,7 @@ public class DeepseekOCR: Module, VLMModel, KVCacheDimensionProvider {
         let s = sqrt((xf * xf).mean().item(Float.self) - m * m)
         let mn = xf.min().item(Float.self)
         let mx = xf.max().item(Float.self)
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[stat] \(name): shape=\(x.shape) mean=\(m) std=\(s) min=\(mn) max=\(mx)\n".utf8))
     }
 

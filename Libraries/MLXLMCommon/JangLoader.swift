@@ -2917,7 +2917,7 @@ public struct JangLoader: Sendable {
                     + "-> shape-inferred (bits=\(inferred.0), gs=\(inferred.1)), "
                     + "\(disagreementCount) per-layer override\(plural) applied.\n"
             )
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
 
         return BaseConfiguration.PerLayerQuantization(

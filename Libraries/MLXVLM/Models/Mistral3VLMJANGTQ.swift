@@ -93,7 +93,7 @@ internal final class Mistral3JANGTQAttention: Module {
             let kNormsL2 = sqrt((wk.norms.asType(.float32) * wk.norms.asType(.float32)).sum()).item(Float.self)
             let vNormsL2 = sqrt((wv.norms.asType(.float32) * wv.norms.asType(.float32)).sum()).item(Float.self)
             let oNormsL2 = sqrt((wo.norms.asType(.float32) * wo.norms.asType(.float32)).sum()).item(Float.self)
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[mistral3-proj-jangtq] layer=\(li) input.L2=\(xL2) tqN(q=\(qNormsL2) k=\(kNormsL2) v=\(vNormsL2) o=\(oNormsL2))\n".utf8))
         }
 
@@ -108,7 +108,7 @@ internal final class Mistral3JANGTQAttention: Module {
                 .item(Float.self)
             let vL2 = sqrt((values.asType(.float32) * values.asType(.float32)).sum())
                 .item(Float.self)
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[mistral3-proj-jangtq] layer=\(li) q.L2=\(qL2) k.L2=\(kL2) v.L2=\(vL2)\n".utf8))
         }
 
@@ -130,7 +130,7 @@ internal final class Mistral3JANGTQAttention: Module {
         if projProbe, let li = layerIndex {
             let attL2 = sqrt((output.asType(.float32) * output.asType(.float32)).sum())
                 .item(Float.self)
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[mistral3-proj-jangtq] layer=\(li) attn-out.L2=\(attL2)\n".utf8))
         }
 
@@ -138,7 +138,7 @@ internal final class Mistral3JANGTQAttention: Module {
         if projProbe, let li = layerIndex {
             let oL2 = sqrt((result.asType(.float32) * result.asType(.float32)).sum())
                 .item(Float.self)
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[mistral3-proj-jangtq] layer=\(li) o.L2=\(oL2)\n".utf8))
         }
         return result
@@ -327,7 +327,7 @@ internal final class Mistral3JANGTQModelInner: Module {
                 layerIndex: i)
             if probe {
                 let l2 = sqrt((h.asType(.float32) * h.asType(.float32)).sum()).item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-probe-jangtq] layer=\(i) L2=\(l2)\n".utf8))
             }
         }
@@ -335,7 +335,7 @@ internal final class Mistral3JANGTQModelInner: Module {
         let out = norm(h)
         if probe {
             let l2 = sqrt((out.asType(.float32) * out.asType(.float32)).sum()).item(Float.self)
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data("[mistral3-probe-jangtq] final-norm L2=\(l2)\n".utf8))
         }
         return out

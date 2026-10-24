@@ -292,11 +292,11 @@ private enum Qwen4ExpDTypeTrace {
             + " layer_output_dtypes=\(layerSummary)"
             + " mismatched_layers=\(mismatchSummary)"
             + " final_mixer=\(finalMixer) declared=\(declaredSummary)\n"
-        FileHandle.standardError.write(Data(message.utf8))
+        RuntimeDiagnostics.write(Data(message.utf8))
     }
 
     static func logHeadAudit(input: DType, rawLogits: DType, returnedLogits: DType) {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[Qwen4Exp] live_dtype_head head_input=\(input) raw_logits=\(rawLogits)"
                 + " returned_logits=\(returnedLogits)\n").utf8))
     }
@@ -591,7 +591,7 @@ private enum Qwen4ExpCompiledMHC {
     private static func reportLocked() {
         guard !didReport else { return }
         didReport = true
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Qwen4Exp] compiled_mhc_decode=active shared_weight_inputs=true dtype=bfloat16\n".utf8))
     }
 
@@ -885,7 +885,7 @@ private final class Qwen4ExpGatedResidual: Module {
             Self.fusionDiagnosticLock.lock()
             if !Self.didReportInputFusion {
                 Self.didReportInputFusion = true
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[Qwen4Exp] fused_hyper_decode_input_projections=active kind=\(fusionKind) dtype=\(input.dtype)\n".utf8))
             }
             Self.fusionDiagnosticLock.unlock()
@@ -1046,7 +1046,7 @@ private final class Qwen4ExpPLE: Module {
             historyTraceCount < 8, let first = history.first
         {
             historyTraceCount += 1
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[Qwen4ExpPLEHistory] sample=\(historyTraceCount)"
                     + " prior=\(Array(first.dropLast())) token=\(first.last ?? -1)\n").utf8))
             if Self.traceState, let cache {
@@ -1056,7 +1056,7 @@ private final class Qwen4ExpPLE: Module {
                     MLX.eval(result)
                     return result.item(Float.self)
                 }
-                FileHandle.standardError.write(Data(String(format:
+                RuntimeDiagnostics.write(Data(String(format:
                     "[Qwen4ExpPLEState] sample=%d offset=%d conv=%.9g recurrent=%.9g ple_conv=%.9g\n",
                     historyTraceCount, cache.offset,
                     magnitude(cache[0]), magnitude(cache[1]), magnitude(cache[3])).utf8))
@@ -1072,7 +1072,7 @@ private final class Qwen4ExpPLE: Module {
         let prefetch = Prefetch(
             table: table, batch: batch, length: length, history: history, rows: rows)
         if Self.profileHost, length == 1, hostProfileCount < 8 {
-            FileHandle.standardError.write(Data(String(format:
+            RuntimeDiagnostics.write(Data(String(format:
                 "[Qwen4ExpPLEProfile] prefetch_start token_read=%.3fms history=%.3fms hash=%.3fms rows=%d\n",
                 (tokenReadFinished - hostStarted) * 1000,
                 (historyFinished - tokenReadFinished) * 1000,
@@ -1108,7 +1108,7 @@ private final class Qwen4ExpPLE: Module {
             let arrayFinished = CFAbsoluteTimeGetCurrent()
             if Self.profileHost, length == 1, hostProfileCount < 8 {
                 hostProfileCount += 1
-                FileHandle.standardError.write(Data(String(format:
+                RuntimeDiagnostics.write(Data(String(format:
                     "[Qwen4ExpPLEProfile] sample=%d join_wait=%.3fms mlx_array=%.3fms rows=%d\n",
                     hostProfileCount,
                     (gatherFinished - gatherStarted) * 1000,
@@ -1626,7 +1626,7 @@ private final class Qwen4ExpDecoderLayer: Module {
             profileCount += 1
             let fields = timings.map { String(format: "%@=%.3fms", $0.0, $0.1) }
                 .joined(separator: " ")
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[Qwen4ExpProfile] layer=\(layerIndex)"
                     + " sequence_length=\(inputIds.size) sample=\(profileCount)"
                     + " \(fields)\n").utf8))
@@ -2630,7 +2630,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let computeDType = config.declaredComputeDType.map(String.init(describing:))
             ?? "unresolved"
         let storageDTypes = affineMetadataDTypes.sorted().joined(separator: ",")
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Qwen4Exp] declared_compute_dtype=\(computeDType) affine_metadata_checkpoint_dtype=\(storageDTypes) affine_metadata_count=\(affineMetadataCount)\n".utf8))
 
         return output
@@ -2673,7 +2673,7 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
         // low-bit head copy (plus a ~1 GB transient dequantized peak) would
         // be pure waste. Stamping is unaffected; only the install is skipped.
         guard mtp != nil else {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[ProposalHead] eligible bundle but no MTP module loaded — skipping proposal-head build\n".utf8))
             return
         }
@@ -2725,7 +2725,7 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
             hasher.update(data: data)
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
         }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[ProposalHead] digest origin=\(origin) "
                 + "weight=\(digest(copy.weight)) "
                 + "scales=\(digest(copy.scales)) "
@@ -2742,7 +2742,7 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
         let inFeatures = head.scales.dim(1) * head.groupSize
         let outFeatures = head.scales.dim(0)
         func rejected(_ why: String) -> QuantizedLinear? {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[ProposalHead] calibrated sidecar shape rejected (\(why)) — RTN rebuild\n".utf8))
             return nil
         }

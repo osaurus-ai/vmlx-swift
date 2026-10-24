@@ -143,7 +143,7 @@ public enum RuntimeMoETopKOverride {
             "MoE top-k override: \(decision.modelType) \(decision.field) "
             + "\(decision.originalTopK) -> \(decision.effectiveTopK)\n"
         if let data = line.data(using: .utf8) {
-            FileHandle.standardError.write(data)
+            RuntimeDiagnostics.write(data)
         }
     }
 }

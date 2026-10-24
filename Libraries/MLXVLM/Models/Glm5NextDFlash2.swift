@@ -26,7 +26,7 @@ extension Glm5Next: HiddenStateCaptureModel, TokenEmbedderModel, DFlash2VerifyRo
             return (projectToLogits(hidden), captured)
         } catch {
             // Same non-throwing contract as the token-only forward above.
-            FileHandle.standardError.write(Data("[glm5_next] capturing forward failed: \(error)\n".utf8))
+            RuntimeDiagnostics.write(Data("[glm5_next] capturing forward failed: \(error)\n".utf8))
             return (MLXArray.zeros([inputs.dim(0), inputs.dim(1), vocabularySize]), [:])
         }
     }

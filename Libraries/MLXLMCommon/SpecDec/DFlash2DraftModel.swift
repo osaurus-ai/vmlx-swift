@@ -321,7 +321,7 @@ final class GroupedDynamicCausalConv: Module {
         if convTraceEnabled {
             let line = "[DFlash2Conv] hidden=\(hidden.shape) dynamic=\(dynamic.shape)"
                 + " base=\(base.shape) groupSize=\(groupSize)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         // A degraded upstream result (an MLX error inside an earlier op
         // collapses to a 0-dim husk, #123) must flow OUT of the drafter

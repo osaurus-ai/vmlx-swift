@@ -626,7 +626,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 if restored, Self.traceEnabled {
                     let offsets = Set(self.cache.map(\.offset)).sorted()
                     let kvLens = self.cache.compactMap { ($0 as? KVCacheSimple)?.state.first?.dim(2) }
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         "[DFlash2 restore] matched=\(matchedTokens) remaining=\(remainingTokens.count) offsets=\(offsets) kvLens=\(Set(kvLens).sorted())\n"
                             .utf8))
                 }
@@ -723,7 +723,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let offsets: [Int] = self.cache.prefix(3).map { $0.offset }
             let line = "[DFlash2Init] prompt=\(promptCount) toPrefill=\(prefillCount)"
                 + " restored=\(restoredCount) offsets=\(offsets)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         try Task.checkCancellation()
         let prefill: PrefillResult
@@ -775,7 +775,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let logitsShape = prefill.lastLogits.shape
             let hiddenShape = prefill.hidden.shape
             let line = "[DFlash2Init] lastLogits=\(logitsShape) hidden=\(hiddenShape)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         self.hybridStripSnapshot = prefill.boundarySnapshot
         // Vocabulary agreement, checked against the first real logits row.
@@ -814,7 +814,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let firstDtype = first.dtype
             let samplerKind = String(describing: type(of: self.sampler))
             let line = "[DFlash2Init] first=\(firstShape) dtype=\(firstDtype) sampler=\(samplerKind)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         let firstToken = first.reshaped(-1)[0].item(Int.self)
         self.lastToken = firstToken
@@ -866,7 +866,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             self.useCompiledVerify = true
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[DFlash2] verify-mode staged=\(useStagedVerify) compiled=\(useCompiledVerify)\n".utf8))
         }
     }
@@ -977,7 +977,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     stats.autoregressiveFallbackTokens,
                     stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
                         .joined(separator: ","))
-                FileHandle.standardError.write(Data(line.utf8))
+                RuntimeDiagnostics.write(Data(line.utf8))
             }
             // Release the compiled traces at end of generation. They
             // capture the cache array, and letting them outlive the run
@@ -1011,7 +1011,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         guard Self.chooserTraceEnabled, let widthChooser else { return }
         let line = "[DFlash2 chooser] context=\(promptTokenIds.count + tokenCount)"
             + " observedWidth=\(width) tokens=\(tokens) \(widthChooser.traceDescription)\n"
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 
     /// One draft → verify → accept cycle. Returns false when nothing more
@@ -1075,7 +1075,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // after a fully-rejected block once the context passed the
             // drafter's 2048-token sliding window.
             drafterDisabled = true
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[DFlash2] drafter forward degenerated at cycle "
                     + "\(stats.verifyCalls) (ctx=\(promptTokenIds.count + stats.emittedTokens)); "
                     + "speculation disabled for the rest of the turn, "
@@ -1127,7 +1127,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     logitsStart: 1)
             }
         } catch {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[DFlash2] drafter forward error: \(error)\n".utf8))
             return nil
         }
@@ -1361,7 +1361,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     blockLength: flight.verifyRows) ?? false
             guard committed else {
                 stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): staged verify "
                             + "commit failed for \(committedInputs) of "
@@ -1390,7 +1390,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // indistinguishable from a short one, so say so loudly
                 // rather than letting it look like a normal completion.
                 stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): no recorded "
                             + "recurrent state for the accepted prefix (\(committedInputs) of "
@@ -1429,7 +1429,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if Self.traceEnabled {
             let line =
                 "[DFlash2] cycle=\(stats.verifyCalls) bs=\(bs) drafted=\(draftIDs.count) accepted=\(accepted) emitted=\(emitted.count) ids=\(emitted) draftIds=\(draftIDs) ctxRows=\(contextHidden.dim(1)) accLen=\(String(format: "%.2f", stats.acceptanceLength))\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         return true
     }
@@ -1563,7 +1563,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let commitStart = Date.timeIntervalSinceReferenceDate
         guard treeTarget.dflash2CommitTree(cache: cache, scope: scope, keptRows: keptRows) else {
             stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): tree commit failed for "
                     + "\(keptRows.count) of \(plan.rows) rows. The turn is TRUNCATED at "
                     + "\(stats.emittedTokens) tokens.\n").utf8))
@@ -1597,7 +1597,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             if nextRows >= 2 { pendingLattice = dispatchLattice(rows: nextRows) }
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[DFlash2] tree cycle=\(stats.verifyCalls) rows=\(plan.rows) "
                     + "depthMax=\(plan.depths.max() ?? 0) accepted=\(accepted) "
                     + "emitted=\(emitted.count) path=\(keptRows)\n").utf8))
@@ -1656,7 +1656,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             }
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[DFlash2] abandoned in-flight verify (\(flight.verifyRows) rows)\n".utf8))
         }
     }
@@ -1688,7 +1688,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             }
         }
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[DFlash2] compiled verify built (S=\(blockLength))\n".utf8))
         }
     }
@@ -1786,7 +1786,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let rates = Self.blockLadder
             .map { String(format: "b%d=%.1f", $0, throughput(of: $0)) }
             .joined(separator: " ")
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[DFlash2] block \(from) -> \(to)\(settled ? " (settled)" : "") tok/verify-s: \(rates)\n"
                 .utf8))
     }

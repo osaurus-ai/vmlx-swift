@@ -297,7 +297,7 @@ enum DiskCacheIndexSchema {
     }
 
     private static func warn(_ message: String) {
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[vmlx][cache/disk-index] schema migration: \(message)\n".utf8))
     }
 }

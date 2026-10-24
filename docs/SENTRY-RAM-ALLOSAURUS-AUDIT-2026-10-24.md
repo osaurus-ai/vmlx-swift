@@ -1,7 +1,7 @@
 # Sentry, RAM parity and Allosaurus investigation — 2026-10-24
 
-Status: **Audit PARTIAL. Scoped diagnostic/mixer fixes locally qualified;
-remaining crash and hardware-performance rows are not cleared.**
+Status: **Audit PARTIAL. Full-app broken-stderr requalification is required
+before diagnostic promotion. Remaining crash and hardware-speed rows are not cleared.**
 
 The investigation starts at vMLX `b9a1afaeb` and Osaurus `c5fabeea4`.
 All builds, loads, reproductions, tests and visual proof now run locally on
@@ -235,3 +235,37 @@ Growing tool history accepted disk-backed restore boundaries 4318, 4412 and
 4621, with all 48 cache layers restored and correct continuation to 1200.
 These are full hybrid checkpoint restores; the separate SSM-pool counters
 still show zero hits and must be reported separately.
+
+## Later full-app invalid-stderr finding and expanded candidate
+
+The narrower runtime2a147/app200c artifact was launched with the read end of
+its stderr pipe closed. An actual v0.2 load failed after 4.006 seconds in
+Qwen4ExpNGramTable.log/shouldWarm, raising the same broken-pipe
+NSFileHandleOperationException. No generation began and token/s was absent;
+this is a failed row. Passing the registry subprocess and normal-stderr app
+flows does not clear the full app. Promotion was held when this surfaced.
+
+The expanded candidate adds public `RuntimeDiagnostics` for runtime/host callers:
+on Darwin it emits private-field unified logs and never writes stderr or
+changes signals/descriptors; non-Darwin keeps its existing stderr behavior.
+The 242 call replacements in 63 runtime files are mechanically verified; the
+image-model target declares its already-transitive MLXLMCommon dependency
+explicitly. Six host diagnostic writers are being routed through it too.
+Compiler-plugin output and Linux logging compatibility are outside the macOS
+host migration. This is diagnostic routing, not suppression of typed errors.
+
+After the expansion, 112 distinct focused cases pass, including three sink
+cases (errno preservation adds one), actual-registry disconnected-stderr
+subprocesses, failure transport, checked host reads, resident readers,
+writer/write-behind ownership, cache checkpoints, MTP boundaries and low-bit
+kernels. Full Release load/generation/cache/lifecycle with disconnected stderr
+remains pending. Prior exact-pin timing/RAM/UI receipts stay tied to their
+original source, not to this unqualified candidate.
+
+The shared-memory fused-rotation prototype failed its full-model AR control:
+four seeded rows have byte-identical answer AND reasoning with equal token
+counts, but fusion/original speed ratios 0.938–0.957 (4.3–6.2 percent slower).
+It remains default-off and is rejected for promotion. Adaptive rows differ in
+reasoning length even at the same seed and do not support a matched speedup
+claim. A second SIMD-register candidate retains 64-thread dot geometry, passes
+120 bit-exact parity configurations, and is under separate app qualification.

@@ -787,6 +787,6 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     }
 
     private static func log(_ message: String) {
-        FileHandle.standardError.write(Data("[Qwen4ExpPLE] \(message)\n".utf8))
+        RuntimeDiagnostics.write(Data("[Qwen4ExpPLE] \(message)\n".utf8))
     }
 }

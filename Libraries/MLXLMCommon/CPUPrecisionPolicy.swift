@@ -101,7 +101,7 @@ package enum CPUPrecisionPolicy {
             defaultDevice: Device.defaultDevice().deviceType,
             nativeDTypeRequested: RuntimeEnvironment.flag(nativeDTypeVariable),
             limitBytes: { memoryLimitBytes() },
-            report: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) })
+            report: { RuntimeDiagnostics.write(Data(($0 + "\n").utf8)) })
     }
 
     /// The rule with every input injected. `report` receives one line whenever the rule acts: when

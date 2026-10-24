@@ -232,7 +232,7 @@ public final class AffineStreamingExpertCatalog: @unchecked Sendable {
         lock.unlock()
 
         let mappedBytes = shards.values.reduce(UInt64(0)) { $0 + $1.fileSize }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Qwen4AffineExperts] exact-region catalog ready layers=\(layerCount) experts=\(numExperts) files=\(shards.count) indexed_file_bytes=\(mappedBytes) cache=file-backed\n".utf8))
     }
 
@@ -475,7 +475,7 @@ public final class AffineStreamingSwitchGLU: Module {
         lock.unlock()
 
         if accessClock == 2 || accessClock % 256 == 0 {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[Qwen4AffineExperts] layer=\(layerIndex) mapped_expert=\(index) cache=\(count)/\(cacheExpertLimit) backend=exact-mmap-region mode=affine\n".utf8))
         }
         return loaded

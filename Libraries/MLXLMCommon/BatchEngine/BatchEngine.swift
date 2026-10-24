@@ -108,7 +108,7 @@ private func debugLogReasoningPromptTail(
         .replacingOccurrences(of: "\r", with: "\\r")
     let line = "[vmlx] reasoning promptTail path=\(path) model=\(modelName) tail=\(escaped)\n"
     if let data = line.data(using: .utf8) {
-        FileHandle.standardError.write(data)
+        RuntimeDiagnostics.write(data)
     }
 }
 
@@ -147,12 +147,12 @@ private func debugDumpReasoningPrompt(
         try body.write(to: url, atomically: true, encoding: .utf8)
         let line = "[vmlx] reasoning promptDump path=\(path) model=\(modelName) file=\(url.path)\n"
         if let data = line.data(using: .utf8) {
-            FileHandle.standardError.write(data)
+            RuntimeDiagnostics.write(data)
         }
     } catch {
         let line = "[vmlx] reasoning promptDump failed path=\(path) model=\(modelName) error=\(error.localizedDescription)\n"
         if let data = line.data(using: .utf8) {
-            FileHandle.standardError.write(data)
+            RuntimeDiagnostics.write(data)
         }
     }
 }
@@ -1113,7 +1113,7 @@ public actor BatchEngine {
                         let now = Date()
                         let sinceToken = lastTokenAt.map { now.timeIntervalSince($0) } ?? -1
                         let sincePump = lastPumpAt.map { now.timeIntervalSince($0) } ?? -1
-                        FileHandle.standardError.write(Data(
+                        RuntimeDiagnostics.write(Data(
                             ("[vmlx][gen/info-gap] sinceLastToken=\(sinceToken)s "
                                 + "sinceLastEmittedText=\(sincePump)s "
                                 + "tokens=\(generatedTokenCount)\n").utf8))
@@ -1523,7 +1523,7 @@ public actor BatchEngine {
                 case .info:
                     if gapTrace {
                         let gap = lastTextAt.map { Date().timeIntervalSince($0) } ?? -1
-                        FileHandle.standardError.write(Data(
+                        RuntimeDiagnostics.write(Data(
                             ("[vmlx][solo/info-gap] sinceLastText=\(gap)s "
                                 + "textEvents=\(textEvents)\n").utf8))
                     }
@@ -1820,7 +1820,7 @@ public actor BatchEngine {
         MemoryStageTrace.log("batch-idle-payloads-released", tokens: 0,
                              detail: "slots=0 writerPayloadsReleased=true")
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/idle-purge] slots=0 writerPayloadsReleased=true\n".utf8))
         }
     }
@@ -2619,7 +2619,7 @@ public actor BatchEngine {
             chainId: slot.parameters.cacheChainId,
             isResumeBoundary: true)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
         }
         // This includes admitted in-flight stores; durability is reported by
@@ -2873,7 +2873,7 @@ public actor BatchEngine {
                         canonicalChunkSize: canonicalPrefillStart && consumed % chunkSize == 0
                             ? chunkSize : nil)
                     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                        FileHandle.standardError.write(
+                        RuntimeDiagnostics.write(
                             Data(
                                 "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n"
                                     .utf8))
@@ -3800,7 +3800,7 @@ public actor BatchEngine {
                     isPostAnswer: label == "post-answer"
                 )
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         "[vmlx][cache/store] label=\(label) count=\(tokens.count)\n".utf8))
                 }
                 Self.logger.debug(
@@ -3951,7 +3951,7 @@ public actor BatchEngine {
                         {
                             boundaryReplaySeed = (persisted.tokens, restored, chunkSize)
                             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                                FileHandle.standardError.write(Data(
+                                RuntimeDiagnostics.write(Data(
                                     "[vmlx][cache/canonical-checkpoint] restored=\(persisted.tokens.count) target=\(tokens.count) chunk=\(chunkSize)\n".utf8))
                             }
                         } else {
@@ -4018,13 +4018,13 @@ public actor BatchEngine {
                     MLX.eval(cache)
                     if traceRebuild {
                         let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - rebuildStart) / 1_000_000
-                        FileHandle.standardError.write(Data(
+                        RuntimeDiagnostics.write(Data(
                             "[vmlx][cache/boundary-rederive] tokens=\(tokens.count) reused=\(reusedCount) ms=\(String(format: "%.3f", milliseconds))\n".utf8))
                     }
                     return cache
                 } catch {
                     if ProcessInfo.processInfo.environment["VMLX_SSM_STORE_TRACE"] != nil {
-                        FileHandle.standardError.write(Data(
+                        RuntimeDiagnostics.write(Data(
                             "[vmlx][ssm-strip-store] boundarySnapshot rederive THREW: \(String(describing: error))\n".utf8))
                     }
                     Self.logger.debug(

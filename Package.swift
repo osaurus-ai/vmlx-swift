@@ -996,7 +996,7 @@ let package = Package(
         ),
         .target(
             name: "vMLXFluxModels",
-            dependencies: ["vMLXFluxKit", "vMLXSeedVR2", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
+            dependencies: ["vMLXFluxKit", "MLXLMCommon", "vMLXSeedVR2", "MLX", "MLXNN", "MLXRandom", "VMLXTokenizers"],
             path: "Libraries/vMLXFluxModels"
         ),
         .target(

@@ -372,7 +372,7 @@ private enum Language {
             if projProbe, let li = layerIndex {
                 let xL2 = sqrt((x.asType(.float32) * x.asType(.float32)).sum())
                     .item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-proj-mxfp4] layer=\(li) input.L2=\(xL2)\n".utf8))
             }
 
@@ -387,7 +387,7 @@ private enum Language {
                     .item(Float.self)
                 let vL2 = sqrt((values.asType(.float32) * values.asType(.float32)).sum())
                     .item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-proj-mxfp4] layer=\(li) q.L2=\(qL2) k.L2=\(kL2) v.L2=\(vL2)\n".utf8))
             }
 
@@ -410,7 +410,7 @@ private enum Language {
             if projProbe, let li = layerIndex {
                 let attL2 = sqrt((output.asType(.float32) * output.asType(.float32)).sum())
                     .item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-proj-mxfp4] layer=\(li) attn-out.L2=\(attL2)\n".utf8))
             }
 
@@ -418,7 +418,7 @@ private enum Language {
             if projProbe, let li = layerIndex {
                 let oL2 = sqrt((result.asType(.float32) * result.asType(.float32)).sum())
                     .item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-proj-mxfp4] layer=\(li) o.L2=\(oL2)\n".utf8))
             }
             return result
@@ -591,7 +591,7 @@ private enum Language {
                     layerIndex: i)
                 if probe {
                     let l2 = sqrt((h.asType(.float32) * h.asType(.float32)).sum()).item(Float.self)
-                    FileHandle.standardError.write(
+                    RuntimeDiagnostics.write(
                         Data("[mistral3-probe-mxfp4] layer=\(i) L2=\(l2)\n".utf8))
                 }
             }
@@ -599,7 +599,7 @@ private enum Language {
             let out = norm(h)
             if probe {
                 let l2 = sqrt((out.asType(.float32) * out.asType(.float32)).sum()).item(Float.self)
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[mistral3-probe-mxfp4] final-norm L2=\(l2)\n".utf8))
             }
             return out

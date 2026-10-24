@@ -150,6 +150,7 @@ final class ModelResidencyTests: XCTestCase {
             var lease: ModelResidency.Lease? = registry.acquire(request(2)).lease
             withExtendedLifetime(lease) {}
             lease = nil
+            RuntimeDiagnostics.write(Data("[Runtime] disconnected diagnostic sink\n".utf8))
             // Both acquire and deinit must finish even when diagnostic output cannot.
             _ = dup2(saved, STDERR_FILENO)
             XCTAssertEqual(backend.limits.count, 2)

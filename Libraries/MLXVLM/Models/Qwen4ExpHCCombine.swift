@@ -34,7 +34,7 @@ enum Qwen4ExpHCCombine {
             """)
 
     private static let report: Void = {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Qwen4Exp] exact_hc_combine=active product_rounding=preserved fma=off\n".utf8))
     }()
     #endif
