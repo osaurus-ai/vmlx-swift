@@ -16,14 +16,18 @@ on another GPU cannot certify their speed or hardware-specific behavior.
 Read-only, paginated Sentry queries cover all statuses over the last 90 days,
 including ignored and resolved issues. The broad snapshot contains 2,676 issue
 groups. A separate fatal query contains 114 groups (82 unresolved, 19 resolved,
-13 ignored), with their latest full events collected. Severity can change
+13 ignored), with all 1,358 retained full events collected by exhausting each group cursor.
+Sixty groups span multiple releases. Group Z6 reports 29 lifetime events but
+retains 28; the missing event is not silently counted as inspected. Severity can change
 between the two queries. Counts are issue groups, not unique defects; Sentry's
 per-group event totals are lifetime totals, not necessarily 90-day totals.
 The project API's no-period query was also paginated to exhaustion and returned
 the same 2,676 IDs. This covers the accessible inventory; it does not establish
 availability of historical events beyond Sentry's retained data.
 
-Latest-event triage is not reproduction of every event in a group. Each group
+A per-group report records retained releases, exception mechanisms, source
+assessment and proof gaps for every fatal group. Full-event triage is not
+reproduction of every event in a group. Each group
 keeps an explicit unproven status until its failure mechanism, affected source,
 reproduction, regression tests and applicable live app rows are established.
 Old-client events must not be attributed to current source without evidence.
@@ -46,9 +50,9 @@ pipe and default SIGPIPE, a broken pipe and ignored SIGPIPE, and closed stderr.
 Acquire and final lease release must complete. The original code fails all
 three cases; the corrected registry passes all eight residency cases. The two
 existing diagnostic tests also pass, including thread signal-mask and descriptor
-flag preservation. Commit `1804f03ab` contains the fix. Normal fresh Release
-load/unload was exercised in earlier diagnostics; local requalification is in
-progress. This does not claim the entire runtime is safe with broken stderr:
+flag preservation. Commit `1804f03ab` contains the fix. The exact committed runtime was subsequently consumed through its remote
+revision by a fresh local Release Osaurus build. Local normal loading, strict
+model handoff, idle unloading, cancellation and successful retry were exercised. This does not claim the entire runtime is safe with broken stderr:
 other direct stderr diagnostics remain outside this scoped fix.
 
 ### Other priority crash families
@@ -59,7 +63,10 @@ other direct stderr diagnostics remain outside this scoped fix.
   A historical null-pointer signature alone does not establish a fresh defect.
 - SQLite WAL reads: `388` and `2Z7` require connection ownership, concurrent
   readers/writers, cancellation, clear/unload and database-lifetime reproduction.
-  Their similar signatures do not prove the same owning database or root cause.
+  Both retained call chains reach the vMLX DiskCache WAL: one through quota
+  accounting, the other candidate metadata. Instance locking and writer
+  ownership are present; the exact connection-lifetime failure is unproven.
+  Twenty write-behind and four budget cases pass; that is not crash reproduction.
 - `384`: the actual failing call chain is Nemotron Mamba2 / `ssmUpdate` /
   `ssmAttn` / `shape4`. Allosaurus appears elsewhere in the event; that alone
   does not attribute this crash to Allosaurus. The exact tensor/cache boundary
@@ -110,7 +117,11 @@ media companion state and cold/fresh-process restore. No new flat-RAM claim.
 - JANGHT has fused gate/up+SwiGLU and weighted-down decode kernels, but its H128
   input/hidden rotations are separate dispatches. Fusing rotation into a dot
   kernel must be measured: recomputing a rotation per output tile can increase
-  work. No such optimization has been proven here.
+  work. A separate opt-in prototype computes each rotation once per threadgroup
+  and shares it across 32 output rows. Its 120 deterministic parity
+  configurations are bit-identical and hot-bank microbenchmarks show
+  1.05–1.20x ratios. Full-model benefit is unproven; it remains off by default
+  and outside this crash/RAM change.
 - JANGT sorted matrix prefill is available only through NAX. On other GPUs it
   falls back to decode kernels for every prompt batch. This is a concrete
   missing optimization for older hardware, not a measured explanation of all
@@ -148,3 +159,69 @@ failure/ownership, append-only checkpoints, native-MTP priming/boundaries,
 JANGH NAX/Steel prefill and low-bit JANGT decode/prefill geometry. The three new mixer
 storage cases pass on the candidate (111 distinct focused cases total). GPU kernel tests ran on M5
 Max; they do not constitute M3/M5 Pro hardware proof.
+
+## Exact-pin local qualification
+
+Release artifact: Osaurus source `200c73539c8c588e40728bd43367f5daadd0a88b`,
+vMLX revision `2a147e3cb4eb1dbd7b3cdbc04c56bec813247c4d`, executable SHA-256
+`b6d40ff3bac534da42b95da4428f2e64752ac7c88b10bd23a040d95c93583f4e`.
+Built and run on erics-m5-max2, Apple M5 Max (40 GPU cores), 128 GiB.
+The isolated proof app uses its own data root and bundle ID, no Sentry DSN,
+and the real Chat/Settings/runtime path. No hidden sampler or memory throttle.
+
+Easy-code observations, Extra High reasoning, natural stop and closed reasoning:
+
+| Bundle | Mode | Task | Generation tok/s | Generated tokens | Prompt tok/s |
+| --- | --- | --- | ---: | ---: | ---: |
+| v0.1 JANGH2 | Adaptive MTP | 100 Python print statements | 48.66 | 2691 | 806.67 |
+| v0.1 JANGH2 | AR | same request | 49.67 | 959 | 499.31 |
+| v0.2 JANGHT1.8 | Adaptive MTP | same request | 70.69 | 965 | 251.84 |
+| v0.2 JANGHT1.8 | AR | same request | 51.50 | 1182 | 581.78 |
+| v0.2 JANGHT1.8 | Adaptive MTP | JavaScript array 1..150 | 95.79 | 1234 | 662.47 |
+| v0.1 JANGH2 | Adaptive MTP | same array request | 81.91 | 1438 | 775.67 |
+
+All six visible code outputs validate exactly. Growing follow-ups return
+100/1/100 and 150/151 correctly. The AR-to-adaptive transition was exercised
+inside the same conversation. These UI samples are unseeded, with different
+reasoning lengths; they are not a matched-token speedup experiment. Prompt
+rates are effective runtime prompt telemetry and must be read with cache
+receipts; short prompts do not establish long-context prefill throughput.
+The 50–100 tok/s target is observed for both array rows, not every workload.
+No current universal 11 tok/s cap was reproduced on this M5 Max.
+
+Physical footprint is sampled at 50 Hz using `proc_pid_rusage`, with actual
+Activity Monitor screenshots and PID identity. v0.1 settles around 38.5 GB
+(decimal), v0.2 around 30.5 GB. Activity Monitor shows v0.2 at 28.30 GiB.
+Strict v0.1→v0.2→v0.1 handoffs remain within a 41.11 GB lifetime peak in the
+exact-pin process, rather than retaining both weight banks. Idle unload drops
+the still-running app to 936.8 MiB in Activity Monitor (about 0.982 GB sampled
+physical footprint). Cancelling a subsequent load returns below 1 GB and
+unlocks the composer; retry loads successfully and answers 65 for 37+28.
+These observations support parity with GPU weight payload plus runtime state;
+they do not claim that total process footprint equals file size exactly.
+
+Real-image fresh-process history restore answers correctly. Effective cache
+mode is fp16 hybrid rotating KV with disk-backed restore, 48 layers (12 KV,
+36 Mamba), prefix and disk L2 enabled, paged RAM disabled, and zero TurboQuant
+KV layers. Media follow-up restored boundary 101 and reprocessed the image;
+this is not a full-image checkpoint hit or an SSM-pool hit. Separate SSM-pool
+counters remained zero hits. No video row has been cleared.
+
+Native picker cancellation, reopening and selection were re-exercised on this
+exact artifact. Keep Model Loaded persists through relaunch; changing it to
+30-second idle unload applies to the existing resident without a new request,
+and restoring it saves successfully. Raw receipts stay private.
+
+Remaining independent crash finding: 1ZM still has a ChatPanel event on
+0.25.23 with an approximately 56,386-point width. The existing AppKit-owned
+controller fix covers management windows, while ChatWindowManager still sets
+`.minSize`. A settings regression pass cannot qualify this chat variant.
+No speculative chat-sizing fix is included without a baseline reproduction.
+
+CI distinction: Linux SwiftPM (both architectures) and four Linux CMake builds
+pass. Runtime lint is advisory in the existing workflow and reports broad
+format drift; it is not green. The self-hosted macOS and CUDA jobs remain
+queued. Local runtime regression and fresh Release app evidence are recorded
+separately from those unavailable runners. App required checks include
+`test-core`, `test-cli`, `swiftlint`, and `shellcheck`; do not merge the app
+until those pass.
