@@ -38,6 +38,10 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     static let sortThreshold = 512
     /// `VMLX_JANGT_PREFILL=0` keeps the decode kernels for every batch (A/B and diagnosis).
     static let prefillEnabled = ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL"] != "0"
+    /// Explicit A/B candidate until complete-model timing and lifecycle proof
+    /// establish a gain. The geometry gates bound threadgroup memory and keep
+    /// large prefills on their existing route.
+    static let fusedRotationEnabled = RuntimeEnvironment.flag("VMLX_JANGT_FUSED_ROTATION")
     private let intermediateSize: Int
     /// The gate/up outlier columns when they are layer-wide (the same real columns for every expert, gate and up):
     /// the fused prefill epilogue needs one column list per tile.
@@ -156,9 +160,18 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let hidden: MLXArray
             switch gateUp {
             case .trellis(let gate, let up, let signs):
-                hidden = JANGTKernels.gateUp(
-                    xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids, gate: gate, up: up,
-                    limit: limit, outputDType: .float32)
+                if Self.fusedRotationEnabled, x.dim(0) <= 8,
+                    gate.outputs.isMultiple(of: 32), hiddenSize * 4 <= 32768
+                {
+                    hidden = JANGTKernels.gateUpWithRotation(
+                        x: x, signs: signs, indices: ids, gate: gate, up: up,
+                        limit: limit, outputDType: .float32)
+                } else {
+                    hidden = JANGTKernels.gateUp(
+                        xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids,
+                        gate: gate, up: up,
+                        limit: limit, outputDType: .float32)
+                }
             case .codebook(let kernel, _, let gate, let up):
                 hidden = try kernel.activatePreparedInput(
                     kernel.prepareInputForFusedDecode(x), gatePacked: gate.packed, gateScales: gate.scales,
@@ -167,9 +180,23 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let y: MLXArray
             switch down {
             case .trellis(let projection, let signs):
-                let rotated = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: ids.flattened())
-                y = JANGTKernels.down(hr: rotated, h: hidden, indices: ids, weights: weights, projection: projection)
+                if Self.fusedRotationEnabled, x.dim(0) <= 8,
+                    projection.outputs.isMultiple(of: 32), routes * intermediateSize * 4 <= 32768
+                {
+                    y = JANGTKernels.downWithRotation(
+                        h: hidden, signs: signs, indices: ids, weights: weights,
+                        projection: projection
+                    )
                     .asType(input.dtype)
+                } else {
+                    let rotated = JANGTKernels.rotateRows(
+                        hidden, signs: signs, rowExperts: ids.flattened())
+                    y = JANGTKernels.down(
+                        hr: rotated, h: hidden, indices: ids, weights: weights,
+                        projection: projection
+                    )
+                    .asType(input.dtype)
+                }
             case .codebook(let kernel, _, let bank):
                 let prepared = kernel.inputRotation == .hadamard32
                     ? try rowRotation(hidden, outputDType: .float32) : hidden
