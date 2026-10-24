@@ -481,7 +481,7 @@ public final class VLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
-        if DecisionBundle.isDecisionModel(at: modelDirectory) {
+        if DecisionBundle.declaresDecisionModel(at: modelDirectory) {
             throw DecisionRuntimeError.invalid("This is a decision model; use the System One decision runtime, not chat generation")
         }
 

@@ -14,6 +14,27 @@ public actor D3Model {
     private let processor: Qwen3VLProcessor
     private var resources: DecisionLoadResources?
 
+    private var requestActive = false
+    private var closing = false
+    private var requestWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func beginRequest() async throws {
+        while requestActive {
+            await withCheckedContinuation { requestWaiters.append($0) }
+            try Task.checkCancellation()
+        }
+        guard !closing else { throw DecisionRuntimeError.invalid("Decision model has been unloaded") }
+        try Task.checkCancellation()
+        requestActive = true
+    }
+
+    private func endRequest() {
+        requestActive = false
+        let waiters = requestWaiters
+        requestWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
     private init(bundle: DecisionBundle, tokenizer: any Tokenizer, backbone: Qwen35,
         readout: MLXArray, processor: Qwen3VLProcessor, resources: DecisionLoadResources) {
         self.bundle = bundle; self.tokenizer = tokenizer; self.backbone = backbone
@@ -49,17 +70,22 @@ public actor D3Model {
         guard tokenizerConfig?["tokenizer_class"] as? String == "Qwen2Tokenizer" else {
             throw DecisionRuntimeError.invalid("D3 requires the declared Qwen2Tokenizer contract")
         }
+        let qwen2Pattern = #"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
+        var replacements = 0
         func normalize(_ value: Any) -> Any {
-            if let object = value as? [String: Any] {
+            if var object = value as? [String: Any] {
+                if object["type"] as? String == "Split", let pattern = object["pattern"] as? [String: Any], pattern["Regex"] is String {
+                    object["pattern"] = ["Regex": qwen2Pattern]
+                    replacements += 1
+                    return object
+                }
                 return object.mapValues { normalize($0) }
             }
             if let array = value as? [Any] { return array.map(normalize) }
-            if let text = value as? String {
-                return text.replacingOccurrences(of: "[\\p{L}\\p{M}]+", with: "\\p{L}+")
-            }
             return value
         }
         let normalized = normalize(try JSONSerialization.jsonObject(with: tokenData))
+        guard replacements == 1 else { throw DecisionRuntimeError.invalid("D3 requires one declared Qwen2 regex pre-tokenizer") }
         try JSONSerialization.data(withJSONObject: normalized).write(to: view.appendingPathComponent("tokenizer.json"))
         let tokenizer = try await tokenizerLoader.load(from: view)
         try D3Prompt.validateCodes(tokenizer: tokenizer, configuration: bundle.configuration)
@@ -87,14 +113,22 @@ public actor D3Model {
         let pc = try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self,
             from: JSONSerialization.data(withJSONObject: processorConfig))
         return D3Model(bundle: bundle, tokenizer: tokenizer, backbone: backbone, readout: readout,
-            processor: Qwen3VLProcessor(pc, tokenizer: tokenizer, videoTimestampGroups: true), resources: resources)
+            processor: Qwen3VLProcessor(pc, tokenizer: tokenizer, decisionMediaProcessing: true), resources: resources)
     }
 
     /// Host calls under its GPU producer gate before releasing that gate.
-    public func unload() {
+    public func unload() async {
+        closing = true
+        while requestActive { await withCheckedContinuation { requestWaiters.append($0) } }
         backbone = nil
         readout = nil
         resources = nil
+    }
+
+    private static func decisionVideos(_ urls: [URL]) async throws -> sending [UserInput.Video] {
+        var result: [UserInput.Video] = []
+        for url in urls { result.append(try await D3VideoReader.read(url)) }
+        return result
     }
 
     public struct BoxResult: Sendable {
@@ -108,6 +142,8 @@ public actor D3Model {
 
     public func decideBox(state: DecisionJSON, instructions: String, images: [URL] = [],
         videos: [URL] = [], presence: Bool = false, at seconds: Double? = nil) async throws -> BoxResult {
+        try await beginRequest()
+        defer { endRequest() }
         guard let backbone, let readout else { throw DecisionRuntimeError.invalid("Decision model has been unloaded") }
         let kind = presence ? "track" : "box"
         guard case .object(let support)? = bundle.configuration.systemone,
@@ -123,7 +159,7 @@ public actor D3Model {
         content.append(["type": "text", "text": text])
         let input = UserInput(messages: [["role": "system", "content": D3Prompt.system],
             ["role": "user", "content": content]], images: images.map(UserInput.Image.url),
-            videos: videos.map(UserInput.Video.url), additionalContext: ["enable_thinking": false])
+            videos: try await Self.decisionVideos(videos), additionalContext: ["enable_thinking": false])
         let prepared = try await processor.prepare(input: input, assistantSuffix: suffix)
         let ids = prepared.text.tokenIds ?? prepared.text.tokens.asArray(Int32.self).map(Int.init)
         let split = try D3Prompt.stateTokenCount(ids: ids, state: state, tokenizer: tokenizer)
@@ -180,6 +216,9 @@ public actor D3Model {
 
     public struct Result: Sendable {
         public let probabilities: [Float]
+        public let tokenIDs: [Int]
+        public let imageGrids: [THW]
+        public let videoGrids: [THW]
         public let answer: JSONValue
         public let inputTokens: Int
         public let stateTokens: Int
@@ -190,6 +229,8 @@ public actor D3Model {
     public func decide(state: DecisionJSON, question: D3Question,
         images: [URL] = [], videos: [URL] = []) async throws -> Result {
         try Task.checkCancellation()
+        try await beginRequest()
+        defer { endRequest() }
         guard let backbone, let readout else { throw DecisionRuntimeError.invalid("Decision model has been unloaded") }
         let start = Date.timeIntervalSinceReferenceDate
         let text = D3Prompt.user(state: state, question: question, codes: bundle.configuration.codes)
@@ -197,7 +238,7 @@ public actor D3Model {
         content += videos.map { _ in ["type": "video"] }
         content.append(["type": "text", "text": text])
         let input = UserInput(messages: [["role": "system", "content": D3Prompt.system],
-            ["role": "user", "content": content]], images: images.map(UserInput.Image.url), videos: videos.map(UserInput.Video.url),
+            ["role": "user", "content": content]], images: images.map(UserInput.Image.url), videos: try await Self.decisionVideos(videos),
             additionalContext: ["enable_thinking": false])
         let prepared = try await processor.prepare(input: input)
         let ids = prepared.text.tokenIds ?? prepared.text.tokens.asArray(Int32.self).map(Int.init)
@@ -213,7 +254,8 @@ public actor D3Model {
         eval(p)
         try Task.checkCancellation()
         let probabilities = p.asArray(Float.self)
-        return Result(probabilities: probabilities, answer: try question.answer(probabilities: probabilities),
+        return Result(probabilities: probabilities, tokenIDs: ids,
+            imageGrids: prepared.image?.frames ?? [], videoGrids: prepared.video?.frames ?? [], answer: try question.answer(probabilities: probabilities),
             inputTokens: ids.count, stateTokens: split, seconds: Date.timeIntervalSinceReferenceDate - start)
     }
 }

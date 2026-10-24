@@ -38,8 +38,12 @@ public struct DecisionBundle: Sendable {
     public let readoutURL: URL
 
     public static func isDecisionModel(at directory: URL) -> Bool {
-        guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("decision/decision_config.json").path),
-            let data = try? Data(contentsOf: directory.appendingPathComponent("jang_config.json")),
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent("decision/decision_config.json").path)
+            && declaresDecisionModel(at: directory)
+    }
+
+    public static func declaresDecisionModel(at directory: URL) -> Bool {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("jang_config.json")),
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let decision = root["decision"] as? [String: Any]
         else { return false }

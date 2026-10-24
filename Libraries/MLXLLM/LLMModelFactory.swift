@@ -1572,7 +1572,7 @@ public final class LLMModelFactory: ModelFactory {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
-        if DecisionBundle.isDecisionModel(at: modelDirectory) {
+        if DecisionBundle.declaresDecisionModel(at: modelDirectory) {
             throw DecisionRuntimeError.invalid("This is a decision model; use the System One decision runtime, not chat generation")
         }
 

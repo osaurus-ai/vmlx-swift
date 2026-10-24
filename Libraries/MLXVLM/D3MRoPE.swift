@@ -8,7 +8,10 @@ public enum D3MRoPE {
     public static func positions(tokens: [Int], images: [THW], videos: [THW],
         merge: Int, imageToken: Int, videoToken: Int) throws -> [[Int32]] {
         guard merge > 0 else { throw DecisionRuntimeError.invalid("Invalid vision merge size") }
-        var grids = videos.flatMap { grid in (0..<grid.t).map { _ in THW(1, grid.h, grid.w) } }
+        if images.isEmpty && videos.isEmpty {
+            return Array(repeating: tokens.indices.map(Int32.init), count: 3)
+        }
+        let grids = videos.flatMap { grid in (0..<grid.t).map { _ in THW(1, grid.h, grid.w) } }
         var imageIndex = 0, videoIndex = 0, at = 0, current = 0
         var axes = Array(repeating: [Int32](), count: 3)
         while at < tokens.count {

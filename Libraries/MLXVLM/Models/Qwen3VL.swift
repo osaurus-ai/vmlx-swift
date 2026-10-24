@@ -18,12 +18,12 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
-    private let videoTimestampGroups: Bool
+    private let decisionMediaProcessing: Bool
 
-    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer, videoTimestampGroups: Bool = false) {
+    public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer, decisionMediaProcessing: Bool = false) {
         self.config = config
         self.tokenizer = tokenizer
-        self.videoTimestampGroups = videoTimestampGroups
+        self.decisionMediaProcessing = decisionMediaProcessing
     }
 
     /// Frames are rendered without colour management (`asMLXArrayUnmanaged`), so the stored,
@@ -33,6 +33,16 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         image
             .resampled(to: resizedSize, method: .bicubic)
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+    }
+
+    private func decisionPixels(image: CIImage, resizedSize: CGSize) throws -> MLXArray {
+        let rgb = try MiniCPMV47ImageProcessing.rgb8(from: image)
+        let width = Int(resizedSize.width), height = Int(resizedSize.height)
+        let resized = MiniCPMV47ImageProcessing.resizeBicubicPIL(rgb, toWidth: width, height: height)
+        let mean = config.imageMean.map(Float.init), std = config.imageStd.map(Float.init)
+        var values = [Float](repeating: 0, count: resized.data.count)
+        for i in values.indices { values[i] = (Float(resized.data[i]) * (1 / 255) - mean[i % 3]) / std[i % 3] }
+        return MLXArray(values, [height, width, 3])
     }
 
     static func videoTargetSize(
@@ -115,17 +125,15 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
-        let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
-
-        let normalized =
-            resampled
-            .map {
-                MediaProcessing.normalize(
-                    $0,
-                    mean: config.imageMeanTuple,
-                    std: config.imageStdTuple)
-            }
-            .map { MediaProcessing.asMLXArrayUnmanaged($0) }
+        let normalized: [MLXArray]
+        if decisionMediaProcessing {
+            normalized = try processed.map { try decisionPixels(image: $0, resizedSize: targetSize) }
+        } else {
+            let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
+            normalized = resampled.map {
+                MediaProcessing.normalize($0, mean: config.imageMeanTuple, std: config.imageStdTuple)
+            }.map { MediaProcessing.asMLXArrayUnmanaged($0) }
+        }
 
         return try QwenVL.patchify(
             images: normalized,
@@ -205,7 +213,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             var videoTimes: [[Double]] = []
 
             for video in input.videos {
-                let sequence = try await MediaProcessing.asProcessedVideoFrames(
+                let sequence: ProcessedVideoFrames
+                if decisionMediaProcessing, case .frames(let frames) = video {
+                    let processed = frames.map { frame in
+                        VideoFrame(frame: MediaProcessing.apply(frame.frame, processing: input.processing), timeStamp: frame.timeStamp)
+                    }
+                    sequence = ProcessedVideoFrames(frames: processed, totalDuration: frames.last?.timeStamp ?? .zero)
+                } else {
+                sequence = try await MediaProcessing.asProcessedVideoFrames(
                     video,
                     targetFPS: { _ in config.videoFPS },
                     minFrames: config.videoMinFrames,
@@ -213,6 +228,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     return VideoFrame(frame: processed, timeStamp: frame.timeStamp)
+                }
                 }
                 guard let firstFrame = sequence.frames.first else {
                     throw VLMError.imageProcessingFailure("No video frames were decoded")
@@ -225,13 +241,15 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     temporalFactor: config.temporalPatchSize,
                     factor: config.patchSize * config.mergeSize,
                     minPixels: config.videoMinPixels,
-                    maxPixels: config.videoMaxPixels)
+                    maxPixels: decisionMediaProcessing
+                        ? min(config.videoMaxPixels, 200_704 * sequence.frames.count)
+                        : config.videoMaxPixels)
                 let resizedSize = CGSize(width: width, height: height)
                 videoTimes.append(sequence.frames.map { $0.timeStamp.seconds })
                 accumulatedFrames.append(
-                    sequence.frames.map {
-                        MediaProcessing.asMLXArrayUnmanaged(
-                            preprocess(image: $0.frame, resizedSize: resizedSize))
+                    try sequence.frames.map {
+                        if decisionMediaProcessing { return try decisionPixels(image: $0.frame, resizedSize: resizedSize) }
+                        return MediaProcessing.asMLXArrayUnmanaged(preprocess(image: $0.frame, resizedSize: resizedSize))
                     })
             }
 
@@ -247,7 +265,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             processedVideo = .init(pixels: concatenated, frames: videoFrames.map { $0.1 })
 
             if let frames = processedVideo?.frames {
-                if videoTimestampGroups {
+                if decisionMediaProcessing {
                     guard let pad = tokenizer.convertTokenToId("<|video_pad|>") else {
                         throw VLMError.processing("Missing video padding token")
                     }

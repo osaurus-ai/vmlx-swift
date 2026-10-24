@@ -202,6 +202,27 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
         )
     }
 
+    func testDecisionMetadataDoesNotBecomeAQuantizationOwner() throws {
+        var config = denseQwenConfiguration()
+        config["architectures"] = ["Qwen3_5Model"]
+        var summary: [String: Any] = [
+            "decision": ["format_id": "d3-code-readout-v1", "generates_text": false, "pooling": "last"],
+            "runtime": ["lm_head": false, "bundle_has_mtp": false, "mtp_layers": 0],
+            "quantization": ["bits": 8, "group_size": 64, "bit_widths_used": [2, 8], "unquantized_linears": []],
+        ]
+        let result = try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary))
+        XCTAssertEqual(result.customModules.count, 3)
+        var bad = summary
+        bad["format_version"] = 3
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(bad)))
+        bad = summary
+        bad["quantization_config"] = config["quantization"]!
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(bad)))
+        summary["quantization"] = ["bits": 8, "group_size": 64, "bit_widths_used": [2, 8],
+            "unquantized_linears": ["language_model.model.layers.3.mlp.gate_proj"]]
+        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+    }
+
     func testActualDenseQwenMetadataWhenProvided() throws {
         guard
             let path = ProcessInfo.processInfo.environment[
