@@ -840,12 +840,18 @@ private final class Qwen4ExpGatedResidual: Module {
                 down.bits == injection.bits, down.mode == injection.mode,
                 down.scales.dtype == injection.scales.dtype,
                 downBiases.dtype == injectionBiases.dtype,
-                down.scales.dtype == downBiases.dtype
+                down.scales.dtype == downBiases.dtype,
+                WeightBacking.copyWouldReplace([down.weight, injection.weight])
             {
                 let weight = concatenated([down.weight, injection.weight], axis: 0)
                 let scales = concatenated([down.scales, injection.scales], axis: 0)
                 let biases = concatenated([downBiases, injectionBiases], axis: 0)
                 MLX.eval(weight, scales, biases)
+                // The fused projection must replace its source allocations.
+                // Prefill and exact-row consumers keep the original bytes as
+                // row views, rather than retaining a second permanent bank.
+                WeightBacking.rebindAsRows(
+                    [down, injection], weight: weight, scales: scales, biases: biases)
                 fusedInputProjection = .affine(
                     weight: weight, scales: scales, biases: biases,
                     groupSize: down.groupSize, bits: down.bits, mode: down.mode)
@@ -855,10 +861,20 @@ private final class Qwen4ExpGatedResidual: Module {
                 mixDown.bias == nil, injection.bias == nil,
                 mixDown.weight.dtype == injection.weight.dtype,
                 Array(mixDown.weight.shape.dropFirst())
-                    == Array(injection.weight.shape.dropFirst())
+                    == Array(injection.weight.shape.dropFirst()),
+                WeightBacking.copyWouldReplace([mixDown.weight, injection.weight])
             {
                 let weight = concatenated([mixDown.weight, injection.weight], axis: 0)
                 MLX.eval(weight)
+                let downRows = mixDown.weight.dim(0)
+                let injectionRows = injection.weight.dim(0)
+                _ = mixDown.update(parameters: ModuleParameters.unflattened([
+                    "weight": weight[0 ..< downRows],
+                ]))
+                _ = injection.update(parameters: ModuleParameters.unflattened([
+                    "weight": weight[downRows ..< downRows + injectionRows],
+                ]))
+                MLX.eval(mixDown.weight, injection.weight)
                 fusedInputProjection = .dense(weight: weight)
                 fusionKind = "dense"
             } else {
