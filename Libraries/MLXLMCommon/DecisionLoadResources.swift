@@ -27,8 +27,6 @@ public final class DecisionLoadResources {
             workingSet: workingSet, systemWireLimit: wire.userWireLimitBytes)).lease
     }
 
-    /// Match the chat loader: the temporary load-time pool cap is restored once weights settle.
-    public func finishLoading() {
-        if let priorAllocatorCap { Memory.cacheLimit = priorAllocatorCap }
-    }
+    /// Host restores this scalar after load, before transferring the lease to the model owner.
+    public var previousAllocatorCacheLimit: Int? { priorAllocatorCap }
 }

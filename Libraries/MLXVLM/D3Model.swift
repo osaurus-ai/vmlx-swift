@@ -25,7 +25,8 @@ public actor D3Model {
         let bundle = try DecisionBundle(directory: directory)
         try Task.checkCancellation()
         let resources = DecisionLoadResources(directory: directory, configuration: loadConfiguration)
-        defer { resources.finishLoading() }
+        let previousAllocatorCacheLimit = resources.previousAllocatorCacheLimit
+        defer { if let cap = previousAllocatorCacheLimit { Memory.cacheLimit = cap } }
         let readoutData = try Data(contentsOf: bundle.readoutURL)
         let hash = SHA256.hash(data: readoutData).map { String(format: "%02x", $0) }.joined()
         guard hash == bundle.readoutSHA256 else { throw DecisionRuntimeError.invalid("D3 readout SHA256 mismatch") }
