@@ -505,7 +505,7 @@ public func loadModel(
             allocatorCacheLimit: loadConfiguration.maxResidentBytes
                 .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory))
     if loadConfiguration.memoryLimit != memoryLimit {
-        FileHandle.standardError.write(
+        LoadDiagnostics.write(
             Data(
                 (facts.customRoutedFormat == .janghV2
                     ? "[Load] Automatic JANGH scheduling budget includes mapped weights plus scratch headroom; explicit limits and physical-memory admission remain separate\n"
@@ -570,9 +570,9 @@ public func loadModel(
     let wireReport = ModelWireBudgetReport(
         modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
     ModelWireBudgetReport.recordLastLoad(wireReport)
-    FileHandle.standardError.write(Data(
+    LoadDiagnostics.write(Data(
         "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
-    FileHandle.standardError.write(Data("\(wireReport.logLine)\n".utf8))
+    LoadDiagnostics.write(Data("\(wireReport.logLine)\n".utf8))
     loadTiming.mark("memory_and_residency")
 
     // Load original packed bytes into owned allocations; alignment repair and
@@ -638,7 +638,7 @@ func applyResidentPoolProcessMemoryLimitsIfNeeded(
     MLX.Memory.memoryLimit = nativeCeiling
     MLX.Memory.cacheLimit = min(nativeCeiling, max(0, allocatorCacheLimit ?? nativeCeiling))
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
-        FileHandle.standardError.write(Data(
+        LoadDiagnostics.write(Data(
             ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
                 + "previous_memory=\(previousMemoryLimit) previous_cache=\(previousCacheLimit) "
                     + "native_ceiling=\(nativeCeiling) allocator_ceiling=\(MLX.Memory.cacheLimit)\n")
