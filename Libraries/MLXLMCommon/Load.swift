@@ -219,6 +219,78 @@ func indexedShardFileNames(at modelDirectory: URL) -> [String]? {
     return names.isEmpty ? nil : names.sorted()
 }
 
+/// Every safetensors file in `modelDirectory` that may hold this model's
+/// weights. The index-manifest contract in ``loadWeights`` narrows this
+/// further for JANG bundles.
+func candidateShardURLs(in modelDirectory: URL, skipDSV4Sidecar: Bool) -> [URL] {
+    var urls: [URL] = []
+    let indexedNames = Set(indexedShardFileNames(at: modelDirectory) ?? [])
+    let enumerator = FileManager.default.enumerator(
+        at: modelDirectory, includingPropertiesForKeys: nil)!
+    for case let url as URL in enumerator {
+        guard url.pathExtension == "safetensors" else { continue }
+        if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
+        // Converter calibration captures are provenance artifacts, not
+        // inference weights.  DSV4's AWQ/imatrix converter folds these
+        // statistics completely into the indexed model tensors and marks
+        // the resulting bundle as requiring no runtime sidecar.  Loading
+        // the capture alongside the 102 indexed shards injects keys such
+        // as `layers.0.experts_input` into model.update(), which correctly
+        // rejects them as unhandled parameters.
+        if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
+            continue
+        }
+        if isNestedModelBundleShard(url, in: modelDirectory, indexedNames: indexedNames) {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] skipping \(url.path): it belongs to a nested model with its own config.json\n".utf8))
+            continue
+        }
+        if skipDSV4Sidecar
+            && url.lastPathComponent == "jangtq_stacked.safetensors"
+        {
+            LoadDiagnostics.write(Data(
+                "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
+            continue
+        }
+        urls.append(url)
+    }
+    return urls
+}
+
+/// A safetensors file below a subdirectory that has its own config.json
+/// belongs to another model: a drafter shipped beside its target, such as
+/// the `mtp-drafter/` in bottlecapai/ThinkingCap-Qwen3.8-27B-MLX-4bit-DWQ.
+/// Merged into the target, its prefix-free keys (`fc`, `layers`, `norm`)
+/// fail `model.update()` as unhandled parameters. A file the root index
+/// names is still this model's.
+private func isNestedModelBundleShard(
+    _ url: URL, in modelDirectory: URL, indexedNames: Set<String>
+) -> Bool {
+    let base = modelDirectory.standardizedFileURL.resolvingSymlinksInPath()
+    let baseComponents = base.pathComponents
+    // Only the directories are resolved: a Hugging Face cache stores every file as a symlink into
+    // `blobs/`, and resolving the file itself would lose its place in the bundle.
+    let fileComponents = url.deletingLastPathComponent().standardizedFileURL
+        .resolvingSymlinksInPath().pathComponents + [url.lastPathComponent]
+    guard fileComponents.count > baseComponents.count + 1,
+        Array(fileComponents.prefix(baseComponents.count)) == baseComponents
+    else { return false }
+    let relative = fileComponents.dropFirst(baseComponents.count)
+    if indexedNames.contains(relative.joined(separator: "/")) { return false }
+    var directory = base
+    for component in relative.dropLast() {
+        directory.appendPathComponent(component, isDirectory: true)
+        if FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("config.json").path)
+        {
+            return true
+        }
+    }
+    return false
+}
+
 private func loadJangConfigSanitizeMetadata(at modelDirectory: URL) -> [String: String] {
     guard let url = JangLoader.findConfigPath(at: modelDirectory),
         let data = try? Data(contentsOf: url),
@@ -328,33 +400,8 @@ public func loadWeights(
         // docs/OSAURUS-DSV4-INTEGRATION.md.
         let skipDSV4Sidecar =
             ProcessInfo.processInfo.environment["VMLX_DSV4_SKIP_SIDECAR"] == "1"
-        var allShardURLs: [URL] = []
-        let enumerator = FileManager.default.enumerator(
-            at: modelDirectory, includingPropertiesForKeys: nil)!
-        for case let url as URL in enumerator {
-            guard url.pathExtension == "safetensors" else { continue }
-            if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
-            // Converter calibration captures are provenance artifacts, not
-            // inference weights.  DSV4's AWQ/imatrix converter folds these
-            // statistics completely into the indexed model tensors and marks
-            // the resulting bundle as requiring no runtime sidecar.  Loading
-            // the capture alongside the 102 indexed shards injects keys such
-            // as `layers.0.experts_input` into model.update(), which correctly
-            // rejects them as unhandled parameters.
-            if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
-                LoadDiagnostics.write(Data(
-                    "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
-                continue
-            }
-            if skipDSV4Sidecar
-                && url.lastPathComponent == "jangtq_stacked.safetensors"
-            {
-                LoadDiagnostics.write(Data(
-                    "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
-                continue
-            }
-            allShardURLs.append(url)
-        }
+        var allShardURLs = candidateShardURLs(
+            in: modelDirectory, skipDSV4Sidecar: skipDSV4Sidecar)
         // FINAL bundle-layout contract (2026-09-04, JANG bundles): when the
         // bundle ships `model.safetensors.index.json`, the index IS the load
         // manifest — load exactly the files its weight_map names, nothing
