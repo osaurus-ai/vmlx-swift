@@ -33,11 +33,14 @@ final class Qwen4ExpMixerStorageTests: XCTestCase {
                 ],
             ]
             let config = try JSONDecoder().decode(
-                Qwen4ExpConfiguration.self, from: JSONSerialization.data(withJSONObject: configuration))
+                Qwen4ExpConfiguration.self,
+                from: JSONSerialization.data(withJSONObject: configuration))
             let width = 10240
             func bank(_ rows: Int, _ columns: Int, phase: Int) -> MLXArray {
-                MLXArray((0 ..< rows * columns).map { Float(($0 + phase) % 17 - 8) / 1024 },
-                         [rows, columns]).asType(.bfloat16)
+                MLXArray(
+                    (0 ..< rows * columns).map { Float(($0 + phase) % 17 - 8) / 1024 },
+                    [rows, columns]
+                ).asType(.bfloat16)
             }
             var parameters = [
                 "hc_norm.weight": MLXArray.ones([width], dtype: .bfloat16),
@@ -47,25 +50,30 @@ final class Qwen4ExpMixerStorageTests: XCTestCase {
             ]
             MLX.eval(Array(parameters.values))
             let bridge = try Qwen4ExpMHCSubstageBridge(config: config, parameters: parameters)
-            parameters.removeAll() // The caller must not keep the original banks alive.
+            parameters.removeAll()  // The caller must not keep the original banks alive.
             // Reuse the existing diagnostic bridge without adding a shipping
             // API to expose its private mixer solely for this storage test.
             let module = try XCTUnwrap(
-                Mirror(reflecting: bridge).children.first { $0.label == "residual" }?.value as? Module)
+                Mirror(reflecting: bridge).children.first { $0.label == "residual" }?.value
+                    as? Module)
             if let metadataType {
                 quantize(model: module, groupSize: 64, bits: 8)
                 for (_, child) in module.leafModules().flattened() {
-                    guard let linear = child as? QuantizedLinear, let biases = linear.biases else { continue }
-                    _ = linear.update(parameters: ModuleParameters.unflattened([
-                        "scales": linear.scales.asType(metadataType),
-                        "biases": biases.asType(metadataType),
-                    ]))
+                    guard let linear = child as? QuantizedLinear, let biases = linear.biases else {
+                        continue
+                    }
+                    _ = linear.update(
+                        parameters: ModuleParameters.unflattened([
+                            "scales": linear.scales.asType(metadataType),
+                            "biases": biases.asType(metadataType),
+                        ]))
                 }
             }
             func snapshot() -> [String: Data] {
-                Dictionary(uniqueKeysWithValues: module.parameters().flattened().map {
-                    ($0.0, $0.1.asData(access: .copy).data)
-                })
+                Dictionary(
+                    uniqueKeysWithValues: module.parameters().flattened().map {
+                        ($0.0, $0.1.asData(access: .copy).data)
+                    })
             }
             MLX.eval(module.parameters())
             let expected = snapshot()
@@ -81,8 +89,11 @@ final class Qwen4ExpMixerStorageTests: XCTestCase {
             XCTAssertEqual(snapshot(), expected)
             let second = try bridge.mix(input)
             MLX.eval(second.mixed, second.injection)
-            XCTAssertEqual(first.mixed.asData(access: .copy).data, second.mixed.asData(access: .copy).data)
-            XCTAssertEqual(first.injection.asData(access: .copy).data, second.injection.asData(access: .copy).data)
+            XCTAssertEqual(
+                first.mixed.asData(access: .copy).data, second.mixed.asData(access: .copy).data)
+            XCTAssertEqual(
+                first.injection.asData(access: .copy).data,
+                second.injection.asData(access: .copy).data)
         }
     }
 }

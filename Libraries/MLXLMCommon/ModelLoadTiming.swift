@@ -21,8 +21,9 @@ public struct ModelLoadTiming {
     public mutating func mark(_ stage: String) {
         guard enabled else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        LoadDiagnostics.write(Data(
-            String(format: "[LoadTiming] scope=%@ stage=%@ elapsed_ms=%.3f total_ms=%.3f\n",
+        LoadDiagnostics.write(
+            Data(
+                String(format: "[LoadTiming] scope=%@ stage=%@ elapsed_ms=%.3f total_ms=%.3f\n",
                    scope, stage, (now - previous) * 1000, (now - started) * 1000).utf8))
         previous = now
     }

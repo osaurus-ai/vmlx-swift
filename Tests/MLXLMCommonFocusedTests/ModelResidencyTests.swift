@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #endif
 
 @testable import MLXLMCommon
@@ -106,53 +106,54 @@ final class ModelResidencyTests: XCTestCase {
     }
 
     #if canImport(Darwin)
-    /// The legacy FileHandle write raises an Objective-C exception (or SIGPIPE),
-    /// so exercise the production registry in an isolated XCTest subprocess.
-    func testResidencySurvivesDisconnectedDiagnosticSinks() throws {
-        for mode in ["broken-default", "broken-ignored", "closed"] {
-            let child = Process()
-            child.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            child.arguments = [
-                "xctest", "-XCTest",
-                "MLXLMCommonFocusedTests.ModelResidencyTests/testDiagnosticSinkChild",
-                Bundle(for: Self.self).bundleURL.path,
-            ]
-            var environment = ProcessInfo.processInfo.environment
-            environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"] = mode
-            child.environment = environment
-            child.standardOutput = FileHandle.nullDevice
-            child.standardError = FileHandle.nullDevice
-            try child.run()
-            child.waitUntilExit()
-            XCTAssertEqual(child.terminationReason, .exit, mode)
-            XCTAssertEqual(child.terminationStatus, 0, mode)
+        /// The legacy FileHandle write raises an Objective-C exception (or SIGPIPE),
+        /// so exercise the production registry in an isolated XCTest subprocess.
+        func testResidencySurvivesDisconnectedDiagnosticSinks() throws {
+            for mode in ["broken-default", "broken-ignored", "closed"] {
+                let child = Process()
+                child.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+                child.arguments = [
+                    "xctest", "-XCTest",
+                    "MLXLMCommonFocusedTests.ModelResidencyTests/testDiagnosticSinkChild",
+                    Bundle(for: Self.self).bundleURL.path,
+                ]
+                var environment = ProcessInfo.processInfo.environment
+                environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"] = mode
+                child.environment = environment
+                child.standardOutput = FileHandle.nullDevice
+                child.standardError = FileHandle.nullDevice
+                try child.run()
+                child.waitUntilExit()
+                XCTAssertEqual(child.terminationReason, .exit, mode)
+                XCTAssertEqual(child.terminationStatus, 0, mode)
+            }
         }
-    }
 
-    func testDiagnosticSinkChild() throws {
-        guard let mode = ProcessInfo.processInfo.environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"] else { return }
-        let saved = dup(STDERR_FILENO)
-        XCTAssertGreaterThanOrEqual(saved, 0)
-        defer { _ = dup2(saved, STDERR_FILENO); close(saved) }
-        if mode == "closed" {
-            close(STDERR_FILENO)
-        } else {
-            var descriptors: [Int32] = [0, 0]
-            XCTAssertEqual(pipe(&descriptors), 0)
-            close(descriptors[0])
-            XCTAssertEqual(dup2(descriptors[1], STDERR_FILENO), STDERR_FILENO)
-            close(descriptors[1])
-            signal(SIGPIPE, mode == "broken-default" ? SIG_DFL : SIG_IGN)
+        func testDiagnosticSinkChild() throws {
+            guard let mode = ProcessInfo.processInfo.environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"]
+            else { return }
+            let saved = dup(STDERR_FILENO)
+            XCTAssertGreaterThanOrEqual(saved, 0)
+            defer { _ = dup2(saved, STDERR_FILENO); close(saved) }
+            if mode == "closed" {
+                close(STDERR_FILENO)
+            } else {
+                var descriptors: [Int32] = [0, 0]
+                XCTAssertEqual(pipe(&descriptors), 0)
+                close(descriptors[0])
+                XCTAssertEqual(dup2(descriptors[1], STDERR_FILENO), STDERR_FILENO)
+                close(descriptors[1])
+                signal(SIGPIPE, mode == "broken-default" ? SIG_DFL : SIG_IGN)
+            }
+            let backend = Backend()
+            let registry = ModelResidency(apply: backend.apply)
+            var lease: ModelResidency.Lease? = registry.acquire(request(2)).lease
+            withExtendedLifetime(lease) {}
+            lease = nil
+            // Both acquire and deinit must finish even when diagnostic output cannot.
+            _ = dup2(saved, STDERR_FILENO)
+            XCTAssertEqual(backend.limits.count, 2)
+            XCTAssertEqual(backend.limits.last, 0)
         }
-        let backend = Backend()
-        let registry = ModelResidency(apply: backend.apply)
-        var lease: ModelResidency.Lease? = registry.acquire(request(2)).lease
-        withExtendedLifetime(lease) {}
-        lease = nil
-        // Both acquire and deinit must finish even when diagnostic output cannot.
-        _ = dup2(saved, STDERR_FILENO)
-        XCTAssertEqual(backend.limits.count, 2)
-        XCTAssertEqual(backend.limits.last, 0)
-    }
     #endif
 }

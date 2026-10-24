@@ -88,8 +88,9 @@ final class ModelResidency: @unchecked Sendable {
         // incorrect for multi-model hosts, that forces needless residency work.
         let applied = requested == appliedTarget || apply(requested)
         if applied { appliedTarget = requested }
-        LoadDiagnostics.write(Data(
-            "[Load] residency_models=\(requests.count) target_bytes=\(requested) applied=\(applied)\n".utf8))
+        LoadDiagnostics.write(
+            Data(
+                "[Load] residency_models=\(requests.count) target_bytes=\(requested) applied=\(applied)\n".utf8))
         return (requested, applied)
     }
 }

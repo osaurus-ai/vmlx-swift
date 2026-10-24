@@ -570,8 +570,9 @@ public func loadModel(
     let wireReport = ModelWireBudgetReport(
         modelBytes: modelBytes, budget: wireBudget, residencyTargetBytes: residencyTarget)
     ModelWireBudgetReport.recordLastLoad(wireReport)
-    LoadDiagnostics.write(Data(
-        "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
+    LoadDiagnostics.write(
+        Data(
+            "[Load] Model residency requested=\(loadConfiguration.keepModelInMemory) target_bytes=\(residencyTarget ?? 0) weight_bytes=\(modelBytes) working_set_bytes=\(workingSet) applied=\(residencyApplied)\n".utf8))
     LoadDiagnostics.write(Data("\(wireReport.logLine)\n".utf8))
     loadTiming.mark("memory_and_residency")
 
@@ -638,8 +639,9 @@ func applyResidentPoolProcessMemoryLimitsIfNeeded(
     MLX.Memory.memoryLimit = nativeCeiling
     MLX.Memory.cacheLimit = min(nativeCeiling, max(0, allocatorCacheLimit ?? nativeCeiling))
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
-        LoadDiagnostics.write(Data(
-            ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
+        LoadDiagnostics.write(
+            Data(
+                ("[Load] resident-pool limits model_type=\(facts.modelType ?? "unknown") "
                 + "previous_memory=\(previousMemoryLimit) previous_cache=\(previousCacheLimit) "
                     + "native_ceiling=\(nativeCeiling) allocator_ceiling=\(MLX.Memory.cacheLimit)\n")
                     .utf8))

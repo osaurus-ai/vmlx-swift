@@ -868,12 +868,14 @@ private final class Qwen4ExpGatedResidual: Module {
                 MLX.eval(weight)
                 let downRows = mixDown.weight.dim(0)
                 let injectionRows = injection.weight.dim(0)
-                _ = mixDown.update(parameters: ModuleParameters.unflattened([
-                    "weight": weight[0 ..< downRows],
-                ]))
-                _ = injection.update(parameters: ModuleParameters.unflattened([
-                    "weight": weight[downRows ..< downRows + injectionRows],
-                ]))
+                _ = mixDown.update(
+                    parameters: ModuleParameters.unflattened([
+                        "weight": weight[0 ..< downRows]
+                    ]))
+                _ = injection.update(
+                    parameters: ModuleParameters.unflattened([
+                        "weight": weight[downRows ..< downRows + injectionRows]
+                    ]))
                 MLX.eval(mixDown.weight, injection.weight)
                 fusedInputProjection = .dense(weight: weight)
                 fusionKind = "dense"
