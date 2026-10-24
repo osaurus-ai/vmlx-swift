@@ -41,7 +41,7 @@ public enum Qwen4ExpBF16Affine {
             lock.lock()
             verdicts[key] = equal
             lock.unlock()
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] bf16_affine_rows kind=\(kind) K=\(k) N=\(n) rows=\(rows) admitted=\(equal)\n"
                         .utf8))
@@ -62,7 +62,7 @@ public enum Qwen4ExpBF16Affine {
         let inserted = reportedSignatures.insert(signature).inserted
         diagnosticLock.unlock()
         guard inserted else { return }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[Qwen4Exp] bf16_affine_dispatch op=\(operation) native=\(native) "
                 + "input=\(input.dtype) weight=\(weight.dtype) scales=\(scales.dtype) "
                 + "biases=\(String(describing: biases?.dtype)) gs=\(groupSize) bits=\(bits)\n").utf8))

@@ -10,6 +10,7 @@
 //
 
 import Foundation
+import MLXLMCommon
 @preconcurrency import MLX
 import MLXNN
 import MLXRandom
@@ -859,14 +860,14 @@ final class QwenImagePipeline {
     }
 
     private static func mark(_ s: String) {
-        FileHandle.standardError.write("[qwen] >> \(s)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] >> \(s)\n".data(using: .utf8)!)
     }
     private static func dbg(_ label: String, _ x: MLXArray) {
-        FileHandle.standardError.write("[qwen] \(label) shape=\(x.shape) (evaluating...)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] \(label) shape=\(x.shape) (evaluating...)\n".data(using: .utf8)!)
         eval(x)
         let f = x.asType(.float32)
         let mn = mean(f).item(Float.self), mx = MLX.max(f).item(Float.self)
-        FileHandle.standardError.write("[qwen] \(label) mean=\(mn) max=\(mx) finite=\(mn.isFinite && mx.isFinite)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[qwen] \(label) mean=\(mn) max=\(mx) finite=\(mn.isFinite && mx.isFinite)\n".data(using: .utf8)!)
     }
 
     func generate(prompt: String, negativePrompt: String?, width: Int, height: Int, steps: Int,

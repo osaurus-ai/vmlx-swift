@@ -229,7 +229,7 @@ public enum MmapSafetensorsLoader {
                 offsets.count == 2
             else {
                 // Malformed individual entry — skip but keep loading.
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[MmapSafetensorsLoader] skipping malformed entry \(key) in \(path)\n".utf8))
                 continue
             }

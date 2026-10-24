@@ -438,7 +438,7 @@ public func canonicalChatCacheBoundaries(
         // up to the history boundary, which is where the remaining `stored+2`
         // miss must originate.
         let historyDigest = all.last.map { digest(promptTokens.prefix($0)) } ?? "-"
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)"
                 + " head=\(headDigest) stable0=\(stableDigest) hist=\(historyDigest)"
                 + " stableDigests=[\(stableDigests)]\n").utf8

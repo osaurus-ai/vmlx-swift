@@ -341,7 +341,7 @@ public enum RowExactAffineQMV {
         lock.lock()
         verdicts[key] = equal
         lock.unlock()
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[RowExactQMV] rows K=\(k) N=\(n) bits=\(bits) rows=\(rows) dtype=\(dtype) admitted=\(equal)\n".utf8))
         return equal ? launch(input) : nil
     }
@@ -642,7 +642,7 @@ public enum RowExactGatherQMV {
         lock.lock()
         verdicts[key] = equal
         lock.unlock()
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[RowExactGather] K=\(k) N=\(n) bits=\(bits) pairs=\(pairs) fast=\(fast) admitted=\(equal)\n".utf8))
         return equal ? launch(x, indices, divisor: xDivisor) : nil
     }

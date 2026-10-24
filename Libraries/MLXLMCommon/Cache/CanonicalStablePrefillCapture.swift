@@ -99,7 +99,7 @@ final class CanonicalStablePrefillCapture {
             let bytes = owned.reduce(0) { total, layer in
                 total + layer.state.reduce(0) { $0 + $1.nbytes }
             }
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/canonical-capture] seed=\(seedCount) chunk=\(chunkSize)"
                     + " snapshot_state_bytes=\(bytes) copy_eval_seconds=\(elapsed)\n").utf8))
         }

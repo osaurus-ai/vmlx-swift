@@ -1952,7 +1952,7 @@ public enum DeepseekV4Math {
             heads16SelfTested = true
             if let err = heads16SelfTest() {
                 heads16Disabled = true
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data(
                         "DSV4 heads16 indexed-prefill kernel self-test FAILED (\(err)); using stock indexed prefill for this process\n"
                             .utf8))

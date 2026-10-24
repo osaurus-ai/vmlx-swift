@@ -1022,7 +1022,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             primer.finish(firstToken: firstToken)
             promptPrimedRows = primer.foldedRows
             self.mtpDraftTime += NativeMTPClock.now() - primeStart
-            FileHandle.standardError.write(Data(String(
+            RuntimeDiagnostics.write(Data(String(
                 format: "[NativeMTP] prompt_priming rows=%d prompt_positions=%d sec=%.3f\n",
                 primer.foldedRows, primer.receivedPositions, NativeMTPClock.now() - primeStart).utf8))
         }
@@ -1445,7 +1445,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         && tokenCount == generatedTokenIds.count + 1
                     ? lastReturnedTokenId : nil
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
                             + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
                             + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil)\n").utf8))
@@ -1615,7 +1615,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             adaptiveWallClockDemotes,
             adaptiveAcceptanceDemotes,
             arLookaheadCount)
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 
     /// Compile the fixed-shape staged verify forward. Built AFTER the
@@ -1633,7 +1633,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // rebound somewhere and every replay silently degrades to a
             // rebuild.
             if ProcessInfo.processInfo.environment["VMLX_MTP_PHASE_TIMERS"] == "1" {
-                FileHandle.standardError.write(
+                RuntimeDiagnostics.write(
                     Data("[NativeMTP] compiled verify TRACE build rows=\(rows)\n".utf8))
             }
             return CompiledDecodeTrace.withActive {
@@ -1914,7 +1914,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             if Self.traceEnabled {
                 let line =
                     "[NativeMTPTrace] skipped history-boundary cache rederive after trim miss for disk-backed cache topology\n"
-                FileHandle.standardError.write(Data(line.utf8))
+                RuntimeDiagnostics.write(Data(line.utf8))
             }
             return nil
         }
@@ -2244,7 +2244,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let nextID = recordMaterializeSync { nextVerifiedToken.item(Int.self) }
             let line =
                 "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(verifyDecision.targetTokenIds) accepted=\(accepted) next=\(nextID)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
 
         for (index, token) in drafts.prefix(accepted).enumerated() {
@@ -2775,7 +2775,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 arSafetySeedStepSec = arSafetyLiveStepSec ?? arSafetySeedStepSec
                 arSafetyFirstVerifySec = nil
                 adaptiveFallbackReason = nil
-                FileHandle.standardError.write(Data(String(
+                RuntimeDiagnostics.write(Data(String(
                     format: "[NativeMTP] ar_safety resumed: mtp=%.1fms/tok live_ar=%.1fms depth=%d\n",
                     mtpMs, arMs, currentDepth).utf8))
             }
@@ -2863,7 +2863,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
         headChainPairs = 0
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[NativeMTP] ar_safety depth=\(previous)->\(currentDepth) reason=\(reason)\n".utf8))
     }
     private mutating func arSafetyPause(reason: String, loss: Bool = true) {
@@ -2891,7 +2891,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         drafts.removeAll(keepingCapacity: true)
         draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
-        FileHandle.standardError.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
+        RuntimeDiagnostics.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
     }
 
     /// After every AR step: capture the seed AR cost on the very first
@@ -3610,7 +3610,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let nextID = recordMaterializeSync { nextToken.item(Int.self) }
             let line =
                 "[NativeMTPTrace] call=\(verifyCalls) emitted=\(tokenCount) requested=\(requestedIDs) drafts=\(draftIDs) target=\(targetTokenIds) accepted=\(accepted) next=\(nextID) sequential=1\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
 
         var alignedCommitHidden: MLXArray?

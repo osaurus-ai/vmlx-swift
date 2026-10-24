@@ -21,7 +21,7 @@ struct CacheFinalizationTrace {
         let delta = Double(now - previous) / 1e6
         let total = Double(now - start) / 1e6
         previous = now
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[vmlx][cache/finalize-phase] operation=\(operation) tokens=\(tokens) phase=\(phase) deltaMs=\(delta) totalMs=\(total)\n".utf8))
     }
 }

@@ -280,7 +280,7 @@ final class JANGHDenseFastAdmission {
             equal = false
         }
         verdicts[key] = equal
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data("[JANGH] projection admission \(key) admitted=\(equal)\n".utf8))
         return equal
     }

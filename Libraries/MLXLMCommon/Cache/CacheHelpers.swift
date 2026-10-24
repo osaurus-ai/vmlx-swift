@@ -263,9 +263,9 @@ public func validateRestoredCacheBoundary(
             + "matched=\(matchedTokens) restored=\(restoredTokens) offsets=\(unique)"
         // Always visible: a refused restore is the difference between one
         // extra prefill and a whole corrupted continuation.
-        FileHandle.standardError.write(Data((message + "\n").utf8))
+        RuntimeDiagnostics.write(Data((message + "\n").utf8))
     } else if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] != nil {
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[vmlx][cache/restore] ACCEPTED detail=\(detail) boundary=\(matchedTokens) layers=\(cache.count)\n".utf8))
     }
     return consistent
@@ -1061,7 +1061,7 @@ private func restoreFromV2Arrays(
             // the caller re-prefills instead of fatal-trapping. Belt &
             // suspenders on top of v2 layer-kind tagging.
             guard keys.shape.count >= 3, values.shape.count >= 3 else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape)). Need >= 3D. Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -1072,7 +1072,7 @@ private func restoreFromV2Arrays(
             // record predates the `.qsaKV` kind — refuse the whole entry
             // (one re-prefill) instead of diverging.
             guard !(cache[i] is QSAKVCache) else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: layer \(i) is a QSA layer but the stored record has no indexer lane (pre-qsaKV entry). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -1095,12 +1095,12 @@ private func restoreFromV2Arrays(
             guard keys.shape.count >= 3, values.shape.count >= 3,
                 indexer.shape.count >= 3
             else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: QSA layer \(i) has incompatible shape (k=\(keys.shape) v=\(values.shape) idx=\(indexer.shape)). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
             guard let qsa = cache[i] as? QSAKVCache else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: stored QSA record for layer \(i) but the live cache is \(type(of: cache[i])). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -1108,7 +1108,7 @@ private func restoreFromV2Arrays(
             // `state`'s setter derives offset from keys, and a shorter lane
             // would recreate the divergence this record exists to prevent.
             guard indexer.dim(1) == keys.dim(2) else {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[disk cache] restore SKIPPED: QSA layer \(i) indexer lane length \(indexer.dim(1)) != KV offset \(keys.dim(2)). Falling back to fresh prefill.\n".utf8))
                 return 0
             }
@@ -1398,7 +1398,7 @@ private func restoreKVLayer(
         // entries predate qwen4_exp and CacheList never wraps QSA, so this
         // is a defense-in-depth backstop for future call sites. Loud no-op:
         // the layer stays empty rather than becoming inconsistent.
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[disk cache] restoreKVLayer REFUSED: 2-array record for a QSAKVCache (would drop the indexer lane).\n".utf8))
         return
     }

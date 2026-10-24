@@ -43,9 +43,9 @@ final class StreamTimingRecorder {
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             let url = directory.appendingPathComponent("stream-\(UUID().uuidString).json")
             try data.write(to: url, options: .atomic)
-            FileHandle.standardError.write(Data("[StreamTiming] path=\(url.path) tokens=\(arrivals.count) truncated=\(truncated)\n".utf8))
+            RuntimeDiagnostics.write(Data("[StreamTiming] path=\(url.path) tokens=\(arrivals.count) truncated=\(truncated)\n".utf8))
         } catch {
-            FileHandle.standardError.write(Data("[StreamTiming] FAILED: \(error)\n".utf8))
+            RuntimeDiagnostics.write(Data("[StreamTiming] FAILED: \(error)\n".utf8))
         }
     }
 }

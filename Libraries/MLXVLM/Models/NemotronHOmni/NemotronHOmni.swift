@@ -144,7 +144,7 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
             // HF builds the LN iff the LLM ships an MTP head. A bundle that
             // disagrees is unusual, but the tensors are what the model computes
             // with; say so instead of guessing.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[NemotronHOmni] vision_final_layernorm present=\(self.hasVisionFinalLayerNorm) but num_nextn_predict_layers=\(self.llmConfig.numNextnPredictLayers); following the tensors\n".utf8))
         }
 

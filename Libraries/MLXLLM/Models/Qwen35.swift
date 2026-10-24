@@ -274,7 +274,7 @@ final class Qwen35GatedDeltaNet: Module {
             Self.fusionDiagnosticLock.lock()
             if !Self.didReportInputFusionSkipped {
                 Self.didReportInputFusionSkipped = true
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[Qwen35] fused_gdn_decode_input_projections=skipped reason=mapped_shard_weights\n".utf8))
             }
             Self.fusionDiagnosticLock.unlock()
@@ -337,7 +337,7 @@ final class Qwen35GatedDeltaNet: Module {
                 }
                 return nil
             }
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[Qwen35] fused_gdn_decode_input_projections=active groups=\(fusedCounts)\n"
                     .utf8))
         }
@@ -708,7 +708,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             let diff = abs(prefixState - chained!).max().item(Float.self)
             let scale = abs(chained!).max().item(Float.self)
-            FileHandle.standardError.write(Data(String(
+            RuntimeDiagnostics.write(Data(String(
                 format: "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
                 n, diff, scale).utf8))
         }

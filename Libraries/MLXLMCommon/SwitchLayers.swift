@@ -127,7 +127,7 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
         }
         if !didReport {
             didReport = true
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[Qwen4Exp] compiled_routed_switch_glu=active stock_gather_qmm=true shared_weight_inputs=true dtype=bfloat16\n"
                         .utf8))

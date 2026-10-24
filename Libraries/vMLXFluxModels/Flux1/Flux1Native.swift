@@ -10,6 +10,7 @@
 //
 
 import Foundation
+import MLXLMCommon
 @preconcurrency import MLX
 import MLXNN
 import MLXRandom
@@ -537,7 +538,7 @@ final class FluxSchnellPipeline {
         let mn = mean(f).item(Float.self)
         let mx = MLX.max(f).item(Float.self)
         let finite = mn.isFinite && mx.isFinite
-        FileHandle.standardError.write("[flux] \(label) shape=\(x.shape) mean=\(mn) max=\(mx) finite=\(finite)\n".data(using: .utf8)!)
+        RuntimeDiagnostics.write("[flux] \(label) shape=\(x.shape) mean=\(mn) max=\(mx) finite=\(finite)\n".data(using: .utf8)!)
     }
 
     func generate(prompt: String, width: Int, height: Int, steps: Int, seed: UInt64?,

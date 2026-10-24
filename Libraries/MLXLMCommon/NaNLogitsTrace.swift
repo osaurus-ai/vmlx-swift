@@ -110,7 +110,7 @@ public final class NaNLogitsTrace: @unchecked Sendable {
         var line =
             "[vmlx][nan-logits] site=\(site) step=\(step) slot=\(slot) model=\(model) nan=\(nan) inf=\(inf) sampled=\(sampled)"
         if let role { line += " role=\(role)" }
-        FileHandle.standardError.write(Data((line + "\n").utf8))
+        RuntimeDiagnostics.write(Data((line + "\n").utf8))
     }
 
     /// Emit the per-generation summary once. Silent when the generation
@@ -129,6 +129,6 @@ public final class NaNLogitsTrace: @unchecked Sendable {
 
         let line =
             "[vmlx][nan-logits] summary generations-with-nonfinite=\(Self.generationsWithNonFiniteCount) steps=\(steps) site=\(site) slot=\(slot) model=\(model) first-step=\(first ?? -1) nan=\(nan) inf=\(inf) total-steps=\(totalSteps)\n"
-        FileHandle.standardError.write(Data(line.utf8))
+        RuntimeDiagnostics.write(Data(line.utf8))
     }
 }

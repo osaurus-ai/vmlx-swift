@@ -360,7 +360,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // "no companions" would commit, mark the root done, and leave every
         // companion in it uncounted for good. Not committed; retried later.
         guard let companions = companionStore.listedQuotaEntries() else {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk-index] companion import reason=\(reason) committed=false "
                     + "companion directory could not be listed or examined\n").utf8))
             return false
@@ -392,7 +392,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 "unindexedPayloadsRemoved=\(counts.unindexedPayloadsRemoved)",
             ]
             let line = "[vmlx][cache/disk-index] companion import " + fields.joined(separator: " ") + "\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         return summary != nil
     }
@@ -595,7 +595,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             return nil
         }
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/canonical-required] accepted=\(boundary) layers=\(staged.count) chunk=\(chunk)\n".utf8))
         }
         return (staged, boundary)
@@ -846,7 +846,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
         func ftrace(_ msg: String) {
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/fetch] \(msg) tokens=\(tokens.count) skipExactDisk=\(skipExactDiskBoundary) "
                         + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "none")\n").utf8))
             }
@@ -1177,7 +1177,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
         if marked || ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             // Said once per payload: it explains a full prefill after a hit.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/restore] disk restore rejected boundary=\(boundary) "
                     + "tokens=\(tokens.count) marked=\(marked) reason=\(reason)\n").utf8))
         }
@@ -1449,7 +1449,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             let offsets = Set(cacheBoundaryLeafOffsets(cache))
             if totalTokens <= 0 || offsets.isEmpty || offsets.contains(where: { $0 != totalTokens }) {
                 if traceCacheStore {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/store] REFUSED offset/key mismatch"
                             + " tokens=\(totalTokens) offsets=\(offsets.sorted())\n").utf8))
                 }
@@ -1505,7 +1505,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 + "blocks=\(blockLayerData.count) payload=\(hasPagedKVPayload) "
                 + "companion=\(pagedBoundaryCompanion != nil) "
                 + "rotatingOffsets=\(uniqueRotatingOffsets)\n"
-            FileHandle.standardError.write(Data(message.utf8))
+            RuntimeDiagnostics.write(Data(message.utf8))
         }
 
         trace.mark("geometry-and-paged-companion")
@@ -1646,7 +1646,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             let payload = IndexedBytes.sum(kvBytes, companionBytes)
             if payload > cap {
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/disk-store] SKIP oversized count=\(tokens.count) "
                             + "bytes=\(payload) cap=\(cap) chain=\(chainId ?? "nil")\n").utf8))
                 }
@@ -2043,7 +2043,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             // Same leading keys as the directory-walk line; `ms` and `event`
             // are appended. An index pass never removes an orphan on sight, so
             // that count is always 0 here.
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.totalAfter)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(removedLegacy.count) orphanCompanionEvicted=0 deleteFailures=\(evictKV.count - removedKV.count + companionsStillOnDisk.count) source=index ms=\(String(format: "%.3f", totalMs)) rowsMs=\(String(format: "%.3f", rowsMs)) selectMs=\(String(format: "%.3f", selectMs)) deleteMs=\(String(format: "%.3f", deleteMs)) event=\(confirmedEvent?.kind.rawValue ?? "none") chain=\(activeChain ?? "none")\n".utf8))
         }
     }
@@ -2143,7 +2143,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 "[vmlx][cache/disk-quota] before=\(plan.totalBefore) after=\(max(0, plan.remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroups) kvEvicted=\(removedKV.count) companionEvicted=\(removedCompanions.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count) deleteFailures=\(evictKV.count - removedKV.count + evictCompanion.count - removedCompanions.count) source=walk\n".utf8))
         }
     }

@@ -55,7 +55,7 @@ public enum JangHadamardAttention {
             let stored =
                 cache?.innerState().filter { $0.ndim == 4 }
                 .map { String(describing: $0.dtype) }.joined(separator: ",") ?? "none"
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     ("[BonsaiAttention] source_qkv=\(queries.dtype)/\(keys.dtype)/\(values.dtype) "
                         + "attention_output=\(output.dtype) stored_kv=\(stored) "

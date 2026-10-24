@@ -437,7 +437,7 @@ struct UnoDecoder {
         UnoProcessCounters.arSteps += steps
         chooser?.observe(verifyWidth: 1, tokens: 1, seconds: seconds / Double(steps), count: steps)
         if Self.traceEnabled, let chooser {
-            FileHandle.standardError.write(Data(String(
+            RuntimeDiagnostics.write(Data(String(
                 format: "[Uno] ar_stretch steps=%d ms_per_step=%.2f chooser %@\n", steps,
                 seconds * 1000 / Double(steps), chooser.traceDescription).utf8))
         }
@@ -591,7 +591,7 @@ struct UnoDecoder {
         }
         stats.verifySeconds += Date.timeIntervalSinceReferenceDate - verifyStart
         if Self.traceEnabled {
-            FileHandle.standardError.write(Data(String(
+            RuntimeDiagnostics.write(Data(String(
                 format: "[Uno] cycle=%d L=%d accepted=%d committed=%d ctx=%d draft_ms=%.2f verify_ms=%.2f\n",
                 stats.cycles + 1, L, accepted, committed.count, cache.first?.offset ?? -1,
                 (verifyStart - draftStart) * 1000,
@@ -601,7 +601,7 @@ struct UnoDecoder {
             verifyWidth: L, tokens: accepted + 1,
             seconds: Date.timeIntervalSinceReferenceDate - draftStart)
         if Self.traceEnabled, let chooser {
-            FileHandle.standardError.write(Data("[Uno] chooser \(chooser.traceDescription)\n".utf8))
+            RuntimeDiagnostics.write(Data("[Uno] chooser \(chooser.traceDescription)\n".utf8))
         }
         stats.cycles += 1
         stats.cyclesByWidth[L, default: 0] += 1

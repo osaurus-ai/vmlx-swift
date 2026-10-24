@@ -284,7 +284,7 @@ public func computeCacheSalt(
         let mediaDesc = includingMedia
             ? (computeMediaSalt(for: input).map { String($0.prefix(12)) } ?? "nil")
             : "excluded"
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/salt] salt=\(salt.prefix(12)) policy={\(policy)} "
                 + "scope=\(scopeDesc) media=\(mediaDesc)"
                 + (requestedMaxKVSize != parameters.maxKVSize

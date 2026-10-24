@@ -906,7 +906,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
             guard profileStages else { return }
             MLX.eval(arrays)
             let now = CFAbsoluteTimeGetCurrent()
-            FileHandle.standardError.write(Data(String(format:
+            RuntimeDiagnostics.write(Data(String(format:
                 "[DSV4MoEProfile] layer=%d stage=%@ ms=%.3f\n",
                 layerIdx, name, (now - stageStart) * 1_000).utf8))
             stageStart = now
@@ -1169,7 +1169,7 @@ class DeepseekV4DecoderLayer: Module {
             guard profileStages else { return }
             MLX.eval(arrays)
             let now = CFAbsoluteTimeGetCurrent()
-            FileHandle.standardError.write(Data(String(format:
+            RuntimeDiagnostics.write(Data(String(format:
                 "[DSV4StageProfile] layer=%d stage=%@ ms=%.3f\n",
                 layerIdx, name, (now - stageStart) * 1_000).utf8))
             stageStart = now

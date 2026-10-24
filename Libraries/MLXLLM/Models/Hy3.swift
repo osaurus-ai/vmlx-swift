@@ -685,7 +685,7 @@ public class Hy3Model: Module, LLMModel, KVCacheDimensionProvider {
                     continue
                 }
 
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     """
                     [Hy3 sanitize] layer \(layer) self_attn has mismatched bit widths across q/k/v projections \
                     (q packed_in=\(qPacked), k=\(kPacked), v=\(vPacked)) and cannot be safely dequantized for QKV fusion. \

@@ -132,7 +132,7 @@ extension JangTernaryPackedRuntimeContract {
             throw JangLoaderError.loadFailed(
                 "packed ternary expansion count does not match manifest")
         }
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 "[Load] JANG ternary_packed_26b expanded=\(expanded) runtime_bits=2 scales_unchanged=true\n"
                     .utf8))

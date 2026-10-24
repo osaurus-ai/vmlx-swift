@@ -32,7 +32,7 @@ private func zayaPrintLayerStats(_ label: String, _ h: MLXArray) {
     let first = (0..<min(4, last.size)).map { i in
         String(format: "%.6f", last[i].item(Float.self))
     }.joined(separator: ",")
-    FileHandle.standardError.write(Data(
+    RuntimeDiagnostics.write(Data(
         String(format: "[ZAYA_STATS] %@ shape=%@ last_l2=%.4f last_mean=%.6f last_std=%.6f first4=[%@]\n",
             label, "\(h.shape)", l2, mean, std, first).utf8))
 }

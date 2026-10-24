@@ -1327,7 +1327,7 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
             let line =
                 "[vmlx][reasoning-floor] step remaining=\(remaining) preMaskTop=\(top) "
                 + "bannedMass=\(bannedMass) topMass=\(probs[top].item(Float.self))\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
         let bestSurvivor = MLX.max(logits, axis: -1, keepDims: true)
@@ -1340,7 +1340,7 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
         if trace {
             let line =
                 "[vmlx][reasoning-floor] sampled=\(token.reshaped(-1)[0].item(Int.self))\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            RuntimeDiagnostics.write(Data(line.utf8))
         }
         remaining -= 1
     }
@@ -1513,7 +1513,7 @@ private final class MLXPressGenerationProfileState: @unchecked Sendable {
                     name, row.count, totalMS, avgMS)
             }
             .joined(separator: " | ")
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 String(
                     format: "[MLXPressGenerationProfile] %@ total=%.1fms %@\n",
@@ -2000,7 +2000,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1",
            let prefix = cacheSaltPlan.mediaIndependentPrefix
         {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/salt] media-independent prefix tokens=\(prefix.tokenCount)"
                     + " salt=\(prefix.salt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
         }
@@ -2151,7 +2151,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 let counts = Dictionary(grouping: types, by: { $0 }).mapValues { $0.count }
                                 let ssmN = ssmStates?.count ?? -1
                                 let fmtV = TQDiskSerializer.formatVersion(of: diskArrays)
-                                FileHandle.standardError.write(
+                                RuntimeDiagnostics.write(
                                     "[vmlx][ssm-restore] types=\(counts) hasArrays=\(cacheHasArraysState) ssmN=\(ssmN) fmtV=\(fmtV) willRestore=\(ssmStates != nil && (fmtV < 2 || cacheHasArraysState))\n"
                                         .data(using: .utf8)!)
                             }
@@ -2724,7 +2724,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             trace += "stableCounts=\(input.cacheStablePrefixTokenCounts) "
             trace += "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
             trace += "heuristic=\(heuristicBoundary.map(String.init) ?? "nil")\n"
-            FileHandle.standardError.write(Data(trace.utf8))
+            RuntimeDiagnostics.write(Data(trace.utf8))
         }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
@@ -3056,7 +3056,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let bytes = snapshot.reduce(0) { total, layer in
                     total + layer.state.reduce(0) { $0 + $1.nbytes }
                 }
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/stable-head-capture] boundary=\(boundary)"
                         + " inputStart=\(consumed) snapshot_state_bytes=\(bytes)\n").utf8))
             }
@@ -3814,7 +3814,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // it is several guards deep and only logs at debug
                         // level, which is not persisted — so report the inputs
                         // and the outcome for each boundary considered.
-                        FileHandle.standardError.write(Data(
+                        RuntimeDiagnostics.write(Data(
                             ("[vmlx][cache/store-boundary] boundary=\(boundary)"
                                 + " store=\(storeBoundary) stable=\(isStableBoundary)"
                                 + " allowRederive=\(allowRederive)"
@@ -3840,7 +3840,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/post-answer] gate include=\(includeGeneratedBoundary) "
                     + "canonicalHybrid=\(usesCanonicalHybridBoundary) warmup=\(isReusablePrefixWarmup) "
                     + "generated=\(generatedTokenIds.count) quantize=\(needsCacheQuantization)\n").utf8))
@@ -3872,7 +3872,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             cacheOffsets: cacheBoundaryLeafOffsets(cache),
             pendingDrainedTokenId: lastForwardedTokenId)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-            FileHandle.standardError.write(Data(
+            RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/post-answer] prompt=\(promptTokenIds.count) generated=\(generatedTokenIds.count) "
                     + "offsets=\(Array(Set(cacheBoundaryLeafOffsets(cache))).sorted()) "
                     + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
@@ -3956,7 +3956,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let seed = canonicalSeedUsed,
                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 let elapsed = Date.timeIntervalSinceReferenceDate - reconstructionStarted
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/canonical-residual] seed=\(seed) target=\(tokens.count)"
                         + " residual_tokens=\(tokens.count - seed)"
                         + " copy_and_forward_seconds=\(elapsed) success=\(reconstructionSucceeded)\n").utf8))
@@ -4018,7 +4018,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // This catch silently costs hybrid-SSM models every
                 // cross-conversation prefix hit (vmlx#219). At debug level the
                 // reason is unobservable on a real run, so surface it.
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/rederive-failed] tokens=\(tokens.count) "
                         + "error=\(String(describing: error))\n").utf8))
             }

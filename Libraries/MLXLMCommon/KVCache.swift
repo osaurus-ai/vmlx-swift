@@ -2360,7 +2360,7 @@ public func maybeQuantizeKVCache(
                 // cache that has no indexer lane (and `fromSimpleCache`
                 // refuses 3-array state, yielding an EMPTY cache) — the
                 // qwen4_exp sparse selector then diverges (osaurus#2525).
-                FileHandle.standardError.write(Data(
+                RuntimeDiagnostics.write(Data(
                     "[kv quant] skipping QSA layer \(i): TurboQuant promotion would drop the indexer lane.\n".utf8))
                 continue
             }

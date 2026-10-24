@@ -275,7 +275,7 @@ public enum Qwen4ExpFusedAffineMoE {
         defer { reportLock.unlock() }
         guard !didReportConstructionRejection else { return }
         didReportConstructionRejection = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 ("[Qwen4Exp] fused_affine_moe_decode=construction_rejected"
                     + " gate=\(gate.inputDims)x\(gate.outputDims):\(gate.bits)b:g\(gate.groupSize):\(gate.mode):\(gate.weight.dtype):\(gate.scales.dtype):\(String(describing: gate.biases?.dtype))"
@@ -291,7 +291,7 @@ public enum Qwen4ExpFusedAffineMoE {
         defer { reportLock.unlock() }
         guard !didReportInvocationRejection else { return }
         didReportInvocationRejection = true
-        FileHandle.standardError.write(
+        RuntimeDiagnostics.write(
             Data(
                 ("[Qwen4Exp] fused_affine_moe_decode=invocation_rejected"
                     + " input=\(input.shape):\(input.dtype):size\(input.size)"
@@ -315,7 +315,7 @@ public enum Qwen4ExpFusedAffineMoE {
         diag += " affine_metadata=bf16_or_f16 router_scores=bf16_or_f32"
         diag += " accumulator=float32"
         diag += " weighted_down=true\n"
-        FileHandle.standardError.write(Data(diag.utf8))
+        RuntimeDiagnostics.write(Data(diag.utf8))
     }
 
     private static func supports(_ projection: QuantizedSwitchLinear) -> Bool {

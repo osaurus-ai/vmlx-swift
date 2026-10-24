@@ -128,7 +128,7 @@ public enum CacheStoreBudget {
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             let source = physicalFootprint == nil ? "mlx_active_fallback" : "phys_footprint"
             let budget = budgetBytes.map(String.init) ?? "unknown"
-            FileHandle.standardError.write(
+            RuntimeDiagnostics.write(
                 Data(
                     "[vmlx][cache/store-budget] cache=\(liveBytes) active=\(activeBytes) budget=\(budget) source=\(source) fraction=\(policy.headroomFraction) allowed=\(allowed)\n"
                         .utf8

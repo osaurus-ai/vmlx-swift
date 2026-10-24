@@ -185,7 +185,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     MLX.eval(result.0)
                     var hash: UInt64 = 0xcbf2_9ce4_8422_2325
                     for byte in result.0.asData(access: .copy).data { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01b3 }
-                    FileHandle.standardError.write(Data(
+                    RuntimeDiagnostics.write(Data(
                         ("[vmlx][media/image] index=\(index) extent=\(source.extent) "
                             + "colorSpace=\(source.colorSpace?.name.map { $0 as String } ?? "nil") "
                             + "properties=\(source.properties.count) grid=\(result.1.t)x\(result.1.h)x\(result.1.w) "

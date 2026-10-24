@@ -8,7 +8,7 @@ import Foundation
     import Darwin
 #endif
 
-/// Weight-loader diagnostics must not abort a load when a launcher's stderr
+/// Loader, residency and load-timing diagnostics must not abort a load when a launcher's stderr
 /// pipe closes. This helper handles the diagnostic sink only, never model errors.
 enum LoadDiagnostics {
     #if canImport(os)

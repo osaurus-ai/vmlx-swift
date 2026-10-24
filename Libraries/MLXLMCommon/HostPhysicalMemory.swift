@@ -15,7 +15,7 @@ public enum HostPhysicalMemory {
         guard let emulated = emulatedBytes(
             RuntimeEnvironment.value("VMLX_EMULATE_PHYSICAL_MEMORY_GIB"))
         else { return actual }
-        FileHandle.standardError.write(Data(
+        RuntimeDiagnostics.write(Data(
             "[Memory] emulated_physical_memory=\(emulated) actual=\(actual) (VMLX_EMULATE_PHYSICAL_MEMORY_GIB, diagnostics only)\n"
                 .utf8))
         return emulated

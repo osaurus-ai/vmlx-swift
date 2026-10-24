@@ -16,6 +16,7 @@ import XCTest
             var afterMask = sigset_t()
             XCTAssertEqual(pthread_sigmask(SIG_BLOCK, nil, &beforeMask), 0)
             LoadDiagnostics.write(Data("[Load] diagnostic sink regression\n".utf8))
+            RuntimeDiagnostics.write(Data("[Runtime] diagnostic sink regression\n".utf8))
             XCTAssertEqual(pthread_sigmask(SIG_BLOCK, nil, &afterMask), 0)
             XCTAssertEqual(beforeMask, afterMask)
             XCTAssertEqual(fcntl(STDERR_FILENO, F_GETNOSIGPIPE), flags)
@@ -27,8 +28,18 @@ import XCTest
                 var afterMask = sigset_t()
                 XCTAssertEqual(pthread_sigmask(SIG_BLOCK, nil, &beforeMask), 0)
                 LoadDiagnostics.write(Data("[Load] concurrent sink regression \(index)\n".utf8))
+                RuntimeDiagnostics.write(
+                    Data("[Runtime] concurrent sink regression \(index)\n".utf8))
                 XCTAssertEqual(pthread_sigmask(SIG_BLOCK, nil, &afterMask), 0)
                 XCTAssertEqual(beforeMask, afterMask)
+            }
+        }
+
+        func testRuntimeDiagnosticsPreserveErrnoForEmptyAndInvalidUTF8Payloads() {
+            for data in [Data(), Data([0xFF, 0xFE, 0x00]), Data("metadata\n".utf8)] {
+                errno = EBUSY
+                RuntimeDiagnostics.write(data)
+                XCTAssertEqual(errno, EBUSY)
             }
         }
     }
