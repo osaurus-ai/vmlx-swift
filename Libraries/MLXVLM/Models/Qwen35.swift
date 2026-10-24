@@ -1905,16 +1905,31 @@ enum Qwen35Language {
             let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             let attended: MLXArray
             if let split = decisionStateTokenCount {
-                precondition(cache == nil && split > 0 && split < L)
-                // Exact block mask with two fused calls; no quadratic dense mask allocation.
-                let state = MLXFast.scaledDotProductAttention(
-                    queries: queries[0..., 0..., 0..<split, 0...],
-                    keys: keys[0..., 0..., 0..<split, 0...],
-                    values: values[0..., 0..., 0..<split, 0...], scale: scale, mask: .none)
-                let question = MLXFast.scaledDotProductAttention(
-                    queries: queries[0..., 0..., split..., 0...], keys: keys,
-                    values: values, scale: scale, mask: .none)
-                attended = concatenated([state, question], axis: 2)
+                // Zero selects noncausal full attention; a positive value selects prefix-bidir.
+                // Only the explicit cache-free decision forward supplies this parameter.
+                precondition(cache == nil && split >= 0 && split < L)
+                func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> MLXArray {
+                    let count = q.dim(2)
+                    var pieces: [MLXArray] = []
+                    // Match the reference query-only chunking. Every row still sees ALL keys;
+                    // this bounds fallback head-256 score allocation without windowing/truncation.
+                    for start in stride(from: 0, to: count, by: 2048) {
+                        let piece = MLXFast.scaledDotProductAttention(
+                            queries: q[0..., 0..., start..<min(start + 2048, count), 0...],
+                            keys: k, values: v, scale: scale, mask: .none)
+                        eval(piece)
+                        pieces.append(piece)
+                    }
+                    return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 2)
+                }
+                if split == 0 {
+                    attended = attend(queries, keys, values)
+                } else {
+                    let state = attend(queries[0..., 0..., 0..<split, 0...],
+                        keys[0..., 0..., 0..<split, 0...], values[0..., 0..., 0..<split, 0...])
+                    let question = attend(queries[0..., 0..., split..., 0...], keys, values)
+                    attended = concatenated([state, question], axis: 2)
+                }
             } else if B == 1, (2...8).contains(L), !hadamard, let simple = cache,
                 type(of: simple) == KVCacheSimple.self,
                 FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
@@ -4346,7 +4361,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         for layer in languageModel.model.layers {
             try Task.checkCancellation()
             hidden = layer(hidden, attentionMask: nil, ssmMask: nil, cache: nil,
-                positionIds: positions, decisionStateTokenCount: stateTokenCount)
+                positionIds: positions, decisionStateTokenCount: stateTokenCount ?? 0)
             // Bound activation ownership to one block rather than the entire eager graph.
             eval(hidden)
         }
