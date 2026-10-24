@@ -145,23 +145,37 @@ public actor D3Model {
         backbone.train(false)
         eval(backbone, readout)
         try Task.checkCancellation()
-        var processorConfig =
-            try JSONSerialization.jsonObject(
-                with: Data(contentsOf: directory.appendingPathComponent("preprocessor_config.json"))
-            ) as! [String: Any]
-        // Vendor D3 video normalization, distinct from unrestricted generative chat video.
-        processorConfig["video_preprocessor_config"] =
-            [
-                "fps": 2, "min_frames": 4, "max_frames": 32,
-                "min_pixels": 4096, "max_pixels": 200704 * 32,
-            ] as [String: Any]
-        let pc = try JSONDecoder().decode(
-            Qwen3VLProcessorConfiguration.self,
-            from: JSONSerialization.data(withJSONObject: processorConfig))
+        let pc = try mediaProcessorConfiguration(directory: directory)
         return D3Model(
             bundle: bundle, tokenizer: tokenizer, backbone: backbone, readout: readout,
             processor: Qwen3VLProcessor(pc, tokenizer: tokenizer, decisionMediaProcessing: true),
             resources: resources)
+    }
+
+    /// The vendor D3 API overrides the checkpoint's generic image/video budgets.
+    /// These decision-only budgets must never be applied to ordinary chat processors.
+    public static func mediaProcessorConfiguration(directory: URL) throws
+        -> Qwen3VLProcessorConfiguration
+    {
+        guard
+            var value = try JSONSerialization.jsonObject(
+                with: Data(
+                    contentsOf:
+                        directory.appendingPathComponent("preprocessor_config.json")))
+                as? [String: Any]
+        else {
+            throw DecisionRuntimeError.invalid("D3 preprocessor configuration must be an object")
+        }
+        value["min_pixels"] = 65_536
+        value["max_pixels"] = 1_638_400
+        value["video_preprocessor_config"] =
+            [
+                "fps": 2, "min_frames": 4, "max_frames": 32,
+                "min_pixels": 4096, "max_pixels": 200704 * 32,
+            ] as [String: Any]
+        return try JSONDecoder().decode(
+            Qwen3VLProcessorConfiguration.self,
+            from: JSONSerialization.data(withJSONObject: value))
     }
 
     /// Host calls under its GPU producer gate before releasing that gate.

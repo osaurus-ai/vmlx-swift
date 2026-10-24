@@ -11,10 +11,7 @@ enum D3DecisionProbe {
     static func run(directory: URL) async throws {
         let env = ProcessInfo.processInfo.environment
         if let image = env["D3_DUMP_IMAGE"], let destination = env["D3_DUMP_PIXELS"] {
-            let configuration = try JSONDecoder().decode(
-                Qwen3VLProcessorConfiguration.self,
-                from: Data(contentsOf: directory.appendingPathComponent("preprocessor_config.json"))
-            )
+            let configuration = try D3Model.mediaProcessorConfiguration(directory: directory)
             guard let input = CIImage(contentsOf: URL(fileURLWithPath: image)) else {
                 throw DecisionRuntimeError.invalid("Diagnostic image could not be decoded")
             }

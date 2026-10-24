@@ -42,6 +42,24 @@ final class D3DecisionTests: XCTestCase {
                 DecisionJSON.parse(Data(#"{"type":"score","criteria":["same","same"]}"#.utf8))))
     }
 
+    func testDecisionBudgetsOverrideGenericCheckpointProcessor() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(
+            #"{"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"merge_size":2,"patch_size":16,"temporal_patch_size":2,"image_processor_type":"Qwen3VLImageProcessor","size":{"min_pixels":65536,"max_pixels":16777216}}"#
+                .utf8
+        )
+        .write(to: directory.appendingPathComponent("preprocessor_config.json"))
+        let config = try D3Model.mediaProcessorConfiguration(directory: directory)
+        XCTAssertEqual(config.minPixels, 65_536)
+        XCTAssertEqual(config.maxPixels, 1_638_400)
+        XCTAssertEqual(config.videoMaxPixels, 200_704 * 32)
+        XCTAssertEqual(config.videoMinFrames, 4)
+        XCTAssertEqual(config.videoMaxFrames, 32)
+    }
+
     func testNFCStateBoundaryMatchesTokenBytes() throws {
         let state = DecisionJSON.string("e\u{301}")
         let text = "prefix State:\né\n\nQuestion:\nChoose."
