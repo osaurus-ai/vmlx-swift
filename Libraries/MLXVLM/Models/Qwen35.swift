@@ -4283,7 +4283,10 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         // the report cannot claim a lane the instance lacks.
         var tower: (any ModelCapabilityProviding)?
         if let vision = config.visionConfiguration, plan.builds(.visionTower) {
-            let built = Qwen3VLVision.VisionModel(vision)
+            // D3's trained vision MLP declares GELU-tanh, not the legacy sigmoid approximation.
+            // Preserve the existing generative constructor until its separate regression lane.
+            let built = Qwen3VLVision.VisionModel(vision,
+                mlpActivation: decisionBackbone ? (vision.hiddenAct == "gelu" ? .none : .tanh) : .fast)
             tower = built
             _visionModel.wrappedValue = built
         } else if let vision = config.miniCPMVisionConfiguration, plan.builds(.visionTower) {

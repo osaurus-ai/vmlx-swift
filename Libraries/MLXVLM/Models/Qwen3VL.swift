@@ -789,10 +789,10 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "linear_fc2") var linear2: Linear
         @ModuleInfo(key: "act") var activation: GELU
 
-        init(dim: Int, hiddenDim: Int) {
+        init(dim: Int, hiddenDim: Int, activation: GELU.Approximation = .fast) {
             _linear1.wrappedValue = Linear(dim, hiddenDim, bias: true)
             _linear2.wrappedValue = Linear(hiddenDim, dim, bias: true)
-            _activation.wrappedValue = GELU(approximation: .fast)
+            _activation.wrappedValue = GELU(approximation: activation)
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -806,11 +806,11 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "attn") var attention: Attention
         @ModuleInfo(key: "mlp") var mlp: MLP
 
-        init(_ config: Qwen3VLConfiguration.VisionConfiguration) {
+        init(_ config: Qwen3VLConfiguration.VisionConfiguration, mlpActivation: GELU.Approximation = .fast) {
             _norm1.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _norm2.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _attention.wrappedValue = Attention(dim: config.hiddenSize, numHeads: config.numHeads)
-            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize)
+            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize, activation: mlpActivation)
         }
 
         func callAsFunction(
@@ -840,7 +840,7 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "deepstack_merger_list") var deepstackMergers: [PatchMerger]
         let deepstackVisualIndexes: [Int]
 
-        init(_ config: Qwen3VLConfiguration.VisionConfiguration) {
+        init(_ config: Qwen3VLConfiguration.VisionConfiguration, mlpActivation: GELU.Approximation = .fast) {
             self.config = config
             self.spatialMergeSize = config.spatialMergeSize
             self.numGridPerSide = Int(sqrt(Double(config.numPositionEmbeddings)))
@@ -859,7 +859,7 @@ enum Qwen3VLVision {
                 embeddingCount: config.numPositionEmbeddings,
                 dimensions: config.hiddenSize)
 
-            _blocks.wrappedValue = (0 ..< config.depth).map { _ in VisionBlock(config) }
+            _blocks.wrappedValue = (0 ..< config.depth).map { _ in VisionBlock(config, mlpActivation: mlpActivation) }
             _merger.wrappedValue = PatchMerger(config: config, usePostShuffleNorm: false)
 
             _deepstackMergers.wrappedValue = config.deepstackVisualIndexes.map { _ in

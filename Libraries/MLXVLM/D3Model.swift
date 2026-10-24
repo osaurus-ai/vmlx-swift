@@ -93,6 +93,10 @@ public actor D3Model {
         let custom = try Qwen35JANGHPreparation.loadIfDeclared(directory: directory, configurationData: configData)
         if let custom { configData = custom.dense.ordinaryConfiguration }
         let config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configData)
+        guard let vision = config.visionConfiguration,
+            ["gelu", "gelu_pytorch_tanh"].contains(vision.hiddenAct) else {
+            throw DecisionRuntimeError.invalid("Unsupported D3 vision activation contract")
+        }
         guard config.textConfiguration.hiddenSize == bundle.readoutShape[1],
             config.textConfiguration.numExperts == 0, config.textConfiguration.mtpNumHiddenLayers == 0 else {
             throw DecisionRuntimeError.invalid("D3 backbone/readout dimensions or head declarations disagree")

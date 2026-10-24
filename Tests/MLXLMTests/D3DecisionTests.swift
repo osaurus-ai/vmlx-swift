@@ -1,3 +1,4 @@
+import Cmlx
 import CoreImage
 import Foundation
 import MLX
@@ -39,6 +40,9 @@ final class D3DecisionTests: XCTestCase {
     }
 
     func testDecisionImageUsesNCHWPatchLayout() throws {
+        if let path = ProcessInfo.processInfo.environment["MLX_TEST_METALLIB_PATH"] {
+            XCTAssertEqual(path.withCString { mlx_metal_set_metallib_path($0) }, 0)
+        }
         let config = try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self, from: Data(#"{"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"merge_size":2,"patch_size":16,"temporal_patch_size":2,"image_processor_type":"Qwen3VLImageProcessor","size":{"min_pixels":2048,"max_pixels":2048}}"#.utf8))
         let processor = Qwen3VLProcessor(config, tokenizer: D3ByteTokenizer(), decisionMediaProcessing: true)
         let image = CIImage(color: CIColor(red: 1, green: 0, blue: 0)).cropped(to: CGRect(x: 0, y: 0, width: 64, height: 32))
