@@ -25,8 +25,12 @@ func runRowExactBench(modelPath: String) async throws {
         Int($0)
     }
     guard steps > 0, !widths.isEmpty, widths.allSatisfy({ $0 > 1 && $0 <= steps }) else {
-        throw NSError(domain: "RowExactBench", code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Non-empty staged verify widths >=2 must fit the reference stream"])
+        throw NSError(
+            domain: "RowExactBench", code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Non-empty staged verify widths >=2 must fit the reference stream"
+            ])
     }
     let promptText =
         env["BENCH_ROWEXACT_PROMPT"]
@@ -123,8 +127,10 @@ func runRowExactBench(modelPath: String) async throws {
         token = argMax(row, axis: -1).item(Int.self)
         stream.append(token)
     }
-    print(String(format: "[ROWEXACT-AR] tokens=%d diagnostic_tok_s=%.3f natural_stop_test=false",
-        steps, Double(steps) / max(CFAbsoluteTimeGetCurrent() - arStart, 1e-9)))
+    print(
+        String(
+            format: "[ROWEXACT-AR] tokens=%d diagnostic_tok_s=%.3f natural_stop_test=false",
+            steps, Double(steps) / max(CFAbsoluteTimeGetCurrent() - arStart, 1e-9)))
     if env["BENCH_ROWEXACT_AR_REPEAT"] == "1" {
         let (repeatCache, _) = prefill()
         var equal = 0
@@ -140,8 +146,11 @@ func runRowExactBench(modelPath: String) async throws {
         }
         print("[ROWEXACT-AR-REPEAT] rows=\(steps) bitwise=\(equal) max_abs_diff=\(maximum)")
         guard equal == steps else {
-            throw NSError(domain: "RowExactBench", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "INVALID: AR reference does not repeat exactly"])
+            throw NSError(
+                domain: "RowExactBench", code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "INVALID: AR reference does not repeat exactly"
+                ])
         }
     }
     if env["BENCH_ROWEXACT_NEMO_LAYERS"] == "1", let tappable = context.model as? NemotronHBlockOutputTappable {
@@ -309,8 +318,9 @@ func runRowExactBench(modelPath: String) async throws {
         let width = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_WIDTH"] ?? "2") ?? 2
         let selectedRow = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_ROW"] ?? "1") ?? 1
         guard width > 0, selectedRow >= 0, selectedRow < width, at <= stream.count - width else {
-            throw NSError(domain: "RowExactBench", code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid diagnostic width/row/position"] )
+            throw NSError(
+                domain: "RowExactBench", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid diagnostic width/row/position"])
         }
         print("[ROWEXACT-BISECT] at=\(at) width=\(width) row=\(selectedRow)")
         // Row-1 bisect: AR steps t_at then t_{at+1} vs verify row 1 of [t_at, t_{at+1}], every layer, then the
@@ -325,15 +335,18 @@ func runRowExactBench(modelPath: String) async throws {
             let c = c0.map { $0.copy() }
             MLX.eval(c)
             for prefix in 0 ..< selectedRow {
-                MLX.eval(autoregressiveForward(
-                    MLXArray([Int32(stream[at + prefix])]).reshaped(1, 1), cache: c).logits)
+                MLX.eval(
+                    autoregressiveForward(
+                        MLXArray([Int32(stream[at + prefix])]).reshaped(1, 1), cache: c
+                    ).logits)
             }
             Qwen4ExpRowExactCapture.layers = []
             Qwen4ExpRowExactCapture.parts = []
             Qwen4ExpRowExactCapture.partLayer = part ?? -1
             Qwen4ExpRowExactCapture.enabled = true
             MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[at + selectedRow])]).reshaped(1, 1), cache: c).logits)
+                    MLXArray([Int32(stream[at + selectedRow])]).reshaped(1, 1), cache: c
+                ).logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
         }
@@ -346,8 +359,9 @@ func runRowExactBench(modelPath: String) async throws {
             Qwen4ExpRowExactCapture.enabled = true
             MLX.eval(NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
                 model.nativeBackboneMTPVerifyForward(
-                    MLXArray(stream[at ..< (at + width)].map(Int32.init)).reshaped(1, width), cache: c)
-            }.logits)
+                        MLXArray(stream[at ..< (at + width)].map(Int32.init)).reshaped(1, width),
+                        cache: c)
+                }.logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
         }
@@ -360,7 +374,8 @@ func runRowExactBench(modelPath: String) async throws {
         MLX.eval(aL)
         MLX.eval(vL)
         guard !aL.isEmpty, aL.count == vL.count else {
-            throw NSError(domain: "RowExactBench", code: 4,
+            throw NSError(
+                domain: "RowExactBench", code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "INVALID: missing/mismatched layer captures"])
         }
         var first: Int?
@@ -369,8 +384,11 @@ func runRowExactBench(modelPath: String) async throws {
             let m = d.max().item(Float.self)
             if m > 0, first == nil { first = i }
             if m > 0 || i == aL.count - 1 {
-                print(String(format: "[ROWEXACT] selected-row at=%d layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
-                             (d .> 0).sum().item(Int.self)))
+                print(
+                    String(
+                        format: "[ROWEXACT] selected-row at=%d layer=%d maxdiff=%.4g nonzero=%d",
+                        at, i, m,
+                        (d .> 0).sum().item(Int.self)))
             }
             if first != nil, i > first! + 1 { break }
         }
@@ -382,16 +400,21 @@ func runRowExactBench(modelPath: String) async throws {
                     let verifyInput = vP.first(where: { $0.0 == "moe.router_input" })?.1,
                     let weight = aP.first(where: { $0.0 == "moe.router_weight" })?.1
                 else {
-                    throw NSError(domain: "RowExactBench", code: 6,
+                    throw NSError(
+                        domain: "RowExactBench", code: 6,
                         userInfo: [NSLocalizedDescriptionKey: "INVALID: router capture missing"])
                 }
-                try MLX.save(arrays: ["ar_input": arInput, "verify_input": verifyInput, "weight": weight],
+                try MLX.save(
+                    arrays: ["ar_input": arInput, "verify_input": verifyInput, "weight": weight],
                     url: URL(fileURLWithPath: path))
             }
             for ((name, x), (_, y)) in zip(aP, vP) where name != "moe.router_weight" {
                 let d = abs(last(x, row: 0) - last(y, row: selectedRow))
-                print(String(format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
-                             name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+                print(
+                    String(
+                        format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d",
+                        at, first,
+                        name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
             }
         }
         Qwen4ExpRowExactCapture.partLayer = 0
@@ -423,8 +446,12 @@ func runRowExactBench(modelPath: String) async throws {
             MLX.eval(rows)
             guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: w, blockLength: w)
             else {
-                throw NSError(domain: "RowExactBench", code: 5,
-                    userInfo: [NSLocalizedDescriptionKey: "INVALID: staged commit failed at width \(w), position \(p)"] )
+                throw NSError(
+                    domain: "RowExactBench", code: 5,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INVALID: staged commit failed at width \(w), position \(p)"
+                    ])
             }
             if p == 0 {
                 print(

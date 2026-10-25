@@ -414,7 +414,8 @@ enum Qwen4ExpCompiledMoE {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var denseRouterRegions: [DenseRouterKey: Region] = [:]
-    nonisolated(unsafe) private static var denseRouterRowsRegions: [DenseRouterRowsKey: Region] = [:]
+    nonisolated(unsafe) private static var denseRouterRowsRegions: [DenseRouterRowsKey: Region] =
+        [:]
     nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReportRouter = false
     nonisolated(unsafe) private static var didReportShared = false
