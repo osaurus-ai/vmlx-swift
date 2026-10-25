@@ -34,6 +34,7 @@ public enum DeepseekV4Tokens {
     public static let eos = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
     public static let user = "<\u{FF5C}User\u{FF5C}>"
     public static let assistant = "<\u{FF5C}Assistant\u{FF5C}>"
+    public static let system = "<\u{FF5C}System\u{FF5C}>"
     public static let latestReminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
     public static let thinkStart = "<think>"
     public static let thinkEnd = "</think>"
@@ -73,40 +74,27 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
     public init() {}
 
-    // `high`/`max` are verbatim 0731 `REASONING_EFFORT_PROMPTS` values —
-    // part of the model's prompt contract; never reword or interchange them.
-    //
-    // The official contract defines `low` as the EMPTY STRING: no directive
-    // is injected and the model self-modulates think depth, so hard first
-    // prompts still produce long reasoning on the "Low" rail. That is
-    // unacceptable for surfaces whose default promises low reasoning, so
-    // vmlx deliberately deviates: `.low` (and absent effort, which the
-    // official DEFAULT_REASONING_EFFORT maps to low) injects a style-matched
-    // enforcement preface. nil ≡ .low by construction so warmup and send
-    // renders can never diverge.
-    static let reasoningEffortLowPreface = """
-        Reasoning Effort: Low — minimal thinking only.
-        Begin with a very short thinking block: one or two sentences confirming your approach, never more.
-        Then close your thinking and give only the final answer — clean and direct, without restating your reasoning.
+    // V4.1 (1017) reasoning-effort contract: a NUMERIC budget rendered inside
+    // the System token, per the bundle's `encoding/encoding.py`
+    // (`REASONING_EFFORT_TEMPLATE` + `render_reasoning_effort`). This REPLACES
+    // the earlier 0731 text prefaces ("Reasoning Effort: Low — minimal thinking
+    // only. Begin with a very short thinking block…"), which were the WRONG
+    // contract for the 1017 model: the model was never trained on that
+    // instruction and meta-reasoned about "complying with a thinking block",
+    // degenerating into repetition loops on some prompts (e.g. "Say hello in
+    // exactly one word."). The vmlx-py reference uses this numeric contract and
+    // does not degenerate. Rendered at index 0 in thinking mode only.
+    static let reasoningEffortTemplate =
+        "Reasoning Effort: %d (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 
-
-        """
-
-    static let reasoningEffortHighPreface = """
-        Reasoning Effort: Absolute maximum with no shortcuts permitted.
-        You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
-        Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.
-
-
-        """
-
-    static let reasoningEffortMaxPreface = """
-        Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.
-        You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.
-        Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.
-
-
-        """
+    // low/high/max → numeric budget (encoding.py `REASONING_EFFORT_MAPPINGS`).
+    static func reasoningEffortBudget(_ effort: DeepseekV4ReasoningEffort) -> Int {
+        switch effort {
+        case .low: return 50
+        case .high: return 75
+        case .max: return 100
+        }
+    }
 
     // MARK: - Public API
 
@@ -468,22 +456,29 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let lastUserIdx = Self.findLastUserIndex(messages)
         var out = ""
 
-        // Reasoning-effort preface only at index 0 in thinking mode. Every
-        // rail injects its preface — including low (nil ≡ .low), which the
-        // official contract leaves empty; see reasoningEffortLowPreface.
-        if index == 0 && thinkingMode == .thinking {
-            switch reasoningEffort ?? .low {
-            case .low:
-                out += Self.reasoningEffortLowPreface
-            case .high:
-                out += Self.reasoningEffortHighPreface
-            case .max:
-                out += Self.reasoningEffortMaxPreface
-            }
+        // V4.1 reasoning-effort prefix: the numeric budget, rendered inside the
+        // System token, at index 0 in thinking mode. encoding.py has the System
+        // token LEAD the conversation when there is a reasoning-effort prefix OR
+        // the first message is itself a system message; the effort prefix then
+        // precedes the (optional) system content. nil effort ≡ `.low` (50),
+        // preserving the low-reasoning default of surfaces that promise it.
+        let effortPrefix: String = {
+            guard index == 0 && thinkingMode == .thinking else { return "" }
+            let budget = Self.reasoningEffortBudget(reasoningEffort ?? .low)
+            return String(format: Self.reasoningEffortTemplate, budget)
+        }()
+        if index == 0 && (!effortPrefix.isEmpty || msg.role == .system) {
+            out += DeepseekV4Tokens.system
         }
+        out += effortPrefix
 
         switch msg.role {
         case .system:
+            // Mid-conversation system message gets its own System token lead;
+            // at index 0 the lead was already emitted above.
+            if index > 0 {
+                out += DeepseekV4Tokens.system
+            }
             out += msg.content ?? ""
             if let tools = msg.tools, !tools.isEmpty {
                 out += "\n\n" + Self.renderTools(

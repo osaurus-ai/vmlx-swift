@@ -515,7 +515,9 @@ value_1
 {%- set think_close = '</think>' -%}
 {%- set action_token = '<｜action｜>' -%}
 {%- set dsml = '｜DSML｜' -%}
-{%- set ns = namespace(last_user_index=-1) -%}
+{%- set sys_token = '<｜System｜>' -%}
+{%- set effort_budget = {'low': 50, 'high': 75, 'max': 100} -%}
+{%- set ns = namespace(last_user_index=-1, sys_lead_emitted=false) -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'user' or message['role'] == 'developer' -%}
 {%- set ns.last_user_index = loop.index0 -%}
@@ -574,15 +576,21 @@ value_1
 {{- '</' + dsml + 'tool_calls>' -}}
 {%- endmacro -%}
 {{- bos -}}
-{%- if enable_thinking and reasoning_effort == 'high' -%}
-{{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
-{%- elif enable_thinking and reasoning_effort == 'max' -%}
-{{- 'Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n' -}}
-{%- elif enable_thinking -%}
-{{- 'Reasoning Effort: Low — minimal thinking only.\nBegin with a very short thinking block: one or two sentences confirming your approach, never more.\nThen close your thinking and give only the final answer — clean and direct, without restating your reasoning.\n\n' -}}
+{#- V4.1 (1017) numeric reasoning-effort contract: <｜System｜>Reasoning Effort: N
+    (range 1-100 ...)\n\n at index 0 in thinking mode, per encoding/encoding.py.
+    Replaces the old 0731 text prefaces, which were the wrong contract for 1017
+    and drove repetition loops under the decode-side reasoning floor. -#}
+{%- if enable_thinking -%}
+{%- set _budget = effort_budget[reasoning_effort] if (reasoning_effort is defined and reasoning_effort in effort_budget) else 50 -%}
+{{- sys_token -}}
+{%- set ns.sys_lead_emitted = true -%}
+{{- 'Reasoning Effort: ' + _budget|string + ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -}}
 {%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}
+{%- if not (loop.index0 == 0 and ns.sys_lead_emitted) -%}
+{{- sys_token -}}
+{%- endif -%}
 {{- message['content'] -}}
 {%- if tools -%}
 {{- render_tools(tools) -}}
