@@ -3188,6 +3188,9 @@ enum Qwen35Language {
 
         /// Top-k expert indices and routing weights (the compiled router when it applies).
         func routerSelection(_ x: MLXArray) -> (MLXArray, MLXArray) {
+            let captureLayer = Qwen4ExpRowExactCapture.currentLayer
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.router_input", x)
+            Qwen4ExpRowExactCapture.part(captureLayer, "moe.router_weight", gate.weight)
             if let compiled = compiledRouter(x) { return compiled }
             var gates: MLXArray
             if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),

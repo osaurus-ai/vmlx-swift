@@ -377,6 +377,17 @@ func runRowExactBench(modelPath: String) async throws {
         if let first {
             let (_, aP) = arSecond(part: first)
             let (_, vP) = verify(part: first)
+            if let path = env["BENCH_ROWEXACT_ROUTER_OUT"] {
+                guard let arInput = aP.first(where: { $0.0 == "moe.router_input" })?.1,
+                    let verifyInput = vP.first(where: { $0.0 == "moe.router_input" })?.1,
+                    let weight = aP.first(where: { $0.0 == "moe.router_weight" })?.1
+                else {
+                    throw NSError(domain: "RowExactBench", code: 6,
+                        userInfo: [NSLocalizedDescriptionKey: "INVALID: router capture missing"])
+                }
+                try MLX.save(arrays: ["ar_input": arInput, "verify_input": verifyInput, "weight": weight],
+                    url: URL(fileURLWithPath: path))
+            }
             for ((name, x), (_, y)) in zip(aP, vP) {
                 let d = abs(last(x, row: 0) - last(y, row: selectedRow))
                 print(String(format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
