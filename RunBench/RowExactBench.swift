@@ -24,6 +24,10 @@ func runRowExactBench(modelPath: String) async throws {
     let widths = (env["BENCH_ROWEXACT_WIDTHS"] ?? "2,4,8").split(separator: ",").compactMap {
         Int($0)
     }
+    guard steps > 0, !widths.isEmpty, widths.allSatisfy({ $0 > 0 && $0 <= steps }) else {
+        throw NSError(domain: "RowExactBench", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Non-empty positive widths must fit the reference stream"])
+    }
     let promptText =
         env["BENCH_ROWEXACT_PROMPT"]
         ?? "Write a detailed essay of about 400 words on the history of the printing press and its effect on literacy in Europe."
@@ -105,6 +109,7 @@ func runRowExactBench(modelPath: String) async throws {
     var (cache, token) = prefill()
     var stream: [Int] = [token]
     var arLogits: [MLXArray] = []
+    let arStart = CFAbsoluteTimeGetCurrent()
     for _ in 0 ..< steps {
         let tokenInput = MLXArray([Int32(token)]).reshaped(1, 1)
         // BENCH_ROWEXACT_AR=plain: nativeBackboneForward (S=1, no autoregressive flag) as the reference.
@@ -117,6 +122,27 @@ func runRowExactBench(modelPath: String) async throws {
         arLogits.append(row)
         token = argMax(row, axis: -1).item(Int.self)
         stream.append(token)
+    }
+    print(String(format: "[ROWEXACT-AR] tokens=%d diagnostic_tok_s=%.3f natural_stop_test=false",
+        steps, Double(steps) / max(CFAbsoluteTimeGetCurrent() - arStart, 1e-9)))
+    if env["BENCH_ROWEXACT_AR_REPEAT"] == "1" {
+        let (repeatCache, _) = prefill()
+        var equal = 0
+        var maximum: Float = 0
+        for index in 0 ..< steps {
+            let out = autoregressiveForward(
+                MLXArray([Int32(stream[index])]).reshaped(1, 1), cache: repeatCache)
+            let row = out.logits[0, -1].asType(.float32)
+            MLX.eval(row)
+            let difference = abs(row - arLogits[index]).max().item(Float.self)
+            maximum = max(maximum, difference)
+            if difference == 0 { equal += 1 }
+        }
+        print("[ROWEXACT-AR-REPEAT] rows=\(steps) bitwise=\(equal) max_abs_diff=\(maximum)")
+        guard equal == steps else {
+            throw NSError(domain: "RowExactBench", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: AR reference does not repeat exactly"])
+        }
     }
     if env["BENCH_ROWEXACT_NEMO_LAYERS"] == "1", let tappable = context.model as? NemotronHBlockOutputTappable {
         // Nemotron-H layer bisect: every block output of the AR step on t0 vs row 0 of the staged
@@ -279,7 +305,14 @@ func runRowExactBench(modelPath: String) async throws {
             }
         }
     }
-    if let atRaw = env["BENCH_ROWEXACT_ROW1_AT"], let at = Int(atRaw), at >= 0, at + 1 < stream.count {
+    if let atRaw = env["BENCH_ROWEXACT_ROW1_AT"], let at = Int(atRaw), at >= 0 {
+        let width = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_WIDTH"] ?? "2") ?? 2
+        let selectedRow = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_ROW"] ?? "1") ?? 1
+        guard width > 0, selectedRow >= 0, selectedRow < width, at <= stream.count - width else {
+            throw NSError(domain: "RowExactBench", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid diagnostic width/row/position"] )
+        }
+        print("[ROWEXACT-BISECT] at=\(at) width=\(width) row=\(selectedRow)")
         // Row-1 bisect: AR steps t_at then t_{at+1} vs verify row 1 of [t_at, t_{at+1}], every layer, then the
         // parts of the first differing layer.
         var (c0, _) = prefill()
@@ -291,14 +324,16 @@ func runRowExactBench(modelPath: String) async throws {
         func arSecond(part: Int?) -> ([MLXArray], [(String, MLXArray)]) {
             let c = c0.map { $0.copy() }
             MLX.eval(c)
-            MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c).logits)
+            for prefix in 0 ..< selectedRow {
+                MLX.eval(autoregressiveForward(
+                    MLXArray([Int32(stream[at + prefix])]).reshaped(1, 1), cache: c).logits)
+            }
             Qwen4ExpRowExactCapture.layers = []
             Qwen4ExpRowExactCapture.parts = []
             Qwen4ExpRowExactCapture.partLayer = part ?? -1
             Qwen4ExpRowExactCapture.enabled = true
             MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[at + 1])]).reshaped(1, 1), cache: c).logits)
+                MLXArray([Int32(stream[at + selectedRow])]).reshaped(1, 1), cache: c).logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
         }
@@ -311,7 +346,7 @@ func runRowExactBench(modelPath: String) async throws {
             Qwen4ExpRowExactCapture.enabled = true
             MLX.eval(NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
                 model.nativeBackboneMTPVerifyForward(
-                    MLXArray([Int32(stream[at]), Int32(stream[at + 1])]).reshaped(1, 2), cache: c)
+                    MLXArray(stream[at ..< (at + width)].map(Int32.init)).reshaped(1, width), cache: c)
             }.logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
@@ -324,13 +359,17 @@ func runRowExactBench(modelPath: String) async throws {
         let (vL, _) = verify(part: nil)
         MLX.eval(aL)
         MLX.eval(vL)
+        guard !aL.isEmpty, aL.count == vL.count else {
+            throw NSError(domain: "RowExactBench", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: missing/mismatched layer captures"])
+        }
         var first: Int?
         for (i, (x, y)) in zip(aL, vL).enumerated() {
-            let d = abs(last(x, row: 0) - last(y, row: 1))
+            let d = abs(last(x, row: 0) - last(y, row: selectedRow))
             let m = d.max().item(Float.self)
             if m > 0, first == nil { first = i }
             if m > 0 || i == aL.count - 1 {
-                print(String(format: "[ROWEXACT] row1 at=%d layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
+                print(String(format: "[ROWEXACT] selected-row at=%d layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
                              (d .> 0).sum().item(Int.self)))
             }
             if first != nil, i > first! + 1 { break }
@@ -339,8 +378,8 @@ func runRowExactBench(modelPath: String) async throws {
             let (_, aP) = arSecond(part: first)
             let (_, vP) = verify(part: first)
             for ((name, x), (_, y)) in zip(aP, vP) {
-                let d = abs(last(x, row: 0) - last(y, row: 1))
-                print(String(format: "[ROWEXACT] row1 at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
+                let d = abs(last(x, row: 0) - last(y, row: selectedRow))
+                print(String(format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
                              name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
             }
         }
