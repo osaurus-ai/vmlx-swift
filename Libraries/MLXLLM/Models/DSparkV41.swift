@@ -119,7 +119,8 @@ final class DSparkV41Attention: Module {
         super.init()
     }
 
-    /// Append committed positions' main-derived KV to the window (rope'd).
+    /// Append committed positions' main-derived KV to the window (rope'd), capped at the last `win`
+    /// rows so repeated appends stay O(win), not O(context) (an uncapped grow-append is O(N²)).
     func seed(mainX: MLXArray, positions: MLXArray) {
         var kv = kvNorm(wkv(mainX))                               // [1, S, headDim]
         kv = ropeApply(kv, positions: positions, inverse: false)  // [1, S, headDim]
@@ -128,6 +129,9 @@ final class DSparkV41Attention: Module {
             window = concatenated([w, kv], axis: 1)
         } else {
             window = kv
+        }
+        if let w = window, w.dim(1) > win {
+            window = w[0..., (w.dim(1) - win)...]
         }
     }
 
@@ -347,6 +351,17 @@ final class DSparkV41Drafter: Module {
     func windowCheckpoint() -> [MLXArray?] { stages.map { $0.attn.window } }
     func windowRestore(_ ck: [MLXArray?]) { for (s, w) in zip(stages, ck) { s.attn.window = w } }
 
+    /// Number of committed positions currently held in the (shared-length) stage windows.
+    func windowCount() -> Int { stages.first?.attn.window?.dim(1) ?? 0 }
+
+    /// Keep only the first `n` window rows (drop a rejected tail); n<=0 clears.
+    func truncateWindows(toCount n: Int) {
+        for s in stages {
+            guard let w = s.attn.window else { continue }
+            s.attn.window = n <= 0 ? nil : w[0..., 0 ..< Swift.min(n, w.dim(1))]
+        }
+    }
+
     /// Draft from `seedTok` (the backbone's token for position startPos+1). Windows hold committed
     /// KV for [0..startPos]. Returns output ids [bs+1] = [seedTok, draft@+2, ..., draft@+bs+1].
     func draft(seedTok: Int, startPos: Int) -> [Int] {
@@ -446,80 +461,138 @@ extension DSparkV41Drafter {
     }
 }
 
-// MARK: - Lane (records target taps, seeds the drafter, drafts blocks)
+// MARK: - Lane (permanent block-output tap -> records taps on every forward; seeds drafter; drafts)
 
-/// Bridges the backbone's mean-over-hc target-layer taps to the dSpark drafter, and drafts a block
-/// for the native-MTP speculative loop. Mirrors NemotronLiLiCorrLane, simplified for dSpark's
-/// window-seeded drafter: it keeps the last `window` positions of concatenated target-layer hidden
-/// and re-seeds the drafter windows from them per draft (correct; the window is only 128 rows).
+/// Bridges the backbone's mean-over-hc target-layer taps to the dSpark drafter. Modeled on
+/// NemotronLiLiCorrLane: the tap is installed ONCE on the backbone and fires on every forward
+/// (prefill + decode), so the drafter window carries the full committed context. Each draft seeds
+/// only the newly committed positions (and truncates a rejected tail); windows cap at `sliding_window`.
 public final class DSparkV41Lane: @unchecked Sendable {
     let drafter: DSparkV41Drafter
     let cfg: DSparkV41Config
+    private let layerOrder: [Int]
+    private let attentionCacheIndex: Int
+    private let keep: Int
     private let lock = NSLock()
-    private var pending: [Int: MLXArray] = [:]   // layer -> [1,S,d] for the in-flight forward
-    private var mainHidden: MLXArray?            // [1, N, d*nTargets] rolling (<= window rows)
-    private var mainStart = 0                    // absolute position of row 0 of mainHidden
+    // in-flight forward
+    private var pendingLayers: [Int: MLXArray] = [:]
+    private var pendingStart = 0
+    private var pendingRows = 0
+    private var pendingOwner: ObjectIdentifier?
+    // committed concatenated target-layer hidden, as contiguous chunks (absolute start, [S, d*nTargets])
+    private var recorderOwner: ObjectIdentifier?
+    private var chunks: [(start: Int, taps: MLXArray)] = []
+    // drafter window sync
+    private var drafterOwner: ObjectIdentifier?
+    private var winEnd = 0
+    private var draftCalls = 0
+    private var tapLogs = 0
 
-    init(drafter: DSparkV41Drafter, cfg: DSparkV41Config) {
+    init(drafter: DSparkV41Drafter, cfg: DSparkV41Config, attentionCacheIndex: Int = 0) {
         self.drafter = drafter
         self.cfg = cfg
+        self.layerOrder = cfg.targetLayerIds
+        self.attentionCacheIndex = attentionCacheIndex
+        self.keep = cfg.slidingWindow + cfg.blockSize * 2
     }
 
-    /// Tap closure installed on DeepseekV4ModelInner for the duration of a backbone forward.
-    func tap(layer: Int, hidden: MLXArray) {
-        lock.lock(); pending[layer] = hidden; lock.unlock()
+    func makeTap() -> NemotronHBlockOutputTap {
+        NemotronHBlockOutputTap(
+            layerIndices: Set(layerOrder),
+            record: { [unowned self] layer, output in
+                self.lock.lock(); self.pendingLayers[layer] = output; self.lock.unlock()
+            },
+            begin: { [unowned self] cache, rows in
+                guard let cache, self.attentionCacheIndex < cache.count else { return false }
+                let attn = cache[self.attentionCacheIndex]
+                self.lock.lock()
+                self.pendingOwner = ObjectIdentifier(attn as AnyObject)
+                self.pendingStart = attn.offset
+                self.pendingRows = rows
+                self.pendingLayers.removeAll(keepingCapacity: true)
+                let dbg = ProcessInfo.processInfo.environment["VMLX_DSV41_DSPARK_DBG"] == "1" && self.tapLogs < 8
+                if dbg { self.tapLogs += 1; NSLog("DSPARK-TAP begin rows=\(rows) start=\(attn.offset)") }
+                self.lock.unlock()
+                return true
+            },
+            end: { [unowned self] in
+                self.lock.lock(); defer { self.lock.unlock() }
+                self.commitPendingLocked()
+            })
     }
 
-    /// Commit the taps collected during a forward that appended rows at absolute `start`.
-    func finishForward(start: Int) {
-        lock.lock(); defer { lock.unlock() }
-        guard pending.count == cfg.targetLayerIds.count else { pending.removeAll(); return }
-        // [1,S,d] per target layer -> [1,S,d*nTargets] in target order.
-        let rows = concatenated(cfg.targetLayerIds.map { pending[$0]! }, axis: -1)
-        pending.removeAll()
-        let win = cfg.slidingWindow
-        if mainHidden == nil || start <= mainStart {
-            mainHidden = rows; mainStart = start
-        } else {
-            // supersede everything at >= start, then append.
-            let keepRows = start - mainStart
-            if let mh = mainHidden, keepRows > 0 {
-                mainHidden = concatenated([mh[0..., 0 ..< keepRows], rows], axis: 1)
-            } else {
-                mainHidden = rows; mainStart = start
-            }
+    private func commitPendingLocked() {
+        guard let owner = pendingOwner, pendingLayers.count == layerOrder.count, pendingRows > 0 else {
+            pendingLayers.removeAll(keepingCapacity: true); pendingOwner = nil; return
         }
-        // bound to the last `win` positions.
-        if let mh = mainHidden, mh.dim(1) > win {
-            let drop = mh.dim(1) - win
-            mainHidden = mh[0..., drop...]; mainStart += drop
+        var rows = concatenated(layerOrder.map { pendingLayers[$0]![0] }, axis: -1)  // [S, d*nTargets]
+        var start = pendingStart
+        pendingLayers.removeAll(keepingCapacity: true); pendingOwner = nil
+        if recorderOwner != owner {
+            recorderOwner = owner; chunks.removeAll()
+            drafterOwner = owner; drafter.resetWindows(); winEnd = 0
+        }
+        if rows.dim(0) > keep { let drop = rows.dim(0) - keep; rows = rows[drop...]; start += drop }
+        chunks = chunks.compactMap { c in
+            if c.start >= start { return nil }
+            let end = c.start + c.taps.dim(0)
+            if end <= start { return c }
+            return (c.start, c.taps[0 ..< (start - c.start)])
+        }
+        chunks.append((start, rows))
+        if ProcessInfo.processInfo.environment["VMLX_DSV41_DSPARK_DBG"] == "1" && tapLogs < 10 {
+            tapLogs += 1; NSLog("DSPARK-TAP commit start=\(start) rows=\(rows.dim(0)) chunks=\(chunks.count)")
+        }
+        let floor = (start + rows.dim(0)) - keep
+        chunks = chunks.compactMap { c in
+            let end = c.start + c.taps.dim(0)
+            if end <= floor { return nil }
+            if c.start >= floor { return c }
+            return (floor, c.taps[(floor - c.start)...])
         }
     }
 
-    /// Draft `depth` tokens after `nextToken` (at committed position = `position`).
-    func draft(nextToken: MLXArray, depth: Int, position: Int) -> MLXArray {
-        lock.lock()
-        let mh = mainHidden; let mStart = mainStart
-        lock.unlock()
+    private func recordedTapsLocked(owner: ObjectIdentifier, from: Int, to: Int) -> (Int, MLXArray)? {
+        guard recorderOwner == owner, to > from else { return nil }
+        var pieces: [MLXArray] = []; var cursor = to
+        for c in chunks.reversed() {
+            let end = c.start + c.taps.dim(0)
+            guard end >= cursor, c.start < cursor else { if end < cursor { break }; continue }
+            let lo = Swift.max(c.start, from)
+            pieces.append(c.taps[(lo - c.start) ..< (cursor - c.start)])
+            cursor = lo
+            if cursor <= from { break }
+        }
+        guard cursor < to, !pieces.isEmpty else { return nil }
+        let joined = pieces.count == 1 ? pieces[0] : concatenated(pieces.reversed(), axis: 0)
+        return (cursor, joined)
+    }
+
+    /// Draft `depth` tokens after `nextToken` (committed position = `position`).
+    func draft(nextToken: MLXArray, depth: Int, position: Int, owner: ObjectIdentifier?) -> MLXArray {
         let seedTok = Int(nextToken.reshaped(1).asType(.int32).item(Int32.self))
-        guard let mh, position >= 1 else {
-            return MLXArray(Array(repeating: Int32(cfg.noiseTokenId), count: depth))
+        lock.lock()
+        if drafterOwner != owner { drafterOwner = owner; drafter.resetWindows(); winEnd = 0 }
+        if position < winEnd {                       // rollback a rejected tail
+            drafter.truncateWindows(toCount: Swift.max(0, drafter.windowCount() - (winEnd - position)))
+            winEnd = position
         }
-        // Windows must hold KV for [0..startPos] where startPos = position-1. Re-seed from the recorded
-        // target-layer hidden covering (mStart .. position). positions are absolute.
-        drafter.resetWindows()
-        let lo = Swift.max(mStart, position - cfg.slidingWindow)
-        let hiExcl = Swift.min(position, mStart + mh.dim(1))      // commit rows up to position-1 inclusive
-        guard hiExcl > lo else {
-            return MLXArray(Array(repeating: Int32(cfg.noiseTokenId), count: depth))
+        if position > winEnd, let o = owner,
+           let (first, taps) = recordedTapsLocked(owner: o, from: winEnd, to: position) {
+            if first > winEnd { drafter.resetWindows(); winEnd = first }   // taps don't reach the anchor
+            let positions = MLXArray(Array(stride(from: Int32(winEnd), to: Int32(winEnd + taps.dim(0)), by: 1)))
+            drafter.seedWindows(mainHidden: taps.expandedDimensions(axis: 0), positions: positions)
+            winEnd += taps.dim(0)
         }
-        let seg = mh[0..., (lo - mStart) ..< (hiExcl - mStart)]   // [1, S', d*nTargets]
-        let positions = MLXArray(Array(stride(from: Int32(lo), to: Int32(hiExcl), by: 1)))
-        drafter.seedWindows(mainHidden: seg, positions: positions)
-        let out = drafter.draft(seedTok: seedTok, startPos: position - 1)  // [seedTok, d@+1 ... d@+bs]
-        // out[0] is the (already-known) seed; drafts are out[1...]; return `depth` of them.
-        let drafts = out.dropFirst().prefix(depth).map { Int32($0) }
-        return MLXArray(Array(drafts))
+        let winCount = drafter.windowCount()
+        if ProcessInfo.processInfo.environment["VMLX_DSV41_DSPARK_DBG"] == "1", draftCalls < 4 {
+            draftCalls += 1
+            NSLog("DSPARK-DRAFT call#\(draftCalls) pos=\(position) winCount=\(winCount) seed=\(seedTok)")
+        }
+        lock.unlock()
+        guard winCount > 0 else { return MLXArray(Array(repeating: Int32(cfg.noiseTokenId), count: depth)) }
+        let out = drafter.draft(seedTok: seedTok, startPos: position - 1)
+        return MLXArray(Array(out.dropFirst().prefix(depth).map { Int32($0) }))
     }
 }
 
@@ -541,7 +614,10 @@ extension DeepseekV4Model {
             bundle: bundle, config: cfg,
             embed: { [unowned self] ids in self.model.embedTokens(ids) },
             head: { [unowned self] x in self.lmHead(x) }) else { return }
-        self.dsparkLane = DSparkV41Lane(drafter: drafter, cfg: cfg)
+        let lane = DSparkV41Lane(drafter: drafter, cfg: cfg)
+        self.dsparkLane = lane
+        // Install the block-output tap PERMANENTLY so it records on every forward (prefill + decode).
+        self.model.blockOutputTap = lane.makeTap()
         NSLog("dsv41 dSpark drafter attached (block speculative decode)")
     }
 }
@@ -552,16 +628,8 @@ extension DeepseekV4Model: NativeMTPModel {
     public func makeNativeMTPCache() -> [KVCache] { [] }  // the drafter owns its own windows
 
     public func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        let start = cache?.first?.offset ?? 0
-        if let lane = dsparkLane {
-            model.dsparkTargetLayers = Set(DSparkV41Config(config).targetLayerIds)
-            model.dsparkTap = { layer, h in lane.tap(layer: layer, hidden: h) }
-        }
+        // The dSpark tap is permanent (installed at attach) and records on this forward automatically.
         let logits = self(inputs, cache: cache)
-        if let lane = dsparkLane {
-            model.dsparkTap = nil
-            lane.finishForward(start: start)
-        }
         // Block-draft path doesn't consume hiddenStates; return a shaped placeholder.
         let h = zeros([inputs.dim(0), inputs.dim(1), config.hiddenSize]).asType(logits.dtype)
         return NativeMTPForwardResult(logits: logits, hiddenStates: h)
@@ -580,6 +648,7 @@ extension DeepseekV4Model: NativeMTPBlockDraftModel {
     public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
         guard let lane = dsparkLane else { return MLXArray(Array(repeating: Int32(0), count: depth)) }
         let position = targetCache.first?.offset ?? 0
-        return lane.draft(nextToken: nextToken, depth: depth, position: position)
+        let owner = targetCache.first.map { ObjectIdentifier($0 as AnyObject) }
+        return lane.draft(nextToken: nextToken, depth: depth, position: position, owner: owner)
     }
 }

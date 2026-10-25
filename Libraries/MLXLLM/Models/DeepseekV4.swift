@@ -1362,7 +1362,7 @@ class DeepseekV4DecoderLayer: Module {
 
 // MARK: - Inner model
 
-public class DeepseekV4ModelInner: Module {
+public class DeepseekV4ModelInner: Module, NemotronHBlockOutputTappable {
     let config: DeepseekV4Configuration
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     var layers: [DeepseekV4DecoderLayer]
@@ -1376,11 +1376,11 @@ public class DeepseekV4ModelInner: Module {
     private var engramInit = false
     private let engramLock = NSLock()
 
-    /// dSpark MTP tap: when set, the staggered-hc loop records the mean-over-hc hidden
-    /// `(layerIndex, [1,S,d])` at every layer in `dsparkTargetLayers`. Used by DSparkV41Lane to seed
-    /// the drafter windows from a backbone forward. nil (default) = no recording, zero overhead.
-    public var dsparkTap: ((Int, MLXArray) -> Void)?
-    public var dsparkTargetLayers: Set<Int> = []
+    /// dSpark MTP tap (reuses the NemotronH block-output tap mechanism): when set, the staggered-hc
+    /// loop records the mean-over-hc hidden at the INPUT of each layer in `tap.layerIndices` on EVERY
+    /// forward — prefill and decode — so the drafter window carries the full committed context. The
+    /// lane installs this once at attach (never per-forward). nil (default) = zero overhead.
+    public var blockOutputTap: NemotronHBlockOutputTap?
 
     init(config: DeepseekV4Configuration) {
         self.config = config
@@ -1448,18 +1448,24 @@ public class DeepseekV4ModelInner: Module {
                 .asType(.float32)
             // Shared compress-KV holder: kv_source layers publish their pool, later ratio>0 layers read it.
             let compressShare = DSV41CompressShare()
+            // dSpark MTP tap: fires on EVERY forward (prefill + decode) so the drafter window carries
+            // the full committed context. `begin` records the forward's start position from the cache.
+            let dsTap: NemotronHBlockOutputTap? = blockOutputTap.flatMap {
+                ($0.begin?(cache, h.dim(1)) ?? true) ? $0 : nil
+            }
+            defer { dsTap?.end?() }
             for (i, layer) in layers.enumerated() {
                 if let eng = layer.engram, let rows = engramRows[i] {
                     h = eng(h, rows: rows, textMask: nil)
                 }
+                // Record mean-over-hc at the INPUT of each target layer (post-engram, pre-layer) —
+                // ref model.py collects mean(h,axis=2) BEFORE layer(i).
+                if let dsTap, dsTap.layerIndices.contains(i) {
+                    dsTap.record(i, h.mean(axis: 2))
+                }
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
                 preMix = r.ffnPre
-                // dSpark MTP tap: record the mean-over-hc hidden at the draft target layers
-                // (ref model.py return_hidden = mean(h, axis=2) at dspark_target_layer_ids).
-                if let tap = dsparkTap, dsparkTargetLayers.contains(i) {
-                    tap(i, h.mean(axis: 2))
-                }
                 if ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil {
                     let ma = MLX.abs(h.asType(.float32)).mean(); MLX.eval(ma)
                     NSLog("VMLX-DBG layer\(i) out.meanAbs=\(ma.item(Float.self))")
