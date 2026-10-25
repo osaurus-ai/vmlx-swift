@@ -49,14 +49,29 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
             let routed = model.namedModules().filter { $0.1 is JANGTRoutedExpertLayer }.map(\.0).sorted()
             XCTAssertEqual(routed, ["language_model.layers.0.mlp.switch_mlp", "language_model.layers.1.mlp.switch_mlp"])
             XCTAssertTrue(model.namedModules().allSatisfy { !($0.1 is JANGHRoutedExpertLayer) })
-            // Prompt caches written by other trellis kernels must not restore: JANGT bundles carry a computation
-            // identity in the cache key; ordinary bundles keep their existing (nil) identity.
-            XCTAssertEqual(model.cacheComputationIdentity, "qwen4_exp:jangt-v2-halfbits-k1-masked-tail-v1")
+            // Earlier batched-router math can survive in typed recurrent snapshots,
+            // independently of the trellis codec revision. Both namespaces must move.
+            let routerIdentity = "qwen4_exp:router-singleton-window-v1"
+            let trellisIdentity = routerIdentity + ";qwen4_exp:jangt-v2-halfbits-k1-masked-tail-v1"
+            XCTAssertEqual(model.cacheComputationIdentity, trellisIdentity)
             var shellRoot = f.configuration()
             shellRoot["quantization"] = ["group_size": 64, "bits": 8]
-            let shell = try Qwen4Exp(try JSONDecoder.json5().decode(
-                Qwen4ExpConfiguration.self, from: JSONSerialization.data(withJSONObject: shellRoot)), requesting: [.text])
-            XCTAssertNil(shell.cacheComputationIdentity)
+            let shell = try Qwen4Exp(
+                try JSONDecoder.json5().decode(
+                    Qwen4ExpConfiguration.self,
+                    from: JSONSerialization.data(withJSONObject: shellRoot)), requesting: [.text])
+            XCTAssertEqual(shell.cacheComputationIdentity, routerIdentity)
+            let cache = shell.newCache(parameters: nil)
+            let legacy = ModelCacheTopologySnapshot(cache: cache)
+            let corrected = ModelCacheTopologySnapshot(
+                cache: cache, cacheComputationIdentity: shell.cacheComputationIdentity)
+            XCTAssertNotEqual(legacy.topologyTags, corrected.topologyTags)
+            XCTAssertTrue(corrected.topologyTags.contains("compute=" + routerIdentity))
+            XCTAssertEqual(legacy.layerCount, corrected.layerCount)
+            XCTAssertEqual(legacy.diskCacheStateIdentifiers, corrected.diskCacheStateIdentifiers)
+            XCTAssertEqual(
+                legacy.requiresSeparateRecurrentPayloadState,
+                corrected.requiresSeparateRecurrentPayloadState)
             for name in prepared.banks.excludedTensorNames where !name.hasSuffix(".jt_cs") || name.contains("down_proj") {
                 XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key: name), name)
             }

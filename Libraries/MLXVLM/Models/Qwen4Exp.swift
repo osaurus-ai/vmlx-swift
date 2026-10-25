@@ -2117,11 +2117,18 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
 
     /// JANGT trellis experts: the sub-2-bit port (K = 1 / 1.5 units, masked tail block for the 640-wide down input)
     /// changed the decoded expert outputs versus the earlier trellis kernels, so a prompt cache written by those
-    /// kernels must not restore into this runtime. Nil for affine and JANGH-only bundles (their keys are unchanged).
+    /// kernels must not restore into this runtime. Absent for affine and JANGH-only bundles.
     /// Bump only when the trellis decode semantics change, not for equivalent speedups.
     private let jangtCacheComputationIdentity: String?
 
-    public var cacheComputationIdentity: String? { jangtCacheComputationIdentity }
+    public var cacheComputationIdentity: String? {
+        // Earlier batched router scores could differ from AR. Typed post-answer
+        // snapshots retain that difference in KV/GDN/PLE state even after the
+        // router is repaired. Keep their arithmetic outside this namespace;
+        // the ordinary cache miss rebuilds state without deleting old records.
+        let router = "qwen4_exp:router-singleton-window-v1"
+        return jangtCacheComputationIdentity.map { "\(router);\($0)" } ?? router
+    }
 
     // QSA's raw indexer keys, GDN/PLE recurrent state and media RoPE delta are
     // persisted with the prefix. A forced tool-selection suffix does not alter

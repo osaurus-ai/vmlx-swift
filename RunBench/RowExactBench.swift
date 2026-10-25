@@ -24,6 +24,14 @@ func runRowExactBench(modelPath: String) async throws {
     let widths = (env["BENCH_ROWEXACT_WIDTHS"] ?? "2,4,8").split(separator: ",").compactMap {
         Int($0)
     }
+    guard steps > 0, !widths.isEmpty, widths.allSatisfy({ $0 > 1 && $0 <= steps }) else {
+        throw NSError(
+            domain: "RowExactBench", code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Non-empty staged verify widths >=2 must fit the reference stream"
+            ])
+    }
     let promptText =
         env["BENCH_ROWEXACT_PROMPT"]
         ?? "Write a detailed essay of about 400 words on the history of the printing press and its effect on literacy in Europe."
@@ -37,6 +45,76 @@ func runRowExactBench(modelPath: String) async throws {
         print("[ROWEXACT] model lacks native MTP / staged verify")
         return
     }
+    if let output = env["BENCH_ROWEXACT_IDENTITY_OUT"] {
+        let topology = ModelCacheTopologySnapshot(
+            cache: model.newCache(parameters: GenerateParameters()),
+            cacheComputationIdentity: context.model.cacheComputationIdentity)
+        var record: [String: Any] = [
+            "model": modelDir.lastPathComponent, "topology_tags": topology.topologyTags,
+            "scope": "actual loaded model cache identity; load only, generation_tps=NA",
+        ]
+        if let identity = context.model.cacheComputationIdentity {
+            record["compute_identity"] = identity
+        }
+        if let legacyPath = env["BENCH_ROWEXACT_LEGACY_IDENTITY"] {
+            let legacy =
+                try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: URL(fileURLWithPath: legacyPath))) as? [String: Any]
+            guard legacy?["model"] as? String == modelDir.lastPathComponent,
+                let oldTags = legacy?["topology_tags"] as? [String], !oldTags.isEmpty,
+                let directory = env["BENCH_ROWEXACT_NAMESPACE_DIR"]
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 17,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "INVALID: legacy namespace probe metadata"
+                    ])
+            }
+            let base = "rowexact-unchanged-weights:" + modelDir.lastPathComponent
+            let oldKey = base + "|" + oldTags.joined(separator: "|")
+            let newKey = base + "|" + topology.topologyTags.joined(separator: "|")
+            let outcomes = Device.withDefaultDevice(.cpu) { () -> [Bool] in
+                let tokens = Array(1 ... 74)  // Deliberately not a page/chunk multiple.
+                let url = URL(fileURLWithPath: directory)
+                let old = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: oldKey)
+                old.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(11), 12])])
+                let oldPositive =
+                    old.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [11, 12]
+                let current = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: newKey)
+                let legacyMiss = current.fetch(tokens: tokens) == nil
+                current.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(21), 22])])
+                let restart = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: newKey)
+                let currentHit =
+                    restart.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [21, 22]
+                let oldPreserved =
+                    old.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [11, 12]
+                return [oldPositive, legacyMiss, currentHit, oldPreserved]
+            }
+            record["same_model_key"] = oldKey == newKey
+            record["same_noncompute_topology"] =
+                oldTags.filter { !$0.hasPrefix("compute=") }
+                == topology.topologyTags.filter { !$0.hasPrefix("compute=") }
+            record["old_positive_new_miss_new_restart_hit_old_preserved"] = outcomes
+            try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(
+                to: URL(fileURLWithPath: output))
+            guard oldKey != newKey, record["same_noncompute_topology"] as? Bool == true,
+                outcomes == [true, true, true, true]
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 18,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Cache arithmetic namespaces are not isolated"
+                    ])
+            }
+        } else {
+            try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(
+                to: URL(fileURLWithPath: output))
+        }
+        print(
+            "[ROWEXACT-CACHE-MODEL] identity=\(context.model.cacheComputationIdentity ?? "nil") generation_tps=NA reason=load_only"
+        )
+        return
+    }
     // Match NativeMTPTokenIterator's AR dispatch: Qwen3.5 uses the ordinary
     // backbone, while families with a dedicated one-row path opt into it.
     func autoregressiveForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
@@ -47,13 +125,30 @@ func runRowExactBench(modelPath: String) async throws {
     }
     var input = UserInput(prompt: promptText)
     input.additionalContext = ["enable_thinking": false]
-    let prompt = try await context.processor.prepare(input: input).text.tokens.reshaped(1, -1)
+    let prepared = try await context.processor.prepare(input: input)
+    let prompt = prepared.text.tokens.reshaped(1, -1)
+    let cacheSalt = computeCacheSalt(
+        for: prepared, parameters: GenerateParameters(), model: context.model)
 
+    let prefillStep = Int(env["BENCH_ROWEXACT_PREFILL_STEP"] ?? "512") ?? 512
+    guard prefillStep > 0, prompt.dim(1) > 0 else {
+        throw NSError(
+            domain: "RowExactBench", code: 10,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Non-empty prompt and positive prefill step required"
+            ])
+    }
     func prefill() -> ([KVCache], Int) {
         let cache = model.newCache(parameters: GenerateParameters())
-        let out = model.nativeBackboneForward(prompt, cache: cache)
-        let first = argMax(out.logits[0, -1], axis: -1).item(Int.self)
-        MLX.eval(cache)
+        var first = 0
+        for start in stride(from: 0, to: prompt.dim(1), by: prefillStep) {
+            let end = min(start + prefillStep, prompt.dim(1))
+            let out = model.nativeBackboneForward(prompt[0..., start ..< end], cache: cache)
+            if end == prompt.dim(1) {
+                first = argMax(out.logits[0, -1], axis: -1).item(Int.self)
+            }
+            MLX.eval(cache)
+        }
         return (cache, first)
     }
 
@@ -75,7 +170,8 @@ func runRowExactBench(modelPath: String) async throws {
                 }
                 : autoregressiveForward(input, cache: c)
             // Graph construction ends here (early-submit layers may already be running on the GPU).
-            buildSamples[verify ? ids.count : 0, default: []].append(CFAbsoluteTimeGetCurrent() - t0)
+            buildSamples[verify ? ids.count : 0, default: []].append(
+                CFAbsoluteTimeGetCurrent() - t0)
             MLX.eval(out.logits)
             return CFAbsoluteTimeGetCurrent() - t0
         }
@@ -88,15 +184,26 @@ func runRowExactBench(modelPath: String) async throws {
         var verifySamples = [Int: [Double]]()
         for _ in 0 ..< reps {
             arSamples.append(once([ids[0]], verify: false))
-            for w in widths { verifySamples[w, default: []].append(once(Array(ids.prefix(w)), verify: true)) }
+            for w in widths {
+                verifySamples[w, default: []].append(once(Array(ids.prefix(w)), verify: true))
+            }
         }
-        func median(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] * 1000 }
+        func median(_ v: [Double]) -> Double {
+            let s = v.sorted()
+            return s[s.count / 2] * 1000
+        }
         let ar = median(arSamples)
-        print(String(format: "[ROWEXACT-TIME] AR step %.2f ms (graph build %.2f ms)", ar, median(buildSamples[0] ?? [0])))
+        print(
+            String(
+                format: "[ROWEXACT-TIME] AR step %.2f ms (graph build %.2f ms)", ar,
+                median(buildSamples[0] ?? [0])))
         for w in widths {
             let v = median(verifySamples[w] ?? [0])
-            print(String(format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR) (graph build %.2f ms)", w, v, v / ar,
-                         median(buildSamples[w] ?? [0])))
+            print(
+                String(
+                    format: "[ROWEXACT-TIME] verify W=%d %.2f ms (%.2fx AR) (graph build %.2f ms)",
+                    w, v, v / ar,
+                    median(buildSamples[w] ?? [0])))
         }
         if env["BENCH_ROWEXACT_TIME_ONLY"] == "1" { return }
     }
@@ -105,6 +212,7 @@ func runRowExactBench(modelPath: String) async throws {
     var (cache, token) = prefill()
     var stream: [Int] = [token]
     var arLogits: [MLXArray] = []
+    let arStart = CFAbsoluteTimeGetCurrent()
     for _ in 0 ..< steps {
         let tokenInput = MLXArray([Int32(token)]).reshaped(1, 1)
         // BENCH_ROWEXACT_AR=plain: nativeBackboneForward (S=1, no autoregressive flag) as the reference.
@@ -118,7 +226,35 @@ func runRowExactBench(modelPath: String) async throws {
         token = argMax(row, axis: -1).item(Int.self)
         stream.append(token)
     }
-    if env["BENCH_ROWEXACT_NEMO_LAYERS"] == "1", let tappable = context.model as? NemotronHBlockOutputTappable {
+    print(
+        String(
+            format: "[ROWEXACT-AR] tokens=%d diagnostic_tok_s=%.3f natural_stop_test=false",
+            steps, Double(steps) / max(CFAbsoluteTimeGetCurrent() - arStart, 1e-9)))
+    if env["BENCH_ROWEXACT_AR_REPEAT"] == "1" {
+        let (repeatCache, _) = prefill()
+        var equal = 0
+        var maximum: Float = 0
+        for index in 0 ..< steps {
+            let out = autoregressiveForward(
+                MLXArray([Int32(stream[index])]).reshaped(1, 1), cache: repeatCache)
+            let row = out.logits[0, -1].asType(.float32)
+            MLX.eval(row)
+            let difference = abs(row - arLogits[index]).max().item(Float.self)
+            maximum = max(maximum, difference)
+            if difference == 0 { equal += 1 }
+        }
+        print("[ROWEXACT-AR-REPEAT] rows=\(steps) bitwise=\(equal) max_abs_diff=\(maximum)")
+        guard equal == steps else {
+            throw NSError(
+                domain: "RowExactBench", code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "INVALID: AR reference does not repeat exactly"
+                ])
+        }
+    }
+    if env["BENCH_ROWEXACT_NEMO_LAYERS"] == "1",
+        let tappable = context.model as? NemotronHBlockOutputTappable
+    {
         // Nemotron-H layer bisect: every block output of the AR step on t0 vs row 0 of the staged
         // verify [t0, t1] (both from the same prefilled state).
         func capture(_ run: () -> Void) -> [Int: MLXArray] {
@@ -147,8 +283,10 @@ func runRowExactBench(modelPath: String) async throws {
         for layer in arLayers.keys.sorted() {
             guard let x = arLayers[layer], let y = vLayers[layer] else { continue }
             let d = abs(x[0, 0].asType(.float32) - y[0, 0].asType(.float32))
-            print(String(format: "[ROWEXACT] nemo layer=%d maxdiff=%.4g nonzero=%d", layer,
-                d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+            print(
+                String(
+                    format: "[ROWEXACT] nemo layer=%d maxdiff=%.4g nonzero=%d", layer,
+                    d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
         }
     }
     if env["BENCH_ROWEXACT_LAYERS"] == "1" {
@@ -279,26 +417,42 @@ func runRowExactBench(modelPath: String) async throws {
             }
         }
     }
-    if let atRaw = env["BENCH_ROWEXACT_ROW1_AT"], let at = Int(atRaw), at >= 0, at + 1 < stream.count {
+    if let atRaw = env["BENCH_ROWEXACT_ROW1_AT"], let at = Int(atRaw), at >= 0 {
+        let width = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_WIDTH"] ?? "2") ?? 2
+        let selectedRow = Int(env["BENCH_ROWEXACT_DIAGNOSTIC_ROW"] ?? "1") ?? 1
+        guard width > 0, selectedRow >= 0, selectedRow < width, at <= stream.count - width else {
+            throw NSError(
+                domain: "RowExactBench", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid diagnostic width/row/position"])
+        }
+        print("[ROWEXACT-BISECT] at=\(at) width=\(width) row=\(selectedRow)")
         // Row-1 bisect: AR steps t_at then t_{at+1} vs verify row 1 of [t_at, t_{at+1}], every layer, then the
         // parts of the first differing layer.
         var (c0, _) = prefill()
         for i in 0 ..< at {
-            MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0).logits)
+            MLX.eval(
+                autoregressiveForward(
+                    MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0
+                ).logits)
         }
         MLX.eval(c0)
         func arSecond(part: Int?) -> ([MLXArray], [(String, MLXArray)]) {
             let c = c0.map { $0.copy() }
             MLX.eval(c)
-            MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c).logits)
+            for prefix in 0 ..< selectedRow {
+                MLX.eval(
+                    autoregressiveForward(
+                        MLXArray([Int32(stream[at + prefix])]).reshaped(1, 1), cache: c
+                    ).logits)
+            }
             Qwen4ExpRowExactCapture.layers = []
             Qwen4ExpRowExactCapture.parts = []
             Qwen4ExpRowExactCapture.partLayer = part ?? -1
             Qwen4ExpRowExactCapture.enabled = true
-            MLX.eval(autoregressiveForward(
-                MLXArray([Int32(stream[at + 1])]).reshaped(1, 1), cache: c).logits)
+            MLX.eval(
+                autoregressiveForward(
+                    MLXArray([Int32(stream[at + selectedRow])]).reshaped(1, 1), cache: c
+                ).logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
         }
@@ -309,10 +463,12 @@ func runRowExactBench(modelPath: String) async throws {
             Qwen4ExpRowExactCapture.parts = []
             Qwen4ExpRowExactCapture.partLayer = part ?? -1
             Qwen4ExpRowExactCapture.enabled = true
-            MLX.eval(NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
-                model.nativeBackboneMTPVerifyForward(
-                    MLXArray([Int32(stream[at]), Int32(stream[at + 1])]).reshaped(1, 2), cache: c)
-            }.logits)
+            MLX.eval(
+                NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                    model.nativeBackboneMTPVerifyForward(
+                        MLXArray(stream[at ..< (at + width)].map(Int32.init)).reshaped(1, width),
+                        cache: c)
+                }.logits)
             Qwen4ExpRowExactCapture.enabled = false
             return (Qwen4ExpRowExactCapture.layers, Qwen4ExpRowExactCapture.parts)
         }
@@ -324,24 +480,48 @@ func runRowExactBench(modelPath: String) async throws {
         let (vL, _) = verify(part: nil)
         MLX.eval(aL)
         MLX.eval(vL)
+        guard !aL.isEmpty, aL.count == vL.count else {
+            throw NSError(
+                domain: "RowExactBench", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: missing/mismatched layer captures"])
+        }
         var first: Int?
         for (i, (x, y)) in zip(aL, vL).enumerated() {
-            let d = abs(last(x, row: 0) - last(y, row: 1))
+            let d = abs(last(x, row: 0) - last(y, row: selectedRow))
             let m = d.max().item(Float.self)
             if m > 0, first == nil { first = i }
             if m > 0 || i == aL.count - 1 {
-                print(String(format: "[ROWEXACT] row1 at=%d layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
-                             (d .> 0).sum().item(Int.self)))
+                print(
+                    String(
+                        format: "[ROWEXACT] selected-row at=%d layer=%d maxdiff=%.4g nonzero=%d",
+                        at, i, m,
+                        (d .> 0).sum().item(Int.self)))
             }
             if first != nil, i > first! + 1 { break }
         }
         if let first {
             let (_, aP) = arSecond(part: first)
             let (_, vP) = verify(part: first)
-            for ((name, x), (_, y)) in zip(aP, vP) {
-                let d = abs(last(x, row: 0) - last(y, row: 1))
-                print(String(format: "[ROWEXACT] row1 at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
-                             name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+            if let path = env["BENCH_ROWEXACT_ROUTER_OUT"] {
+                guard let arInput = aP.first(where: { $0.0 == "moe.router_input" })?.1,
+                    let verifyInput = vP.first(where: { $0.0 == "moe.router_input" })?.1,
+                    let weight = aP.first(where: { $0.0 == "moe.router_weight" })?.1
+                else {
+                    throw NSError(
+                        domain: "RowExactBench", code: 6,
+                        userInfo: [NSLocalizedDescriptionKey: "INVALID: router capture missing"])
+                }
+                try MLX.save(
+                    arrays: ["ar_input": arInput, "verify_input": verifyInput, "weight": weight],
+                    url: URL(fileURLWithPath: path))
+            }
+            for ((name, x), (_, y)) in zip(aP, vP) where name != "moe.router_weight" {
+                let d = abs(last(x, row: 0) - last(y, row: selectedRow))
+                print(
+                    String(
+                        format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d",
+                        at, first,
+                        name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
             }
         }
         Qwen4ExpRowExactCapture.partLayer = 0
@@ -355,9 +535,101 @@ func runRowExactBench(modelPath: String) async throws {
         "[ROWEXACT] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) steps=\(steps) ar=\(env["BENCH_ROWEXACT_AR"] ?? "native-autoregressive")"
     )
 
+    // Explicit partial-commit diagnostic: trim attention and commit recurrent
+    // state exactly as the serving iterator does, then reverify the overlap.
+    let requestedCommit = env["BENCH_ROWEXACT_COMMIT"].flatMap(Int.init)
+    if let requestedCommit, requestedCommit <= 0 {
+        throw NSError(
+            domain: "RowExactBench", code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "Commit prefix must be positive"])
+    }
+    if let prefix = env["BENCH_ROWEXACT_CACHE_IMPORT"] {
+        let meta =
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: prefix + ".json"))) as? [String: Any]
+        guard let meta, meta["model"] as? String == modelDir.lastPathComponent,
+            let committed = meta["committed"] as? Int, committed > 0, committed < steps,
+            let savedStream = meta["stream"] as? [Int], savedStream == stream,
+            let boundary = meta["boundary"] as? Int, boundary == prompt.dim(1) + committed
+        else {
+            throw NSError(
+                domain: "RowExactBench", code: 11,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "INVALID: incompatible cache diagnostic metadata/AR stream"
+                ])
+        }
+        let sameSalt = (meta["cache_salt"] as? String) == cacheSalt
+        print("[ROWEXACT-CACHE-IDENTITY] same_salt=\(sameSalt) boundary=\(boundary)")
+        if !sameSalt && env["BENCH_ROWEXACT_CACHE_BYPASS_IDENTITY"] != "1" { return }
+        let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: prefix + ".safetensors"))
+        var restored = model.newCache(parameters: GenerateParameters())
+        let count = restoreFromDiskArrays(arrays, into: &restored, requirePromptBoundary: true)
+        guard
+            validateRestoredCacheBoundary(
+                restored, matchedTokens: boundary,
+                restoredTokens: count, detail: "rowexact-cross-runtime-diagnostic")
+        else {
+            throw NSError(
+                domain: "RowExactBench", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: cross-runtime snapshot rejected"])
+        }
+        let saved = try MLX.loadArrays(url: URL(fileURLWithPath: prefix + "-ar.safetensors"))
+        guard let savedAR = saved["next_logits"] else {
+            throw NSError(
+                domain: "RowExactBench", code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: missing nonempty AR control"])
+        }
+        let currentAR = arLogits[committed]
+        // Factor the serializer's own dtype conversion out of the comparison.
+        // Both snapshots must traverse the same production disk codec.
+        let (freshPrefix, _) = prefill()
+        for index in 0 ..< committed {
+            MLX.eval(
+                autoregressiveForward(
+                    MLXArray([Int32(stream[index])]).reshaped(1, 1), cache: freshPrefix
+                ).logits)
+        }
+        var serializedReference = model.newCache(parameters: GenerateParameters())
+        let referenceCount = restoreFromDiskArrays(
+            TQDiskSerializer.serialize(cache: freshPrefix), into: &serializedReference,
+            requirePromptBoundary: true)
+        guard
+            validateRestoredCacheBoundary(
+                serializedReference, matchedTokens: boundary,
+                restoredTokens: referenceCount, detail: "rowexact-current-ar-codec-control")
+        else {
+            throw NSError(
+                domain: "RowExactBench", code: 16,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: current AR codec control rejected"])
+        }
+        let serializedAR = autoregressiveForward(
+            MLXArray([Int32(stream[committed])]).reshaped(1, 1), cache: serializedReference
+        ).logits[0, -1].asType(.float32)
+        let restoredRow = autoregressiveForward(
+            MLXArray([Int32(stream[committed])]).reshaped(1, 1), cache: restored
+        ).logits[0, -1].asType(.float32)
+        MLX.eval(currentAR, savedAR, restoredRow, serializedAR)
+        let referenceDifference = abs(currentAR - savedAR).max().item(Float.self)
+        let codecDifference = abs(currentAR - serializedAR).max().item(Float.self)
+        let difference = abs(serializedAR - restoredRow).max().item(Float.self)
+        print(
+            "[ROWEXACT-CACHE-IMPORT] reference_nonempty=\(currentAR.size > 0) ar_cross_runtime_maxdiff=\(referenceDifference) ar_codec_maxdiff=\(codecDifference) restored_maxdiff=\(difference) restored_exact=\(difference == 0) layers=\(restored.count)"
+        )
+        guard currentAR.size > 0, referenceDifference == 0 else {
+            throw NSError(
+                domain: "RowExactBench", code: 14,
+                userInfo: [NSLocalizedDescriptionKey: "INVALID: AR control differs across runtimes"]
+            )
+        }
+        return
+    }
+
     // 2. Verify windows over the same stream.
     for w in widths {
         (cache, _) = prefill()
+        let initialOffsets = cache.map(\.offset)
+        let kept = min(w, requestedCommit ?? w)
         var p = 0
         var bitwise = 0
         var compared = 0
@@ -371,10 +643,24 @@ func runRowExactBench(modelPath: String) async throws {
             }
             let rows = out.logits[0].asType(.float32)
             MLX.eval(rows)
-            guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: w, blockLength: w)
+            for layer in cache where layer.isTrimmable && kept < w {
+                guard layer.trim(w - kept) == w - kept else {
+                    throw NSError(
+                        domain: "RowExactBench", code: 8,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "INVALID: partial attention trim failed"
+                        ])
+                }
+            }
+            guard
+                staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: kept, blockLength: w)
             else {
-                print("[ROWEXACT] W=\(w) commit failed at \(p)")
-                break
+                throw NSError(
+                    domain: "RowExactBench", code: 5,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INVALID: staged commit failed at width \(w), position \(p)"
+                    ])
             }
             if p == 0 {
                 print(
@@ -400,7 +686,47 @@ func runRowExactBench(modelPath: String) async throws {
                 maxDiff = max(maxDiff, diff)
                 if argMax(got, axis: -1).item(Int.self) != stream[p + j + 1] { argmaxMiss += 1 }
             }
-            p += w
+            p += kept
+            guard
+                cache.enumerated().allSatisfy({ $0.element.offset == initialOffsets[$0.offset] + p }
+                )
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 9,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "INVALID: committed cache offset mismatch"
+                    ])
+            }
+        }
+        print("[ROWEXACT-COMMIT] width=\(w) kept=\(kept) final_offsets=\(cache.map(\.offset))")
+        if let prefix = env["BENCH_ROWEXACT_CACHE_EXPORT"] {
+            guard p > 0, p < steps else {
+                throw NSError(
+                    domain: "RowExactBench", code: 15,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INVALID: cache export needs an unconsumed AR row"
+                    ])
+            }
+            let path = prefix + "-w\(w)"
+            let arrays = TQDiskSerializer.serialize(cache: cache)
+            try MLX.save(arrays: arrays, url: URL(fileURLWithPath: path + ".safetensors"))
+            try MLX.save(
+                arrays: ["next_logits": arLogits[p]],
+                url: URL(fileURLWithPath: path + "-ar.safetensors"))
+            var meta: [String: Any] = [
+                "model": modelDir.lastPathComponent, "committed": p,
+                "boundary": prompt.dim(1) + p, "stream": stream,
+                "width": w,
+                "scope":
+                    "teacher-forced staged-prefix disk roundtrip; no natural-stop/performance certification",
+            ]
+            if let cacheSalt { meta["cache_salt"] = cacheSalt }
+            try JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys]).write(
+                to: URL(fileURLWithPath: path + ".json"))
+            print(
+                "[ROWEXACT-CACHE-EXPORT] width=\(w) committed=\(p) layers=\(cache.count) boundary=\(prompt.dim(1) + p)"
+            )
         }
         print(
             String(

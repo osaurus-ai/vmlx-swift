@@ -1,6 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXRandom
@@ -110,51 +111,179 @@ struct Qwen4ExpDenseRouterTests {
         }
     }
 
-    /// Verify rows in one router call must equal each row's 1-row AR router bit for bit (2026-10-18). A contiguous
-    /// [rows, 1, K] batch is folded by MLX into one M = rows product (`gemv_wide` on M5) and is NOT exact; the
-    /// strided view in `denseRouterRows` keeps every row on the 1-row `gemv` kernel.
+    /// Verification preserves the actual singleton-shaped AR operation graph,
+    /// including score bits near BF16 rounding boundaries and live weights.
     @Test("verify-window router rows equal the 1-row router bit for bit")
     func verifyRowsMatchOneRowRouter() throws {
         try MLXMetalTestLock.withLock {
             var cases = 0
-            var foldedMismatches = 0
-            for dtype in [DType.bfloat16, .float32] {
-                for rows in [2, 3, 4, 6, 8] {
-                    for seed in UInt64(0) ..< 3 {
-                        let window = sample(
-                            [1, rows, 2560], seed: 1_000 + seed, magnitude: 4, dtype: .bfloat16)
-                        let w = sample([512, 2560], seed: 2_000 + seed, magnitude: 0.05, dtype: dtype)
-                        guard dtype == .bfloat16 else {
-                            // F32 weights keep the per-row router (the view's F32 product is not row-exact).
-                            #expect(Qwen4ExpCompiledMoE.denseRouterRows(
-                                window, weight: w, topK: 10, normTopK: true) == nil)
-                            continue
+            for rows in [2, 3, 4, 6, 7, 8, 9, 13] {
+                for seed in UInt64(0) ..< 4 {
+                    for normalize in [false, true] {
+                        for layout in 0 ..< 3 {
+                            let window: MLXArray
+                            if layout == 1 {
+                                window =
+                                    sample(
+                                        [1, rows * 2, 2560], seed: 1_000 + seed,
+                                        magnitude: 4, dtype: .bfloat16)[0..., .stride(by: 2), 0...]
+                            } else if layout == 2 {
+                                window =
+                                    sample(
+                                        [1, rows, 5120], seed: 1_000 + seed,
+                                        magnitude: 4, dtype: .bfloat16)[0..., 0..., .stride(by: 2)]
+                            } else {
+                                window = sample(
+                                    [1, rows, 2560], seed: 1_000 + seed,
+                                    magnitude: 4, dtype: .bfloat16)
+                            }
+                            let weight = sample(
+                                [512, 2560], seed: 2_000 + seed,
+                                magnitude: 0.05, dtype: .bfloat16)
+                            let originals = [bits(window), bits(weight)]
+                            let batched = try #require(
+                                Qwen4ExpCompiledMoE.denseRouterRows(
+                                    window, weight: weight, topK: 10, normTopK: normalize))
+                            var rowIDs: [MLXArray] = []
+                            var rowScores: [MLXArray] = []
+                            for row in 0 ..< rows {
+                                let one = try #require(
+                                    Qwen4ExpCompiledMoE.denseRouter(
+                                        window[0..., row ..< (row + 1)], weight: weight,
+                                        topK: 10, normTopK: normalize))
+                                rowIDs.append(one.indices)
+                                rowScores.append(one.scores)
+                            }
+                            let expectedIDs = concatenated(rowIDs, axis: 1)
+                            let expectedScores = concatenated(rowScores, axis: 1)
+                            MLX.eval(batched.indices, batched.scores, expectedIDs, expectedScores)
+                            #expect(batched.indices.shape == [1, rows, 10])
+                            #expect(
+                                batched.indices.asArray(Int32.self)
+                                    == expectedIDs.asArray(Int32.self))
+                            #expect(
+                                bits(batched.scores) == bits(expectedScores),
+                                "rows=\(rows), seed=\(seed), normalized=\(normalize), layout=\(layout)"
+                            )
+                            #expect([bits(window), bits(weight)] == originals)
+                            cases += 1
                         }
-                        let batched = try #require(
-                            Qwen4ExpCompiledMoE.denseRouterRows(window, weight: w, topK: 10, normTopK: true))
-                        var rowIDs: [MLXArray] = [], rowScores: [MLXArray] = []
-                        for r in 0 ..< rows {
-                            let one = try #require(Qwen4ExpCompiledMoE.denseRouter(
-                                window[0..., r ..< (r + 1)], weight: w, topK: 10, normTopK: true))
-                            rowIDs.append(one.indices)
-                            rowScores.append(one.scores)
+                    }
+                }
+                let f32Weight = sample([512, 2560], seed: 42, magnitude: 0.05, dtype: .float32)
+                #expect(
+                    Qwen4ExpCompiledMoE.denseRouterRows(
+                        .zeros([1, rows, 2560], dtype: .bfloat16), weight: f32Weight,
+                        topK: 10, normTopK: true) == nil)
+            }
+            #expect(cases == 192)
+            print("[DenseRouterRows] exact_cases=\(cases) generation_tps=NA reason=no_generation")
+        }
+    }
+
+    @Test(
+        "Captured router diagnostic compares actual batched math against each AR row",
+        .enabled(if: ProcessInfo.processInfo.environment["VMLX_ROUTER_CAPTURE_FIXTURE"] != nil))
+    func capturedRouterDiagnostic() throws {
+        guard let path = ProcessInfo.processInfo.environment["VMLX_ROUTER_CAPTURE_FIXTURE"] else {
+            Issue.record("Captured diagnostic enabled without a fixture")
+            return
+        }
+        try MLXMetalTestLock.withLock {
+            let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+            let window = try #require(arrays["verify_input"])
+            let ar = try #require(arrays["ar_input"])
+            let weight = try #require(arrays["weight"])
+            let rows = window.dim(1)
+            let hidden = window.dim(2)
+            #expect(rows == 7 && hidden == 2560)
+            #expect(bits(window[0..., 2 ..< 3]) == bits(ar))
+            let view = asStrided(window, [rows, 1, hidden], strides: [hidden, 1, 1])
+            let batched = matmul(view, weight.transposed())
+            let oneRows = (0 ..< rows).map {
+                matmul(window[0..., $0 ..< ($0 + 1)], weight.transposed())
+            }
+            let one = concatenated(oneRows, axis: 0)
+            let batchSoftmax = softmax(batched, axis: -1, precise: true)
+            let oneSoftmax = concatenated(
+                oneRows.map { softmax($0, axis: -1, precise: true) }, axis: 0)
+            MLX.eval(batched, one, batchSoftmax, oneSoftmax)
+            print(
+                "[ROUTER-CAPTURE] input_dtype=\(window.dtype) weight_dtype=\(weight.dtype) matmul_equal=\(bits(batched) == bits(one)) softmax_equal=\(bits(batchSoftmax) == bits(oneSoftmax))"
+            )
+            for normalize in [false, true] {
+                let actual = try #require(
+                    Qwen4ExpCompiledMoE.denseRouterRows(
+                        window, weight: weight, topK: 10, normTopK: normalize))
+                let references = try (0 ..< rows).map { row in
+                    try #require(
+                        Qwen4ExpCompiledMoE.denseRouter(
+                            window[0..., row ..< (row + 1)], weight: weight, topK: 10,
+                            normTopK: normalize))
+                }
+                let ids = concatenated(references.map(\.indices), axis: 1)
+                let scores = concatenated(references.map(\.scores), axis: 1)
+                MLX.eval(actual.indices, actual.scores, ids, scores)
+                print(
+                    "[ROUTER-CAPTURE] normalized=\(normalize) ids_equal=\(bits(actual.indices) == bits(ids)) scores_equal=\(bits(actual.scores) == bits(scores))"
+                )
+                #expect(bits(actual.indices) == bits(ids))
+                #expect(bits(actual.scores) == bits(scores))
+            }
+        }
+    }
+
+    @Test(
+        "Opt-in router timing retains alternating correct-reference controls",
+        .enabled(if: ProcessInfo.processInfo.environment["VMLX_ROUTER_TIMING"] == "1"))
+    func alternatingRouterTiming() throws {
+        try MLXMetalTestLock.withLock {
+            let path = try #require(
+                ProcessInfo.processInfo.environment["VMLX_ROUTER_CAPTURE_FIXTURE"])
+            let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+            let captured = try #require(arrays["verify_input"])
+            let weight = try #require(arrays["weight"])
+            for rows in [2, 4, 6, 8] {
+                let window = concatenated([captured, captured], axis: 1)[0..., 0 ..< rows]
+                func run(_ candidate: Bool) throws -> (indices: MLXArray, scores: MLXArray) {
+                    if candidate {
+                        return try #require(
+                            Qwen4ExpCompiledMoE.denseRouterRows(
+                                window, weight: weight, topK: 10, normTopK: true))
+                    }
+                    let outputs = try (0 ..< rows).map { row in
+                        try #require(
+                            Qwen4ExpCompiledMoE.denseRouter(
+                                window[0..., row ..< (row + 1)], weight: weight,
+                                topK: 10, normTopK: true))
+                    }
+                    return (
+                        concatenated(outputs.map(\.indices), axis: 1),
+                        concatenated(outputs.map(\.scores), axis: 1)
+                    )
+                }
+                let reference = try run(false)
+                let candidate = try run(true)
+                MLX.eval(reference.indices, reference.scores, candidate.indices, candidate.scores)
+                #expect(reference.scores.size > 0)
+                #expect(bits(reference.indices) == bits(candidate.indices))
+                #expect(bits(reference.scores) == bits(candidate.scores))
+                for probe in 0 ..< 8 {
+                    for candidate in (probe.isMultiple(of: 2) ? [false, true] : [true, false]) {
+                        let startUnix = Date().timeIntervalSince1970
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        for _ in 0 ..< 1000 {
+                            let output = try run(candidate)
+                            MLX.eval(output.indices, output.scores)
                         }
-                        let expectedIDs = concatenated(rowIDs, axis: 1)
-                        let expectedScores = concatenated(rowScores, axis: 1)
-                        let folded = matmul(window.reshaped(rows, 1, 2560), w.transposed())
-                        let perRowLogits = concatenated(
-                            (0 ..< rows).map { matmul(window[0..., $0 ..< ($0 + 1)], w.transposed()) }, axis: 0)
-                        MLX.eval(batched.indices, batched.scores, expectedIDs, expectedScores, folded, perRowLogits)
-                        #expect(batched.indices.shape == [1, rows, 10])
-                        #expect(batched.indices.asArray(Int32.self) == expectedIDs.asArray(Int32.self))
-                        #expect(bits(batched.scores) == bits(expectedScores))
-                        if bits(folded) != bits(perRowLogits) { foldedMismatches += 1 }
-                        cases += 1
+                        let nanos = DispatchTime.now().uptimeNanoseconds - start
+                        let endUnix = Date().timeIntervalSince1970
+                        print(
+                            "[ROUTER-TIMING] rows=\(rows) probe=\(probe) candidate=\(candidate) iterations=1000 ns=\(nanos) start_unix=\(startUnix) end_unix=\(endUnix) discard=\(probe == 0) generation_tps=NA"
+                        )
                     }
                 }
             }
-            #expect(cases == 15)
-            print("[DenseRouterRows] exact_cases=\(cases) contiguous_batch_logit_mismatches=\(foldedMismatches)")
         }
     }
 
