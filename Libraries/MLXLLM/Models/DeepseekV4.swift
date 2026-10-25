@@ -167,6 +167,13 @@ class DeepseekV4RoPE: Module {
 
 // MARK: - Attention (MLA with sinks + inverse RoPE + grouped O)
 
+/// DeepSeek-V4.1 shared compress-KV across a forward: kv_source layers write their pool here and
+/// non-kv-source compress_ratio>0 layers read it (ref `SharedAttentionRuntime.compress_kv`). One
+/// instance per forward, threaded through the decoder layers.
+final class DSV41CompressShare {
+    var pool: DeepseekV4PoolView?
+}
+
 class DeepseekV4Attention: Module {
     let config: DeepseekV4Configuration
     let layerIdx: Int
@@ -344,7 +351,8 @@ class DeepseekV4Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        compressShare: DSV41CompressShare? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -419,9 +427,19 @@ class DeepseekV4Attention: Module {
         if compressRatio > 0 {
             let v4Cache = cache as? DeepseekV4Cache
             if v4Cache != nil || L >= compressRatio {
+                // kv_source layers own a compressor and compute the pool, then publish it to the
+                // shared holder; non-kv-source ratio>0 layers (V4.1) have no compressor and READ that
+                // shared pool (ref: compress_kv is produced only at kv_source layers, consumed by the
+                // rest). For DSV4 (no sharing) every ratio>0 layer has its own compressor.
+                let pooledViewOpt: DeepseekV4PoolView?
                 if let comp = compressor {
-                    let pooledView = comp(
-                        x, rope: rope, v4Cache: v4Cache, startPos: offset)
+                    let pv = comp(x, rope: rope, v4Cache: v4Cache, startPos: offset)
+                    compressShare?.pool = pv
+                    pooledViewOpt = pv
+                } else {
+                    pooledViewOpt = compressShare?.pool
+                }
+                if let pooledView = pooledViewOpt {
                     // pooled shape: (B, W, headDim) where W = pooled count.
                     let W = pooledView.rowCount
                     var topK: MLXArray? = nil
@@ -1182,7 +1200,8 @@ class DeepseekV4DecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         inputIds: MLXArray?,
-        preMix: MLXArray
+        preMix: MLXArray,
+        compressShare: DSV41CompressShare? = nil
     ) -> (h: MLXArray, ffnPre: MLXArray) {
         // ---- Attention HC (collapse with INCOMING preMix) ----
         let residualA = h
@@ -1198,12 +1217,12 @@ class DeepseekV4DecoderLayer: Module {
                 let e = min(s + sub, chunkLen)
                 let xs = normedA[0..., s ..< e]
                 let subMask = createAttentionMask(h: xs, cache: cache)
-                outs.append(selfAttn(xs, mask: subMask, cache: cache))
+                outs.append(selfAttn(xs, mask: subMask, cache: cache, compressShare: compressShare))
                 s = e
             }
             attnOut = concatenated(outs, axis: 1)
         } else {
-            attnOut = selfAttn(normedA, mask: mask, cache: cache)
+            attnOut = selfAttn(normedA, mask: mask, cache: cache, compressShare: compressShare)
         }
         let hA = attnHC.expand(blockOut: attnOut, residual: residualA, post: aPost, comb: aComb)
         // ---- FFN HC (collapse with THIS attention's aPre) ----
@@ -1421,11 +1440,13 @@ public class DeepseekV4ModelInner: Module {
             var preMix = concatenated(
                 [MLXArray.ones([B, L, 1]), MLXArray.zeros([B, L, config.hcMult - 1])], axis: -1)
                 .asType(.float32)
+            // Shared compress-KV holder: kv_source layers publish their pool, later ratio>0 layers read it.
+            let compressShare = DSV41CompressShare()
             for (i, layer) in layers.enumerated() {
                 if let eng = layer.engram, let rows = engramRows[i] {
                     h = eng(h, rows: rows, textMask: nil)
                 }
-                let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix)
+                let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
                 preMix = r.ffnPre
                 if ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil {
