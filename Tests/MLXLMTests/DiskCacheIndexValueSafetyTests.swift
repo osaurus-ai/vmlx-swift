@@ -768,7 +768,9 @@ extension DiskCacheCompanionAccountingTests {
                 defer { chmod(url.path, 0o644) }
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (first, log) = try Support.capturingRuntimeDiagnostics { disk.fetch(tokens: tokens) }
+                let (first, log) = try Support.capturingRuntimeDiagnostics {
+                    disk.fetch(tokens: tokens)
+                }
                 #expect(first == nil)
                 #expect(disk.fetch(tokens: tokens) == nil)
                 guard case .regularFile(let size, _) = DiskCache.pathState(at: url) else {

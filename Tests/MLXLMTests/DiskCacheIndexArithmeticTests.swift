@@ -583,7 +583,8 @@ extension DiskCacheCompanionAccountingTests {
 
                 let raw = try RawDB(root: root)
                 try raw.require(
-                    "UPDATE cache_entries SET file_size = '-9000000000abc' WHERE hash = '\(hashes[1])'")
+                    "UPDATE cache_entries SET file_size = '-9000000000abc' WHERE hash = '\(hashes[1])'"
+                )
                 try raw.require(
                     """
                     UPDATE cache_entries SET file_size = CAST('-9000000000' AS BLOB)
@@ -1117,7 +1118,9 @@ extension DiskCacheCompanionAccountingTests {
                 let blocker = try RawDB(root: root)
                 try blocker.require("BEGIN IMMEDIATE")
                 DiskCache.resetRateLimitedReportsForTesting()
-                _ = try Support.capturingRuntimeDiagnostics { coordinator.enforceCombinedDiskQuota() }
+                _ = try Support.capturingRuntimeDiagnostics {
+                    coordinator.enforceCombinedDiskQuota()
+                }
                 try blocker.require("ROLLBACK")
                 try #require(disk.retireAttemptsForTesting == 1, "INVALID: no failed attempt")
                 try #require(try Self.hostileRowCount(root) == 1)
@@ -1169,7 +1172,8 @@ extension DiskCacheCompanionAccountingTests {
                 let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
-                try #require(try Self.hostileRowCount(root) == 1, "INVALID: the trigger did not hold")
+                try #require(
+                    try Self.hostileRowCount(root) == 1, "INVALID: the trigger did not hold")
                 let lines = Self.retireFailureLines(log)
                 try #require(lines.count == 1, "INVALID: no retire failure was logged: \(log)")
                 let line = String(lines[0])
