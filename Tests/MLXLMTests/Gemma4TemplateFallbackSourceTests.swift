@@ -26,8 +26,9 @@ struct Gemma4TemplateFallbackSourceTests {
             !source.contains("if isGemma {\n                                throw error\n                            }"),
             "Gemma native Jinja runtime errors must not bypass built-in Gemma fallbacks."
         )
-        #expect(source.contains("let gemmaToolSchemasPresent"))
-        #expect(source.contains("chat-template tools -> Gemma4WithTools fallback engaged"))
+        #expect(!source.contains("let gemmaToolSchemasPresent"),
+            "Offering tool schemas must not bypass a valid native bundle template")
+        #expect(!source.contains("chat-template tools -> Gemma4WithTools fallback engaged"))
         #expect(source.contains(#""Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools"#))
         #expect(source.contains(#""Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal"#))
     }
@@ -74,7 +75,7 @@ struct Gemma4TemplateFallbackSourceTests {
     @Test
     func gemmaRequiredToolFallbackKeepsUserTurnContract() throws {
         let template = try Template(ChatTemplateFallbacks.gemma4WithTools)
-        let rendered = try template.renderGemma4([
+        var context: [String: any Sendable] = [
             "messages": [
                 [
                     "role": "user",
@@ -101,29 +102,67 @@ struct Gemma4TemplateFallbackSourceTests {
             "tool_choice": "required",
             "tool_choice_name": "line_count",
             "add_generation_prompt": true,
-        ])
+        ]
+        let rendered = try template.renderGemma4(context)
+        context["tool_choice"] = "auto"
+        context.removeValue(forKey: "tool_choice_name")
+        let automatic = try template.renderGemma4(context)
 
         #expect(rendered.contains("<|tool>declaration:line_count"))
-        #expect(rendered.contains("Tool use is REQUIRED for this assistant turn."))
-        #expect(rendered.contains("Use exactly this function name: line_count"))
-        #expect(rendered.contains("Required arguments: text"))
-        #expect(rendered.contains("Required call shape for the current request"))
-        #expect(rendered.components(separatedBy: "Tool use is REQUIRED for this assistant turn.").count == 2)
-        #expect(rendered.contains("""
-            <|tool_call>call:line_count{text:<|"|>red
-            green
-            blue<|"|>}<tool_call|>
-            """))
-        #expect(!rendered.contains(#"Do not replace \n with a physical newline"#))
-        let currentShapeRange = try #require(rendered.range(of: "Required call shape for the current request"))
-        let userContentRange = try #require(rendered.range(of: "Use the line_count tool on this exact text: red\ngreen\nblue"))
-        #expect(currentShapeRange.lowerBound < userContentRange.lowerBound)
-        let instructionRange = try #require(rendered.range(of: "Tool use is REQUIRED for this assistant turn."))
-        #expect(instructionRange.lowerBound < userContentRange.lowerBound)
+        #expect(rendered == automatic, "Tool choice is validated at response completion, not by rewriting prompts")
+        for injected in ["Tool use is REQUIRED", "Use exactly this function name", "Required arguments:",
+            "Required call shape for the current request", "Copy the `text` value exactly"] {
+            #expect(!rendered.contains(injected))
+        }
+        #expect(!rendered.contains("<|tool_call>call:line_count{"),
+            "The runtime must not invent an assistant call from user text")
         #expect(!rendered.contains("FUNCTION_NAME"))
         #expect(!rendered.contains("ARGUMENT_NAME"))
         #expect(!rendered.contains("VALUE_FOR_text"))
         #expect(rendered.contains("Use the line_count tool on this exact text: red\ngreen\nblue"))
         #expect(rendered.hasSuffix("<|turn>model\n"))
+    }
+
+    @Test
+    func fallbackVariantsKeepMediaAndCompletedToolHistoryAcrossChoices() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let sidecar = try String(contentsOf: root.appendingPathComponent(
+            "Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja"), encoding: .utf8)
+        let messages: [[String: any Sendable]] = [
+            ["role": "user", "content": [
+                ["type": "text", "text": "Original media question."],
+                ["type": "image"], ["type": "audio"], ["type": "video"],
+            ]],
+            ["role": "assistant", "content": "Earlier narration.", "tool_calls": [[
+                "function": ["name": "line_count", "arguments": ["text": "earlier\ninput"]] as [String: any Sendable],
+            ]]],
+            ["role": "tool", "name": "line_count", "content": "Earlier result: 2."],
+            ["role": "user", "content": "Use line_count on this exact text: current\ninput"],
+        ]
+        let tools: [[String: any Sendable]] = [[
+            "function": ["name": "line_count", "parameters": ["type": "object",
+                "properties": ["text": ["type": "string"]], "required": ["text"]] as [String: any Sendable]] as [String: any Sendable],
+        ]]
+        var baseline: String?
+        for source in [ChatTemplateFallbacks.gemma4WithTools, sidecar] {
+            let template = try Template(source)
+            for choice in ["auto", "required"] {
+                for named in [false, true] where choice == "required" || !named {
+                    var context: [String: any Sendable] = ["bos_token": "<bos>", "messages": messages,
+                        "tools": tools, "tool_choice": choice, "add_generation_prompt": true]
+                    if named { context["tool_choice_name"] = "line_count" }
+                    let rendered = try template.renderGemma4(context)
+                    if let baseline { #expect(rendered == baseline) } else { baseline = rendered }
+                    for original in ["Original media question.", "Earlier narration.", "earlier\ninput",
+                        "Earlier result: 2.", "Use line_count on this exact text: current\ninput",
+                        "<|image|>", "<|audio|>", "<|video|>", "<|tool_call>call:line_count{"] {
+                        #expect(rendered.contains(original))
+                    }
+                    #expect(!rendered.contains("Tool use is REQUIRED"))
+                    #expect(!rendered.contains("Required call shape for the current request"))
+                }
+            }
+        }
     }
 }

@@ -110,84 +110,6 @@ public enum ChatTemplateFallbacks {
         {{- arguments -}}
     {%- endif -%}
 {%- endmacro -%}
-{%- set required_tool_choice = false -%}
-{%- set required_tool_name = '' -%}
-{%- if tool_choice is defined and tool_choice == 'required' -%}
-    {%- set required_tool_choice = true -%}
-{%- elif additionalContext is defined and additionalContext['tool_choice'] == 'required' -%}
-    {%- set required_tool_choice = true -%}
-{%- endif -%}
-{%- if tool_choice_name is defined -%}
-    {%- set required_tool_name = tool_choice_name -%}
-{%- elif additionalContext is defined and additionalContext['tool_choice_name'] is defined -%}
-    {%- set required_tool_name = additionalContext['tool_choice_name'] -%}
-{%- endif -%}
-{%- if required_tool_choice and not required_tool_name and tools is iterable and tools | length == 1 -%}
-    {%- set only_required_tool = tools[0]['function'] if tools[0]['function'] is defined else tools[0] -%}
-    {%- if only_required_tool['name'] is defined -%}
-        {%- set required_tool_name = only_required_tool['name'] -%}
-    {%- endif -%}
-{%- endif -%}
-{%- macro render_required_tool_choice_instruction(latest_user_content='') -%}
-    {%- set latest_user_text = render_content(latest_user_content) -%}
-    {{- '\nTool use is REQUIRED for this assistant turn. Reply only with one native Gemma4 tool call and no prose, reasoning text, markdown, or channel markers.' -}}
-    {%- if required_tool_name -%}
-        {{- '\nUse exactly this function name: ' + required_tool_name -}}
-        {%- for tool in tools -%}
-            {%- set selected_tool = tool['function'] if tool['function'] is defined else tool -%}
-            {%- if selected_tool['name'] == required_tool_name and selected_tool['parameters'] is defined and selected_tool['parameters']['required'] is defined -%}
-                {{- '\nRequired arguments: ' + (selected_tool['parameters']['required'] | join(', ')) -}}
-                {%- for param_name in selected_tool['parameters']['required'] -%}
-                    {%- set exact = namespace(value='') -%}
-                    {%- set exact_markers = [
-                        'on this exact ' ~ param_name ~ ':',
-                        'On this exact ' ~ param_name ~ ':',
-                        'this exact ' ~ param_name ~ ':',
-                        'This exact ' ~ param_name ~ ':',
-                        'exact ' ~ param_name ~ ':',
-                        'Exact ' ~ param_name ~ ':',
-                        'on exactly this ' ~ param_name ~ ':',
-                        'On exactly this ' ~ param_name ~ ':',
-                        'exactly this ' ~ param_name ~ ':',
-                        'Exactly this ' ~ param_name ~ ':',
-                        'on this exact text:',
-                        'On this exact text:',
-                        'this exact text:',
-                        'This exact text:',
-                        'exact text:',
-                        'Exact text:',
-                        'on exactly this text:',
-                        'On exactly this text:',
-                        'exactly this text:',
-                        'Exactly this text:',
-                        'use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
-                        'Use ' ~ required_tool_name ~ ' on exactly this text, preserving newlines:',
-                        'use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
-                        'Use the ' ~ required_tool_name ~ ' tool on exactly this text, preserving newlines:',
-                        'now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
-                        'Now use ' ~ required_tool_name ~ ' on exactly this new text, preserving newlines:',
-                        'now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
-                        'Now use the ' ~ required_tool_name ~ ' tool on exactly this new text, preserving newlines:',
-                        'preserving newlines:'
-                    ] -%}
-                    {%- for marker in exact_markers -%}
-                        {%- if not exact.value and latest_user_text is string and marker in latest_user_text -%}
-                            {%- set exact.value = latest_user_text.split(marker)[1] | trim -%}
-                        {%- endif -%}
-                    {%- endfor -%}
-                    {%- if exact.value -%}
-                        {%- set exact_escaped = exact.value | replace("\\", "\\\\") | replace("\t", "\\t") -%}
-                        {{- '\nRequired call shape for the current request:\n<|tool_call>call:' + required_tool_name + '{' + param_name + ':<|"|>' + exact_escaped + '<|"|>}<tool_call|>' -}}
-                    {%- else -%}
-                        {{- '\nCopy the `' + param_name + '` value exactly from the current user request. Do not invent placeholders, summaries, or prior-turn text.' -}}
-                    {%- endif -%}
-                {%- endfor -%}
-            {%- endif -%}
-        {%- endfor -%}
-    {%- else -%}
-        {{- '\nUse exactly one declared function.' -}}
-    {%- endif -%}
-{%- endmacro -%}
 {%- if (tools or (messages[0]['role'] in ['system', 'developer'])) -%}
     {{- '<|turn>system\n' -}}
     {%- if messages[0]['role'] in ['system', 'developer'] -%}
@@ -252,11 +174,6 @@ public enum ChatTemplateFallbacks {
         {{- '}<tool_response|>\n' -}}
     {%- else -%}
         {{- '<|turn>' + role + '\n' -}}
-        {%- if message['role'] == 'user' and required_tool_choice and loop.last -%}
-            {%- set latest_required_user_content = message['content'] if message['content'] is string else '' -%}
-            {{- render_required_tool_choice_instruction(latest_required_user_content) -}}
-            {{- '\n' -}}
-        {%- endif -%}
         {%- if message['content'] -%}
             {{- render_content(message['content']) -}}
         {%- endif -%}

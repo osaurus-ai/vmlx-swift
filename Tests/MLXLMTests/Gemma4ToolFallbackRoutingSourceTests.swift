@@ -4,26 +4,10 @@
 import Foundation
 import Testing
 
-/// Pins the Gemma-4 tool-template routing condition.
-///
-/// The fallback that swaps a bundle onto `gemma4WithTools` must key on Gemma-4's OWN tool
-/// sentinels, never on `bosToken == "<bos>"`. `<bos>` is not a Gemma marker:
-///
-/// | bundle | bos | `<\|tool_call>` | `<\|turn>` |
-/// |---|---|---|---|
-/// | `gemma-4-12B-it-MXFP8` | `<bos>` | yes | yes |
-/// | `gemma-4-26B-A4B-it-qat-JANG_4M` | `<bos>` | yes | yes |
-/// | `ZAYA1-VL-8B-JANGTQ_K` | `<bos>` | **no** | **no** |
-///
-/// ZAYA1-VL is ChatML (`<bos><|im_start|>system …`). Routing on `<bos>` alone swapped it onto the
-/// Gemma turn-marker template the moment tools were offered, so its prompt arrived as
-/// `<|turn>model … <turn|>` instead of `<|im_start|>assistant`. The model echoed that alien format
-/// back as literal text (`<|turn>user`) and emitted no tool call — on both shipped quants, and only
-/// ever on tool turns. Verified live through `VMLX_CHAT_TEMPLATE_FALLBACK_LOG=1`:
-/// `chat-template tools -> Gemma4WithTools fallback engaged` on Zaya before the fix, absent after,
-/// while gemma-4-12B still engages it and passes the full variating pattern including
-/// image+tools in one turn.
-@Suite("Gemma-4 tool fallback routes on sentinels, not <bos>")
+/// A valid bundle template owns the prompt even on tool turns. Failure-only
+/// fallback selection must still require exact Gemma markers: ZAYA also uses
+/// `<bos>` but has a different ChatML/template contract.
+@Suite("Gemma-4 native-first tool template routing")
 struct Gemma4ToolFallbackRoutingSourceTests {
 
     private func macroSource() throws -> String {
@@ -32,16 +16,15 @@ struct Gemma4ToolFallbackRoutingSourceTests {
             encoding: .utf8)
     }
 
-    @Test("routing requires the Gemma-4 sentinels")
-    func routingRequiresSentinels() throws {
+    @Test("tool availability never selects a fallback before native rendering")
+    func validNativeTemplateHasPriority() throws {
         let source = try macroSource()
-        #expect(
-            source.contains(
-                """
-                !(chatTemplateTools?.isEmpty ?? true)
-                                            && hasGemma4NativeToolSentinels
-                """),
-            "the Gemma-4 tool fallback must gate on hasGemma4NativeToolSentinels")
+        #expect(!source.contains("gemmaToolSchemasPresent"))
+        #expect(!source.contains("chat-template tools -> Gemma4WithTools fallback engaged"))
+        #expect(source.components(separatedBy: "let isGemma = hasGemma4NativeToolSentinels").count == 3,
+            "Both generation-prompt variants must use exact markers only inside failure handling")
+        #expect(source.components(separatedBy: "if hasGemma4NativeToolSentinels {").count == 3,
+            "Both missing-template handlers must retain family-specific structural fallbacks")
     }
 
     @Test("<bos> alone can never select the Gemma-4 tool template")
