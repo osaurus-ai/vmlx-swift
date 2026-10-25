@@ -1369,12 +1369,86 @@ public class DeepseekV4ModelInner: Module {
     @ModuleInfo(key: "hc_head") var hcHead: DeepseekV4HyperHead
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
-    /// DeepSeek-V4.1 Engram runtime (aux hashing tables + disk FP8 n-gram tables + per-sequence
-    /// hashers). Lazily located from VMLX_DSV41_ENGRAM_DIR on first forward; nil when the bundle has
-    /// no engram layers or the env var is unset (then the n-gram taps are skipped).
-    private var engramRuntime: EngramRuntime?
-    private var engramInit = false
+    /// DeepSeek-V4.1 Engram runtime (aux hashing tables + disk FP8 n-gram tables). Resolved from the
+    /// bundle directory at load (`configureEngram(modelDirectory:)`, called by the model factory),
+    /// which throws when a V4.1 bundle's tables are missing. Immutable after load: the per-sequence
+    /// n-gram history lives in the sequence's KV cache, so concurrent forwards share it safely.
+    private(set) var engramRuntime: EngramRuntime?
     private let engramLock = NSLock()
+
+    /// History fallback for cache lists without a `DeepseekV4Cache` (e.g. `DSV4_KV_MODE=full`),
+    /// keyed WEAKLY by the first cache object so an ended sequence's entry disappears with it and a
+    /// reused address can never inherit another conversation's history.
+    private let engramFallbackHistory = NSMapTable<AnyObject, DeepseekV4Cache>.weakToStrongObjects()
+
+    /// Hoisted per-token debug switch (was an environment read per layer per token).
+    private static let layerDebugEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil
+
+    func configureEngram(modelDirectory: URL) throws {
+        guard !config.engramLayerIds.isEmpty else { return }
+        let runtime = try EngramRuntime(modelDirectory: modelDirectory, config: config)
+        engramLock.lock()
+        engramRuntime = runtime
+        engramLock.unlock()
+    }
+
+    /// Engram rows for this chunk. History comes from (and is written back to) the cache, never
+    /// from model state, so restores/copies/trims hash exactly like an uninterrupted sequence.
+    private func engramChunk(_ inputs: MLXArray, cache: [KVCache]?) -> EngramRuntime.Chunk? {
+        guard !config.engramLayerIds.isEmpty else { return nil }
+        engramLock.lock()
+        if engramRuntime == nil,
+            let dir = ProcessInfo.processInfo.environment["VMLX_DSV41_ENGRAM_DIR"]
+        {
+            engramRuntime = try? EngramRuntime(
+                modelDirectory: URL(fileURLWithPath: dir), config: config)
+        }
+        let runtime = engramRuntime
+        engramLock.unlock()
+        guard let runtime else {
+            fatalError(
+                "DeepSeek-V4.1 engram tables are not configured. Load the bundle through "
+                    + "LLMModelFactory (which resolves <bundle>/engram) or call "
+                    + "DeepseekV4Model.configureBundle(modelDirectory:) before the first forward.")
+        }
+        precondition(inputs.dim(0) == 1, "DeepSeek-V4.1 engram hashing is batch-1 per sequence")
+
+        let startPos = cache?.first?.offset ?? 0
+        let ids = inputs.reshaped(-1).asType(.int32).asArray(Int32.self)
+        let comp = runtime.hasher.compress(ids)
+
+        var holder = cache?.first(where: { $0 is DeepseekV4Cache }) as? DeepseekV4Cache
+        if holder == nil, let first = cache?.first {
+            engramLock.lock()
+            if let existing = engramFallbackHistory.object(forKey: first as AnyObject) {
+                holder = existing
+            } else {
+                let box = DeepseekV4Cache(slidingWindow: 1, compressRatio: 1)
+                engramFallbackHistory.setObject(box, forKey: first as AnyObject)
+                holder = box
+            }
+            engramLock.unlock()
+        }
+
+        let reach = min(runtime.hasher.historyReach, startPos)
+        var previous: [Int64] = []
+        if reach > 0 {
+            if let tail = holder?.auxiliaryTokens(before: startPos, count: reach) {
+                previous = tail.map(Int64.init)
+            } else {
+                // Only reachable when a cache arrived at offset>0 without its history through a
+                // path that does not carry it (the disk tier refuses such records). Loud, not silent.
+                NSLog(
+                    "VMLX DSV4.1 engram: n-gram history missing before position \(startPos); the first "
+                        + "\(reach) token(s) of this chunk hash with pad history (cache restored without "
+                        + "its engram tail).")
+            }
+        }
+        let chunk = runtime.prepare(comp: comp, startPos: startPos, previous: previous)
+        holder?.recordAuxiliaryTokens(comp.map { Int32(truncatingIfNeeded: $0) }, startPos: startPos)
+        return chunk
+    }
 
     init(config: DeepseekV4Configuration) {
         self.config = config
@@ -1411,21 +1485,9 @@ public class DeepseekV4ModelInner: Module {
                 chunkTokens: chunkTokens,
                 finalContextTokens: (firstCache?.offset ?? 0) + chunkTokens)
 
-        // DeepSeek-V4.1 Engram n-gram rows for this chunk (one lookup set shared by all engram layers).
-        var engramRows: [Int: MLXArray] = [:]
-        if !config.engramLayerIds.isEmpty {
-            engramLock.lock()
-            if !engramInit { engramRuntime = EngramRuntime.locate(); engramInit = true }
-            let rt = engramRuntime
-            engramLock.unlock()
-            if let rt {
-                let startPos = firstCache?.offset ?? 0
-                let ids = inputs.reshaped(-1).asType(.int32).asArray(Int32.self)
-                let key = firstCache.map { ObjectIdentifier($0 as AnyObject) }
-                    ?? ObjectIdentifier(self)
-                engramRows = rt.rows(inputIds: ids, startPos: startPos, cacheKey: key, reset: startPos == 0)
-            }
-        }
+        // DeepSeek-V4.1 Engram n-gram rows for this chunk (one hash set shared by all engram layers;
+        // deeper layers' table reads overlap the forward of the layers before them).
+        let engramRows = engramChunk(inputs, cache: cache)
 
         let staggeredMHC = !config.engramLayerIds.isEmpty  // DeepSeek-V4.1 threads a staggered hc pre_mix
 
@@ -1443,13 +1505,16 @@ public class DeepseekV4ModelInner: Module {
             // Shared compress-KV holder: kv_source layers publish their pool, later ratio>0 layers read it.
             let compressShare = DSV41CompressShare()
             for (i, layer) in layers.enumerated() {
-                if let eng = layer.engram, let rows = engramRows[i] {
+                if let eng = layer.engram {
+                    guard let rows = engramRows?.rows(layer: i) else {
+                        fatalError("DeepSeek-V4.1 engram rows missing for engram layer \(i)")
+                    }
                     h = eng(h, rows: rows, textMask: nil)
                 }
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
                 preMix = r.ffnPre
-                if ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil {
+                if Self.layerDebugEnabled {
                     let ma = MLX.abs(h.asType(.float32)).mean(); MLX.eval(ma)
                     NSLog("VMLX-DBG layer\(i) out.meanAbs=\(ma.item(Float.self))")
                 }
@@ -1587,10 +1652,23 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     /// can set global TQ defaults for ordinary KV models; DSV4 must keep
     /// its SWA+CSA+HSA hybrid cache unless the operator explicitly opts
     /// into the diagnostic/simple-cache override via `DSV4_KV_MODE=tq`.
+    /// Resolve bundle-side runtime state that is not part of the safetensors weights. For
+    /// DeepSeek-V4.1 this locates and validates the disk-resident Engram tables (throws when they
+    /// are missing — the model cannot produce correct output without them). No-op for DSV4-0731.
+    public func configureBundle(modelDirectory: URL) throws {
+        try model.configureEngram(modelDirectory: modelDirectory)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let mode: String = envMode ?? "sliding"
+        // DeepSeek-V4.1: the first compressed layer's cache carries the Engram n-gram history.
+        let engramHistoryHolder: Int? = config.engramLayerIds.isEmpty
+            ? nil
+            : (0..<config.numHiddenLayers).first {
+                config.compressRatios.count > $0 && config.compressRatios[$0] > 0
+            }
 
         return (0..<config.numHiddenLayers).map { layerIdx in
             switch mode {
@@ -1606,7 +1684,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 if cr > 0 {
                     return DeepseekV4Cache(
                         slidingWindow: config.slidingWindow,
-                        compressRatio: cr)
+                        compressRatio: cr,
+                        requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder)
                 }
                 return RotatingKVCache(
                     maxSize: config.slidingWindow, keep: 0)

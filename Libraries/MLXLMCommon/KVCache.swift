@@ -164,6 +164,41 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     /// Per-branch incomplete-window buffer state.
     func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?)
     func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?)
+
+    /// Model-owned per-sequence token history that must travel with the
+    /// cache (DeepSeek-V4.1 Engram n-gram tail). `nil` for every other
+    /// family. Copies, trims and disk round-trips carry it so a restored
+    /// prefix hashes its suffix exactly like an uninterrupted run.
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? { get set }
+
+    /// True when a restored layer is only valid together with
+    /// ``auxiliaryTokenHistory`` covering its offset. A disk record that
+    /// lacks it is refused (re-prefill) instead of guessing the history.
+    var requiresAuxiliaryTokenHistory: Bool { get }
+}
+
+/// Trailing token history for ``HybridPoolCache/auxiliaryTokenHistory``:
+/// `tokens[k]` belongs to absolute position `endPosition - tokens.count + k`.
+public struct HybridPoolTokenHistory: Sendable, Equatable {
+    public var endPosition: Int
+    public var tokens: [Int32]
+
+    public init(endPosition: Int, tokens: [Int32]) {
+        self.endPosition = endPosition
+        self.tokens = tokens
+    }
+
+    /// First absolute position covered.
+    public var startPosition: Int { endPosition - tokens.count }
+}
+
+public extension HybridPoolCache {
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? {
+        get { nil }
+        set {}
+    }
+
+    var requiresAuxiliaryTokenHistory: Bool { false }
 }
 
 /// One independently encoded row segment from a DSV4 compressor/indexer pool.

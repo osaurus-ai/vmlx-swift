@@ -1950,6 +1950,12 @@ public final class LLMModelFactory: ModelFactory {
         if let mimo = model as? MiMoV26TextModel {
             try mimo.configure(modelDirectory: modelDirectory)
         }
+        // DeepSeek-V4.1: resolve + validate the disk-resident Engram tables from the bundle
+        // (config.json runtime.engram_dir, default <bundle>/engram). Throws at load when a V4.1
+        // bundle's tables are missing instead of decoding garbage. No-op for DSV4-0731.
+        if let dsv4 = model as? DeepseekV4Model {
+            try dsv4.configureBundle(modelDirectory: modelDirectory)
+        }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig =

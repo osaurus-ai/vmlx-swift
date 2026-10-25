@@ -1667,6 +1667,14 @@ private func canRestoreDeepseekV4Layer(
     if comp.quantizedPoolComp != nil || comp.quantizedPoolIdx != nil {
         guard layer is QuantizedHybridPoolCache else { return false }
     }
+    // DeepSeek-V4.1: a prefix is only reusable with the Engram n-gram tail
+    // that ends exactly at its offset. Refuse (re-prefill) rather than let
+    // the suffix hash against a guessed/padded history.
+    if hybrid.requiresAuxiliaryTokenHistory, comp.offset > 0 {
+        guard let history = comp.auxiliaryTokenHistory,
+              history.endPosition == comp.offset
+        else { return false }
+    }
     return true
 }
 
@@ -1705,6 +1713,10 @@ private func restoreDeepseekV4Layer(
         hybrid.setHybridBuffers(
             branch: .indexer,
             kv: comp.bufIdxKV, gate: comp.bufIdxGate)
+        if hybrid.requiresAuxiliaryTokenHistory || comp.auxiliaryTokenHistory != nil {
+            var mutable = hybrid
+            mutable.auxiliaryTokenHistory = comp.auxiliaryTokenHistory
+        }
         return true
     }
     return apply(hybrid)

@@ -743,11 +743,22 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// KV: the rotating local K/V cache remains in its model-selected dtype.
     public let hybridPoolQuantizationEnabled: Bool
 
+    /// DeepSeek-V4.1 Engram n-gram history (compressed token ids) for the
+    /// sequence this cache belongs to — the Swift analog of the reference
+    /// `Session.history`. Only the designated holder layer of a V4.1 cache
+    /// list carries it; it is nil for every DSV4-0731 cache. Bounded to the
+    /// most recent ``auxiliaryTokenHistoryCapacity`` positions (an n-gram
+    /// reaches back `max_ngram_size - 1` tokens; the slack absorbs trims).
+    public var auxiliaryTokenHistory: HybridPoolTokenHistory?
+    public let requiresAuxiliaryTokenHistory: Bool
+    public static let auxiliaryTokenHistoryCapacity = 1024
+
     public init(
         slidingWindow: Int,
         compressRatio: Int,
         poolQuantizationEnabled: Bool? = nil,
-        poolBF16HotByteLimit: Int? = nil
+        poolBF16HotByteLimit: Int? = nil,
+        requiresAuxiliaryTokenHistory: Bool = false
     ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         let quantizationEnabled = poolQuantizationEnabled
@@ -764,6 +775,34 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             quantizationEnabled: quantizationEnabled,
             hotByteLimit: hotByteLimit)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
+        self.requiresAuxiliaryTokenHistory = requiresAuxiliaryTokenHistory
+    }
+
+    /// Append compressed ids for positions `startPos ..< startPos + tokens.count`,
+    /// dropping any stale tail at or beyond `startPos` and keeping the bounded
+    /// window. `previous` is what the caller already validated for the
+    /// positions just before `startPos`.
+    public func recordAuxiliaryTokens(_ tokens: [Int32], startPos: Int) {
+        var kept: [Int32] = []
+        if let h = auxiliaryTokenHistory, h.endPosition >= startPos, h.startPosition <= startPos {
+            kept = Array(h.tokens.prefix(startPos - h.startPosition))
+        }
+        kept.append(contentsOf: tokens)
+        let cap = Self.auxiliaryTokenHistoryCapacity
+        if kept.count > cap { kept.removeFirst(kept.count - cap) }
+        auxiliaryTokenHistory = HybridPoolTokenHistory(
+            endPosition: startPos + tokens.count, tokens: kept)
+    }
+
+    /// Compressed ids at positions `startPos - count ..< startPos`, or nil
+    /// when the carried history does not cover that range.
+    public func auxiliaryTokens(before startPos: Int, count: Int) -> [Int32]? {
+        guard count > 0 else { return [] }
+        guard let h = auxiliaryTokenHistory,
+              startPos <= h.endPosition, startPos - count >= h.startPosition
+        else { return nil }
+        let lo = startPos - count - h.startPosition
+        return Array(h.tokens[lo ..< (lo + count)])
     }
 
     /// Pool quantization is the production default for DSV4 long context.
@@ -900,13 +939,33 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             // First entries are `local.metaState`; we tack on dsv4-
             // specific scalars so the disk serializer + restore path
             // can reconstruct without guessing.
-            local.metaState + [
+            var meta = local.metaState + [
                 "dsv4_cache_v1",
                 String(compressRatio),
                 String(slidingWindow),
             ]
+            // DeepSeek-V4.1 only: Engram history trailer. 0731 caches never
+            // carry history, so their metaState is unchanged.
+            if let h = auxiliaryTokenHistory {
+                meta += [
+                    "dsv41_aux_hist_v1",
+                    String(h.endPosition),
+                    h.tokens.map(String.init).joined(separator: ","),
+                ]
+            }
+            return meta
         }
         set {
+            var newValue = newValue
+            if newValue.count >= 3, newValue[newValue.count - 3] == "dsv41_aux_hist_v1" {
+                let end = Int(newValue[newValue.count - 2]) ?? 0
+                let raw = newValue[newValue.count - 1]
+                let tokens = raw.isEmpty ? [] : raw.split(separator: ",").compactMap { Int32($0) }
+                auxiliaryTokenHistory = HybridPoolTokenHistory(endPosition: end, tokens: tokens)
+                newValue.removeLast(3)
+            } else {
+                auxiliaryTokenHistory = nil
+            }
             // Strip the DSV4 trailer if present and pass the rest to
             // local. We don't need to re-read compressRatio from the
             // trailer because it's an init-time invariant of the
@@ -936,6 +995,12 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         // exactly the same way as the projected incomplete-window buffers.
         dropPoolPending()
         let rv = local.trim(n)
+        if var h = auxiliaryTokenHistory, h.endPosition > local.offset {
+            let drop = min(h.tokens.count, h.endPosition - local.offset)
+            h.tokens.removeLast(drop)
+            h.endPosition = local.offset
+            auxiliaryTokenHistory = h
+        }
         // Incomplete-window buffers are start_pos-keyed and invalidated
         // by ANY trim — clear unconditionally (Python comment
         // mlx_model.py L497-501).
@@ -983,7 +1048,9 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             slidingWindow: slidingWindow,
             compressRatio: compressRatio,
             poolQuantizationEnabled: hybridPoolQuantizationEnabled,
-            poolBF16HotByteLimit: compPool.hotByteLimit)
+            poolBF16HotByteLimit: compPool.hotByteLimit,
+            requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory)
+        dup.auxiliaryTokenHistory = auxiliaryTokenHistory
         let localState = local.state
         if !localState.isEmpty {
             // RotatingKVCache writes decode tokens into its ring in place.

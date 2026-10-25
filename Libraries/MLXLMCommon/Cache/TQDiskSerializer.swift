@@ -811,6 +811,14 @@ public enum TQDiskSerializer {
         putOptional("dsv4_\(i)_buf_idx_kv", idxBuf.kv)
         putOptional("dsv4_\(i)_buf_idx_gate", idxBuf.gate)
         result["__dsv4_\(i)_nilmask__"] = MLXArray(nilMask)
+        // DeepSeek-V4.1 only: the Engram n-gram tail that must accompany this
+        // prefix. Written only when present, so 0731 records are unchanged.
+        if let history = dsv4.auxiliaryTokenHistory {
+            result["__dsv4_\(i)_aux_hist_end__"] = metaInt32(Int32(history.endPosition))
+            result["dsv4_\(i)_aux_hist"] = MLXArray(
+                history.tokens.isEmpty ? [Int32(0)] : history.tokens)
+            result["__dsv4_\(i)_aux_hist_count__"] = metaInt32(Int32(history.tokens.count))
+        }
 
         result[kindKey(for: i)] = kindArray(.deepseekV4)
     }
@@ -996,6 +1004,9 @@ public enum TQDiskSerializer {
         public let bufCompGate: MLXArray?
         public let bufIdxKV: MLXArray?
         public let bufIdxGate: MLXArray?
+        /// DeepSeek-V4.1 Engram n-gram tail (``HybridPoolCache/auxiliaryTokenHistory``).
+        /// Absent for DSV4-0731 records, which never write it.
+        public var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):
@@ -1722,7 +1733,22 @@ public enum TQDiskSerializer {
            quantizedIdx?.isEmpty == true
         { return nil }
 
-        return DeepseekV4LayerComponents(
+        var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        if let endArray = arrays["__dsv4_\(i)_aux_hist_end__"],
+           let end = readMetaInt32(endArray),
+           let countArray = arrays["__dsv4_\(i)_aux_hist_count__"],
+           let count = readMetaInt32(countArray),
+           let tokensArray = arrays["dsv4_\(i)_aux_hist"]
+        {
+            let tokens = tokensArray.asType(.int32).asArray(Int32.self)
+            guard count >= 0, Int(count) <= tokens.count, Int(count) <= Int(end) else {
+                return nil
+            }
+            auxiliaryTokenHistory = HybridPoolTokenHistory(
+                endPosition: Int(end), tokens: Array(tokens.prefix(Int(count))))
+        }
+
+        var components = DeepseekV4LayerComponents(
             keys: keys, values: values,
             keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
             offset: Int(m[3]), idx: Int(m[4]),
@@ -1736,6 +1762,8 @@ public enum TQDiskSerializer {
             bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate", slot: 3),
             bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),
             bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate", slot: 5))
+        components.auxiliaryTokenHistory = auxiliaryTokenHistory
+        return components
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):
