@@ -233,6 +233,58 @@ struct Qwen4ExpDenseRouterTests {
         }
     }
 
+    @Test(
+        "Opt-in router timing retains alternating correct-reference controls",
+        .enabled(if: ProcessInfo.processInfo.environment["VMLX_ROUTER_TIMING"] == "1"))
+    func alternatingRouterTiming() throws {
+        try MLXMetalTestLock.withLock {
+            let path = try #require(
+                ProcessInfo.processInfo.environment["VMLX_ROUTER_CAPTURE_FIXTURE"])
+            let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+            let captured = try #require(arrays["verify_input"])
+            let weight = try #require(arrays["weight"])
+            for rows in [2, 4, 6, 8] {
+                let window = concatenated([captured, captured], axis: 1)[0..., 0 ..< rows]
+                func run(_ candidate: Bool) throws -> (indices: MLXArray, scores: MLXArray) {
+                    if candidate {
+                        return try #require(
+                            Qwen4ExpCompiledMoE.denseRouterRows(
+                                window, weight: weight, topK: 10, normTopK: true))
+                    }
+                    let outputs = try (0 ..< rows).map { row in
+                        try #require(
+                            Qwen4ExpCompiledMoE.denseRouter(
+                                window[0..., row ..< (row + 1)], weight: weight,
+                                topK: 10, normTopK: true))
+                    }
+                    return (
+                        concatenated(outputs.map(\.indices), axis: 1),
+                        concatenated(outputs.map(\.scores), axis: 1)
+                    )
+                }
+                let reference = try run(false)
+                let candidate = try run(true)
+                MLX.eval(reference.indices, reference.scores, candidate.indices, candidate.scores)
+                #expect(reference.scores.size > 0)
+                #expect(bits(reference.indices) == bits(candidate.indices))
+                #expect(bits(reference.scores) == bits(candidate.scores))
+                for probe in 0 ..< 8 {
+                    for candidate in (probe.isMultiple(of: 2) ? [false, true] : [true, false]) {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        for _ in 0 ..< 200 {
+                            let output = try run(candidate)
+                            MLX.eval(output.indices, output.scores)
+                        }
+                        let nanos = DispatchTime.now().uptimeNanoseconds - start
+                        print(
+                            "[ROUTER-TIMING] rows=\(rows) probe=\(probe) candidate=\(candidate) iterations=200 ns=\(nanos) discard=\(probe == 0) generation_tps=NA"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     @Test("prefill, verification, outer traces, and malformed signatures use the ordinary path")
     func eligibility() throws {
         try MLXMetalTestLock.withLock {
