@@ -76,14 +76,14 @@ func runRowExactBench(modelPath: String) async throws {
             let outcomes = Device.withDefaultDevice(.cpu) { () -> [Bool] in
                 let tokens = Array(1 ... 74)  // Deliberately not a page/chunk multiple.
                 let url = URL(fileURLWithPath: directory)
-                let old = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: oldKey)
+                let old = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: oldKey)
                 old.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(11), 12])])
                 let oldPositive =
                     old.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [11, 12]
-                let current = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: newKey)
+                let current = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: newKey)
                 let legacyMiss = current.fetch(tokens: tokens) == nil
                 current.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(21), 22])])
-                let restart = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: newKey)
+                let restart = DiskCache(cacheDir: url, maxSizeGB: 1.0 / 1024, modelKey: newKey)
                 let currentHit =
                     restart.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [21, 22]
                 let oldPreserved =
