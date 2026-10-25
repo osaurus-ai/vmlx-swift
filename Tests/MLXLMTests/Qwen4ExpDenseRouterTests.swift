@@ -270,14 +270,16 @@ struct Qwen4ExpDenseRouterTests {
                 #expect(bits(reference.scores) == bits(candidate.scores))
                 for probe in 0 ..< 8 {
                     for candidate in (probe.isMultiple(of: 2) ? [false, true] : [true, false]) {
+                        let startUnix = Date().timeIntervalSince1970
                         let start = DispatchTime.now().uptimeNanoseconds
-                        for _ in 0 ..< 200 {
+                        for _ in 0 ..< 1000 {
                             let output = try run(candidate)
                             MLX.eval(output.indices, output.scores)
                         }
                         let nanos = DispatchTime.now().uptimeNanoseconds - start
+                        let endUnix = Date().timeIntervalSince1970
                         print(
-                            "[ROUTER-TIMING] rows=\(rows) probe=\(probe) candidate=\(candidate) iterations=200 ns=\(nanos) discard=\(probe == 0) generation_tps=NA"
+                            "[ROUTER-TIMING] rows=\(rows) probe=\(probe) candidate=\(candidate) iterations=1000 ns=\(nanos) start_unix=\(startUnix) end_unix=\(endUnix) discard=\(probe == 0) generation_tps=NA"
                         )
                     }
                 }
