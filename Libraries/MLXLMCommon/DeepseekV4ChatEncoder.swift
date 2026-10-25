@@ -550,7 +550,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// effort was requested (the encoder then uses
     /// ``deepseekV41DefaultReasoningBudget``). V4.1 only; the 0731 contract
     /// never consults this.
-    static func reasoningBudget(from context: [String: any Sendable]?) -> Int? {
+    public static func reasoningBudget(from context: [String: any Sendable]?) -> Int? {
         guard let rawAny = context?["reasoning_effort"] else { return nil }
         if let i = rawAny as? Int { return max(1, min(100, i)) }
         if let d = rawAny as? Double, d.isFinite { return max(1, min(100, Int(d.rounded()))) }
