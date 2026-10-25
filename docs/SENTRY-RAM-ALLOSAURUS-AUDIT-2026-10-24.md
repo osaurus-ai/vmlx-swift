@@ -435,3 +435,101 @@ not an attribution to this reporter or proof of OOM. No watchdog-disabling
 environment variable, blind retry, reduced RAM budget or sampler clamp is
 installed. Pinned attention/command-buffer behavior and bounded reproduction
 remain under investigation; current transport tests do not clear this row.
+
+### Follow-up diagnostics on the merged code
+
+Both scoped fixes are now merged: runtime #647 (`5055455f8`) and app #3185
+(`2f2e1158b`). The app merge tree equals the tested Release source; the runtime
+merge contains the tested pin. Subsequent diagnostics still use that exact
+Release artifact, locally on Max2.
+
+The explicit allocator maximum was also checked **during** native MTP, rather
+than inferred from the post-generation value. Under Safe Auto with a temporary
+64 MiB custom maximum, all 137 active-window polls report exactly 67,108,864
+bytes. The array response contains all 150 correct values, stops naturally,
+and generates 1,720 tokens at 55.34 tok/s. Activity Monitor shows 36.18 GiB in
+the active request. This is a custom-cap policy diagnostic, not default-speed
+qualification. The override is removed through Settings afterward; Save
+unloads the resident model, and Safe Auto/custom-nil is restored.
+
+A pinned-MLX attention diagnostic completes 81 combinations: FP16/BF16/FP32,
+32,769/65,537/131,075 keys, 8/64/512 query rows, and unmasked/causal/last-1,024
+masks, with 20 query heads, two KV heads and head dimension 128. No reported
+Metal error occurs. The largest measured warm forward is 36.83 ms and the MLX
+peak is 408,092,688 bytes. This is a bounded kernel-only diagnostic with no
+model or memory-policy override, not a reproduction of the unknown reporter's
+workload or clearance for older hardware. Six FP32 eight-query cases fail
+the original strict numerical oracle; those failures remain recorded. In
+particular, eight queries times GQA factor ten exceeds the vector-fused
+eligibility limit of 32, so those rows take the unfused fallback. Do not
+attribute their precision differences to the vector kernel without evidence.
+The explicit `MLX_ENABLE_TF32=0` diagnostic repeats all 81 rows on the same
+binary with the same oracle: all pass. The failing default rows use unfused
+softmax/matmul, where TF32 is enabled by default. This isolates a precision
+control dependency; it is not a reproduction of the interactivity failure
+and does not justify changing the app's precision defaults.
+
+Read-only Sentry Logs queries for the exact interactivity message (90 days)
+and command-buffer failure text (30 days) return no records; a general query
+does return logs, so this is not evidence that Logs is entirely unavailable.
+Current source records generation begin/submit breadcrumbs, but the mapper's
+handled `generationFailure` path preserves the error to the caller without
+capturing a dedicated Sentry event. Absence of a recent fatal group therefore
+does not establish absence of handled GPU failures. No guessed RAM policy or
+blind GPU retry is introduced to compensate for the missing workload evidence.
+
+### Controlled greedy observations, with rejected rows retained
+
+The current Release app also runs explicit greedy AR/adaptive controls. These
+are diagnostics, distinct from the bundle-default sampler rows above. Both
+arms receive identical prompts, seed and temperature-zero overrides; each
+arm is primed separately and the full answer, reasoning and token count are
+compared. Settings changes go through the real panel and unload residents.
+
+| Bundle / task | AR tok/s | Adaptive tok/s | Comparison result |
+|---|---:|---:|---|
+| v0.1 / 150-value array | 30.91 | 51.41 | Correct arrays; reasoning/counts differ |
+| v0.1 / 100 individual prints | 28.44 | 29.77 | Same answer/reasoning/611 tokens, but both violate the requested statement format |
+| v0.2 / 150-value array | 29.25 | 53.63 | Correct arrays; formatting/reasoning/counts differ |
+| v0.2 / 100 individual prints | 26.80 | 46.04 | Correct identical answer; reasoning/counts differ |
+
+All stop naturally, but no row establishes a quality-qualified exact-output
+speedup: the only fully identical pair fails its instruction requirement.
+Do not weaken the output validator, apply prompt/sampler masking, or present
+these as universal 50–100 tok/s qualification. The no-custom-cap Safe Auto
+profile and adaptive mode are restored after the controls.
+
+### Actual attention geometry and prefill dispatch controls
+
+Both installed bundles declare 24 attention heads, two KV heads and head
+dimension 256. A second kernel diagnostic uses those dimensions with
+FP16/BF16, 8,193/32,769/65,537 keys, 1/2/4/8/128/512 query rows, and the
+same three mask variants. All 108 default-dispatch cases pass the analytic
+oracle without a Metal failure. The largest warm forward is 36.65 ms;
+maximum MLX allocation is 1,803,995,140 bytes. The sampled process physical
+peak is 2,829,517,640 bytes. These are kernel-process receipts, not Activity
+Monitor proof for a loaded model or a reproduction of the new reporter.
+
+An explicit fused control for the 128/512-query cases passes all 36 rows.
+Its maximum MLX allocation is 207,749,128 bytes and sampled physical peak
+is 524,518,216 bytes. This is a useful allocation lead: default dispatch at
+these head dimensions can materialize the attention score matrix. It is
+not sufficient evidence to change attention defaults: the current oracle
+uses uniform attention, and random-input, full-model/cache and hardware
+qualification remain separate requirements. No product force-fused policy
+has been added.
+
+The unchanged Release app also runs a JANGT-only prefill ablation with two
+new storage roots, identical primes and the same 3,669-token code prompt.
+Default NAX reports 4.373 seconds / 838.99 prompt tok/s; explicit
+`VMLX_JANGT_PREFILL=0` reports 7.193 seconds / 510.02 prompt tok/s. These
+are cache-inclusive prompt rates: each root has one L2 hit, and the exact
+restored count was not captured. Both answers are the correct list
+`[6, 243, 483]`, with natural stop and closed reasoning. Decode is
+66.92 / 66.54 tok/s respectively. Sampled process physical peaks are
+33.94 / 33.57 GB. Activity Monitor receipts are retained separately.
+
+Only JANGT matrix dispatch is disabled in the fallback arm; other M5
+backends remain native. This neither reproduces an 11 tok/s cap locally nor
+emulates an M3. It supports investigating a genuine older-GPU packed matrix
+path without asserting that installed RAM alone determines throughput.
