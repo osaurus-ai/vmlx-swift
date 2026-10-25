@@ -19,7 +19,11 @@ struct DiskCacheValidationSerializationTests {
             let started = DispatchSemaphore(value: 0)
             let finished = DispatchSemaphore(value: 0)
             MLXDiskCacheIOLock.shared.lock()
-            DispatchQueue.global().async {
+            // Other suites can occupy the global pool while waiting for the
+            // process-wide Metal test lock held here. Use an owned queue so
+            // this worker can reach the IO gate independently of those waiters.
+            let worker = DispatchQueue(label: "vmlx.test.invalid-store-io-gate")
+            worker.async {
                 started.signal()
                 cache.store(tokens: [1, 2, 3], arrays: arrays)
                 finished.signal()

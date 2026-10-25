@@ -217,7 +217,7 @@ extension DiskCacheCompanionAccountingTests {
                 try #require(disk.usageBytes() > Self.cap, "INVALID: not over the cap")
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
                 #expect(try Self.hostileRowCount(root) == 0, "the retirement rolled back: \(log)")
@@ -237,7 +237,7 @@ extension DiskCacheCompanionAccountingTests {
                 let legacyBefore = try Self.legacyRecords(root)
                 let attempts = disk.retireAttemptsForTesting
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, again) = try Support.capturingStandardError {
+                let (_, again) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
                 #expect(Self.invalidValueLines(again).isEmpty, "\(again)")
@@ -311,7 +311,7 @@ extension DiskCacheCompanionAccountingTests {
                 let blocker = try RawDB(root: root)
                 try blocker.require("BEGIN IMMEDIATE")
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     for _ in 0 ..< 3 {
                         coordinator.enforceCombinedDiskQuota()
                         clock.advance(by: DiskCache.defaultRetireRetryInterval + 1)
@@ -713,7 +713,7 @@ extension DiskCacheCompanionAccountingTests {
                     Self.tokens(301, seed: 9_061), Self.tokens(517, seed: 9_062),
                     Self.tokens(1_003, seed: 9_063),
                 ]
-                let ((coordinator, disk), log) = try Support.capturingStandardError {
+                let ((coordinator, disk), log) = try Support.capturingRuntimeDiagnostics {
                     let coordinator = Self.coordinator(root: root, modelKey: modelKey)
                     let disk = try #require(coordinator.diskCache)
                     try #require(disk.indexIsFromANewerBuild, "INVALID: not a newer schema")
@@ -742,7 +742,7 @@ extension DiskCacheCompanionAccountingTests {
                 DiskCache.resetRateLimitedReportsForTesting()
                 let standalone = DiskCache(
                     cacheDir: root, maxSizeBytes: Int(Self.cap), modelKey: modelKey)
-                let (_, standaloneLog) = try Support.capturingStandardError {
+                let (_, standaloneLog) = try Support.capturingRuntimeDiagnostics {
                     for tokens in stored { standalone.store(tokens: tokens, arrays: Self.kv()) }
                 }
                 #expect(Self.opaqueCapLines(standaloneLog).count == 1, "\(standaloneLog)")
@@ -886,7 +886,7 @@ extension DiskCacheCompanionAccountingTests {
                     """)
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (summary, log) = try Support.capturingStandardError {
+                let (summary, log) = try Support.capturingRuntimeDiagnostics {
                     disk.reconcileCompanionAccounting(companions: [])
                 }
                 let counts = try #require(summary, "the import did not commit")
@@ -1117,7 +1117,7 @@ extension DiskCacheCompanionAccountingTests {
                 let blocker = try RawDB(root: root)
                 try blocker.require("BEGIN IMMEDIATE")
                 DiskCache.resetRateLimitedReportsForTesting()
-                _ = try Support.capturingStandardError { coordinator.enforceCombinedDiskQuota() }
+                _ = try Support.capturingRuntimeDiagnostics { coordinator.enforceCombinedDiskQuota() }
                 try blocker.require("ROLLBACK")
                 try #require(disk.retireAttemptsForTesting == 1, "INVALID: no failed attempt")
                 try #require(try Self.hostileRowCount(root) == 1)
@@ -1166,7 +1166,7 @@ extension DiskCacheCompanionAccountingTests {
                 try #require(disk.usageBytes() > Self.cap, "INVALID: not over the cap")
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
                 try #require(try Self.hostileRowCount(root) == 1, "INVALID: the trigger did not hold")
@@ -1220,7 +1220,7 @@ extension DiskCacheCompanionAccountingTests {
                 CacheCoordinator.resetImportedRootsForTesting()
                 DiskCache.resetRateLimitedReportsForTesting()
                 let clock = TestClock()
-                let ((coordinator, disk), log) = try Support.capturingStandardError {
+                let ((coordinator, disk), log) = try Support.capturingRuntimeDiagnostics {
                     let coordinator = Self.coordinator(
                         root: root, capBytes: size * 5 / 2, modelKey: modelKey, clock: clock)
                     return (coordinator, try #require(coordinator.diskCache))

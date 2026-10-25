@@ -232,7 +232,7 @@ extension DiskCacheCompanionAccountingTests {
                 }
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (results, log) = try Support.capturingStandardError {
+                let (results, log) = try Support.capturingRuntimeDiagnostics {
                     [fetchWithTimeout("fetch"), fetchWithTimeout("a second fetch")]
                 }
                 #expect(results == [true, true], "\(results)")
@@ -342,7 +342,7 @@ extension DiskCacheCompanionAccountingTests {
                     try #require(
                         try Support.legacyRows(root).isEmpty,
                         "INVALID: the index names the planted pair")
-                    let (_, log) = try Support.capturingStandardError { subject.clear() }
+                    let (_, log) = try Support.capturingRuntimeDiagnostics { subject.clear() }
 
                     #expect(
                         Support.companionBytes(root, named) == 0,
