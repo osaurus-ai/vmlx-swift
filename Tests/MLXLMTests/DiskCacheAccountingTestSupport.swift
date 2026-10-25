@@ -206,9 +206,8 @@ enum DiskCacheAccountingTestSupport {
     /// Storage assertions must not depend on the platform logging transport.
     static func capturingRuntimeDiagnostics<T>(_ body: () throws -> T) rethrows -> (T, String) {
         let capture = DiagnosticCapture()
-        let value = try RuntimeDiagnostics.$observerForTesting.withValue({ capture.append($0) }) {
-            try body()
-        }
+        let value = try RuntimeDiagnostics.$observerForTesting.withValue(
+            { capture.append($0) }, operation: body)
         return (value, capture.text)
     }
 

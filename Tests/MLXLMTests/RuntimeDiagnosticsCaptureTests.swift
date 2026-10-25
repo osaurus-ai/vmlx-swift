@@ -91,9 +91,11 @@ struct RuntimeDiagnosticsCaptureTests {
             let saved = errno
             defer { errno = saved }
             errno = E2BIG
-            RuntimeDiagnostics.$observerForTesting.withValue({ _ in errno = ERANGE }) {
-                RuntimeDiagnostics.write(Data("errno preservation\n".utf8))
-            }
+            RuntimeDiagnostics.$observerForTesting.withValue(
+                { _ in errno = ERANGE },
+                operation: {
+                    RuntimeDiagnostics.write(Data("errno preservation\n".utf8))
+                })
             #expect(errno == E2BIG)
         }
     #endif
