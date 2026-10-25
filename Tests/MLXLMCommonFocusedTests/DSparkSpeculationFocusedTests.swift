@@ -32,6 +32,10 @@ final class DSparkToyTarget {
     let embed: MLXArray
     let out: MLXArray
     var forwards = 0
+    /// Verify capture (the Swift analogue of `capture_verify`): each layer's kv rows of the next
+    /// forward, replayed by `commitPrefix`.
+    var capturing = false
+    var captured: [MLXArray] = []
 
     init(seed: UInt64 = 5) {
         var rng = SplitMix64(seed: seed)
@@ -49,15 +53,29 @@ final class DSparkToyTarget {
         forwards += 1
         let L = ids.count
         var x = take(embed, MLXArray(ids.map { Int32($0) }), axis: 0).reshaped(1, L, dim)
+        if capturing { captured = [] }
         for layer in cache {
             let mask = layer.makeMask(n: L, windowSize: nil, returnArray: false)
             let kv = x.reshaped(1, 1, L, dim)
+            if capturing { captured.append(kv) }
             let (k, v) = layer.update(keys: kv, values: kv)
             let a = MLXFast.scaledDotProductAttention(
                 queries: kv * 1.7, keys: k, values: v, scale: 1 / Float(dim).squareRoot(), mask: mask)
             x = x + a.reshaped(1, L, dim)
         }
         return matmul(x, out)
+    }
+
+    /// Keep only the first `keep` tokens of the captured forward: restore, re-append their rows.
+    func commitPrefix(cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int) -> Bool {
+        guard captured.count == cache.count else { return false }
+        checkpoint.restore()
+        for (layer, kv) in zip(cache, captured) {
+            let rows = kv[0..., 0..., 0 ..< keep, 0...]
+            _ = layer.update(keys: rows, values: rows)
+        }
+        captured = []
+        return true
     }
 
     func argmaxLast(_ logits: MLXArray) -> Int {
@@ -86,6 +104,8 @@ final class DSparkScriptedDraft: DSparkDraftSession {
     let good: (Int) -> Int
     let onDraft: () -> Void
     var calls = 0
+    /// Set to let the decoder commit partial accepts in place through the toy target.
+    var target: DSparkToyTarget?
 
     init(
         reference: [Int: Int], blockSize: Int = 5, vocab: Int, good: @escaping (Int) -> Int,
@@ -107,6 +127,23 @@ final class DSparkScriptedDraft: DSparkDraftSession {
             let truth = reference[end + 1 + i] ?? 0
             return i < g ? truth : (truth + 1) % vocab
         }
+    }
+
+    func beginVerifyCapture(cache: [KVCache]) -> Bool {
+        guard let target else { return false }
+        target.capturing = true
+        return true
+    }
+
+    func commitVerifiedPrefix(
+        cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
+    ) -> Bool {
+        target?.commitPrefix(cache: cache, checkpoint: checkpoint, keep: keep) ?? false
+    }
+
+    func endVerifyCapture(cache: [KVCache]) {
+        target?.capturing = false
+        target?.captured = []
     }
 }
 
@@ -207,9 +244,9 @@ struct DSparkSpeculationFocusedTests {
 
     // MARK: Greedy identity
 
-    static func identityRun(good: @escaping (Int) -> Int, count: Int = 60)
-        -> (spec: [Int], ar: [Int], cachesMatch: Bool, stats: DSparkGenerationStats)
-    {
+    static func identityRun(
+        good: @escaping (Int) -> Int, count: Int = 60, commitInPlace: Bool = false
+    ) -> (spec: [Int], ar: [Int], cachesMatch: Bool, stats: DSparkGenerationStats) {
         Device.withDefaultDevice(.cpu) {
             let target = DSparkToyTarget()
             let prompt = [3, 1, 4, 1, 5, 9, 2]
@@ -217,12 +254,14 @@ struct DSparkSpeculationFocusedTests {
             var reference: [Int: Int] = [:]
             for (i, t) in ar.tokens.enumerated() { reference[prompt.count + i] = t }
             let draft = DSparkScriptedDraft(reference: reference, vocab: target.vocab, good: good)
+            if commitInPlace { draft.target = target }
             let cache = target.newCache()
             let first = target.argmaxLast(target.forward(prompt, cache: cache))
             // Governor that always speculates (AR re-measures are disabled) so every step verifies.
             var decoder = DSparkDecoder(
                 session: draft, blockSize: 5, stopTokenIDs: [],
-                governor: DSparkGovernor(probeEvery: 1, arProbeEvery: 1 << 30, warmupSpec: 1 << 30))
+                governor: DSparkGovernor(probeEvery: 1, arProbeEvery: 1 << 30, warmupSpec: 1 << 30),
+                refeed: false)
             let spec = dsparkRun(
                 decoder: &decoder, cache: cache, firstToken: first, count: count,
                 forward: { target.forward($0, cache: cache) }, argmaxLast: target.argmaxLast)
@@ -238,6 +277,18 @@ struct DSparkSpeculationFocusedTests {
         #expect(r.cachesMatch)
         #expect(r.stats.commitForwards > 0 && r.stats.fullAccepts > 0)
         #expect(r.stats.accepted > 0 && r.stats.accepted < r.stats.drafted)
+    }
+
+    @Test("partial accepts committed in place (no second forward): output and cache equal greedy AR")
+    func identityPartialInPlace() {
+        let r = Self.identityRun(good: { [0, 1, 2, 3, 5, 1, 4][$0 % 7] }, commitInPlace: true)
+        #expect(r.spec == r.ar)
+        #expect(r.cachesMatch)
+        #expect(r.stats.prefixCommits > 0)
+        // Only k == 0 steps (and none of the partial ones) still refeed.
+        #expect(r.stats.commitForwards < r.stats.specSteps - r.stats.fullAccepts - r.stats.prefixCommits + 1)
+        let refeed = Self.identityRun(good: { [0, 1, 2, 3, 5, 1, 4][$0 % 7] })
+        #expect(r.stats.commitForwards < refeed.stats.commitForwards)
     }
 
     @Test("always-wrong drafts: still exactly greedy AR")

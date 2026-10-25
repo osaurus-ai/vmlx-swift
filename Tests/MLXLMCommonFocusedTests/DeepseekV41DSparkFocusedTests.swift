@@ -136,6 +136,103 @@ struct DeepseekV41DSparkFocusedTests {
         }
     }
 
+    // MARK: In-place prefix commit (Python commit_prefix)
+
+    /// One V4.1 kv-source (and index-owner) attention layer at `ratio`.
+    static func commitLayer(ratio: Int) -> DeepseekV4Attention {
+        var c = tinyConfig()
+        c.numHiddenLayers = 1
+        c.compressRatios = [ratio]
+        c.kvSourceLayerIds = [0]
+        c.indexSourceLayerIds = [0]
+        c.indexNHeads = 2
+        c.indexHeadDim = 64
+        c.slidingWindow = 4
+        return DeepseekV4Attention(config: c, layerIdx: 0)
+    }
+
+    static func commitCache() -> DeepseekV4Cache {
+        DeepseekV4Cache(
+            slidingWindow: 4, compressRatio: 2, requiresAuxiliaryTokenHistory: true,
+            poolQuantizationBits: 4)
+    }
+
+    static func run(_ attn: DeepseekV4Attention, _ x: MLXArray, _ cache: DeepseekV4Cache,
+                    capture: DSV41VerifyCapture? = nil) {
+        let share = DSV41CompressShare()
+        if let capture {
+            capture.begin(tokens: x.dim(1))
+            share.capture = capture
+        }
+        let out = attn(x, mask: createAttentionMask(h: x, cache: cache), cache: cache, compressShare: share)
+        eval(out)
+    }
+
+    /// Prompt prefix, then two single-token steps (deferred pool tokens, wrapped window).
+    static func primed(_ attn: DeepseekV4Attention, _ xs: MLXArray) -> DeepseekV4Cache {
+        let cache = commitCache()
+        run(attn, xs[0..., 0 ..< 7], cache)
+        run(attn, xs[0..., 7 ..< 8], cache)
+        run(attn, xs[0..., 8 ..< 9], cache)
+        return cache
+    }
+
+    static func snapshot(_ cache: DeepseekV4Cache) -> (offset: Int, state: [MLXArray], meta: [String]) {
+        let state = cache.state  // flushes deferred decode inputs
+        eval(state)
+        return (cache.offset, state, cache.metaState)
+    }
+
+    @Test("commit_prefix(all) equals the captured verify's own state bit for bit; partial keeps match a forward of only the kept tokens",
+          arguments: [2, 1])
+    func commitPrefixMatchesForward(ratio: Int) {
+        Device.withDefaultDevice(.cpu) {
+            let attn = Self.commitLayer(ratio: ratio)
+            let xs = Self.random([1, 15, 64], seed: 500 + UInt64(ratio), scale: 1)
+            let verify = xs[0..., 9 ..< 15]  // [p0, d1..d5]
+
+            // Reference: the verify forward's own state.
+            let full = Self.primed(attn, xs)
+            Self.run(attn, verify, full)
+            let fullState = Self.snapshot(full)
+
+            for keep in 1 ... 6 {
+                let cache = Self.primed(attn, xs)
+                let objects = ObjectIdentifier(cache)
+                let ck = SpeculativeCacheListCheckpoint([cache])!
+                let capture = DSV41VerifyCapture()
+                Self.run(attn, verify, cache, capture: capture)
+                #expect(capture.valid && capture.layers[0] != nil)
+                ck.restore()
+                attn.commitCapturedPrefix(capture.layers[0]!, keep: keep, cache: cache)
+                #expect(ObjectIdentifier(cache) == objects)
+                let got = Self.snapshot(cache)
+
+                if keep == 6 {
+                    #expect(got.offset == fullState.offset)
+                    #expect(got.meta == fullState.meta)
+                    #expect(got.state.count == fullState.state.count)
+                    for (a, b) in zip(got.state, fullState.state) { #expect(Self.equal(a, b)) }
+                }
+                // A forward of only the kept tokens.
+                let only = Self.primed(attn, xs)
+                Self.run(attn, verify[0..., 0 ..< keep], only)
+                let want = Self.snapshot(only)
+                #expect(got.offset == want.offset, "keep \(keep)")
+                #expect(got.meta == want.meta, "keep \(keep)")
+                #expect(got.state.count == want.state.count)
+                for (a, b) in zip(got.state, want.state) {
+                    #expect(a.shape == b.shape, "keep \(keep)")
+                    if a.shape == b.shape, a.size > 0 {
+                        #expect(allClose(a.asType(.float32), b.asType(.float32), rtol: 2e-2, atol: 2e-2)
+                            .item(Bool.self), "keep \(keep)")
+                    }
+                }
+                #expect(cache.getPooled(.indexer)?.dim(1) == only.getPooled(.indexer)?.dim(1))
+            }
+        }
+    }
+
     // MARK: Draft head
 
     static let blockSize = 5
@@ -417,6 +514,10 @@ struct DeepseekV41DSparkFocusedTests {
             let cache = Self.cacheAt(4, tail: nil)
             #expect(m41.dsparkCacheUnsupportedReason(cache) == nil)
             #expect(m41.dsparkCacheUnsupportedReason([KVCacheSimple()]) != nil)
+            // No capture recorded: the in-place commit refuses and leaves the cache alone.
+            let ck = SpeculativeCacheListCheckpoint(cache)!
+            #expect(!m41.dsparkCommitPrefix(cache: cache, checkpoint: ck, keep: 1))
+            #expect(cache[1].offset == 4)
         }
     }
 }
