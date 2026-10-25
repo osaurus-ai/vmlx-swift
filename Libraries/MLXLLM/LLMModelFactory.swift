@@ -1953,7 +1953,8 @@ public final class LLMModelFactory: ModelFactory {
         // DeepSeek-V4.1 dSpark: attach the bundle's `dspark/` block drafter when native MTP is
         // requested, so the NativeMTPBlockDraftModel path speculative-decodes. No-op without a draft.
         if let dsv4 = model as? DeepseekV4Model, NativeMTPActivation.isExplicitlyRequested {
-            try? dsv4.attachDSpark(bundle: modelDirectory)
+            do { try dsv4.attachDSpark(bundle: modelDirectory) }
+            catch { NSLog("dsv41 dSpark attach failed: \(error)") }
         }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")

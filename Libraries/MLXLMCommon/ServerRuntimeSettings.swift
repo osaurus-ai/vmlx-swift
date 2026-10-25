@@ -532,6 +532,15 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         status: MTPBundleStatus?,
         bundleDirectory: URL? = nil
     ) -> DraftStrategy? {
+        // DSV4.1 dSpark force-on for proving the Swift block drafter (VMLX_DSV41_DSPARK=1), bypassing
+        // the user MTP-mode launch gate. Activates native MTP whenever a block drafter is detected
+        // (dspark/). Verify is exact so output stays == greedy; depth from the family cold-start.
+        if ProcessInfo.processInfo.environment["VMLX_DSV41_DSPARK"] == "1",
+            status?.bundleHasMTP == true
+        {
+            let depth = status?.measuredFamilyAutoDepth ?? 4
+            return .nativeMTP(depth: depth, verifierMode: nil)
+        }
         let launch = resolvedMTPLaunch(
             configData: configData,
             jangConfig: jangConfig,

@@ -542,6 +542,7 @@ extension DeepseekV4Model {
             embed: { [unowned self] ids in self.model.embedTokens(ids) },
             head: { [unowned self] x in self.lmHead(x) }) else { return }
         self.dsparkLane = DSparkV41Lane(drafter: drafter, cfg: cfg)
+        NSLog("dsv41 dSpark drafter attached (block speculative decode)")
     }
 }
 

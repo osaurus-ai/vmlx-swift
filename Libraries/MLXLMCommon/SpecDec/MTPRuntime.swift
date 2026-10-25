@@ -975,6 +975,9 @@ public enum NativeMTPActivation {
             return true
         case "nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text":
             return true
+        case "deepseek_v4", "deepseek_v4_text", "deepseek_v41", "deepseek_v41_text":
+            // DeepSeek-V4.1 dSpark 3-stage block drafter (NativeMTPBlockDraftModel).
+            return true
         default:
             return false
         }
@@ -1268,7 +1271,7 @@ public enum NativeMTPAutoDecodePolicy {
         // DeepSeek-V4.1 dSpark (3-stage block drafter, dspark_block_size=5). Verify is exact
         // (NativeMTPBlockDraftModel point masses), so greedy MTP output == AR; the adaptive controller
         // scales depth down to AR on low-accept content (no hard/manual depth). Cold-start at bs-1=4.
-        if types.contains(where: { $0 == "deepseek_v4" || $0 == "deepseek_v41" }) { return 4 }
+        if types.contains(where: { $0.hasPrefix("deepseek_v4") }) { return 4 }
         // Ornith 1.5 122B (Qwen 3.5 MoE, 48 layers x 3072, 256 experts / top-8, one native MTP layer):
         // its verify rows are bitwise the AR step (row-exact verify, 2026-10-20), so greedy MTP output
         // equals AR, and depth 1 measured faster than AR on code and prose. Keyed from model_type plus
@@ -1929,7 +1932,7 @@ public enum MTPBundleInspector {
         }
         // DeepSeek-V4.1 ships a 3-stage dSpark block drafter in `dspark/dspark.safetensors`
         // (mtp.* tensors) with `num_nextn_predict_layers` in config. Physical evidence = the shard.
-        if type == "deepseek_v4" || type == "deepseek_v41" {
+        if type.hasPrefix("deepseek_v4") {
             let dir = modelDirectory.appendingPathComponent("dspark")
             let file = dir.appendingPathComponent("dspark.safetensors")
             guard FileManager.default.fileExists(atPath: file.path),
