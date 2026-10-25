@@ -4225,7 +4225,28 @@ extension NativeMTPTokenIterator {
               resumes: arSafetyResumes)
     }
 
-    mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
+        var testingAdaptiveThroughput: [Int: Double] { measuredThroughputByDepth }
+
+        mutating func testingEnableDepthChooser() {
+            depthChooser = NativeMTPDepthChooser(
+                initialDepth: currentDepth, maximumDepth: adaptiveDepthCeiling,
+                costs: NativeMTPDepthCostTable())
+        }
+
+        var testingDepthChooserSummary: String? { depthChooser?.summary }
+
+        mutating func testingFeedAdaptiveCostCycle(
+            activeNow: TimeInterval, consumerWait: TimeInterval
+        ) {
+            verifyCalls += 1
+            stagedVerifierCommitCount += 1
+            consumerWaitTotal += consumerWait
+            NativeMTPClock.$testingNow.withValue(activeNow + consumerWaitTotal) {
+                recordAdaptiveCycle(accepted: currentDepth, preserveConfirmedHead: true)
+            }
+        }
+
+        mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
         verifyCalls = Self.arSafetyWarmupCycles
         currentDepth = depth
         arSafetyMeanLoss.reset(afterCycle: verifyCalls)

@@ -7,6 +7,68 @@ import XCTest
 /// Exercises actual iterator verify dispatch. The zero-weight constant target
 /// makes every proposal correct; it is not a model-quality or speed benchmark.
 final class NativeMTPDepthExecutionTests: XCTestCase {
+    func testAdaptiveDepthCostIgnoresConsumerWaitAtBundleTemperatures() throws {
+        try FocusedMLXTestSupport.withLock {
+            for temperature: Float in [1, 0.45] {
+                let reference = try activeClockTrace(temperature: temperature, consumerWait: 0)
+                let delayed = try activeClockTrace(temperature: temperature, consumerWait: 0.1)
+                XCTAssertGreaterThan(
+                    reference.depths.max() ?? 0, 3,
+                    "Positive control must exercise a real adaptive promotion")
+                XCTAssertEqual(
+                    delayed.depths, reference.depths,
+                    "Delivery latency must not change a compute-cost depth decision")
+                XCTAssertEqual(Set(delayed.throughput.keys), Set(reference.throughput.keys))
+                for (depth, rate) in reference.throughput {
+                    XCTAssertEqual(delayed.throughput[depth] ?? -1, rate, accuracy: 0.000001)
+                }
+                print(
+                    "MTP-ACTIVE-CLOCK temperature=\(temperature) referenceDepth=\(reference.depths.last ?? 0) delayedDepth=\(delayed.depths.last ?? 0) referenceRates=\(reference.throughput) delayedRates=\(delayed.throughput) syntheticControllerOnly=true"
+                )
+            }
+        }
+    }
+
+    func testOptInDepthChooserCostIgnoresConsumerWait() throws {
+        try FocusedMLXTestSupport.withLock {
+            let reference = try activeClockTrace(temperature: 0, consumerWait: 0, chooser: true)
+            let delayed = try activeClockTrace(temperature: 0, consumerWait: 0.1, chooser: true)
+            XCTAssertEqual(delayed.depths, reference.depths)
+            XCTAssertEqual(
+                delayed.chooser, reference.chooser,
+                "The opt-in chooser must price the same compute trace identically")
+            print(
+                "MTP-ACTIVE-CLOCK chooser reference=\(reference.chooser ?? "nil") delayed=\(delayed.chooser ?? "nil") syntheticControllerOnly=true"
+            )
+        }
+    }
+
+    private func activeClockTrace(
+        temperature: Float, consumerWait: TimeInterval, chooser: Bool = false
+    ) throws -> (depths: [Int], throughput: [Int: Double], chooser: String?) {
+        var parameters = GenerateParameters(maxTokens: 1024, temperature: temperature)
+        parameters.draftStrategy = .nativeMTP(depth: 3)
+        parameters.nativeMTPDepthPolicy = .adaptive
+        var iterator = try NativeMTPClock.$testingNow.withValue(0) {
+            try NativeMTPTokenIterator(
+                input: LMInput(tokens: MLXArray([1, 1, 1])), model: DepthDispatchTarget(),
+                parameters: parameters, depth: 3)
+        }
+        iterator.testingSeedMeasuredGovernor(depth: 3, now: 0)
+        if chooser { iterator.testingEnableDepthChooser() }
+        var depths: [Int] = []
+        for cycle in 1 ... 128 {
+            let depth = iterator.testingGovernorSnapshot.depth
+            // Identical 20ms compute and fully accepted staged blocks. The
+            // second run changes only the consumer's per-delivered-token wait.
+            iterator.testingFeedAdaptiveCostCycle(
+                activeNow: Double(cycle) * 0.02,
+                consumerWait: cycle == 1 ? 0 : consumerWait * Double(depth + 1))
+            depths.append(iterator.testingGovernorSnapshot.depth)
+        }
+        return (depths, iterator.testingAdaptiveThroughput, iterator.testingDepthChooserSummary)
+    }
+
     func testSampledRejectionPauseCanProbeAfterProposalQualityChanges() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0" else {
             throw XCTSkip("Requires the real governor")
