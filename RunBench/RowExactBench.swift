@@ -57,11 +57,22 @@ func runRowExactBench(modelPath: String) async throws {
     input.additionalContext = ["enable_thinking": false]
     let prompt = try await context.processor.prepare(input: input).text.tokens.reshaped(1, -1)
 
+    let prefillStep = Int(env["BENCH_ROWEXACT_PREFILL_STEP"] ?? "512") ?? 512
+    guard prefillStep > 0, prompt.dim(1) > 0 else {
+        throw NSError(domain: "RowExactBench", code: 10,
+            userInfo: [NSLocalizedDescriptionKey: "Non-empty prompt and positive prefill step required"])
+    }
     func prefill() -> ([KVCache], Int) {
         let cache = model.newCache(parameters: GenerateParameters())
-        let out = model.nativeBackboneForward(prompt, cache: cache)
-        let first = argMax(out.logits[0, -1], axis: -1).item(Int.self)
-        MLX.eval(cache)
+        var first = 0
+        for start in stride(from: 0, to: prompt.dim(1), by: prefillStep) {
+            let end = min(start + prefillStep, prompt.dim(1))
+            let out = model.nativeBackboneForward(prompt[0..., start ..< end], cache: cache)
+            if end == prompt.dim(1) {
+                first = argMax(out.logits[0, -1], axis: -1).item(Int.self)
+            }
+            MLX.eval(cache)
+        }
         return (cache, first)
     }
 
