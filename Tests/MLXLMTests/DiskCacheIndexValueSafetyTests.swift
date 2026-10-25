@@ -242,7 +242,7 @@ extension DiskCacheCompanionAccountingTests {
                     disk.usageBytes() > Self.cap, "INVALID: the fixture is not over the cap")
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
 
@@ -361,7 +361,7 @@ extension DiskCacheCompanionAccountingTests {
                 let hostile = try Self.plantHostileHashRows(root: root, outside: outside)
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (committed, log) = try Support.capturingStandardError {
+                let (committed, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.reconcileDiskAccounting()
                 }
                 #expect(committed, "the import did not commit")
@@ -397,14 +397,14 @@ extension DiskCacheCompanionAccountingTests {
 
                 DiskCache.resetRateLimitedReportsForTesting()
                 try plant()
-                let (_, first) = try Support.capturingStandardError {
+                let (_, first) = try Support.capturingRuntimeDiagnostics {
                     disk.reconcileCompanionAccounting(companions: [])
                 }
                 #expect(try Support.indexedRows(root).isEmpty)
                 #expect(Self.invalidHashLines(first).count == 8, "\(first)")
 
                 try plant()
-                let (_, second) = try Support.capturingStandardError {
+                let (_, second) = try Support.capturingRuntimeDiagnostics {
                     disk.reconcileCompanionAccounting(companions: [])
                 }
                 #expect(try Support.indexedRows(root).isEmpty)
@@ -565,7 +565,7 @@ extension DiskCacheCompanionAccountingTests {
                     disk.usageBytes() > Self.cap, "INVALID: the fixture is not over the cap")
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
 
@@ -636,7 +636,7 @@ extension DiskCacheCompanionAccountingTests {
                     root: root, placement: placement, controls: controls, modelKey: modelKey)
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (committed, log) = try Support.capturingStandardError {
+                let (committed, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.reconcileDiskAccounting()
                 }
                 #expect(committed, "the import did not commit")
@@ -768,7 +768,7 @@ extension DiskCacheCompanionAccountingTests {
                 defer { chmod(url.path, 0o644) }
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (first, log) = try Support.capturingStandardError { disk.fetch(tokens: tokens) }
+                let (first, log) = try Support.capturingRuntimeDiagnostics { disk.fetch(tokens: tokens) }
                 #expect(first == nil)
                 #expect(disk.fetch(tokens: tokens) == nil)
                 guard case .regularFile(let size, _) = DiskCache.pathState(at: url) else {
@@ -1237,7 +1237,7 @@ extension DiskCacheCompanionAccountingTests {
                 kept[rowlessURL] = try Data(contentsOf: rowlessURL)
 
                 try RawDB(root: root).require("PRAGMA user_version = 7")
-                let (newer, log) = try Support.capturingStandardError {
+                let (newer, log) = try Support.capturingRuntimeDiagnostics {
                     DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
                 }
                 try #require(
@@ -1271,7 +1271,7 @@ extension DiskCacheCompanionAccountingTests {
                     #expect((try? Data(contentsOf: url)) == data, "\(url.lastPathComponent)")
                 }
 
-                let (_, clearLog) = try Support.capturingStandardError { newer.clear() }
+                let (_, clearLog) = try Support.capturingRuntimeDiagnostics { newer.clear() }
                 for (url, data) in kept {
                     #expect(
                         (try? Data(contentsOf: url)) == data,

@@ -473,7 +473,7 @@ import Testing
 
         let tokens = (0 ..< 37).map { 7_100_000 + $0 }
         DiskCache.resetRateLimitedReportsForTesting()
-        let (_, log) = try DiskCacheAccountingTestSupport.capturingStandardError {
+        let (_, log) = try DiskCacheAccountingTestSupport.capturingRuntimeDiagnostics {
             for _ in 0 ..< 3 {
                 try MLXMetalTestLock.withLock {
                     let cache = DiskCache(cacheDir: dir, maxSizeBytes: 1 << 30, modelKey: "m")

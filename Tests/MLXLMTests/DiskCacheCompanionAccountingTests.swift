@@ -1779,7 +1779,7 @@ struct DiskCacheCompanionAccountingTests {
                 [.posixPermissions: 0o000], ofItemAtPath: dir.path)
             try Self.requireUnlistable(dir)
             clock.advance(59)
-            let (_, early) = try Self.capturingStandardError {
+            let (_, early) = try Self.capturingRuntimeDiagnostics {
                 coordinator.storePersistentBoundary(
                     tokens: Self.tokens(1_291, seed: 127), diskArrays: Self.kv(), ssmStates: nil)
             }
@@ -2395,8 +2395,8 @@ struct DiskCacheCompanionAccountingTests {
     /// Everything written to standard error while `body` runs. The suite is
     /// serialized and these tests hold `MLXMetalTestLock`, so nothing else in
     /// the process is expected to write meanwhile.
-    private static func capturingStandardError<T>(_ body: () throws -> T) throws -> (T, String) {
-        try Support.capturingStandardError(body)
+    private static func capturingRuntimeDiagnostics<T>(_ body: () throws -> T) throws -> (T, String) {
+        try Support.capturingRuntimeDiagnostics(body)
     }
 
     private static let elevenMinutes: TimeInterval = 11 * 60
@@ -2556,7 +2556,7 @@ struct DiskCacheCompanionAccountingTests {
                 let markerURL = root.appendingPathComponent(marker)
                 try Data("{}".utf8).write(to: markerURL)
 
-                let (committed, log) = try Self.capturingStandardError {
+                let (committed, log) = try Self.capturingRuntimeDiagnostics {
                     coordinator.reconcileDiskAccounting()
                 }
                 #expect(committed, "a skipped sweep is not a failed import")
@@ -2600,7 +2600,7 @@ struct DiskCacheCompanionAccountingTests {
             let newer = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: modelKey)
             try #require(newer.indexSchemaVersion == 7, "INVALID: the newer version was not read")
             try #require(newer.indexHasV2Columns, "INVALID: the import would not run at all")
-            let (summary, log) = try Self.capturingStandardError {
+            let (summary, log) = try Self.capturingRuntimeDiagnostics {
                 newer.reconcileCompanionAccounting(companions: [])
             }
             #expect(summary != nil, "the rest of the import still commits")
@@ -2781,7 +2781,7 @@ struct DiskCacheCompanionAccountingTests {
                 denied.append(url)
                 try Self.denyStat(of: url)
             }
-            let (direct, directLog) = try Self.capturingStandardError {
+            let (direct, directLog) = try Self.capturingRuntimeDiagnostics {
                 disk.reconcileCompanionAccounting(companions: [])
             }
             let viaCoordinator = coordinator.reconcileDiskAccounting()
@@ -2854,7 +2854,7 @@ struct DiskCacheCompanionAccountingTests {
                 try Self.indexedRows(root) == populated,
                 "fetch deleted the row of a payload that is on disk")
 
-            let (committed, log) = try Self.capturingStandardError {
+            let (committed, log) = try Self.capturingRuntimeDiagnostics {
                 coordinator.reconcileDiskAccounting()
             }
             restorePermissions()
@@ -2969,7 +2969,7 @@ struct DiskCacheCompanionAccountingTests {
             try Self.setImmutable(url, true)
         }
 
-        let (results, log) = try Self.capturingStandardError {
+        let (results, log) = try Self.capturingRuntimeDiagnostics {
             [stuck[0], stuck[0], stuck[1], stuck[0]].map { DiskCache.removeCacheFile(at: $0) }
         }
         #expect(results == [false, false, false, false])
@@ -3248,7 +3248,7 @@ struct DiskCacheCompanionAccountingTests {
                     Data(repeating: 0x23, count: 8_209), in: root)
 
                 let before = try Self.listing(root)
-                let (_, log) = try Self.capturingStandardError { coordinator.clear() }
+                let (_, log) = try Self.capturingRuntimeDiagnostics { coordinator.clear() }
 
                 let skipped = log.split(separator: "\n").filter {
                     $0.hasPrefix("[vmlx][cache/disk-index] clear skipped: ")
@@ -3415,7 +3415,7 @@ struct DiskCacheCompanionAccountingTests {
             var foreign = ForeignEntries()
             try foreign.addDirectory("\(hash).safetensors", in: root)
 
-            let (_, log) = try Self.capturingStandardError {
+            let (_, log) = try Self.capturingRuntimeDiagnostics {
                 disk.store(tokens: tokens, arrays: Self.kv(), enforceQuota: false)
             }
             foreign.expectIntact(in: root, after: "a store of the same hash")

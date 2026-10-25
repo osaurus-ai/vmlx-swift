@@ -201,30 +201,32 @@ enum DiskCacheAccountingTestSupport {
             sourceLocation: sourceLocation)
     }
 
-    /// Run `body` with standard error redirected to a file, and return what
-    /// it wrote. The callers are serialized and hold `MLXMetalTestLock`.
-    static func capturingStandardError<T>(_ body: () throws -> T) throws -> (T, String) {
-        let sink = FileManager.default.temporaryDirectory
-            .appendingPathComponent("vmlx-stderr-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: sink) }
-        fflush(stderr)
-        let saved = dup(2)
-        try #require(saved >= 0, "INVALID: could not save standard error")
-        let fd = open(sink.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
-        try #require(fd >= 0, "INVALID: could not open the capture file")
-        dup2(fd, 2)
-        close(fd)
-        defer {
-            fflush(stderr)
-            dup2(saved, 2)
-            close(saved)
+    /// Capture synchronous runtime diagnostics in this task's scope. The
+    /// platform logger still receives each message with its normal privacy.
+    /// Storage assertions must not depend on the platform logging transport.
+    static func capturingRuntimeDiagnostics<T>(_ body: () throws -> T) rethrows -> (T, String) {
+        let capture = DiagnosticCapture()
+        let value = try RuntimeDiagnostics.$observerForTesting.withValue({ capture.append($0) }) {
+            try body()
         }
-        let value = try body()
-        fflush(stderr)
-        let text = (try? String(contentsOf: sink, encoding: .utf8)) ?? ""
-        // Still visible in the test log.
-        FileHandle(fileDescriptor: saved).write(Data(text.utf8))
-        return (value, text)
+        return (value, capture.text)
+    }
+
+    private final class DiagnosticCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func append(_ value: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            data.append(value)
+        }
+
+        var text: String {
+            lock.lock()
+            defer { lock.unlock() }
+            return String(decoding: data, as: UTF8.self)
+        }
     }
 
     /// Set a path's own modification date — a symlink's, not its target's.
