@@ -428,9 +428,18 @@ func runRowExactBench(modelPath: String) async throws {
         "[ROWEXACT] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) steps=\(steps) ar=\(env["BENCH_ROWEXACT_AR"] ?? "native-autoregressive")"
     )
 
+    // Explicit partial-commit diagnostic: trim attention and commit recurrent
+    // state exactly as the serving iterator does, then reverify the overlap.
+    let requestedCommit = env["BENCH_ROWEXACT_COMMIT"].flatMap(Int.init)
+    if let requestedCommit, requestedCommit <= 0 {
+        throw NSError(domain: "RowExactBench", code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "Commit prefix must be positive"])
+    }
     // 2. Verify windows over the same stream.
     for w in widths {
         (cache, _) = prefill()
+        let initialOffsets = cache.map(\.offset)
+        let kept = min(w, requestedCommit ?? w)
         var p = 0
         var bitwise = 0
         var compared = 0
@@ -444,7 +453,13 @@ func runRowExactBench(modelPath: String) async throws {
             }
             let rows = out.logits[0].asType(.float32)
             MLX.eval(rows)
-            guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: w, blockLength: w)
+            for layer in cache where layer.isTrimmable && kept < w {
+                guard layer.trim(w - kept) == w - kept else {
+                    throw NSError(domain: "RowExactBench", code: 8,
+                        userInfo: [NSLocalizedDescriptionKey: "INVALID: partial attention trim failed"])
+                }
+            }
+            guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: kept, blockLength: w)
             else {
                 throw NSError(
                     domain: "RowExactBench", code: 5,
@@ -477,8 +492,13 @@ func runRowExactBench(modelPath: String) async throws {
                 maxDiff = max(maxDiff, diff)
                 if argMax(got, axis: -1).item(Int.self) != stream[p + j + 1] { argmaxMiss += 1 }
             }
-            p += w
+            p += kept
+            guard cache.enumerated().allSatisfy({ $0.element.offset == initialOffsets[$0.offset] + p }) else {
+                throw NSError(domain: "RowExactBench", code: 9,
+                    userInfo: [NSLocalizedDescriptionKey: "INVALID: committed cache offset mismatch"])
+            }
         }
+        print("[ROWEXACT-COMMIT] width=\(w) kept=\(kept) final_offsets=\(cache.map(\.offset))")
         print(
             String(
                 format:
