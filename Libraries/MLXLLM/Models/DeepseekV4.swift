@@ -300,15 +300,18 @@ class DeepseekV4Attention: Module {
         let qResidual = qNorm(wqA(x))
         var q = wqB(qResidual)
         q = q.reshaped(B, L, numHeads, headDim)
-        // Per-head unit-weight RMSNorm via the fused `MLXFast.rmsNorm`
-        // kernel (1 dispatch vs 3 ops for the manual rsqrt path).
-        // Mirrors Python `mx.fast.rms_norm(q, weight=_get_q_norm_ones(...),
-        // eps=...)` — reuses a `(headDim, dtype)`-cached ones tensor so
-        // the 64 heads × 43 layers don't reallocate per token.
-        q = MLXFast.rmsNorm(
-            q,
-            weight: DeepseekV4Math.qNormOnes(headDim: headDim, dtype: q.dtype),
-            eps: config.rmsNormEps)
+        // DSV4 applies a per-head unit-weight RMSNorm to Q here (mirrors its Python
+        // `mx.fast.rms_norm(q, ones, eps)`). DeepSeek-V4.1 does NOT — its reference only q_norms the
+        // LoRA-rank `qr` then projects via wq_b and ropes (inference/model.py Attention.forward +
+        // jang_tools/dsv41 `Attention.__call__`). Applying it on V4.1 unit-normalizes every head's Q,
+        // collapsing the per-head score variance -> a flattened attention-weight distribution across
+        // the 64 heads -> wrong o-proj mix -> compounding garbage. Skip it for V4.1.
+        if config.engramLayerIds.isEmpty {
+            q = MLXFast.rmsNorm(
+                q,
+                weight: DeepseekV4Math.qNormOnes(headDim: headDim, dtype: q.dtype),
+                eps: config.rmsNormEps)
+        }
         q = q.transposed(0, 2, 1, 3)
 
         // --- KV projection (single latent head) ---
@@ -577,7 +580,6 @@ class DeepseekV4Attention: Module {
                 sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
         }
         // sdpaOut shape: (B, numHeads, L, headDim)
-
         if useRegions {
             let region = deepseekV4CachedRegion(regionLock, &outDecodeRegion) {
                 vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
@@ -631,9 +633,6 @@ class DeepseekV4Attention: Module {
             //                              transpose=True, group_size, bits, mode)
             //   out = out.transpose(1, 2, 0, 3).reshape(B, L, oGroups*oLoraRank)
             let xT = oReshape.transposed(2, 0, 1, 3)
-            // Each per-group weight slab keeps its original packed-in
-            // dim (last axis) — `-1` lets MLX work out 1024 → 128 for
-            // 8-bit g=32 packing.
             let wPacked = qwo.weight.reshaped(oGroups, oLoraRank, -1)
                 .expandedDimensions(axis: 1)
             let wScales = qwo.scales.reshaped(oGroups, oLoraRank, -1)
@@ -1010,6 +1009,14 @@ public class DeepseekV4HyperConnection: Module {
     /// does. DeepSeek V4 keeps the compiled graph (its numerics are pinned by its own oracle tests).
     public var fusedDecodeCollapse = false
 
+    /// V4.1 staggered mHC: the (pre, post, comb) coefficients from this sublayer's hc_mixes, WITHOUT
+    /// collapsing. `pre` feeds the NEXT sublayer's collapse; `post`/`comb` drive this sublayer's expand.
+    public func mixes(_ h: MLXArray) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
+        DeepseekV4Math.hcMixes(
+            h, fn: fn, scale: scale, base: base, hcMult: hcMult, hiddenSize: hiddenSize,
+            iters: hcIters, eps: hcEps, normEps: hcNormEps)
+    }
+
     public func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
         if fusedDecodeCollapse, !CompiledDecodeTrace.isActive,
             let fused = MHCFusedDecode.collapse(
@@ -1124,6 +1131,9 @@ class DeepseekV4DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
     @ModuleInfo(key: "attn_hc") var attnHC: DeepseekV4HyperConnection
     @ModuleInfo(key: "ffn_hc") var ffnHC: DeepseekV4HyperConnection
+    /// DeepSeek-V4.1 n-gram-hash gated residual; present only on engram_layer_ids (1, 14). Applied in
+    /// the model loop AFTER this block (matches the reference, which taps engram outside Block.forward).
+    @ModuleInfo(key: "engram") var engram: EngramModule?
 
     let layerIdx: Int
 
@@ -1148,6 +1158,53 @@ class DeepseekV4DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._attnHC.wrappedValue = DeepseekV4HyperConnection(config: config)
         self._ffnHC.wrappedValue = DeepseekV4HyperConnection(config: config)
+        if config.engramLayerIds.contains(layerIdx) {
+            self._engram.wrappedValue = EngramModule(config: config)
+        }
+    }
+
+    /// DeepSeek-V4.1 STAGGERED-mHC forward (ref jang_tools/dsv41/model.py `Block.__call__`). Threads
+    /// `preMix` (the previous sublayer's hc pre): attention collapses the hc copies with the INCOMING
+    /// `preMix`, the FFN collapses with THIS attention's own `aPre`, and the returned `fPre` feeds the
+    /// next layer's attention collapse. (The V4 `callAsFunction` instead collapses each sublayer with
+    /// its own mix via `collapse()`; V4.1 would garble under that.) Eager only — the compiled tail
+    /// region is a V4-decode speed path and is skipped here (correctness first).
+    func callStaggered(
+        _ h: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        inputIds: MLXArray?,
+        preMix: MLXArray
+    ) -> (h: MLXArray, ffnPre: MLXArray) {
+        // ---- Attention HC (collapse with INCOMING preMix) ----
+        let residualA = h
+        let (aPre, aPost, aComb) = attnHC.mixes(h)
+        let normedA = inputLayerNorm(DeepseekV4Math.hcCollapse(h, pre: preMix))
+        let attnOut: MLXArray
+        let sub = DeepseekV4Math.attnSubchunkTokens
+        if let cache, sub > 0, normedA.dim(1) >= 2 * sub {
+            var outs: [MLXArray] = []
+            var s = 0
+            let chunkLen = normedA.dim(1)
+            while s < chunkLen {
+                let e = min(s + sub, chunkLen)
+                let xs = normedA[0..., s ..< e]
+                let subMask = createAttentionMask(h: xs, cache: cache)
+                outs.append(selfAttn(xs, mask: subMask, cache: cache))
+                s = e
+            }
+            attnOut = concatenated(outs, axis: 1)
+        } else {
+            attnOut = selfAttn(normedA, mask: mask, cache: cache)
+        }
+        let hA = attnHC.expand(blockOut: attnOut, residual: residualA, post: aPost, comb: aComb)
+        // ---- FFN HC (collapse with THIS attention's aPre) ----
+        let residualF = hA
+        let (fPre, fPost, fComb) = ffnHC.mixes(hA)
+        let normedF = postAttentionLayerNorm(DeepseekV4Math.hcCollapse(hA, pre: aPre))
+        let ffnOut = mlp(normedF, inputIds: inputIds)
+        let hF = ffnHC.expand(blockOut: ffnOut, residual: residualF, post: fPost, comb: fComb)
+        return (h: hF, ffnPre: fPre)
     }
 
     /// Forward. `h` shape: (B, L, hcMult, hiddenSize).
@@ -1285,6 +1342,13 @@ public class DeepseekV4ModelInner: Module {
     @ModuleInfo(key: "hc_head") var hcHead: DeepseekV4HyperHead
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
+    /// DeepSeek-V4.1 Engram runtime (aux hashing tables + disk FP8 n-gram tables + per-sequence
+    /// hashers). Lazily located from VMLX_DSV41_ENGRAM_DIR on first forward; nil when the bundle has
+    /// no engram layers or the env var is unset (then the n-gram taps are skipped).
+    private var engramRuntime: EngramRuntime?
+    private var engramInit = false
+    private let engramLock = NSLock()
+
     init(config: DeepseekV4Configuration) {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
@@ -1320,24 +1384,65 @@ public class DeepseekV4ModelInner: Module {
                 chunkTokens: chunkTokens,
                 finalContextTokens: (firstCache?.offset ?? 0) + chunkTokens)
 
-        var layerStats: [(String, MLXArray)] = []
-        layerStats.append(contentsOf: DeepseekV4Math.layerStat("embed", h).map { [$0] } ?? [])
-        for (i, layer) in layers.enumerated() {
-            h = layer(
-                h,
-                mask: mask,
-                cache: cache?[i],
-                inputIds: inputs,
-                statsSink: { layerStats.append($0) })
-            if layerwisePrefill {
-                MLX.eval(h)
+        // DeepSeek-V4.1 Engram n-gram rows for this chunk (one lookup set shared by all engram layers).
+        var engramRows: [Int: MLXArray] = [:]
+        if !config.engramLayerIds.isEmpty {
+            engramLock.lock()
+            if !engramInit { engramRuntime = EngramRuntime.locate(); engramInit = true }
+            let rt = engramRuntime
+            engramLock.unlock()
+            if let rt {
+                let startPos = firstCache?.offset ?? 0
+                let ids = inputs.reshaped(-1).asType(.int32).asArray(Int32.self)
+                let key = firstCache.map { ObjectIdentifier($0 as AnyObject) }
+                    ?? ObjectIdentifier(self)
+                engramRows = rt.rows(inputIds: ids, startPos: startPos, cacheKey: key, reset: startPos == 0)
             }
-            layerStats.append(
-                contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
         }
 
-        // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
-        var out = hcHead.reduce(h)
+        let staggeredMHC = !config.engramLayerIds.isEmpty  // DeepSeek-V4.1 threads a staggered hc pre_mix
+
+        var layerStats: [(String, MLXArray)] = []
+        layerStats.append(contentsOf: DeepseekV4Math.layerStat("embed", h).map { [$0] } ?? [])
+        var out: MLXArray
+        if staggeredMHC {
+            // V4.1: thread `preMix` across layers; engram taps the hidden state BEFORE its layer
+            // (ref model.py loop: `if i in engram: h = layer.engram(h,...)` then `h,preMix = layer(...)`).
+            // Initial preMix is the one-hot identity (collapse picks hc copy 0; all copies equal at input).
+            let B = h.dim(0), L = h.dim(1)
+            var preMix = concatenated(
+                [MLXArray.ones([B, L, 1]), MLXArray.zeros([B, L, config.hcMult - 1])], axis: -1)
+                .asType(.float32)
+            for (i, layer) in layers.enumerated() {
+                if let eng = layer.engram, let rows = engramRows[i] {
+                    h = eng(h, rows: rows, textMask: nil)
+                }
+                let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix)
+                h = r.h
+                preMix = r.ffnPre
+                if layerwisePrefill { MLX.eval(h) }
+                layerStats.append(contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
+            }
+            // Final collapse uses the last layer's ffnPre (ref `Block.hc_pre(h, pre_mix)`); V4.1 has NO
+            // learned hc_head (those weights are absent from the bundle).
+            out = DeepseekV4Math.hcCollapse(h, pre: preMix)
+        } else {
+            for (i, layer) in layers.enumerated() {
+                h = layer(
+                    h,
+                    mask: mask,
+                    cache: cache?[i],
+                    inputIds: inputs,
+                    statsSink: { layerStats.append($0) })
+                if layerwisePrefill {
+                    MLX.eval(h)
+                }
+                layerStats.append(
+                    contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
+            }
+            // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
+            out = hcHead.reduce(h)
+        }
         layerStats.append(contentsOf: DeepseekV4Math.layerStat("hcReduce", out).map { [$0] } ?? [])
         out = norm(out)
         layerStats.append(contentsOf: DeepseekV4Math.layerStat("norm", out).map { [$0] } ?? [])
@@ -1552,6 +1657,28 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let projForW = ["w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"]
         for (rawKey, value) in weights {
             if rawKey.hasPrefix("mtp.") { continue }
+            // DeepSeek-V4.1 adds a per-expert VL routing bias `gate.bias_vl` (used only for image
+            // tokens). The V4 MoE gate has only `bias`; drop bias_vl so text loading succeeds (wiring
+            // the VL routing bias into the gate is a V4.1 follow-up).
+            if rawKey.hasSuffix(".bias_vl") { continue }
+            // DeepSeek-V4.1 per-layer Engram module weights (`layers.N.engram.{wkv,q_weight,k_weight}`)
+            // are affine-quantized in the backbone and load into EngramModule at engram_layer_ids
+            // (1, 14); the big FP8 n-gram TABLE (`layers.N.engram.embed.*`) is disk-resident in the
+            // engram/ subdir and is NOT in these backbone weights. Mapped in the layers.N branch below.
+            // DeepSeek-V4.1 attaches a lightning indexer (`self_attn.indexer.{weights_proj,wq_b,wk,
+            // k_norm}`) on its index-source layers. The V4 attention only builds `indexer` when a
+            // layer's compress_ratio == 4, but V4.1's compress_ratios are {2,2,2,1} (never 4), so the
+            // V4 `indexer` property stays nil on every layer and the forward never dereferences it
+            // (`if compressRatio == 4, let idx = indexer`). Drop ALL indexer weights so the nil module
+            // loads cleanly — sparse index selection only engages beyond the 128-token sliding window,
+            // so a short-prompt text load is unaffected. Full long-context indexer is a V4.1 follow-up.
+            if rawKey.contains(".indexer.") { continue }
+            // DeepSeek-V4.1 vision tower (ViT `vision.*`, `aligner.*`, image delimiter embeddings).
+            // Text load drops them; multimodal is served text-routed like the engine's VL path and is
+            // a V4.1 follow-up in Swift.
+            if rawKey.hasPrefix("vision.") || rawKey.hasPrefix("aligner.")
+                || rawKey.hasPrefix("image_start") || rawKey.hasPrefix("image_end")
+                || rawKey.hasPrefix("image_newline") { continue }
 
             // Top-level (no `layers.N.` prefix).
             if rawKey == "embed.weight" || rawKey == "embed.scales"
@@ -1614,6 +1741,15 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 continue
             }
 
+            // Engram module subtree (only present on engram_layer_ids 1, 14):
+            // engram.{wkv.{weight,scales,biases}, q_weight, k_weight}. The disk-resident FP8 table
+            // engram.embed.* is NOT in the backbone, so nothing here maps it.
+            if rest.hasPrefix("engram.") {
+                let inner = String(rest.dropFirst("engram.".count))
+                out["\(pfx).engram.\(inner)"] = value
+                continue
+            }
+
             // Attention subtree (q_norm / kv_norm / wq_a / wq_b / wkv /
             // wo_a / wo_b / attn_sink / compressor.* / indexer.*).
             if rest.hasPrefix("attn.") {
@@ -1647,6 +1783,14 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     guard let eDot = after.firstIndex(of: ".") else { continue }
                     let eStr = String(after[..<eDot])
                     let tail = String(after[after.index(after: eDot)...])
+                    // DeepSeek-V4.1 pre-stacks routed experts as
+                    // experts.{gate,up,down}_proj.{weight,scales,biases} (SwitchGLU stacked layout),
+                    // vs DSV4's per-expert experts.{E}.{w1,w2,w3}. Map the pre-stacked form straight
+                    // to switch_mlp.{proj}.{suffix}.
+                    if eStr.hasSuffix("_proj") {
+                        out["\(pfx).mlp.switch_mlp.\(eStr).\(tail)"] = value
+                        continue
+                    }
                     if let firstDot = tail.firstIndex(of: "."),
                         let proj = projForW[String(tail[..<firstDot])]
                     {

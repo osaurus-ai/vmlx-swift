@@ -37,6 +37,12 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     public var rmsNormEps: Float = 1e-6
     public var maxPositionEmbeddings: Int = 1_048_576
 
+    // MARK: - Engram (DeepSeek-V4.1 n-gram-hash gated residual at engram_layer_ids)
+    public var engramLayerIds: [Int] = []
+    public var engramNHeads: Int = 0
+    public var engramHeadDim: Int = 0
+    public var engramMaxNgramSize: Int = 1
+
     // MARK: - MLA — grouped low-rank O
 
     /// `wo_a` splits head output into `oGroups` × `oLoraRank` via an
@@ -137,6 +143,11 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case mxtqBits = "mxtq_bits"
         case routedExpertBitPlan = "routed_expert_bit_plan"
         case quantization
+        case textConfig = "text_config"
+        case engramLayerIds = "engram_layer_ids"
+        case engramNHeads = "engram_n_heads"
+        case engramHeadDim = "engram_head_dim"
+        case engramMaxNgramSize = "engram_max_ngram_size"
         case hcMult = "hc_mult"
         case hcSinkhornIters = "hc_sinkhorn_iters"
         case hcEps = "hc_eps"
@@ -153,9 +164,17 @@ public struct DeepseekV4Configuration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // DeepSeek-V4.1 wraps the text model's fields in a `text_config` sub-object (alongside
+        // `vision_config`/`quantization`), whereas plain DSV4 keeps them top-level. Decode each field
+        // from `text_config` first and fall back to the top level, so V4.1's hidden_size (5120),
+        // num_hidden_layers (40), q_lora_rank (1280), rms_norm_eps (1e-20), n_routed_experts (384),
+        // moe_intermediate_size (2304), index_n_heads (32), etc. are read instead of silently taking
+        // the DSV4 defaults. `quantization` stays top-level (it is a sibling of `text_config`).
+        let text = try? c.nestedContainer(keyedBy: CodingKeys.self, forKey: .textConfig)
 
         func req<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
-            (try? c.decode(T.self, forKey: k)) ?? fallback
+            if let text, let v = try? text.decode(T.self, forKey: k) { return v }
+            return (try? c.decode(T.self, forKey: k)) ?? fallback
         }
 
         self.vocabSize = req(.vocabSize, 129_280)
@@ -190,13 +209,18 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.hcEps = req(.hcEps, 1e-6)
         self.ropeTheta = req(.ropeTheta, 10000.0)
         self.compressRopeTheta = req(.compressRopeTheta, 160_000.0)
-        self.ropeScaling = try? c.decode([String: StringOrNumber].self, forKey: .ropeScaling)
+        self.ropeScaling = (text.flatMap { try? $0.decode([String: StringOrNumber].self, forKey: .ropeScaling) })
+            ?? (try? c.decode([String: StringOrNumber].self, forKey: .ropeScaling))
         self.slidingWindow = req(.slidingWindow, 128)
         self.compressRatios = req(.compressRatios, [])
         self.indexNHeads = req(.indexNHeads, 64)
         self.indexHeadDim = req(.indexHeadDim, 128)
         self.indexTopk = req(.indexTopk, 512)
         self.useAttnSink = req(.useAttnSink, true)
+        self.engramLayerIds = req(.engramLayerIds, [])
+        self.engramNHeads = req(.engramNHeads, 0)
+        self.engramHeadDim = req(.engramHeadDim, 0)
+        self.engramMaxNgramSize = req(.engramMaxNgramSize, 1)
         self.activationQATEnabled = false
     }
 

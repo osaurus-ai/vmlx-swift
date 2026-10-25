@@ -296,6 +296,10 @@ public enum LLMTypeRegistry {
             // Swift port plan + status:
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
+            // DeepSeek-V4.1-Flash: V4-family backbone (MLA head_dim-512, mHC, DSA compressor/indexer,
+            // quantized pool cache) + engram n-gram taps + 3-stage dSpark. Routes to the V4 dispatch as
+            // the base; engram + dSpark are the V4.1-specific additions still being ported.
+            "deepseek_v41": dispatchDeepseekV4,
             "hy_v3": create(Hy3Configuration.self, Hy3Model.init),
             "hy3":   create(Hy3Configuration.self, Hy3Model.init),
             "hy-v3": create(Hy3Configuration.self, Hy3Model.init),

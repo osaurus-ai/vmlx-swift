@@ -505,6 +505,29 @@ public enum DeepseekV4Math {
         return (x: y.asType(h.dtype), post: post, comb: comb)
     }
 
+    /// DeepSeek-V4.1 STAGGERED mHC: `hc_mixes(x, fn, scale, base)` returns the (pre, post, comb)
+    /// coefficients WITHOUT collapsing. V4.1 threads these across sublayers — a sublayer's `pre` is
+    /// consumed by the NEXT sublayer's collapse, while its `post`/`comb` drive its own expand
+    /// (ref jang_tools/dsv41/model.py `Block.hc_mixes`). Same math as `hcPreGraph` up to the collapse.
+    public static func hcMixes(
+        _ h: MLXArray, fn: MLXArray, scale: MLXArray, base: MLXArray,
+        hcMult: Int, hiddenSize: Int, iters: Int, eps: Float, normEps: Float
+    ) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
+        let B = h.dim(0)
+        let L = h.dim(1)
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
+        let reciprocalRMS = rsqrt((xFlat * xFlat).mean(axis: -1, keepDims: true) + normEps)
+        let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
+        return hcSplitSinkhorn(mixes: mixes, scale: scale, base: base, hcMult: hcMult, iters: iters, eps: eps)
+    }
+
+    /// Collapse the hc copies of `h` [B,L,hcMult,hiddenSize] with an EXTERNALLY supplied `pre`
+    /// [B,L,hcMult] (ref `hc_pre`): `y = sum(pre[...,None] * h, axis=2)`.
+    public static func hcCollapse(_ h: MLXArray, pre: MLXArray) -> MLXArray {
+        let y = (pre.expandedDimensions(axis: -1) * h.asType(.float32)).sum(axis: -2)
+        return y.asType(h.dtype)
+    }
+
     private static let hcPreCompiledLock = NSLock()
     nonisolated(unsafe) private static var hcPreCompiledCache:
         [String: ([MLXArray]) -> [MLXArray]] = [:]
@@ -760,7 +783,8 @@ public enum DeepseekV4Math {
         // reports .gpu, passes this test and then fails on the Metal kernel below;
         // on those builds the test must ask for Metal, as the `#if canImport(Metal)`
         // guards around the same test in `Qwen4ExpQSA.swift` do.
-        if Device.defaultDevice().deviceType == .gpu {
+        if Device.defaultDevice().deviceType == .gpu,
+            ProcessInfo.processInfo.environment["VMLX_HC_SINKHORN_OPS"] == nil {
             let leadShape = Array(mixes.shape.dropLast())
             let rows = mixes.size / ((2 + hcMult) * hcMult)
             let outputs = hcSplitSinkhornKernel(

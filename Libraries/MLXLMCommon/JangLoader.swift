@@ -2702,6 +2702,25 @@ public struct JangLoader: Sendable {
                 return (declared.bits, declared.groupSize)
             }()
 
+            // The TOP-LEVEL declared affine default (config.json `quantization` / jang_config
+            // `affine_bits`+`affine_group_size`), when it can actually have packed THIS tensor. It is
+            // the producer's explicit statement for every non-overridden affine leaf, and -- unlike a
+            // per-layer declaration -- is only reached below as a tie-break against the validInDims
+            // heuristic, never over a semantic-width hint. Needed because `validInDims` is derived
+            // from config dims and does not include every projection's input width: DSV4's grouped
+            // o-proj first stage `wo_a` consumes groupFeat = hidden*heads/oGroups (4096 here), a width
+            // no other tensor exposes, so it is absent from validInDims while the WRONG alternative
+            // (8192) is present -- `inferFromUniqueValidInDim` then uniquely picks 4-bit/g128 and the
+            // 8-bit weights dequantize to an empty output that collapses the forward.
+            let declaredDefaultIfConsistent: (bits: Int, groupSize: Int)? = {
+                guard let d = declaredDefaultQuantization, d.bits > 0, d.groupSize > 0
+                else { return nil }
+                let inDim = numGroups * d.groupSize
+                guard inDim > 0, packedDim > 0, packedDim * 32 == inDim * d.bits
+                else { return nil }
+                return (d.bits, d.groupSize)
+            }()
+
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
             } else if let declared = declaredIfConsistent {
@@ -2827,6 +2846,14 @@ public struct JangLoader: Sendable {
                     knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
+            } else if let dd = declaredDefaultIfConsistent,
+                      { let g = inferFromUniqueValidInDim()
+                        return g == nil || g!.bits != dd.bits || g!.groupSize != dd.groupSize }()
+            {
+                // The validInDims heuristic found nothing, or it CONTRADICTS a shape-consistent
+                // explicit default. Trust the producer's declared default over a membership guess
+                // against an admittedly incomplete validInDims set (fixes DSV4 wo_a -> 8-bit/g64).
+                (bits, inferredGroupSize) = dd
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked
             } else if isExpertDownProjection && !validInDims.isEmpty {
