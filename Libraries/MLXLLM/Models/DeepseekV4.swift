@@ -1446,7 +1446,12 @@ public class DeepseekV4ModelInner: Module {
 
     /// Engram rows for this chunk. History comes from (and is written back to) the cache, never
     /// from model state, so restores/copies/trims hash exactly like an uninterrupted sequence.
-    private func engramChunk(_ inputs: MLXArray, cache: [KVCache]?) -> EngramRuntime.Chunk? {
+    /// Rows a previous forward requested for exactly this chunk (prefill lookahead) are used
+    /// instead of reading again. The returned closure starts the lookahead for the next forward
+    /// when `prepare` asked for one; call it once this forward's rows are resolved.
+    private func engramChunk(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> (chunk: EngramRuntime.Chunk, startLookahead: () -> Void)? {
         guard !config.engramLayerIds.isEmpty else { return nil }
         engramLock.lock()
         if engramRuntime == nil,
@@ -1496,9 +1501,31 @@ public class DeepseekV4ModelInner: Module {
                         + "its engram tail).")
             }
         }
-        let chunk = runtime.prepare(comp: comp, startPos: startPos, previous: previous)
+        let ahead = holder?.engramLookahead
+        holder?.engramLookahead = nil
+        let chunk: EngramRuntime.Chunk
+        if let ahead, ahead.matches(startPos: startPos, comp: comp, previous: previous) {
+            chunk = ahead.chunk
+        } else {
+            chunk = runtime.prepare(comp: comp, startPos: startPos, previous: previous)
+        }
         holder?.recordAuxiliaryTokens(comp.map { Int32(truncatingIfNeeded: $0) }, startPos: startPos)
-        return chunk
+
+        let nextTokens = holder?.engramLookaheadTokens
+        holder?.engramLookaheadTokens = nil
+        let startLookahead: () -> Void = { [weak holder] in
+            guard let holder, let nextTokens, !nextTokens.isEmpty else { return }
+            let nextStart = startPos + comp.count
+            let nextReach = min(runtime.hasher.historyReach, nextStart)
+            guard let tail = holder.auxiliaryTokens(before: nextStart, count: nextReach) else { return }
+            let nextComp = runtime.hasher.compress(nextTokens)
+            let nextPrevious = tail.map(Int64.init)
+            holder.engramLookahead = EngramRuntime.Lookahead(
+                startPos: nextStart, comp: nextComp, previous: nextPrevious,
+                chunk: runtime.prepare(
+                    comp: nextComp, startPos: nextStart, previous: nextPrevious, background: true))
+        }
+        return (chunk, startLookahead)
     }
 
     init(config: DeepseekV4Configuration) {
@@ -1538,7 +1565,9 @@ public class DeepseekV4ModelInner: Module {
 
         // DeepSeek-V4.1 Engram n-gram rows for this chunk (one hash set shared by all engram layers;
         // deeper layers' table reads overlap the forward of the layers before them).
-        let engramRows = engramChunk(inputs, cache: cache)
+        let engram = engramChunk(inputs, cache: cache)
+        let engramRows = engram?.chunk
+        let lastEngramLayer = config.engramLayerIds.max() ?? -1
 
         let staggeredMHC = !config.engramLayerIds.isEmpty  // DeepSeek-V4.1 threads a staggered hc pre_mix
 
@@ -1557,10 +1586,21 @@ public class DeepseekV4ModelInner: Module {
             let compressShare = DSV41CompressShare()
             for (i, layer) in layers.enumerated() {
                 if let eng = layer.engram {
+                    if i > 0 && chunkTokens > 1 {
+                        // Queue the layers before this one on the GPU so its rows' SSD reads
+                        // overlap their compute (reference: `mx.async_eval` before resolving a
+                        // lazy engram layer). Without it the GPU idled while the reads finished.
+                        asyncEval(h, preMix)
+                    }
                     guard let rows = engramRows?.rows(layer: i) else {
                         fatalError("DeepSeek-V4.1 engram rows missing for engram layer \(i)")
                     }
                     h = eng(h, rows: rows, textMask: nil)
+                    if i == lastEngramLayer {
+                        // This forward's reads are done: request the next chunk's rows now,
+                        // so they read while the rest of this chunk computes.
+                        engram?.startLookahead()
+                    }
                 }
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
@@ -1821,6 +1861,12 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             flatMask = m.ndim >= 2 ? m.reshaped([-1]) : m
         }
 
+        // DeepSeek-V4.1: the cache that carries the engram history also carries the next
+        // forward's token ids, so each chunk's forward reads the following chunk's engram rows.
+        let engramHolder = config.engramLayerIds.isEmpty
+            ? nil
+            : cache.first { ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true }
+                as? DeepseekV4Cache
         while flatTokens.size > prefillStepSize {
             try Task.checkCancellation()
             // Always leave >= 1 token so the caller's final forward yields
@@ -1829,6 +1875,15 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             let chunkTokens = flatTokens[..<step][.newAxis, 0...]
             let chunkMask = flatMask.map { $0[..<step] }
             let chunkText = LMInput.Text(tokens: chunkTokens, mask: chunkMask)
+            if let engramHolder {
+                // The next forward: another chunk of this loop, or the caller's final
+                // forward over everything that remains.
+                let remaining = flatTokens.size - step
+                let nextCount = remaining > prefillStepSize
+                    ? min(outerStep, remaining - 1) : remaining
+                engramHolder.engramLookaheadTokens =
+                    flatTokens[step ..< (step + nextCount)].asType(.int32).asArray(Int32.self)
+            }
             _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
             if config.isDeepseekV41 { Self.compactSlidingWindows(cache) }
             MLX.eval(cache)

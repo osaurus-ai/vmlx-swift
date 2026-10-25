@@ -986,6 +986,14 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// reaches back `max_ngram_size - 1` tokens; the slack absorbs trims).
     public var auxiliaryTokenHistory: HybridPoolTokenHistory?
     public let requiresAuxiliaryTokenHistory: Bool
+
+    /// DeepSeek-V4.1 chunked prefill (history holder only): token ids of the NEXT
+    /// forward on this sequence, set by `DeepseekV4Model.prepare` so that forward's
+    /// engram reads start while the current chunk computes. Transient: never copied,
+    /// serialized or restored; any trim drops it.
+    var engramLookaheadTokens: [Int32]?
+    /// The started lookahead (`EngramRuntime.Lookahead`), validated by the next forward.
+    var engramLookahead: EngramRuntime.Lookahead?
     public static let auxiliaryTokenHistoryCapacity = 1024
 
     public init(
@@ -1246,6 +1254,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         // have contributed a pool row. A trim invalidates their positions in
         // exactly the same way as the projected incomplete-window buffers.
         dropPoolPending()
+        engramLookaheadTokens = nil
+        engramLookahead = nil
         let rv = local.trim(n)
         if var h = auxiliaryTokenHistory, h.endPosition > local.offset {
             let drop = min(h.tokens.count, h.endPosition - local.offset)

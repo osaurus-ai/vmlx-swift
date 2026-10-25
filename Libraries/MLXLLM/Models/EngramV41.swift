@@ -669,16 +669,41 @@ final class EngramRuntime: @unchecked Sendable {
         }
     }
 
+    /// The next forward's rows, requested while the current chunk computes (reference
+    /// `DSV41._start_lookahead`). Used only by a forward with exactly this start position,
+    /// compressed ids and history; anything else discards it.
+    final class Lookahead: @unchecked Sendable {
+        let startPos: Int
+        let comp: [Int64]
+        let previous: [Int64]
+        let chunk: Chunk
+
+        init(startPos: Int, comp: [Int64], previous: [Int64], chunk: Chunk) {
+            self.startPos = startPos
+            self.comp = comp
+            self.previous = previous
+            self.chunk = chunk
+        }
+
+        func matches(startPos: Int, comp: [Int64], previous: [Int64]) -> Bool {
+            self.startPos == startPos && self.comp == comp && self.previous == previous
+        }
+    }
+
     /// Hash the chunk and start its table reads.
     /// - Parameters:
     ///   - comp: compressed ids of the chunk (see `EngramNgramHasher.compress`).
     ///   - previous: compressed ids immediately before `startPos` (cache-carried history).
-    func prepare(comp: [Int64], startPos: Int, previous: [Int64]) -> Chunk {
+    ///   - background: read every layer on the background lane, one layer after another so
+    ///     the first layer's rows (needed first) get every I/O lane (lookahead requests).
+    ///     Otherwise the first layer is read before returning.
+    func prepare(comp: [Int64], startPos: Int, previous: [Int64], background: Bool = false) -> Chunk {
         let h = hasher.hashes(comp, startPos: startPos, previous: previous)
         let L = comp.count
         let cols = aux.cols
         let nLayers = aux.layerIds.count
         let chunk = Chunk(tokens: L, cols: cols)
+        var chained: [(table: EngramTable, ids: [Int64], group: DispatchGroup, box: Chunk.Box)] = []
         for (j, lid) in aux.layerIds.enumerated() {
             guard let table = tables[lid] else { continue }
             var ids = [Int64](repeating: 0, count: L * cols)
@@ -688,12 +713,23 @@ final class EngramRuntime: @unchecked Sendable {
             }
             let group = DispatchGroup()
             let box = Chunk.Box()
-            if j == 0 {
+            if background {
+                group.enter()
+                chained.append((table, ids, group, box))
+            } else if j == 0 {
                 box.raw = table.readLookup(ids)
             } else {
                 Self.prefetchQueue.async(group: group) { box.raw = table.readLookup(ids) }
             }
             chunk.add(layer: lid, table: table, group: group, box: box)
+        }
+        if !chained.isEmpty {
+            Self.prefetchQueue.async {
+                for read in chained {
+                    read.box.raw = read.table.readLookup(read.ids)
+                    read.group.leave()
+                }
+            }
         }
         return chunk
     }
