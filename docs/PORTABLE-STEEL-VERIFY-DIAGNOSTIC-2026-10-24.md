@@ -30,3 +30,35 @@ clearance. Quiescent timing and full-model Release proof remain pending. This is
 speedup claim, or a diagnosis of the reported M5 Pro 11 tok/s. No generation
 or RAM Safety defaults change. Do not promote this candidate before
 coherent multi-turn/cache/lifecycle and physical-footprint qualification.
+
+## Call-site scope correction and native integration
+
+The new split-K entry point is called only by the dense JANGH owner in
+`JANGHDenseModelPreparation`. The two audited Allosaurus bundles declare
+custom quantization on routed expert projections; their other linears remain
+ordinary affine modules. These bundles do not reach this dense entry point.
+Do not interpret an Allosaurus run with the split-K flag as evidence that
+this kernel executed or accelerated native MTP. The planned third
+Allosaurus comparison is skipped because the flag is ineffective there.
+
+Quiescent synthetic operator repeats on Max2 gave baseline/split-K ratios
+1.553, 1.575 and 1.054 for rows4,K2560,N512/2560/12288. GPU median338MHz;
+these are operator diagnostics, not a dense-family full-model qualification.
+
+The same Release binary also contains the separate Steel Trellis prefill
+prototype. With generic core g15 dispatch and JANGH Steel on actual g17s
+Max2, the legacy versus Trellis-Steel arms returned correct answers at
+430.89 versus422.47 cache-inclusive prompt tok/s on the3669-token task.
+There is no demonstrated full-portable prefill gain in this pair. Native
+code/growing turns completed at67.93/53.66 and65.96/54.07 tok/s, with
+natural stops, closed reasoning, four generated tests and2000 independent
+function/input-preservation cases per arm. Both150-value arrays and sums
+validate. Reasoning lengths/token counts differ; these unseeded turns are
+regression evidence, not matched-output decode speedup. Activity Monitor
+during the growing turns showed31.49 and32.79GB.
+
+Both processes exited normally; owned clock/log collectors were stopped.
+The exact Release binary SHA-256 is
+97ad57136888ae07703d79bb2343e11fd887983b7d94e781c759828f6bc8173a.
+All work remains local Max2. The candidate stays draft/default-off pending
+a reachable dense-family runtime and physical-footprint qualification.
