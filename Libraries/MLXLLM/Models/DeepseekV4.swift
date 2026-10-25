@@ -1711,13 +1711,27 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let env = ProcessInfo.processInfo.environment
+        Self.makeCaches(config: config)
+    }
+
+    /// The per-layer cache list for `config` (``newCache(parameters:)``), static so
+    /// the cache geometry can be checked without building the model.
+    static func makeCaches(
+        config: DeepseekV4Configuration,
+        environment env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [KVCache] {
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let mode: String = envMode ?? "sliding"
         // DeepSeek-V4.1: the first compressed layer's cache carries the Engram n-gram history.
         // DeepSeek-V4.1 keeps compressed pools at 4 bits (reference: FP4 compressed KV) so 1M
         // context fits; DSV4-0731 stays on its 8-bit pools.
         let poolBits = config.isDeepseekV41 ? 4 : DeepseekV4Cache.poolQuantizationBits
+        // DeepSeek-V4.1 pools follow the reference `QuantGrowBuffer`: 4-bit from the
+        // first row (no BF16 hot tier) in one contiguous slab, so the retained KV is
+        // ~1 KB/token at every context length. `VMLX_DSV41_POOL_LAYOUT=segmented`
+        // restores the previous BF16-hot-tier layout for A/B runs.
+        let v41Contiguous = config.isDeepseekV41
+            && env["VMLX_DSV41_POOL_LAYOUT"]?.lowercased() != "segmented"
         let engramHistoryHolder: Int? = config.engramLayerIds.isEmpty
             ? nil
             : (0..<config.numHiddenLayers).first {
@@ -1732,15 +1746,17 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 let cr =
                     config.compressRatios.count > layerIdx
                     ? config.compressRatios[layerIdx]
-                    : Self.defaultCompressRatio(
+                    : defaultCompressRatio(
                         layerIdx: layerIdx,
                         numLayers: config.numHiddenLayers)
                 if cr > 0 {
                     return DeepseekV4Cache(
                         slidingWindow: config.slidingWindow,
                         compressRatio: cr,
+                        poolBF16HotByteLimit: v41Contiguous ? 0 : nil,
                         requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder,
-                        poolQuantizationBits: poolBits)
+                        poolQuantizationBits: poolBits,
+                        contiguousPools: v41Contiguous)
                 }
                 return RotatingKVCache(
                     maxSize: config.slidingWindow, keep: 0)

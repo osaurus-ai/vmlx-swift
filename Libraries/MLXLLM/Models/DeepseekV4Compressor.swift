@@ -45,55 +45,99 @@ final class DeepseekV4PoolStorage {
     /// Code width for newly encoded rows. DeepSeek-V4.1 uses 4 (its reference
     /// keeps compressed KV in FP4); DSV4-0731 keeps 8.
     let bits: Int
+    /// DeepSeek-V4.1 layout (reference `QuantGrowBuffer`): every row is encoded
+    /// at append (no BF16 hot tier) into ONE growable slab written in place, so
+    /// the retained pool is the packed 4-bit form at every context length, a
+    /// selected-row gather is one device `take` (no host sync), and the disk
+    /// serializer sees a single compact segment. DSV4-0731 keeps the segmented
+    /// hot-tier layout (`false`).
+    let contiguous: Bool
     private(set) var hotPool: MLXArray?
-    private(set) var quantizedSegments: [HybridPoolQuantizedSegment] = []
+    private(set) var segmentStore: [HybridPoolQuantizedSegment] = []
     private var emptySpec: (shape: [Int], dtype: DType)?
+    /// Contiguous layout only: arrays sized to `originalShape[1]` = capacity
+    /// rows; rows `0 ..< slabRows` are live. Never handed out directly except
+    /// for evaluation (rows are written in place).
+    private var slab: HybridPoolQuantizedSegment?
+    private var slabRows = 0
+    /// Contiguous growth step (reference `QuantGrowBuffer.STEP`).
+    static let contiguousGrowRows = 2048
 
-    init(quantizationEnabled: Bool, hotByteLimit: Int, bits: Int = DeepseekV4PoolStorage.bits) {
+    init(
+        quantizationEnabled: Bool, hotByteLimit: Int, bits: Int = DeepseekV4PoolStorage.bits,
+        contiguous: Bool = false
+    ) {
         precondition(Self.supportedBits.contains(bits), "DSV4 pool bits must be 4 or 8")
         self.quantizationEnabled = quantizationEnabled
         self.hotByteLimit = max(0, hotByteLimit)
         self.bits = bits
+        self.contiguous = contiguous && quantizationEnabled
+    }
+
+    /// Encoded segments as the disk serializer and inspection code read them.
+    /// Contiguous layout: one segment holding exactly the live rows.
+    var quantizedSegments: [HybridPoolQuantizedSegment] {
+        if contiguous { return liveSlab().map { [$0] } ?? [] }
+        return segmentStore
+    }
+
+    /// Live rows of the contiguous slab as a fresh segment (new array handles,
+    /// so later in-place writes to the slab never alias it).
+    private func liveSlab() -> HybridPoolQuantizedSegment? {
+        guard let slab, slabRows > 0 else { return nil }
+        return Self.sliceRows(slab, from: 0, to: slabRows)
     }
 
     var rowCount: Int {
+        if contiguous { return slabRows }
         if let hotPool { return hotPool.dim(1) }
-        return quantizedSegments.reduce(0) { $0 + $1.rowCount }
+        return segmentStore.reduce(0) { $0 + $1.rowCount }
     }
 
+    /// Resident bytes. The contiguous slab counts its full capacity (at most
+    /// ``contiguousGrowRows`` rows of slack), not just the live rows.
     var retainedByteCount: Int {
-        (hotPool?.nbytes ?? 0)
-            + quantizedSegments.reduce(0) { $0 + $1.retainedByteCount }
+        if contiguous { return slab?.retainedByteCount ?? 0 }
+        return (hotPool?.nbytes ?? 0)
+            + segmentStore.reduce(0) { $0 + $1.retainedByteCount }
     }
 
     var retainedArrays: [MLXArray] {
+        if contiguous { return slab.map { [$0.codes, $0.scales, $0.biases] } ?? [] }
         if let hotPool { return [hotPool] }
-        return quantizedSegments.flatMap { [$0.codes, $0.scales, $0.biases] }
+        return segmentStore.flatMap { [$0.codes, $0.scales, $0.biases] }
     }
 
     var featureDim: Int? {
+        if contiguous, let slab { return slab.originalShape.last }
         if let hotPool { return hotPool.dim(2) }
-        if let first = quantizedSegments.first { return first.originalShape.last }
+        if let first = segmentStore.first { return first.originalShape.last }
         if let emptySpec { return emptySpec.shape.last }
         return nil
     }
 
     var poolDType: DType? {
+        if contiguous, let slab { return slab.originalDType }
         if let hotPool { return hotPool.dtype }
-        if let first = quantizedSegments.first { return first.originalDType }
+        if let first = segmentStore.first { return first.originalDType }
         if let emptySpec { return emptySpec.dtype }
         return nil
     }
 
     func materialized() -> MLXArray? {
+        if contiguous {
+            if let live = liveSlab() { return Self.dequantize(live) }
+            if let emptySpec { return MLXArray.zeros(emptySpec.shape, dtype: emptySpec.dtype) }
+            return nil
+        }
         if let hotPool { return hotPool }
-        if quantizedSegments.isEmpty {
+        if segmentStore.isEmpty {
             if let emptySpec {
                 return MLXArray.zeros(emptySpec.shape, dtype: emptySpec.dtype)
             }
             return nil
         }
-        let parts = quantizedSegments.map(Self.dequantize)
+        let parts = segmentStore.map(Self.dequantize)
         return parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
     }
 
@@ -104,6 +148,16 @@ final class DeepseekV4PoolStorage {
     /// pools are sliced without any quantization round-trip.
     func forEachDequantizedTile(maxRows: Int, _ body: (Int, MLXArray) -> Void) {
         let maxRows = max(1, maxRows)
+        if contiguous {
+            guard let slab else { return }
+            var start = 0
+            while start < slabRows {
+                let end = min(start + maxRows, slabRows)
+                body(start, Self.dequantize(Self.sliceRows(slab, from: start, to: end)))
+                start = end
+            }
+            return
+        }
         if let hotPool {
             let rows = hotPool.dim(1)
             var start = 0
@@ -129,7 +183,7 @@ final class DeepseekV4PoolStorage {
             body(pendingStart, tile)
         }
 
-        for segment in quantizedSegments {
+        for segment in segmentStore {
             let segmentRows = segment.rowCount
             var segmentOffset = 0
             while segmentOffset < segmentRows {
@@ -164,6 +218,31 @@ final class DeepseekV4PoolStorage {
         let width = featureDim ?? 0
         let dtype = poolDType ?? .float32
 
+        if contiguous {
+            // One device gather from the slab: no host copy of the indices and
+            // no per-segment bookkeeping. Bit-identical to gathering rows of
+            // `materialized()` (dequantization is per row and group).
+            guard let slab, slabRows > 0, indices.size > 0 else {
+                return MLXArray.zeros(outShape + [width], dtype: dtype)
+            }
+            let B = indices.dim(0)
+            let capacity = slab.originalShape[1]
+            var flat = indices.reshaped(B, -1).asType(.int32)
+            if B > 1 {
+                flat = flat + (MLXArray(Int32(0) ..< Int32(B)) * Int32(capacity))
+                    .expandedDimensions(axis: 1)
+            }
+            let linear = flat.reshaped(-1)
+            func rows(_ a: MLXArray) -> MLXArray {
+                take(a.reshaped([a.dim(0) * a.dim(1)] + Array(a.shape.dropFirst(2))), linear, axis: 0)
+            }
+            let codes = Self.elementCodes(rows(slab.codes), bits: slab.bits)
+            return (codes.asType(.float32) * rows(slab.scales).asType(.float32)
+                + rows(slab.biases).asType(.float32))
+                .reshaped(outShape + [width])
+                .asType(slab.originalDType)
+        }
+
         if let hotPool {
             let B = hotPool.dim(0)
             let D = hotPool.dim(2)
@@ -184,7 +263,7 @@ final class DeepseekV4PoolStorage {
 
         var segmentEnds: [Int] = []
         var acc = 0
-        for segment in quantizedSegments {
+        for segment in segmentStore {
             acc += segment.rowCount
             segmentEnds.append(acc)
         }
@@ -214,7 +293,7 @@ final class DeepseekV4PoolStorage {
         for segmentId in batchBySegment.keys.sorted() {
             decodedParts.append(
                 Self.dequantizeSelected(
-                    quantizedSegments[segmentId],
+                    segmentStore[segmentId],
                     batchIndices: batchBySegment[segmentId]!,
                     rowIndices: rowsBySegment[segmentId]!))
             positions.append(contentsOf: positionsBySegment[segmentId]!)
@@ -236,12 +315,19 @@ final class DeepseekV4PoolStorage {
 
     func replace(with value: MLXArray?) {
         hotPool = nil
-        quantizedSegments = []
+        segmentStore = []
         emptySpec = nil
+        slab = nil
+        slabRows = 0
         guard let value else { return }
         precondition(value.ndim == 3, "DSV4 pooled state must have shape [batch, rows, features]")
         if value.dim(1) == 0 {
             emptySpec = (value.shape, value.dtype)
+        } else if contiguous {
+            // A BF16 state (older record, generic `state` setter) is encoded
+            // exactly as appending its rows would have encoded them.
+            slab = Self.quantize(value, bits: bits)
+            slabRows = value.dim(1)
         } else if !quantizationEnabled || value.nbytes <= hotByteLimit {
             hotPool = value
         } else {
@@ -253,12 +339,17 @@ final class DeepseekV4PoolStorage {
         guard value.ndim == 3, value.dim(1) > 0 else { return }
         emptySpec = nil
 
+        if contiguous {
+            appendContiguous(Self.quantize(value, bits: bits))
+            return
+        }
+
         if !quantizationEnabled {
             hotPool = hotPool.map { concatenated([$0, value], axis: 1) } ?? value
             return
         }
 
-        if hotPool != nil || quantizedSegments.isEmpty {
+        if hotPool != nil || segmentStore.isEmpty {
             let combined = hotPool.map { concatenated([$0, value], axis: 1) } ?? value
             if combined.nbytes <= hotByteLimit {
                 hotPool = combined
@@ -273,7 +364,7 @@ final class DeepseekV4PoolStorage {
         let tail = trailingPartialSegmentRows()
         if tail > 0 {
             let take = min(Self.segmentRows - tail, rows)
-            quantizedSegments.append(
+            segmentStore.append(
                 Self.quantize(value[0..., 0..<take, 0...], bits: bits))
             offset += take
             compactCompletedTail()
@@ -285,13 +376,13 @@ final class DeepseekV4PoolStorage {
             while take * 2 <= min(fullRows, Self.slabMaxRows) {
                 take *= 2
             }
-            quantizedSegments.append(
+            segmentStore.append(
                 Self.quantize(value[0..., offset..<(offset + take), 0...], bits: bits))
             offset += take
             compactSlabCascade()
         }
         if offset < rows {
-            quantizedSegments.append(
+            segmentStore.append(
                 Self.quantize(value[0..., offset..<rows, 0...], bits: bits))
         }
     }
@@ -300,18 +391,24 @@ final class DeepseekV4PoolStorage {
         var remaining = max(0, count)
         guard remaining > 0 else { return }
         emptySpec = nil
+        if contiguous {
+            // Dropped rows stay in the slab as slack and are overwritten by the
+            // next append.
+            slabRows = max(0, slabRows - remaining)
+            return
+        }
         if let hotPool {
             let keep = max(0, hotPool.dim(1) - remaining)
             self.hotPool = keep == 0 ? nil : hotPool[0..., 0..<keep, 0...]
             return
         }
 
-        while remaining > 0, let last = quantizedSegments.last {
+        while remaining > 0, let last = segmentStore.last {
             if last.rowCount <= remaining {
-                quantizedSegments.removeLast()
+                segmentStore.removeLast()
                 remaining -= last.rowCount
             } else {
-                quantizedSegments[quantizedSegments.count - 1] = Self.slice(
+                segmentStore[segmentStore.count - 1] = Self.slice(
                     last, keepingRows: last.rowCount - remaining)
                 remaining = 0
             }
@@ -321,11 +418,30 @@ final class DeepseekV4PoolStorage {
     func replace(withQuantizedSegments segments: [HybridPoolQuantizedSegment]) {
         hotPool = nil
         emptySpec = nil
+        if contiguous {
+            slab = nil
+            slabRows = 0
+            guard let first = segments.first else { return }
+            let joinable = segments.allSatisfy { Self.compatible(first, $0) } && first.bits == bits
+            let joined: HybridPoolQuantizedSegment
+            if joinable {
+                joined = segments.count == 1 ? first : Self.concatenate(segments)
+            } else {
+                // A record of another width or group: re-encode once.
+                let parts = segments.map(Self.dequantize)
+                joined = Self.quantize(
+                    parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), bits: bits)
+            }
+            MLX.eval([joined.codes, joined.scales, joined.biases])
+            slab = joined
+            slabRows = joined.rowCount
+            return
+        }
         if quantizationEnabled {
-            quantizedSegments = segments
+            segmentStore = segments
             compactSegmentsToSlabs()
         } else {
-            quantizedSegments = []
+            segmentStore = []
             guard !segments.isEmpty else { return }
             let parts = segments.map(Self.dequantize)
             hotPool = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
@@ -336,10 +452,21 @@ final class DeepseekV4PoolStorage {
         let result = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
             hotByteLimit: hotByteLimit,
-            bits: bits)
+            bits: bits,
+            contiguous: contiguous)
+        if contiguous {
+            // The copy holds only the live rows (fresh handles over the same
+            // buffer). The source keeps appending in place; MLX refuses to
+            // donate a buffer another array still references, so the first
+            // such write copies instead of changing this snapshot.
+            result.emptySpec = emptySpec
+            result.slab = liveSlab()
+            result.slabRows = slabRows
+            return result
+        }
         result.hotPool = hotPool?[.ellipsis]
         result.emptySpec = emptySpec
-        result.quantizedSegments = quantizedSegments.map { segment in
+        result.segmentStore = segmentStore.map { segment in
             HybridPoolQuantizedSegment(
                 codes: segment.codes[.ellipsis],
                 scales: segment.scales[.ellipsis],
@@ -352,9 +479,64 @@ final class DeepseekV4PoolStorage {
         return result
     }
 
+    /// Contiguous layout: write freshly encoded rows after the live rows,
+    /// growing the slab in ``contiguousGrowRows`` steps.
+    private func appendContiguous(_ rows: HybridPoolQuantizedSegment) {
+        let k = rows.rowCount
+        guard k > 0 else { return }
+        if let current = slab, !Self.compatible(current, rows) {
+            // Width/group change (never produced by one cache): re-encode.
+            let live = liveSlab().map(Self.dequantize)
+            let merged = Self.dequantize(rows)
+            slab = Self.quantize(
+                live.map { concatenated([$0, merged], axis: 1) } ?? merged, bits: bits)
+            slabRows = slabRows + k
+            return
+        }
+        let needed = slabRows + k
+        let capacity = slab?.originalShape[1] ?? 0
+        if slab == nil || needed > capacity {
+            let step = Self.contiguousGrowRows
+            let newCapacity = ((needed + step - 1) / step) * step
+            func grown(_ live: MLXArray?, _ fresh: MLXArray) -> MLXArray {
+                var shape = fresh.shape
+                shape[1] = newCapacity - needed
+                var parts: [MLXArray] = []
+                if let live { parts.append(live) }
+                parts.append(fresh)
+                if shape[1] > 0 { parts.append(MLXArray.zeros(shape, dtype: fresh.dtype)) }
+                return concatenated(parts, axis: 1)
+            }
+            let live = liveSlab()
+            var shape = rows.originalShape
+            shape[1] = newCapacity
+            let next = HybridPoolQuantizedSegment(
+                codes: grown(live?.codes, rows.codes),
+                scales: grown(live?.scales, rows.scales),
+                biases: grown(live?.biases, rows.biases),
+                originalShape: shape,
+                groupSize: rows.groupSize,
+                bits: rows.bits,
+                originalDType: rows.originalDType)
+            asyncEval([next.codes, next.scales, next.biases])
+            slab = next
+            slabRows = needed
+            return
+        }
+        guard let slab else { return }
+        // In place: the slab arrays are private to this storage (copies and
+        // views hold fresh handles), so MLX donates the buffer when nothing
+        // else references it.
+        slab.codes[0..., slabRows ..< needed, 0..., 0...] = rows.codes
+        slab.scales[0..., slabRows ..< needed, 0..., 0...] = rows.scales
+        slab.biases[0..., slabRows ..< needed, 0..., 0...] = rows.biases
+        asyncEval([slab.codes, slab.scales, slab.biases])
+        slabRows = needed
+    }
+
     private func replaceQuantized(with value: MLXArray) {
         hotPool = nil
-        quantizedSegments = []
+        segmentStore = []
         var start = 0
         while start < value.dim(1) {
             let remaining = value.dim(1) - start
@@ -366,7 +548,7 @@ final class DeepseekV4PoolStorage {
                 }
             }
             let end = start + take
-            quantizedSegments.append(Self.quantize(value[0..., start..<end, 0...], bits: bits))
+            segmentStore.append(Self.quantize(value[0..., start..<end, 0...], bits: bits))
             start = end
             compactSlabCascade()
         }
@@ -374,7 +556,7 @@ final class DeepseekV4PoolStorage {
 
     private func trailingPartialSegmentRows() -> Int {
         var rows = 0
-        for segment in quantizedSegments.reversed() {
+        for segment in segmentStore.reversed() {
             guard segment.rowCount < Self.segmentRows else { break }
             rows += segment.rowCount
         }
@@ -382,17 +564,17 @@ final class DeepseekV4PoolStorage {
     }
 
     private func compactCompletedTail() {
-        var start = quantizedSegments.count
+        var start = segmentStore.count
         var rows = 0
         while start > 0 {
-            let segment = quantizedSegments[start - 1]
+            let segment = segmentStore[start - 1]
             guard segment.rowCount < Self.segmentRows else { break }
             start -= 1
             rows += segment.rowCount
         }
-        let parts = Array(quantizedSegments[start...])
+        let parts = Array(segmentStore[start...])
         if parts.count >= 2 {
-            quantizedSegments.replaceSubrange(start..., with: [Self.concatenate(parts)])
+            segmentStore.replaceSubrange(start..., with: [Self.concatenate(parts)])
         }
         if rows >= Self.segmentRows {
             compactSlabCascade()
@@ -403,15 +585,15 @@ final class DeepseekV4PoolStorage {
     /// combined row count reaches the 16K ceiling. Codes and affine metadata
     /// are concatenated directly, so this is bit-exact and never requantizes.
     private func compactSlabCascade() {
-        while quantizedSegments.count >= 2 {
-            let previous = quantizedSegments[quantizedSegments.count - 2]
-            let last = quantizedSegments[quantizedSegments.count - 1]
+        while segmentStore.count >= 2 {
+            let previous = segmentStore[segmentStore.count - 2]
+            let last = segmentStore[segmentStore.count - 1]
             guard previous.rowCount == last.rowCount,
                   previous.rowCount + last.rowCount <= Self.slabMaxRows,
                   Self.compatible(previous, last)
             else { return }
-            quantizedSegments.replaceSubrange(
-                (quantizedSegments.count - 2)...,
+            segmentStore.replaceSubrange(
+                (segmentStore.count - 2)...,
                 with: [Self.concatenate([previous, last])])
         }
     }
@@ -419,7 +601,7 @@ final class DeepseekV4PoolStorage {
     /// Imported disk/delta state can still use the legacy 64-row wire shape.
     /// Regroup it once so every later token sees O(rows/16K) slabs.
     private func compactSegmentsToSlabs() {
-        guard quantizedSegments.count > 1 else { return }
+        guard segmentStore.count > 1 else { return }
         var regrouped: [HybridPoolQuantizedSegment] = []
         var pending: [HybridPoolQuantizedSegment] = []
         var pendingRows = 0
@@ -440,7 +622,7 @@ final class DeepseekV4PoolStorage {
             pendingRows = 0
         }
 
-        for segment in quantizedSegments {
+        for segment in segmentStore {
             if let first = pending.first,
                pendingRows + segment.rowCount > Self.slabMaxRows
                     || !Self.compatible(first, segment)
@@ -451,7 +633,7 @@ final class DeepseekV4PoolStorage {
             pendingRows += segment.rowCount
         }
         flushPending()
-        quantizedSegments = regrouped
+        segmentStore = regrouped
     }
 
     static func quantize(_ value: MLXArray, bits: Int = DeepseekV4PoolStorage.bits) -> HybridPoolQuantizedSegment {
@@ -511,7 +693,7 @@ final class DeepseekV4PoolStorage {
     }
 
     /// Codes as one value per element regardless of the storage width.
-    private static func elementCodes(_ codes: MLXArray, bits: Int) -> MLXArray {
+    fileprivate static func elementCodes(_ codes: MLXArray, bits: Int) -> MLXArray {
         bits == 4 ? unpackNibbles(codes) : codes
     }
 
@@ -743,6 +925,9 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// This cache's pool code width: 8 for DSV4-0731, 4 for DeepSeek-V4.1
     /// (its reference stores compressed KV in FP4).
     public var hybridPoolQuantizationBits: Int { compPool.bits }
+    /// True for DeepSeek-V4.1 caches: pools are encoded at append into one
+    /// contiguous slab each (see ``DeepseekV4PoolStorage/contiguous``).
+    public var contiguousPools: Bool { compPool.contiguous }
 
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
@@ -805,7 +990,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         poolQuantizationEnabled: Bool? = nil,
         poolBF16HotByteLimit: Int? = nil,
         requiresAuxiliaryTokenHistory: Bool = false,
-        poolQuantizationBits: Int = 8
+        poolQuantizationBits: Int = 8,
+        contiguousPools: Bool = false
     ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         let quantizationEnabled = poolQuantizationEnabled
@@ -818,11 +1004,13 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         self.compPool = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
             hotByteLimit: hotByteLimit,
-            bits: poolQuantizationBits)
+            bits: poolQuantizationBits,
+            contiguous: contiguousPools)
         self.idxPool = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
             hotByteLimit: hotByteLimit,
-            bits: poolQuantizationBits)
+            bits: poolQuantizationBits,
+            contiguous: contiguousPools)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
         self.requiresAuxiliaryTokenHistory = requiresAuxiliaryTokenHistory
     }
@@ -1103,7 +1291,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             poolQuantizationEnabled: hybridPoolQuantizationEnabled,
             poolBF16HotByteLimit: compPool.hotByteLimit,
             requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory,
-            poolQuantizationBits: compPool.bits)
+            poolQuantizationBits: compPool.bits,
+            contiguousPools: compPool.contiguous)
         dup.auxiliaryTokenHistory = auxiliaryTokenHistory
         let localState = local.state
         if !localState.isEmpty {
@@ -1212,6 +1401,24 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         _ key: BranchKey, isPrefill: Bool, emptyLike: MLXArray
     ) -> DeepseekV4PoolView {
         let storage = key == .compressor ? compPool : idxPool
+        if storage.contiguous {
+            // DeepSeek-V4.1 (reference `Shared.view`): the owner layer dequantizes
+            // a pool once per forward and its consumer layers share that view.
+            // Index keys are always scored densely; compressed KV is dense for a
+            // bounded prefill and gathered row by row otherwise (decode decodes
+            // only the selected rows).
+            let rows = storage.rowCount
+            if rows > 0,
+               key == .indexer || (isPrefill && rows <= Self.poolPrefillDenseMaxRows),
+               let dense = storage.materialized()
+            {
+                return DeepseekV4PoolView(dense: dense)
+            }
+            if rows > 0 { return DeepseekV4PoolView(storage: storage) }
+            return DeepseekV4PoolView(
+                dense: MLXArray.zeros(
+                    [emptyLike.dim(0), 0, emptyLike.dim(2)], dtype: emptyLike.dtype))
+        }
         if let hot = storage.hotPool {
             if !isPrefill || hot.dim(1) <= Self.poolPrefillDenseMaxRows {
                 return DeepseekV4PoolView(dense: hot)
