@@ -59,8 +59,11 @@ func runRowExactBench(modelPath: String) async throws {
 
     let prefillStep = Int(env["BENCH_ROWEXACT_PREFILL_STEP"] ?? "512") ?? 512
     guard prefillStep > 0, prompt.dim(1) > 0 else {
-        throw NSError(domain: "RowExactBench", code: 10,
-            userInfo: [NSLocalizedDescriptionKey: "Non-empty prompt and positive prefill step required"])
+        throw NSError(
+            domain: "RowExactBench", code: 10,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Non-empty prompt and positive prefill step required"
+            ])
     }
     func prefill() -> ([KVCache], Int) {
         let cache = model.newCache(parameters: GenerateParameters())
@@ -443,7 +446,8 @@ func runRowExactBench(modelPath: String) async throws {
     // state exactly as the serving iterator does, then reverify the overlap.
     let requestedCommit = env["BENCH_ROWEXACT_COMMIT"].flatMap(Int.init)
     if let requestedCommit, requestedCommit <= 0 {
-        throw NSError(domain: "RowExactBench", code: 7,
+        throw NSError(
+            domain: "RowExactBench", code: 7,
             userInfo: [NSLocalizedDescriptionKey: "Commit prefix must be positive"])
     }
     // 2. Verify windows over the same stream.
@@ -466,11 +470,15 @@ func runRowExactBench(modelPath: String) async throws {
             MLX.eval(rows)
             for layer in cache where layer.isTrimmable && kept < w {
                 guard layer.trim(w - kept) == w - kept else {
-                    throw NSError(domain: "RowExactBench", code: 8,
-                        userInfo: [NSLocalizedDescriptionKey: "INVALID: partial attention trim failed"])
+                    throw NSError(
+                        domain: "RowExactBench", code: 8,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "INVALID: partial attention trim failed"
+                        ])
                 }
             }
-            guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: kept, blockLength: w)
+            guard
+                staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: kept, blockLength: w)
             else {
                 throw NSError(
                     domain: "RowExactBench", code: 5,
@@ -504,9 +512,15 @@ func runRowExactBench(modelPath: String) async throws {
                 if argMax(got, axis: -1).item(Int.self) != stream[p + j + 1] { argmaxMiss += 1 }
             }
             p += kept
-            guard cache.enumerated().allSatisfy({ $0.element.offset == initialOffsets[$0.offset] + p }) else {
-                throw NSError(domain: "RowExactBench", code: 9,
-                    userInfo: [NSLocalizedDescriptionKey: "INVALID: committed cache offset mismatch"])
+            guard
+                cache.enumerated().allSatisfy({ $0.element.offset == initialOffsets[$0.offset] + p }
+                )
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 9,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "INVALID: committed cache offset mismatch"
+                    ])
             }
         }
         print("[ROWEXACT-COMMIT] width=\(w) kept=\(kept) final_offsets=\(cache.map(\.offset))")
