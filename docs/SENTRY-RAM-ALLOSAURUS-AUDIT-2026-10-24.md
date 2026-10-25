@@ -498,3 +498,38 @@ speedup: the only fully identical pair fails its instruction requirement.
 Do not weaken the output validator, apply prompt/sampler masking, or present
 these as universal 50–100 tok/s qualification. The no-custom-cap Safe Auto
 profile and adaptive mode are restored after the controls.
+
+### Actual attention geometry and prefill dispatch controls
+
+Both installed bundles declare 24 attention heads, two KV heads and head
+dimension 256. A second kernel diagnostic uses those dimensions with
+FP16/BF16, 8,193/32,769/65,537 keys, 1/2/4/8/128/512 query rows, and the
+same three mask variants. All 108 default-dispatch cases pass the analytic
+oracle without a Metal failure. The largest warm forward is 36.65 ms;
+maximum MLX allocation is 1,803,995,140 bytes. The sampled process physical
+peak is 2,829,517,640 bytes. These are kernel-process receipts, not Activity
+Monitor proof for a loaded model or a reproduction of the new reporter.
+
+An explicit fused control for the 128/512-query cases passes all 36 rows.
+Its maximum MLX allocation is 207,749,128 bytes and sampled physical peak
+is 524,518,216 bytes. This is a useful allocation lead: default dispatch at
+these head dimensions can materialize the attention score matrix. It is
+not sufficient evidence to change attention defaults: the current oracle
+uses uniform attention, and random-input, full-model/cache and hardware
+qualification remain separate requirements. No product force-fused policy
+has been added.
+
+The unchanged Release app also runs a JANGT-only prefill ablation with two
+new storage roots, identical primes and the same 3,669-token code prompt.
+Default NAX reports 4.373 seconds / 838.99 prompt tok/s; explicit
+`VMLX_JANGT_PREFILL=0` reports 7.193 seconds / 510.02 prompt tok/s. These
+are cache-inclusive prompt rates: each root has one L2 hit, and the exact
+restored count was not captured. Both answers are the correct list
+`[6, 243, 483]`, with natural stop and closed reasoning. Decode is
+66.92 / 66.54 tok/s respectively. Sampled process physical peaks are
+33.94 / 33.57 GB. Activity Monitor receipts are retained separately.
+
+Only JANGT matrix dispatch is disabled in the fallback arm; other M5
+backends remain native. This neither reproduces an 11 tok/s cap locally nor
+emulates an M3. It supports investigating a genuine older-GPU packed matrix
+path without asserting that installed RAM alone determines throughput.
