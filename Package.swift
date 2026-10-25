@@ -969,6 +969,7 @@ let package = Package(
                 "DeepseekV41ChatEncoderFocusedTests.swift",
                 "EngramV41FocusedTests.swift",
                 "DeepseekV41PoolBitsFocusedTests.swift",
+                "DeepseekV41IndexerFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",

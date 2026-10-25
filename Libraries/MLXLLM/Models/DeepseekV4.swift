@@ -167,12 +167,6 @@ class DeepseekV4RoPE: Module {
 
 // MARK: - Attention (MLA with sinks + inverse RoPE + grouped O)
 
-/// DeepSeek-V4.1 shared compress-KV across a forward: kv_source layers write their pool here and
-/// non-kv-source compress_ratio>0 layers read it (ref `SharedAttentionRuntime.compress_kv`). One
-/// instance per forward, threaded through the decoder layers.
-final class DSV41CompressShare {
-    var pool: DeepseekV4PoolView?
-}
 
 class DeepseekV4Attention: Module {
     let config: DeepseekV4Configuration
@@ -219,6 +213,9 @@ class DeepseekV4Attention: Module {
     // forward when compressRatio == 0.
     @ModuleInfo(key: "compressor") var compressor: DeepseekV4Compressor?
     @ModuleInfo(key: "indexer") var indexer: DeepseekV4Indexer?
+    /// DeepSeek-V4.1 shared lightning indexer, present only on index_source_layer_ids
+    /// (bundle `attn.indexer.*`, mapped to `self_attn.v41_indexer.*` by sanitize).
+    @ModuleInfo(key: "v41_indexer") var v41Indexer: DeepseekV41Indexer?
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
@@ -291,10 +288,16 @@ class DeepseekV4Attention: Module {
         if buildsCompressor {
             self._compressor.wrappedValue = DeepseekV4Compressor(
                 config: config, compressRatio: compressRatio, headDim: headDim)
-            if compressRatio == 4 {
+            if compressRatio == 4, !config.isDeepseekV41 {
                 self._indexer.wrappedValue = DeepseekV4Indexer(
                     config: config, compressRatio: compressRatio)
             }
+        }
+        if config.isDeepseekV41, compressRatio > 0,
+            config.indexSourceLayerIds.contains(layerIdx)
+        {
+            self._v41Indexer.wrappedValue = DeepseekV41Indexer(
+                config: config, layerIdx: layerIdx, compressRatio: compressRatio)
         }
     }
 
@@ -432,10 +435,43 @@ class DeepseekV4Attention: Module {
                 // shared pool (ref: compress_kv is produced only at kv_source layers, consumed by the
                 // rest). For DSV4 (no sharing) every ratio>0 layer has its own compressor.
                 let pooledViewOpt: DeepseekV4PoolView?
+                let isV41 = config.isDeepseekV41
                 if let comp = compressor {
-                    let pv = comp(x, rope: rope, v4Cache: v4Cache, startPos: offset)
+                    // V4.1 owners (kv-source + index-source) derive the shared index keys from the
+                    // compressor latents of every newly completed group, including groups that a
+                    // deferred decode flush completes later.
+                    var latentSink: ((MLXArray, Int) -> Void)? = nil
+                    let freshIndexK = DSV41IndexKeyBox()
+                    if isV41, let idx = v41Indexer, idx.ownsK {
+                        let r = rope
+                        if let v4Cache {
+                            latentSink = { [unowned idx, weak v4Cache] latent, base in
+                                guard let v4Cache else { return }
+                                let k = idx.indexKeys(latent: latent, base: base, rope: r)
+                                _ = v4Cache.appendPooled(.indexer, value: k, isPrefill: true)
+                            }
+                        } else {
+                            latentSink = { [unowned idx] latent, base in
+                                freshIndexK.rows.append(
+                                    idx.indexKeys(latent: latent, base: base, rope: r))
+                            }
+                        }
+                    }
+                    let pv = comp(
+                        x, rope: rope, v4Cache: v4Cache, startPos: offset,
+                        latentSink: latentSink)
                     compressShare?.pool = pv
                     pooledViewOpt = pv
+                    if latentSink != nil {
+                        if let v4Cache {
+                            compressShare?.indexK = v4Cache.poolView(
+                                .indexer, isPrefill: L > 1,
+                                emptyLike: MLXArray.zeros([B, 0, config.indexHeadDim], dtype: x.dtype))
+                        } else if !freshIndexK.rows.isEmpty {
+                            compressShare?.indexK = DeepseekV4PoolView(
+                                dense: concatenated(freshIndexK.rows, axis: 1))
+                        }
+                    }
                 } else {
                     pooledViewOpt = compressShare?.pool
                 }
@@ -443,7 +479,22 @@ class DeepseekV4Attention: Module {
                     // pooled shape: (B, W, headDim) where W = pooled count.
                     let W = pooledView.rowCount
                     var topK: MLXArray? = nil
-                    if compressRatio == 4, let idx = indexer {
+                    if isV41 {
+                        // DeepSeek-V4.1: index-source layers select their own top-k over the shared
+                        // index keys; the compressed layers after them reuse that selection.
+                        if let idx = v41Indexer, let indexK = compressShare?.indexK {
+                            let sel = idx.select(
+                                x: x, qResidual: qResidual, indexK: indexK, startPos: offset,
+                                rope: rope, candidates: compressShare?.candidates[offset])
+                            compressShare?.selections[offset] = .some(sel.topK)
+                            if idx.isCandidateSource {
+                                compressShare?.candidates[offset] = sel.candidates
+                            }
+                            topK = sel.topK
+                        } else if let entry = compressShare?.selections[offset] {
+                            topK = entry
+                        }
+                    } else if compressRatio == 4, let idx = indexer {
                         // The indexer's learned compressor owns a separate
                         // cache branch. Advance it even before either branch
                         // emits its first complete row, so partial windows and
@@ -1841,7 +1892,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             // so a short-prompt text load is unaffected. Full long-context indexer is a V4.1 follow-up.
             // V4.1 ONLY: DSV4-0731 ratio-4 layers DO build an indexer and must load its weights
             // (dropping them would leave a random-init indexer choosing the top-k pool rows).
-            if config.isDeepseekV41, rawKey.contains(".indexer.") { continue }
+            // (V4.1 now maps them to the shared lightning indexer below instead of dropping.)
             // DeepSeek-V4.1 vision tower (ViT `vision.*`, `aligner.*`, image delimiter embeddings).
             // Text load drops them; multimodal is served text-routed like the engine's VL path and is
             // a V4.1 follow-up in Swift.
@@ -1923,6 +1974,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             // wo_a / wo_b / attn_sink / compressor.* / indexer.*).
             if rest.hasPrefix("attn.") {
                 let inner = String(rest.dropFirst("attn.".count))
+                // DeepSeek-V4.1 shared lightning indexer (index_source_layer_ids) lives under its
+                // own module key so it never collides with the DSV4-0731 ratio-4 indexer.
+                if config.isDeepseekV41, inner.hasPrefix("indexer.") {
+                    let tail = String(inner.dropFirst("indexer.".count))
+                    out["\(pfx).self_attn.v41_indexer.\(tail)"] = value
+                    continue
+                }
                 out["\(pfx).self_attn.\(inner)"] = value
                 continue
             }

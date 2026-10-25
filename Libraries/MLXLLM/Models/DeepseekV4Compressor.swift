@@ -1460,7 +1460,8 @@ public final class DeepseekV4Compressor: Module {
         rope: DeepseekV4RoPE,
         v4Cache: DeepseekV4Cache?,
         startPos: Int,
-        branch: DeepseekV4Cache.BranchKey = .compressor
+        branch: DeepseekV4Cache.BranchKey = .compressor,
+        latentSink: ((MLXArray, Int) -> Void)? = nil
     ) -> DeepseekV4PoolView {
         if deferPoolDuringDecode,
            x.dim(0) == 1,
@@ -1486,7 +1487,8 @@ public final class DeepseekV4Compressor: Module {
                     v4Cache: cache,
                     startPos: basePosition,
                     branch: branch,
-                    isPrefill: false)
+                    isPrefill: false,
+                    latentSink: latentSink)
             }
         }
 
@@ -1496,7 +1498,8 @@ public final class DeepseekV4Compressor: Module {
         let result = advance(
             x, rope: rope, v4Cache: v4Cache,
             startPos: startPos, branch: branch,
-            isPrefill: x.dim(1) > 1)
+            isPrefill: x.dim(1) > 1,
+            latentSink: latentSink)
         v4Cache?.notePoolResult(result, branch: branch)
         return result
     }
@@ -1509,7 +1512,8 @@ public final class DeepseekV4Compressor: Module {
         v4Cache: DeepseekV4Cache?,
         startPos: Int,
         branch: DeepseekV4Cache.BranchKey,
-        isPrefill: Bool
+        isPrefill: Bool,
+        latentSink: ((MLXArray, Int) -> Void)? = nil
     ) -> DeepseekV4PoolView {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1658,6 +1662,9 @@ public final class DeepseekV4Compressor: Module {
                 kvWin.dtype)
         var pooled = (kvWin * weights).sum(axis: 2)
         pooled = norm(pooled.asType(x.dtype))
+        // DeepSeek-V4.1: the pre-RoPE latents of the newly completed groups feed the shared
+        // lightning indexer's key projection (reference `Indexer.__call__`: k = k_norm(wk(latent))).
+        latentSink?(pooled, poolBase)
 
         // Apply RoPE at the chunk centers (position = chunk_idx * ratio
         // + pool_base). Shared strided table: same-ratio compressor
