@@ -37,6 +37,9 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     public var rmsNormEps: Float = 1e-6
     public var maxPositionEmbeddings: Int = 1_048_576
 
+    // MARK: - DSA kv-source layers (DeepSeek-V4.1 only computes compress-KV here; others read shared)
+    public var kvSourceLayerIds: [Int] = []
+
     // MARK: - Engram (DeepSeek-V4.1 n-gram-hash gated residual at engram_layer_ids)
     public var engramLayerIds: [Int] = []
     public var engramNHeads: Int = 0
@@ -144,6 +147,7 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case routedExpertBitPlan = "routed_expert_bit_plan"
         case quantization
         case textConfig = "text_config"
+        case kvSourceLayerIds = "kv_source_layer_ids"
         case engramLayerIds = "engram_layer_ids"
         case engramNHeads = "engram_n_heads"
         case engramHeadDim = "engram_head_dim"
@@ -217,6 +221,7 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.indexHeadDim = req(.indexHeadDim, 128)
         self.indexTopk = req(.indexTopk, 512)
         self.useAttnSink = req(.useAttnSink, true)
+        self.kvSourceLayerIds = req(.kvSourceLayerIds, [])
         self.engramLayerIds = req(.engramLayerIds, [])
         self.engramNHeads = req(.engramNHeads, 0)
         self.engramHeadDim = req(.engramHeadDim, 0)

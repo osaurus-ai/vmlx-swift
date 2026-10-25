@@ -271,9 +271,17 @@ class DeepseekV4Attention: Module {
             dim: ropeDim, base: theta, factor: factor,
             origMaxPos: origMax, betaFast: 32, betaSlow: 1)
 
-        // Compressor + Indexer are attached ONLY on layers with a
-        // non-zero compress_ratio — matches bundle weight keys.
-        if compressRatio > 0 {
+        // Compressor is attached only on layers that actually own compress-KV weights. For DSV4 that
+        // is every compress_ratio>0 layer; for DeepSeek-V4.1 it is ONLY the kv_source layers
+        // ([2,8,14,20]) — the other ratio>0 layers (e.g. the ratio-1 band 20-39) have NO compressor in
+        // the bundle and READ the shared compress-KV from the last kv_source layer. Building a
+        // compressor for them would load a zero-init one and inject garbage compress-KV -> drift from
+        // ~layer 20 (where ratio becomes 1 and compression fires for a single token). When
+        // kvSourceLayerIds is set (V4.1), gate on it; otherwise keep the DSV4 behavior.
+        let buildsCompressor = config.kvSourceLayerIds.isEmpty
+            ? compressRatio > 0
+            : config.kvSourceLayerIds.contains(layerIdx)
+        if buildsCompressor {
             self._compressor.wrappedValue = DeepseekV4Compressor(
                 config: config, compressRatio: compressRatio, headDim: headDim)
             if compressRatio == 4 {
@@ -1420,6 +1428,10 @@ public class DeepseekV4ModelInner: Module {
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix)
                 h = r.h
                 preMix = r.ffnPre
+                if ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil {
+                    let ma = MLX.abs(h.asType(.float32)).mean(); MLX.eval(ma)
+                    NSLog("VMLX-DBG layer\(i) out.meanAbs=\(ma.item(Float.self))")
+                }
                 if layerwisePrefill { MLX.eval(h) }
                 layerStats.append(contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
             }
