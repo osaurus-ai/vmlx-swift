@@ -1265,6 +1265,10 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> Int? {
         let types = modelTypes(config: config, fallback: fallback)
         if types.contains(where: isQwen4ExpModelType) { return 3 }
+        // DeepSeek-V4.1 dSpark (3-stage block drafter, dspark_block_size=5). Verify is exact
+        // (NativeMTPBlockDraftModel point masses), so greedy MTP output == AR; the adaptive controller
+        // scales depth down to AR on low-accept content (no hard/manual depth). Cold-start at bs-1=4.
+        if types.contains(where: { $0 == "deepseek_v4" || $0 == "deepseek_v41" }) { return 4 }
         // Ornith 1.5 122B (Qwen 3.5 MoE, 48 layers x 3072, 256 experts / top-8, one native MTP layer):
         // its verify rows are bitwise the AR step (row-exact verify, 2026-10-20), so greedy MTP output
         // equals AR, and depth 1 measured faster than AR on code and prose. Keyed from model_type plus
@@ -1913,15 +1917,29 @@ public enum MTPBundleInspector {
         let text = (config?["text_config"] as? [String: Any]) ?? config
         let type = ((text?["model_type"] as? String) ?? (config?["model_type"] as? String) ?? "")
             .lowercased().replacingOccurrences(of: "-", with: "_")
-        guard type == "nemotron_h" || type == "nemotron_h_text" else { return nil }
-        let dir = modelDirectory.appendingPathComponent("lilicorr")
-        guard let drafterConfig = try? loadJSONObjectIfExists(dir.appendingPathComponent("config.json")),
-            let dflash = drafterConfig["dflash_config"] as? [String: Any],
-            (dflash["projector_type"] as? String)?.lowercased() == "lilicorr",
-            let layers = drafterConfig["num_hidden_layers"] as? Int, layers > 0,
-            let names = try? loadTensorNames(from: dir), !names.isEmpty
-        else { return nil }
-        return (layers, names)
+        if type == "nemotron_h" || type == "nemotron_h_text" {
+            let dir = modelDirectory.appendingPathComponent("lilicorr")
+            guard let drafterConfig = try? loadJSONObjectIfExists(dir.appendingPathComponent("config.json")),
+                let dflash = drafterConfig["dflash_config"] as? [String: Any],
+                (dflash["projector_type"] as? String)?.lowercased() == "lilicorr",
+                let layers = drafterConfig["num_hidden_layers"] as? Int, layers > 0,
+                let names = try? loadTensorNames(from: dir), !names.isEmpty
+            else { return nil }
+            return (layers, names)
+        }
+        // DeepSeek-V4.1 ships a 3-stage dSpark block drafter in `dspark/dspark.safetensors`
+        // (mtp.* tensors) with `num_nextn_predict_layers` in config. Physical evidence = the shard.
+        if type == "deepseek_v4" || type == "deepseek_v41" {
+            let dir = modelDirectory.appendingPathComponent("dspark")
+            let file = dir.appendingPathComponent("dspark.safetensors")
+            guard FileManager.default.fileExists(atPath: file.path),
+                let names = try? loadTensorNames(from: dir), !names.isEmpty
+            else { return nil }
+            let layers = (intValue(text?["num_nextn_predict_layers"])
+                ?? intValue(config?["num_nextn_predict_layers"]) ?? 3)
+            return (layers, names)
+        }
+        return nil
     }
 
     private static func configuredMTPLayers(
