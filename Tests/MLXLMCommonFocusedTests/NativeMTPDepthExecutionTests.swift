@@ -144,8 +144,9 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
 
     func testLosingDepthsDescendAndChangedRegimeCanRecover() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] != "0",
-              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0" else {
-            throw XCTSkip("Controlled host-cost row: governor on, verify prefetch off; prefetch parity is separate")
+              ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "0",
+              !NativeMTPCopyProposer.enabled else {
+            throw XCTSkip("Controlled head-cost row: governor on, verify prefetch and copy proposer off")
         }
         try FocusedMLXTestSupport.withLock {
             let model = DepthDispatchTarget(sequence: true, backboneDelay: 0.004)
@@ -249,8 +250,9 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
     }
 
     private func requireIsolatedDepthRun() throws {
-        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0" else {
-            throw XCTSkip("Run this dispatch-only fixture with VMLX_NATIVE_MTP_AR_SAFETY=0; real governor speed qualification is separate")
+        guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0",
+              !NativeMTPCopyProposer.enabled else {
+            throw XCTSkip("Head dispatch requires VMLX_NATIVE_MTP_AR_SAFETY=0 and VMLX_NATIVE_MTP_COPY=0; real governor/copy qualification is separate")
         }
     }
 
