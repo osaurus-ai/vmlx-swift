@@ -974,6 +974,8 @@ let package = Package(
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
                 "LogitProcessorIndependentCopyTests.swift",
+                "DSparkSpeculationFocusedTests.swift",
+                "DeepseekV41DSparkFocusedTests.swift",
             ]
         ),
         .testTarget(
