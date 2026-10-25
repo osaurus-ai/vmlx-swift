@@ -15,8 +15,10 @@ final class JANGHPrefillArchitectureTests: XCTestCase {
     }
 
     func testOlderArchitecturesKeepSteel() {
-        for name in ["applegpu_g14g", "applegpu_g14s", "applegpu_g15g", "applegpu_g15s", "applegpu_g15d",
-                     "applegpu_g16g", "applegpu_g16s", "applegpu_g16d", "applegpu_g17p"] {
+        for name in [
+            "applegpu_g14g", "applegpu_g14s", "applegpu_g15g", "applegpu_g15s", "applegpu_g15d",
+            "applegpu_g16g", "applegpu_g16s", "applegpu_g16d", "applegpu_g17p",
+        ] {
             XCTAssertEqual(JANGHPrefillKernel.backend(forMetalArchitecture: name), .steel, name)
         }
     }
