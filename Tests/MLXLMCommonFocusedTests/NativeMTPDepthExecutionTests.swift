@@ -153,6 +153,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             model.setVerifyDelays([2: 0.001, 3: 0.040, 4: 0.080])
             var parameters = GenerateParameters(maxTokens: 480, temperature: 0)
             parameters.draftStrategy = .nativeMTP(depth: 3)
+            parameters.nativeMTPDepthPolicy = .adaptive(maximumDepth: 3)
             var iterator = try NativeMTPTokenIterator(
                 input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
                 parameters: parameters, depth: 3)
