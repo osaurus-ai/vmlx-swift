@@ -21,8 +21,10 @@ forced to Steel. Twelve packed-Trellis/general-kernel methods also pass with
 JANGH/trellis Steel and generic g15 core dispatch controls. The latter is a
 software-path diagnostic on raw g17s hardware, not older physical hardware.
 
-Review added previously missing 6-bit codebook coverage, including a
-one-column output and uneven K partition; that expanded rerun is pending.
+The expanded native and forced-portable reruns also pass all 40 independent
+CPU-golden configurations across the five supported 2/3/4/6/8-bit code
+widths, FP16/BF16, 1/3/8/16 rows, ragged columns and uneven K partitions.
+The 6-bit case includes a one-column output, exercising tiny-scale padding.
 A first operator timing probe overlaps app compilation and is not performance
 clearance. Quiescent timing and full-model Release proof remain pending. This is not a physical M3/M4 benchmark, an end-to-end MTP
 speedup claim, or a diagnosis of the reported M5 Pro 11 tok/s. No generation
