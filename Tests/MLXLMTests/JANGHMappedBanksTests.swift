@@ -57,15 +57,18 @@ final class JANGHMappedBanksTests: XCTestCase {
         try body(directory, contract, dimensions)
     }
 
-    func testMappedCompositionSurvivesOwnerReleaseAndUnlink() throws {
+    func testOwnedCompositionSurvivesBankOwnerReleaseAndUnlink() throws {
         try MLXMetalTestLock.withLock {
             try withFixture { directory, contract, dimensions in
                 let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: index)
                 let before = mlx_safetensors_mmap_tracked_buffer_bytes()
                 var owner: JANGHMappedBanks? = try JANGHMappedBanks(
                     directory: directory, metadata: metadata, contract: contract, dimensions: dimensions)
-                XCTAssertGreaterThan(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+                // Production reads into owned allocations since 1747b2bdb.
+                // A rising retired mmap counter would violate that contract.
+                XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
                 let gate = try owner!.projection(parent + ".gate_proj")
+                XCTAssertFalse(WeightBacking.sharesMappedShard(gate.packed))
                 try JANGHBankLayout.requireReadyRowContiguous(gate.packed, role: "test packed")
                 let block = try JANGHRoutedDecodeBlock(banks: owner!, parentModule: parent, activationLimit: 10)
                 owner = nil
@@ -137,16 +140,22 @@ final class JANGHMappedBanksTests: XCTestCase {
         }
     }
 
-    func testDroppingAllBankOwnersReleasesMappedRegions() throws {
+    func testDroppingBankOwnerReleasesOwnedActiveAllocations() throws {
         try MLXMetalTestLock.withLock {
             try withFixture { directory, contract, dimensions in
                 let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: index)
                 let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+                let activeBefore = MLX.Memory.snapshot().activeMemory
                 var owner: JANGHMappedBanks? = try JANGHMappedBanks(
                     directory: directory, metadata: metadata, contract: contract, dimensions: dimensions)
+                weak var releasedOwner = owner
                 XCTAssertNotNil(owner)
-                XCTAssertGreaterThan(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+                XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+                XCTAssertGreaterThan(MLX.Memory.snapshot().activeMemory, activeBefore)
                 owner = nil
+                XCTAssertNil(releasedOwner)
+                // Reusable allocator cache bytes are distinct from live weights.
+                XCTAssertEqual(MLX.Memory.snapshot().activeMemory, activeBefore)
                 XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
             }
         }
