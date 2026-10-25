@@ -332,6 +332,24 @@ final class DeepseekV4PoolStorage {
         }
     }
 
+    /// Reference snapshot for an in-place speculative restore. Rows are only ever appended as new
+    /// arrays or segments (never written in place), so saved references stay valid.
+    struct Snapshot {
+        let hotPool: MLXArray?
+        let quantizedSegments: [HybridPoolQuantizedSegment]
+        let emptySpec: (shape: [Int], dtype: DType)?
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(hotPool: hotPool, quantizedSegments: quantizedSegments, emptySpec: emptySpec)
+    }
+
+    func load(_ snapshot: Snapshot) {
+        hotPool = snapshot.hotPool
+        quantizedSegments = snapshot.quantizedSegments
+        emptySpec = snapshot.emptySpec
+    }
+
     func copy() -> DeepseekV4PoolStorage {
         let result = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
@@ -799,6 +817,12 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     public let requiresAuxiliaryTokenHistory: Bool
     public static let auxiliaryTokenHistoryCapacity = 1024
 
+    /// DeepSeek-V4.1 dSpark draft-window tail: the target-layer hidden rows of the last committed
+    /// positions, recorded by every forward while a dSpark head is attached (holder layer only).
+    /// Travels with copies, trims, speculative restores and disk records so the draft windows can
+    /// be rebuilt from the cache alone. Speed-only: nil or stale just means a shorter window.
+    public var auxiliaryHiddenTail: HybridPoolHiddenTail?
+
     public init(
         slidingWindow: Int,
         compressRatio: Int,
@@ -1054,6 +1078,10 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             h.endPosition = local.offset
             auxiliaryTokenHistory = h
         }
+        if var tail = auxiliaryHiddenTail, tail.endPosition > local.offset {
+            tail.truncate(toEnd: local.offset)
+            auxiliaryHiddenTail = tail.isEmpty ? nil : tail
+        }
         // Incomplete-window buffers are start_pos-keyed and invalidated
         // by ANY trim — clear unconditionally (Python comment
         // mlx_model.py L497-501).
@@ -1105,6 +1133,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory,
             poolQuantizationBits: compPool.bits)
         dup.auxiliaryTokenHistory = auxiliaryTokenHistory
+        dup.auxiliaryHiddenTail = auxiliaryHiddenTail
         let localState = local.state
         if !localState.isEmpty {
             // RotatingKVCache writes decode tokens into its ring in place.
@@ -1374,6 +1403,78 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         branch == .compressor
             ? compPool.retainedByteCount
             : idxPool.retainedByteCount
+    }
+
+    // MARK: - In-place speculative checkpoint (dSpark verify)
+
+    private struct PendingSnapshot {
+        let inputs: [MLXArray]
+        let basePosition: Int
+        let lastPool: DeepseekV4PoolView?
+        let flush: ((MLXArray, Int) -> DeepseekV4PoolView)?
+    }
+
+    private struct SpeculativeSnapshot {
+        let local: Any
+        let compBufferKV: MLXArray?
+        let compBufferGate: MLXArray?
+        let idxBufferKV: MLXArray?
+        let idxBufferGate: MLXArray?
+        let compPool: DeepseekV4PoolStorage.Snapshot
+        let idxPool: DeepseekV4PoolStorage.Snapshot
+        let compPending: PendingSnapshot
+        let idxPending: PendingSnapshot
+        let history: HybridPoolTokenHistory?
+        let hiddenTail: HybridPoolHiddenTail?
+    }
+
+    private static func pendingSnapshot(_ slot: PendingPoolSlot) -> PendingSnapshot {
+        PendingSnapshot(
+            inputs: slot.inputs, basePosition: slot.basePosition, lastPool: slot.lastPool,
+            flush: slot.flush)
+    }
+
+    private static func loadPending(_ snapshot: PendingSnapshot, into slot: PendingPoolSlot) {
+        slot.inputs = snapshot.inputs
+        slot.basePosition = snapshot.basePosition
+        slot.lastPool = snapshot.lastPool
+        slot.flush = snapshot.flush
+    }
+}
+
+extension DeepseekV4Cache: SpeculativeCheckpointCache {
+    public var speculativeCheckpointIsExact: Bool { true }
+
+    /// Every field a forward can change, by reference: the local window, both pools, the
+    /// incomplete-window buffers, the deferred decode inputs, the Engram n-gram history and the
+    /// dSpark hidden tail. Restoring writes them back into this object, so anything holding the
+    /// cache (or keyed on it) sees the pre-verify state.
+    public func speculativeCheckpoint() -> Any {
+        SpeculativeSnapshot(
+            local: local.speculativeCheckpoint(),
+            compBufferKV: compBufferKV?[.ellipsis], compBufferGate: compBufferGate?[.ellipsis],
+            idxBufferKV: idxBufferKV?[.ellipsis], idxBufferGate: idxBufferGate?[.ellipsis],
+            compPool: compPool.snapshot(), idxPool: idxPool.snapshot(),
+            compPending: Self.pendingSnapshot(compPending),
+            idxPending: Self.pendingSnapshot(idxPending),
+            history: auxiliaryTokenHistory, hiddenTail: auxiliaryHiddenTail)
+    }
+
+    public func restoreSpeculativeCheckpoint(_ checkpoint: Any) {
+        guard let s = checkpoint as? SpeculativeSnapshot else {
+            preconditionFailure("DeepseekV4Cache: foreign speculative checkpoint")
+        }
+        local.restoreSpeculativeCheckpoint(s.local)
+        compBufferKV = s.compBufferKV
+        compBufferGate = s.compBufferGate
+        idxBufferKV = s.idxBufferKV
+        idxBufferGate = s.idxBufferGate
+        compPool.load(s.compPool)
+        idxPool.load(s.idxPool)
+        Self.loadPending(s.compPending, into: compPending)
+        Self.loadPending(s.idxPending, into: idxPending)
+        auxiliaryTokenHistory = s.history
+        auxiliaryHiddenTail = s.hiddenTail
     }
 }
 
