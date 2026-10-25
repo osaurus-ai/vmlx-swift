@@ -41,6 +41,8 @@ final class DSV41CompressShare {
     var selections: [Int: MLXArray?] = [:]
     /// Candidate-source layer's row mask `[L, T]` bool, per query sub-chunk.
     var candidates: [Int: MLXArray] = [:]
+    /// dSpark verify capture for this forward (nil unless the sequence asked for one).
+    var capture: DSV41VerifyCapture?
 }
 
 /// Index keys produced without a cache (cache-less prefill), collected by the latent sink.

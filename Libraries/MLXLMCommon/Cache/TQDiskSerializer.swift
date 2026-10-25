@@ -828,6 +828,13 @@ public enum TQDiskSerializer {
                 history.tokens.isEmpty ? [Int32(0)] : history.tokens)
             result["__dsv4_\(i)_aux_hist_count__"] = metaInt32(Int32(history.tokens.count))
         }
+        // DeepSeek-V4.1 dSpark draft-window tail (speed-only; absent records restore without it).
+        if let tail = dsv4.auxiliaryHiddenTail?.joined() {
+            result["dsv4_\(i)_dspark_tail"] = tail.rows
+            result["__dsv4_\(i)_dspark_tail_start__"] = metaInt32(Int32(tail.start))
+            result["__dsv4_\(i)_dspark_tail_cap__"] = metaInt32(
+                Int32(dsv4.auxiliaryHiddenTail?.capacity ?? tail.rows.dim(0)))
+        }
 
         result[kindKey(for: i)] = kindArray(.deepseekV4)
     }
@@ -1016,6 +1023,8 @@ public enum TQDiskSerializer {
         /// DeepSeek-V4.1 Engram n-gram tail (``HybridPoolCache/auxiliaryTokenHistory``).
         /// Absent for DSV4-0731 records, which never write it.
         public var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        /// DeepSeek-V4.1 dSpark draft-window tail (``HybridPoolCache/auxiliaryHiddenTail``).
+        public var auxiliaryHiddenTail: HybridPoolHiddenTail? = nil
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):
@@ -1775,6 +1784,14 @@ public enum TQDiskSerializer {
             bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),
             bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate", slot: 5))
         components.auxiliaryTokenHistory = auxiliaryTokenHistory
+        if let rows = arrays["dsv4_\(i)_dspark_tail"], rows.ndim == 2, rows.dim(0) > 0,
+           let startArray = arrays["__dsv4_\(i)_dspark_tail_start__"],
+           let start = readMetaInt32(startArray), start >= 0
+        {
+            let cap = arrays["__dsv4_\(i)_dspark_tail_cap__"].flatMap(readMetaInt32).map(Int.init)
+            components.auxiliaryHiddenTail = HybridPoolHiddenTail(
+                capacity: Swift.max(cap ?? rows.dim(0), rows.dim(0)), start: Int(start), rows: rows)
+        }
         return components
     }
 

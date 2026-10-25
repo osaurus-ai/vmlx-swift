@@ -393,6 +393,11 @@ class DeepseekV4Attention: Module {
             (qResidual, q, kv) = preMath(x, cosT: cosT, sinT: sinT)
         }
 
+        // dSpark verify capture: this layer's cache inputs, so a verified prefix can be committed
+        // in place later (`commitCapturedPrefix`) without a second forward.
+        compressShare?.capture?.record(
+            layer: layerIdx, offset: offset, kv: kv, x: compressor != nil ? x : nil)
+
         // --- Cache update (sliding-window local) ---
         var keys = kv
         if let cache = cache {
@@ -445,11 +450,7 @@ class DeepseekV4Attention: Module {
                     if isV41, let idx = v41Indexer, idx.ownsK {
                         let r = rope
                         if let v4Cache {
-                            latentSink = { [unowned idx, weak v4Cache] latent, base in
-                                guard let v4Cache else { return }
-                                let k = idx.indexKeys(latent: latent, base: base, rope: r)
-                                _ = v4Cache.appendPooled(.indexer, value: k, isPrefill: true)
-                            }
+                            latentSink = indexKeySink(v4Cache)
                         } else {
                             latentSink = { [unowned idx] latent, base in
                                 freshIndexK.rows.append(
@@ -671,6 +672,34 @@ class DeepseekV4Attention: Module {
             // Failed compiled evaluation — fall through to eager.
         }
         return outMath(sdpaOut, cosT: cosT, sinT: sinT)
+    }
+
+    /// V4.1 index-key owner: append the shared index keys derived from newly completed compressor
+    /// latents to the cache's indexer pool. nil on every other layer.
+    func indexKeySink(_ v4Cache: DeepseekV4Cache) -> ((MLXArray, Int) -> Void)? {
+        guard config.isDeepseekV41, let idx = v41Indexer, idx.ownsK else { return nil }
+        let r = rope
+        return { [unowned idx, weak v4Cache] latent, base in
+            guard let v4Cache else { return }
+            let k = idx.indexKeys(latent: latent, base: base, rope: r)
+            _ = v4Cache.appendPooled(.indexer, value: k, isPrefill: true)
+        }
+    }
+
+    /// Python `DSV41.commit_prefix`, one layer: on the restored cache, append only the first `keep`
+    /// tokens of a captured forward, exactly as a forward of those tokens updates the cache (local
+    /// window rows, then the compressor: pending tail, completed groups, pool and index rows at the
+    /// same RoPE positions). The attention math itself is not rerun.
+    func commitCapturedPrefix(_ record: DSV41VerifyCapture.Layer, keep: Int, cache: KVCache) {
+        let rows = record.kv[0..., 0..., 0 ..< keep, 0...]
+        _ = cache.update(keys: rows, values: rows)
+        if compressRatio > 0, let comp = compressor, let x = record.x,
+            let v4Cache = cache as? DeepseekV4Cache
+        {
+            _ = comp(
+                x[0..., 0 ..< keep], rope: rope, v4Cache: v4Cache, startPos: record.offset,
+                latentSink: indexKeySink(v4Cache))
+        }
     }
 
     /// Python `_decode_out_math`: inverse RoPE + grouped o-proj + wo_b.
@@ -1432,6 +1461,13 @@ public class DeepseekV4ModelInner: Module {
     /// reused address can never inherit another conversation's history.
     private let engramFallbackHistory = NSMapTable<AnyObject, DeepseekV4Cache>.weakToStrongObjects()
 
+    /// dSpark target layers (DeepSeek-V4.1 `dspark_target_layer_ids`) whose INPUT hidden (mean over
+    /// hc, after Engram) every forward records into the cache's draft-window tail. Empty (the
+    /// default, and always for DSV4-0731) records nothing. Set once when a dSpark head attaches.
+    var dsparkTapLayers: [Int] = []
+    /// Rows the tail keeps (the dSpark attention window).
+    var dsparkTailCapacity = 128
+
     /// Hoisted per-token debug switch (was an environment read per layer per token).
     private static let layerDebugEnabled =
         ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil
@@ -1584,6 +1620,23 @@ public class DeepseekV4ModelInner: Module {
                 .asType(.float32)
             // Shared compress-KV holder: kv_source layers publish their pool, later ratio>0 layers read it.
             let compressShare = DSV41CompressShare()
+            // dSpark tail: the cache's holder layer records the target layers' input hidden for the
+            // last `dsparkTailCapacity` positions of this forward (Python `return_hidden`).
+            let tailHolder: DeepseekV4Cache? = dsparkTapLayers.isEmpty
+                ? nil
+                : cache?.first(where: {
+                    ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
+                }) as? DeepseekV4Cache
+            let tailStart = tailHolder?.offset ?? 0
+            // dSpark verify capture requested on this sequence (see `dsparkCommitPrefix`).
+            if let capture = (cache?.first(where: {
+                ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
+            }) as? DeepseekV4Cache)?.dsparkVerifyCapture {
+                capture.begin(tokens: L)
+                compressShare.capture = capture
+            }
+            let tailLo = Swift.max(0, L - dsparkTailCapacity)
+            var tailRows: [Int: MLXArray] = [:]
             for (i, layer) in layers.enumerated() {
                 if let eng = layer.engram {
                     if i > 0 && chunkTokens > 1 {
@@ -1602,6 +1655,10 @@ public class DeepseekV4ModelInner: Module {
                         engram?.startLookahead()
                     }
                 }
+                if tailHolder != nil, dsparkTapLayers.contains(i) {
+                    let hTail = tailLo == 0 ? h : h[0..., tailLo..., 0..., 0...]
+                    tailRows[i] = hTail.mean(axis: 2).asType(.bfloat16)  // [1, n, d]
+                }
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
                 preMix = r.ffnPre
@@ -1611,6 +1668,13 @@ public class DeepseekV4ModelInner: Module {
                 }
                 if layerwisePrefill { MLX.eval(h) }
                 layerStats.append(contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
+            }
+            if let tailHolder, tailRows.count == dsparkTapLayers.count {
+                let rows = concatenated(dsparkTapLayers.map { tailRows[$0]! }, axis: -1)[0]
+                var tail = tailHolder.auxiliaryHiddenTail
+                    ?? HybridPoolHiddenTail(capacity: dsparkTailCapacity)
+                tail.record(rows: rows, startPosition: tailStart + tailLo)
+                tailHolder.auxiliaryHiddenTail = tail
             }
             // Final collapse uses the last layer's ffnPre (ref `Block.hc_pre(h, pre_mix)`); V4.1 has NO
             // learned hc_head (those weights are absent from the bundle).
@@ -1676,6 +1740,11 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+
+    /// DeepSeek-V4.1 dSpark draft head (`dspark/`), attached on the first `.dspark` request. Not a
+    /// Module child: its weights load and evaluate at attach. nil for DSV4-0731, always.
+    var dsparkHead: DSparkV41Head?
+    let dsparkAttachLock = NSLock()
 
     // MARK: - Resident weight loading (SafetensorsLoadKeyExcluding)
     //
@@ -1842,7 +1911,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let outerStep: Int
         if sub > 0 {
             let env = ProcessInfo.processInfo.environment
-            let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init) ?? 2048
+            // With the 8.3 GB dSpark head resident, 2048-token chunks push active memory plus the
+            // allocator cache past Metal's working set and prefill slows ~30% (RUNTIME_SERVING.md);
+            // 1024 measured best with the head resident.
+            let dsparkResident = dsparkHead != nil
+            let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init)
+                ?? (dsparkResident
+                    ? env["VMLX_DSV41_DSPARK_PREFILL_STEP"].flatMap(Int.init) ?? 1024 : 2048)
             outerStep = max(prefillStepSize, requested)
         } else {
             outerStep = prefillStepSize
