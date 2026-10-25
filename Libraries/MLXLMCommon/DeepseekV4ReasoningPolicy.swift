@@ -35,6 +35,30 @@ public enum DeepseekV4ReasoningPolicy {
             || normalized.hasPrefix("deepseekv4_")
     }
 
+    /// DeepSeek-V4.1 (`deepseek_v41`, text decoder `deepseek_v41_text`). Kept
+    /// separate from ``isDeepseekV4(modelType:)`` so the 0731 policy is unchanged.
+    public static func isDeepseekV41(modelType: String?) -> Bool {
+        DeepseekV4ChatFamily(modelType: modelType) == .deepseekV41
+    }
+
+    /// DeepSeek-V4.1 effort vocabulary: the host ladder (weakest → strongest)
+    /// mapped onto the numeric 1-100 budget by the V4.1 encoder.
+    public static let deepseekV41Efforts = ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+    /// Normalize a V4.1 effort: a ladder name (`none` ≡ `minimal`) or a 1-100
+    /// number (Int, Double or numeric string; out-of-range values are clamped
+    /// by the encoder). Returns nil for anything else.
+    public static func normalizedDeepseekV41ReasoningEffort(
+        _ value: (any Sendable)?
+    ) -> (any Sendable)? {
+        if let i = value as? Int { return i }
+        if let d = value as? Double, d.isFinite { return Int(d.rounded()) }
+        guard let effort = normalizedString(value) else { return nil }
+        if let i = Int(effort) { return i }
+        if effort == "none" { return "minimal" }
+        return deepseekV41Efforts.contains(effort) ? effort : nil
+    }
+
     public static func rawMaxEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
@@ -84,6 +108,24 @@ public enum DeepseekV4ReasoningPolicy {
         modelType: String?,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> [String: any Sendable]? {
+        if isDeepseekV41(modelType: modelType) {
+            // DeepSeek-V4.1: same explicit-mode rule as 0731, with the V4.1
+            // numeric/ladder effort vocabulary.
+            var normalized = context ?? [:]
+            if let rawEffort = normalized["reasoning_effort"] {
+                guard let canonical = normalizedDeepseekV41ReasoningEffort(rawEffort) else {
+                    throw DeepseekV4ReasoningPolicyError.invalidReasoningEffort(
+                        String(describing: rawEffort))
+                }
+                if normalized["enable_thinking"] as? Bool == false {
+                    normalized.removeValue(forKey: "reasoning_effort")
+                } else {
+                    normalized["enable_thinking"] = true
+                    normalized["reasoning_effort"] = canonical
+                }
+            }
+            return normalized.isEmpty ? nil : normalized
+        }
         guard isDeepseekV4(modelType: modelType) else { return context }
 
         var normalized = context ?? [:]

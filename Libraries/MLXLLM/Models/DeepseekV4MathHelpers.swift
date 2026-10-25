@@ -528,6 +528,11 @@ public enum DeepseekV4Math {
         return y.asType(h.dtype)
     }
 
+    /// `VMLX_HC_SINKHORN_OPS=1` forces the op-by-op Sinkhorn (diagnostic A/B). Read once — this
+    /// sits on the per-sublayer, per-token path.
+    static let hcSinkhornForceOps =
+        ProcessInfo.processInfo.environment["VMLX_HC_SINKHORN_OPS"] != nil
+
     private static let hcPreCompiledLock = NSLock()
     nonisolated(unsafe) private static var hcPreCompiledCache:
         [String: ([MLXArray]) -> [MLXArray]] = [:]
@@ -783,8 +788,7 @@ public enum DeepseekV4Math {
         // reports .gpu, passes this test and then fails on the Metal kernel below;
         // on those builds the test must ask for Metal, as the `#if canImport(Metal)`
         // guards around the same test in `Qwen4ExpQSA.swift` do.
-        if Device.defaultDevice().deviceType == .gpu,
-            ProcessInfo.processInfo.environment["VMLX_HC_SINKHORN_OPS"] == nil {
+        if Device.defaultDevice().deviceType == .gpu, !Self.hcSinkhornForceOps {
             let leadShape = Array(mixes.shape.dropLast())
             let rows = mixes.size / ((2 + hcMult) * hcMult)
             let outputs = hcSplitSinkhornKernel(

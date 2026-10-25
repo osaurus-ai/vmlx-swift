@@ -600,6 +600,21 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && (numRoutedExperts ?? 0) >= 128
     }
 
+    /// DeepSeek-V4.1 affine JANG (prestacked routed experts, disk-resident
+    /// engram). Resident like plain DSV4 (the model requests it), so the MLX
+    /// memory/allocator caps must not throttle decode either.
+    public var isDeepseekV41AffineJANG: Bool {
+        let type = modelType?.lowercased() ?? ""
+        let format = weightFormat?.lowercased() ?? ""
+        let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
+        return (type == "deepseek_v41" || type == "deepseek_v41_text")
+            && hasJangConfig
+            && !hasJangTQRuntime
+            && declaresAffine
+            && isRouted
+            && (numRoutedExperts ?? 0) >= 128
+    }
+
     /// Qwen3.8 Flash Next JANG keeps its large PLE/ngram table in a
     /// model-owned exact-row SSD reader. Match the bundle's explicit family,
     /// JANG format, and BF16 compute declaration; model names and directory
@@ -671,7 +686,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// One property for both caps deliberately: they are the same decision about the same bundle,
     /// and a family added to one list and not the other is exactly how this reached production.
     public var requiresUncappedResidentPools: Bool {
-        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG
+        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG || isDeepseekV41AffineJANG
     }
 
     public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {

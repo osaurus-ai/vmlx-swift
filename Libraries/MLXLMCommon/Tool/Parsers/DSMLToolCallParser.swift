@@ -45,16 +45,45 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
     static let dsmlToolStartPrefix = "<\u{FF5C}DSML\u{FF5C}tool_"
     static let dsmlToolEndPrefix = "</\u{FF5C}DSML\u{FF5C}tool_"
 
-    public let startTag: String? = "<\u{FF5C}DSML\u{FF5C}tool_calls>"
-    public let endTag: String? = "</\u{FF5C}DSML\u{FF5C}tool_calls>"
-    public let startTagAliases: [String] = ["<\u{FF5C}DSML\u{FF5C}tool_calls>"]
-    public let endTagAliases: [String] = ["</\u{FF5C}DSML\u{FF5C}tool_calls>"]
+    /// Which DSML wire dialect this parser accepts.
+    ///
+    /// - `deepseekV4`: the 0731 contract (`<｜DSML｜tool_calls>`, `invoke`,
+    ///   `parameter`).
+    /// - `deepseekV41`: DeepSeek-V4.1 (`encoding/encoding.py`): the SAME
+    ///   envelope with leading-space tag names — `<｜DSML｜ calls>`,
+    ///   `<｜DSML｜ invoke name=…>`, `<｜DSML｜ parameter name=…>`. Exactly
+    ///   one dialect is accepted per parser, so 0731 parsing is unchanged.
+    public enum Dialect: Sendable {
+        case deepseekV4
+        case deepseekV41
+
+        var callsTag: String { self == .deepseekV41 ? " calls" : "tool_calls" }
+        var invokeTag: String { self == .deepseekV41 ? " invoke" : "invoke" }
+        var parameterTag: String { self == .deepseekV41 ? " parameter" : "parameter" }
+    }
+
+    public let dialect: Dialect
+    public let startTag: String?
+    public let endTag: String?
+    public let startTagAliases: [String]
+    public let endTagAliases: [String]
     // Keep namespace-prefix buffering so malformed native markup remains
     // quarantined from visible text. Parsing below still requires the exact
     // canonical wrapper and never promotes a completed typo into a tool call.
-    public let startTagPrefixes: [String] = [Self.dsmlToolStartPrefix]
-    public let endTagPrefixes: [String] = [Self.dsmlToolEndPrefix]
+    public let startTagPrefixes: [String]
+    public let endTagPrefixes: [String]
     private let allowsLegacyNonDSMLFallbacks: Bool
+
+    /// Outer-block marker prefixes for this dialect. 0731 keeps the broad
+    /// `tool_` namespace (quarantines typos such as `tool_cs`); V4.1 uses its
+    /// exact block name because ` invoke`/` parameter` share the bare
+    /// `<｜DSML｜ ` prefix inside the block.
+    private let toolStartPrefix: String
+    private let toolEndPrefix: String
+    private var invokeTagOpen: String { Self.dsmlPrefix + dialect.invokeTag }
+    private var invokeTagClose: String { Self.dsmlPrefixClose + dialect.invokeTag + ">" }
+    private var parameterTagOpen: String { Self.dsmlPrefix + dialect.parameterTag }
+    private var parameterTagClose: String { Self.dsmlPrefixClose + dialect.parameterTag + ">" }
 
     public var supportsInlineJSONToolFallback: Bool {
         allowsLegacyNonDSMLFallbacks
@@ -62,13 +91,39 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
     /// DeepSeek V4's native DSML parser accepts only the exact 0731 envelope.
     public init() {
-        self.allowsLegacyNonDSMLFallbacks = false
+        self.init(dialect: .deepseekV4, allowsLegacyNonDSMLFallbacks: false)
+    }
+
+    /// Native exact-envelope parser for one DSML dialect.
+    public init(dialect: Dialect) {
+        self.init(dialect: dialect, allowsLegacyNonDSMLFallbacks: false)
     }
 
     /// Retained only for the Nemotron compatibility parser, whose independent
     /// family contract historically included these non-DSML fallback rails.
     init(allowsLegacyNonDSMLFallbacks: Bool) {
+        self.init(dialect: .deepseekV4, allowsLegacyNonDSMLFallbacks: allowsLegacyNonDSMLFallbacks)
+    }
+
+    private init(dialect: Dialect, allowsLegacyNonDSMLFallbacks: Bool) {
+        self.dialect = dialect
         self.allowsLegacyNonDSMLFallbacks = allowsLegacyNonDSMLFallbacks
+        let start = Self.dsmlPrefix + dialect.callsTag + ">"
+        let end = Self.dsmlPrefixClose + dialect.callsTag + ">"
+        self.startTag = start
+        self.endTag = end
+        self.startTagAliases = [start]
+        self.endTagAliases = [end]
+        switch dialect {
+        case .deepseekV4:
+            self.toolStartPrefix = Self.dsmlToolStartPrefix
+            self.toolEndPrefix = Self.dsmlToolEndPrefix
+        case .deepseekV41:
+            self.toolStartPrefix = Self.dsmlPrefix + dialect.callsTag
+            self.toolEndPrefix = Self.dsmlPrefixClose + dialect.callsTag
+        }
+        self.startTagPrefixes = [toolStartPrefix]
+        self.endTagPrefixes = [toolEndPrefix]
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -179,11 +234,11 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         in text: String,
         tools: [[String: any Sendable]]?
     ) -> [ToolCall]? {
-        let invokeOpen = "\(Self.dsmlPrefix)invoke name=\""
-        let invokeClose = "\(Self.dsmlPrefixClose)invoke>"
-        let parameterOpen = "\(Self.dsmlPrefix)parameter name=\""
+        let invokeOpen = "\(invokeTagOpen) name=\""
+        let invokeClose = invokeTagClose
+        let parameterOpen = "\(parameterTagOpen) name=\""
         let parameterNameSuffix = " string=\""
-        let parameterClose = "\(Self.dsmlPrefixClose)parameter>"
+        let parameterClose = parameterTagClose
 
         var calls: [ToolCall] = []
         var cursor = text.startIndex
@@ -387,8 +442,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         tools: [[String: any Sendable]]?,
         allowPartialEOF: Bool = false
     ) -> [ToolCall] {
-        let invokeOpen = "\(Self.dsmlPrefix)invoke name="
-        let invokeClose = "\(Self.dsmlPrefixClose)invoke>"
+        let invokeOpen = "\(invokeTagOpen) name="
+        let invokeClose = invokeTagClose
 
         var results: [ToolCall] = []
         var cursor = text.startIndex
@@ -452,8 +507,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             return nil
         }
         let hasOuterMarker =
-            text.contains(Self.dsmlToolStartPrefix)
-            || text.contains(Self.dsmlToolEndPrefix)
+            text.contains(toolStartPrefix)
+            || text.contains(toolEndPrefix)
         guard hasOuterMarker else {
             return (text, false)
         }
@@ -467,8 +522,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         let body = text[start.upperBound ..< end.lowerBound]
         let after = text[end.upperBound...]
         let residue = String(before) + String(body) + String(after)
-        guard !residue.contains(Self.dsmlToolStartPrefix),
-            !residue.contains(Self.dsmlToolEndPrefix)
+        guard !residue.contains(toolStartPrefix),
+            !residue.contains(toolEndPrefix)
         else { return nil }
         return (body.trimmingCharacters(in: .whitespacesAndNewlines), true)
     }
@@ -485,8 +540,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         for end in endTagAliases {
             text = text.replacingOccurrences(of: end, with: "")
         }
-        text = removingCompletedTags(withPrefix: Self.dsmlToolStartPrefix, from: text)
-        text = removingCompletedTags(withPrefix: Self.dsmlToolEndPrefix, from: text)
+        text = removingCompletedTags(withPrefix: toolStartPrefix, from: text)
+        text = removingCompletedTags(withPrefix: toolEndPrefix, from: text)
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -514,8 +569,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         schema: [String: any Sendable]?,
         allowPartialEOF: Bool = false
     ) -> [String: any Sendable] {
-        let paramOpen = "\(Self.dsmlPrefix)parameter name="
-        let paramClose = "\(Self.dsmlPrefixClose)parameter>"
+        let paramOpen = "\(parameterTagOpen) name="
+        let paramClose = parameterTagClose
 
         var args: [String: any Sendable] = [:]
         var cursor = body.startIndex

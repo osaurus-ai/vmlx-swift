@@ -1971,7 +1971,9 @@ public final class LLMModelFactory: ModelFactory {
             configurationData: configData,
             generationConfig: generationConfig,
             jangStopTokenIds: earlyJangConfig?.chat?.stopTokenIds)
-        if baseConfig.modelType == "deepseek_v4" {
+        if baseConfig.modelType == "deepseek_v4"
+            || DeepseekV4ReasoningPolicy.isDeepseekV41(modelType: baseConfig.modelType)
+        {
             // DSV4's Python runtime treats EOS plus both role-boundary
             // sentinels as hard stops: {1, 128803, 128804}. The public
             // bundle's config/generation_config omit 128804

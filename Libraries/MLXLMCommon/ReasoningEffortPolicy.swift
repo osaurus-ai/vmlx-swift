@@ -274,6 +274,25 @@ public enum DeepseekV4EffortPolicy: ReasoningEffortPolicy {
     }
 }
 
+/// DeepSeek-V4.1. Numeric 1-100 budget contract; the host ladder below maps
+/// onto it in the V4.1 encoder (`minimal`=25 … `max`=100). Absent effort renders
+/// low (50) by vmlx convention (the bundle reference default is high=75).
+public enum DeepseekV41EffortPolicy: ReasoningEffortPolicy {
+    public static func applies(to modelType: String?) -> Bool {
+        DeepseekV4ReasoningPolicy.isDeepseekV41(modelType: modelType)
+    }
+    public static let templateKey = "reasoning_effort"
+    public static let efforts = DeepseekV4ReasoningPolicy.deepseekV41Efforts
+    public static let defaultEffort = "low"
+    public static let supportsDisabling = true
+    public static let offEffort: String? = nil
+    public static func normalize(_ raw: String) -> String? {
+        DeepseekV4ReasoningPolicy.normalizedDeepseekV41ReasoningEffort(raw).map {
+            String(describing: $0)
+        }
+    }
+}
+
 /// Hunyuan 3. Expresses off as an effort VALUE (`no_think`) rather than through `enable_thinking`,
 /// and accepts aliases — `none|off → no_think`, `minimal|medium → low`.
 public enum Hy3EffortPolicy: ReasoningEffortPolicy {
@@ -361,6 +380,7 @@ public enum ReasoningCapabilityRegistry {
         MuseGlimmerReasoningPolicy.self,
         BailingReasoningPolicy.self,
         DeepseekV4EffortPolicy.self,
+        DeepseekV41EffortPolicy.self,
         Hy3EffortPolicy.self,
         Glm5EffortPolicy.self,
     ]
