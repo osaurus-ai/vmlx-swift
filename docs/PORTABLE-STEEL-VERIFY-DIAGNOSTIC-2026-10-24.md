@@ -42,20 +42,20 @@ this kernel executed or accelerated native MTP. The planned third
 Allosaurus comparison is skipped because the flag is ineffective there.
 
 Quiescent synthetic operator repeats on Max2 gave baseline/split-K ratios
-1.553, 1.575 and 1.054 for rows4,K2560,N512/2560/12288. GPU median338MHz;
+1.553, 1.575 and 1.054 for rows=4, K=2560, N=512/2560/12288. GPU median 338 MHz;
 these are operator diagnostics, not a dense-family full-model qualification.
 
 The same Release binary also contains the separate Steel Trellis prefill
 prototype. With generic core g15 dispatch and JANGH Steel on actual g17s
 Max2, the legacy versus Trellis-Steel arms returned correct answers at
-430.89 versus422.47 cache-inclusive prompt tok/s on the3669-token task.
+430.89 versus 422.47 cache-inclusive prompt tok/s on the 3669-token task.
 There is no demonstrated full-portable prefill gain in this pair. Native
-code/growing turns completed at67.93/53.66 and65.96/54.07 tok/s, with
-natural stops, closed reasoning, four generated tests and2000 independent
-function/input-preservation cases per arm. Both150-value arrays and sums
+code/growing turns completed at 67.93/53.66 and 65.96/54.07 tok/s, with
+natural stops, closed reasoning, four generated tests and 2,000 independent
+function/input-preservation cases per arm. Both 150-value arrays and sums
 validate. Reasoning lengths/token counts differ; these unseeded turns are
 regression evidence, not matched-output decode speedup. Activity Monitor
-during the growing turns showed31.49 and32.79GB.
+during the growing turns showed 31.49 and 32.79 GB.
 
 Both processes exited normally; owned clock/log collectors were stopped.
 The exact Release binary SHA-256 is
