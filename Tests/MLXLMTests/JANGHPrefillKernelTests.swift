@@ -236,7 +236,7 @@ final class JANGHPrefillKernelTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             // Ragged columns, non-divisible K partitions, real model K=2560,
             // both tile dtypes and every supported odd-cubic code width.
-            for (bits, k, n) in [(2, 1088, 65), (3, 2048, 192), (4, 2560, 640), (8, 1088, 7)] {
+            for (bits, k, n) in [(2, 1088, 65), (3, 2048, 192), (4, 2560, 640), (6, 1472, 1), (8, 1088, 7)] {
                 let gate = bank(bits: bits, experts: 1, n: n, k: k, seed: 37)
                 let kernel = try JANGHPrefillKernel(contract: contract(bits, bits), module: module + ".gate_proj")
                 for tokens in [1, 3, 8, 16] {
