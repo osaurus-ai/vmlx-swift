@@ -232,6 +232,97 @@ final class JANGHPrefillKernelTests: XCTestCase {
         XCTAssertEqual(JANGHPrefillKernel.resolvedBackend(dtype: .float16, requested: .steel), .steel)
     }
 
+    func testPortableDenseSplitKMatchesIndependentReference() throws {
+        try MLXMetalTestLock.withLock {
+            // Ragged columns, non-divisible K partitions, real model K=2560,
+            // both tile dtypes and every supported odd-cubic code width.
+            for (bits, k, n) in [(2, 1088, 65), (3, 2048, 192), (4, 2560, 640), (6, 1472, 1), (8, 1088, 7)] {
+                let gate = bank(bits: bits, experts: 1, n: n, k: k, seed: 37)
+                let kernel = try JANGHPrefillKernel(contract: contract(bits, bits), module: module + ".gate_proj")
+                for tokens in [1, 3, 8, 16] {
+                    for dtype in [DType.float16, .bfloat16] {
+                        let values = rounded((0 ..< tokens * k).map {
+                            Float(($0 * 11 + $0 / k * 3) % 29 - 14) / 32
+                        }, dtype)
+                        let input = MLXArray(values, [tokens, k]).asType(dtype)
+                        let result = JANGHPrefillKernel.nativeBackend == .steel && JANGHPrefillKernel.denseSteelSplitKEnabled
+                            ? kernel.projectDenseSplitK(input, packed: gate.packed, scales: gate.scaleArray)
+                            : kernel.projectDenseSteelSplitK(input, packed: gate.packed, scales: gate.scaleArray)
+                        let actual = try XCTUnwrap(result)
+                        let expected = reference(input: values, ids: [UInt32](repeating: 0, count: tokens),
+                            gate: gate, up: nil, dtype: dtype, backend: .steel, rotate: false, limit: nil)
+                        XCTAssertEqual(actual.shape, [tokens, n]); XCTAssertEqual(actual.dtype, dtype)
+                        let got = actual.asType(.float32).asArray(Float.self)
+                        let tolerance: Float = dtype == .bfloat16 ? 0.012 : 0.004
+                        for i in got.indices {
+                            XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
+                                "portable split-K bits\(bits) T\(tokens) \(dtype) element\(i)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testPortableDenseSplitKDeclinesInvalidAndImplicitBankCopies() throws {
+        try MLXMetalTestLock.withLock {
+            let gate = bank(bits: 2, experts: 1, n: 64, k: 1024, seed: 7)
+            let kernel = try JANGHPrefillKernel(contract: contract(2, 2), module: module + ".gate_proj")
+            let packed = gate.packed, scales = gate.scaleArray
+            for rows in [0, 17] {
+                XCTAssertNil(kernel.projectDenseSteelSplitK(
+                    MLXArray.zeros([rows, 1024], dtype: .float16), packed: packed, scales: scales))
+            }
+            XCTAssertNil(kernel.projectDenseSteelSplitK(
+                MLXArray.zeros([3, 1024], dtype: .float32), packed: packed, scales: scales))
+            XCTAssertNil(kernel.projectDenseSteelSplitK(
+                MLXArray.zeros([3, 1000], dtype: .float16), packed: packed, scales: scales))
+            XCTAssertNil(kernel.projectDenseSteelSplitK(
+                MLXArray.zeros([3, 1024], dtype: .float16), packed: packed, scales: scales.asType(.float32)))
+            let lazy = packed + UInt32(0)
+            XCTAssertNil(kernel.projectDenseSteelSplitK(
+                MLXArray.zeros([3, 1024], dtype: .float16), packed: lazy, scales: scales))
+            let strided = packed.transposed(0, 2, 1)
+            eval(strided)
+            XCTAssertNil(kernel.projectDenseSteelSplitK(
+                MLXArray.zeros([3, 1024], dtype: .float16), packed: strided, scales: scales))
+        }
+    }
+
+    /// Explicit operator diagnostic; not physical older-chip or end-to-end MTP proof.
+    func testPortableDenseSplitKTimingDiagnostic() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_TEST_JANGH_STEEL_BENCH"] == "1" else {
+            throw XCTSkip("explicit operator timing diagnostic")
+        }
+        try MLXMetalTestLock.withLock {
+            for n in [512, 2560, 12288] {
+                let k = 2560, tokens = 4
+                let gate = bank(bits: 4, experts: 1, n: n, k: k, seed: 43)
+                let kernel = try JANGHPrefillKernel(contract: contract(4, 4), module: module + ".gate_proj")
+                let packed = gate.packed, scales = gate.scaleArray
+                let x = MLXArray((0 ..< tokens * k).map { Float($0 % 31 - 15) / 32 }, [tokens, k]).asType(.bfloat16)
+                let ids = MLXArray.zeros([tokens], type: UInt32.self)
+                eval(x, ids)
+                func run(_ split: Bool) throws -> MLXArray {
+                    if split { return try XCTUnwrap(kernel.projectDenseSteelSplitK(x, packed: packed, scales: scales)) }
+                    return try kernel.projectSorted(x, packed: packed, scales: scales, indices: ids, backend: .steel)
+                }
+                for split in [false, true] { for _ in 0..<3 { eval(try run(split)) } }
+                var baseline: [Double] = [], candidate: [Double] = []
+                for i in 0..<18 {
+                    for split in (i % 2 == 0 ? [false, true] : [true, false]) {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(try run(split))
+                        let us = Double(DispatchTime.now().uptimeNanoseconds - start) / 1000
+                        if split { candidate.append(us) } else { baseline.append(us) }
+                    }
+                }
+                let b = baseline.sorted()[baseline.count / 2], c = candidate.sorted()[candidate.count / 2]
+                print("STEEL_VERIFY_TIMING rows=\(tokens) K=\(k) N=\(n) baseline_us=\(b) splitk_us=\(c) ratio=\(b/c)")
+            }
+        }
+    }
+
     func testProjectionRaggedRowsAndColumnsBothBackends() throws {
         try MLXMetalTestLock.withLock {
             for backend in backends {

@@ -231,6 +231,41 @@ struct TQBlockLoader {
         }
 
         """#
+    static let steelSplitK = #"""
+
+template <typename T, int bits>
+METAL_FUNC void tq_dense_qmm_steel_splitk(
+    const device T* x, const device uint32_t* wg, const device half* sg, device float* y,
+    const int M, const int N, const int K, const int SPLITK, threadgroup T* Xs, threadgroup T* Ws,
+    uint3 tid, uint simd_group_id, uint simd_lane_id) {
+  constexpr int BM = 16, BN = 32, BK = 32, WM = 1, WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int PAD = BK + 16 / sizeof(T);
+  using mma_t = mlx::steel::BlockMMA<T, float, BM, BN, BK, WM, WN, false, true, PAD, PAD>;
+  using loader_x_t = mlx::steel::BlockLoader<T, BM, BK, PAD, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = TQBlockLoader<T, BN, BK, PAD, WM * WN * SIMD_SIZE, bits>;
+  const int steps = K / BK, part = int(tid.z);
+  const int start = part * (steps / SPLITK) + min(part, steps % SPLITK);
+  const int count = steps / SPLITK + int(part < steps % SPLITK);
+  const int col = int(tid.x) * BN;
+  const short rows = short(M), cols = short(min(BN, N - col));
+  x += size_t(start) * BK;
+  auto w = (const device uint8_t*)wg + size_t(col) * (K * bytes_per_pack / pack_factor)
+      + size_t(start) * (BK * bytes_per_pack / pack_factor);
+  y += size_t(part) * M * N + col;
+  thread mma_t mma_op(simd_group_id, simd_lane_id);
+  thread loader_x_t lx(x, K, Xs, simd_group_id, simd_lane_id);
+  thread loader_w_t lw(w, sg + col, K, Ws, simd_group_id, simd_lane_id, cols);
+  if (rows == BM && cols == BN) gemm_loop_aligned(Xs, Ws, mma_op, lx, lw, count);
+  else if (cols == BN) gemm_loop_unaligned<false, true, true>(Xs, Ws, mma_op, lx, lw, count, rows, cols, (short)BK);
+  else if (rows == BM) gemm_loop_unaligned<true, false, true>(Xs, Ws, mma_op, lx, lw, count, rows, cols, (short)BK);
+  else gemm_loop_unaligned<false, false, true>(Xs, Ws, mma_op, lx, lw, count, rows, cols, (short)BK);
+  if (rows == BM && cols == BN) mma_op.store_result(y, N);
+  else mma_op.store_result_slice(y, N, short2(0, 0), short2(cols, rows));
+}
+
+"""#
     static let steel = #"""
 
 template <typename T, int bits>
