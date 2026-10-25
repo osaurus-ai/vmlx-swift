@@ -149,7 +149,7 @@ final class DSparkV41Attention: Module {
         let L = full.dim(1)
         // q: [1,H,bs,headDim]; k/v: [1,H,L,headDim] (single latent KV broadcast to H heads).
         let qh = q.transposed(0, 2, 1, 3)
-        let kh = full.reshaped(1, 1, L, headDim).broadcast(to: [1, nHeads, L, headDim])
+        let kh = broadcast(full.reshaped(1, 1, L, headDim), to: [1, nHeads, L, headDim])
         // every query sees all keys (non-causal within the speculative block) → mask nil.
         var o = MLXFast.scaledDotProductAttention(
             queries: qh, keys: kh, values: kh, scale: scale, mask: nil,
@@ -307,11 +307,11 @@ final class DSparkV41Stage: Module {
         var residual = x
         let (aPre, aPost, aComb) = mixes(x, which: 0)
         var h = attn.attend(attnNorm(DeepseekV4Math.hcCollapse(x, pre: preMix)), positions: positions)
-        var xx = DeepseekV4Math.hcPost(h, residual: residual, post: aPost, comb: aComb)
+        var xx = DeepseekV4Math.hcPost(blockOut: h, residual: residual, post: aPost, comb: aComb)
         residual = xx
         let (fPre, fPost, fComb) = mixes(xx, which: 1)
         h = moe(ffnNorm(DeepseekV4Math.hcCollapse(xx, pre: aPre)))
-        xx = DeepseekV4Math.hcPost(h, residual: residual, post: fPost, comb: fComb)
+        xx = DeepseekV4Math.hcPost(blockOut: h, residual: residual, post: fPost, comb: fComb)
         return (xx, fPre)
     }
 }
@@ -355,7 +355,7 @@ final class DSparkV41Drafter: Module {
         ids[0] = Int32(seedTok)
         var x = embed(MLXArray(ids).reshaped(1, bs))                 // [1,bs,d]
         x = x.expandedDimensions(axis: 2)
-        x = MLX.broadcast(x, to: [1, bs, cfg.hcMult, cfg.hiddenSize])  // [1,bs,hc,d]
+        x = broadcast(x, to: [1, bs, cfg.hcMult, cfg.hiddenSize])  // [1,bs,hc,d]
         var preMix = zeros([1, bs, cfg.hcMult]).asType(.float32)
         preMix[0..., 0..., 0] = MLXArray(Float(1.0))
         let positions = MLXArray(Array(stride(from: Int32(startPos + 1), to: Int32(startPos + 1 + bs), by: 1)))
@@ -370,5 +370,78 @@ final class DSparkV41Drafter: Module {
             out.append(Int(MLX.argMax(logits[i] + bias).item(Int32.self)))
         }
         return out
+    }
+}
+
+// MARK: - Loader
+
+extension DSparkV41Drafter {
+    /// Resolve the bundle's self-contained dSpark draft (`dspark/dspark.safetensors`).
+    static func resolveFile(bundle: URL) -> URL? {
+        let fm = FileManager.default
+        for c in [bundle.appending(path: "dspark/dspark.safetensors"),
+                  bundle.appending(path: "dspark.safetensors")] where fm.fileExists(atPath: c.path) {
+            return c
+        }
+        return nil
+    }
+
+    /// Load the dSpark draft head from a bundle. Returns nil if no draft is present.
+    /// Routed experts arrive prestacked + 4-bit (SwitchGLU layout); attn/norms/shared/heads are bf16.
+    static func load(bundle: URL, config cfg: DSparkV41Config,
+                     embed: @escaping (MLXArray) -> MLXArray,
+                     head: @escaping (MLXArray) -> MLXArray) throws -> DSparkV41Drafter? {
+        guard let file = resolveFile(bundle: bundle) else { return nil }
+        let raw = try loadArrays(url: file)
+        let drafter = DSparkV41Drafter(cfg, embed: embed, head: head)
+        // Set up the 4-bit routed-expert structure (zeros) so update() can fill weight/scales/biases.
+        quantize(model: drafter, groupSize: 64, bits: 4,
+            filter: { path, m in path.contains(".switch_mlp.") && (m is SwitchLinear) })
+        var P: [String: MLXArray] = [:]
+        func bf(_ k: String) -> MLXArray? { raw[k].map { $0.asType(.bfloat16) } }
+        func f32(_ k: String) -> MLXArray? { raw[k].map { $0.asType(.float32) } }
+        for i in 0 ..< cfg.nStages {
+            let p = "mtp.\(i)", s = "stages.\(i)"
+            let last = i == cfg.nStages - 1
+            P["\(s).attn.wq_a.weight"] = bf("\(p).attn.wq_a.weight")
+            P["\(s).attn.wq_b.weight"] = bf("\(p).attn.wq_b.weight")
+            P["\(s).attn.wkv.weight"] = bf("\(p).attn.wkv.weight")
+            P["\(s).attn.wo_b.weight"] = bf("\(p).attn.wo_b.weight")
+            P["\(s).attn.q_norm.weight"] = bf("\(p).attn.q_norm.weight")
+            P["\(s).attn.kv_norm.weight"] = bf("\(p).attn.kv_norm.weight")
+            P["\(s).attn.attn_sink"] = f32("\(p).attn.attn_sink")
+            if let woa = bf("\(p).attn.wo_a.weight") {   // [groups*o_lora, (H/groups)*headDim]
+                P["\(s).attn.wo_a"] = woa.reshaped(cfg.oGroups, cfg.oLoraRank, cfg.nHeads * cfg.headDim / cfg.oGroups)
+            }
+            P["\(s).attn_norm.weight"] = bf("\(p).attn_norm.weight")
+            P["\(s).ffn_norm.weight"] = bf("\(p).ffn_norm.weight")
+            for w in ["hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"] {
+                P["\(s).\(w)"] = f32("\(p).\(w)")
+            }
+            P["\(s).moe.gate_w"] = bf("\(p).ffn.gate.weight")
+            P["\(s).moe.gate_bias"] = f32("\(p).ffn.gate.bias")
+            P["\(s).moe.sw1.weight"] = bf("\(p).ffn.shared_experts.w1.weight")
+            P["\(s).moe.sw3.weight"] = bf("\(p).ffn.shared_experts.w3.weight")
+            P["\(s).moe.sw2.weight"] = bf("\(p).ffn.shared_experts.w2.weight")
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                P["\(s).moe.switch_mlp.\(proj).weight"] = raw["\(p).ffn.experts.\(proj).weight"]
+                P["\(s).moe.switch_mlp.\(proj).scales"] = bf("\(p).ffn.experts.\(proj).scales")
+                P["\(s).moe.switch_mlp.\(proj).biases"] = bf("\(p).ffn.experts.\(proj).biases")
+            }
+            if i == 0 {
+                P["\(s).mainProj.weight"] = bf("\(p).main_proj.weight")
+                P["\(s).mainNorm.weight"] = bf("\(p).main_norm.weight")
+            }
+            if last {
+                P["\(s).norm.weight"] = bf("\(p).norm.weight")
+                P["\(s).markov_embed"] = bf("\(p).markov_head.embed.weight")
+                P["\(s).markov_head"] = bf("\(p).markov_head.head.weight")
+                P["\(s).conf_proj"] = f32("\(p).confidence_head.proj.weight")
+            }
+        }
+        let clean = P.compactMapValues { $0 }
+        drafter.update(parameters: ModuleParameters.unflattened(clean))
+        eval(drafter)
+        return drafter
     }
 }
