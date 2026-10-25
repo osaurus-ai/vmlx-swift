@@ -244,8 +244,11 @@ final class JANGHPrefillKernelTests: XCTestCase {
                         let values = rounded((0 ..< tokens * k).map {
                             Float(($0 * 11 + $0 / k * 3) % 29 - 14) / 32
                         }, dtype)
-                        let actual = try XCTUnwrap(kernel.projectDenseSteelSplitK(
-                            MLXArray(values, [tokens, k]).asType(dtype), packed: gate.packed, scales: gate.scaleArray))
+                        let input = MLXArray(values, [tokens, k]).asType(dtype)
+                        let result = JANGHPrefillKernel.nativeBackend == .steel && JANGHPrefillKernel.denseSteelSplitKEnabled
+                            ? kernel.projectDenseSplitK(input, packed: gate.packed, scales: gate.scaleArray)
+                            : kernel.projectDenseSteelSplitK(input, packed: gate.packed, scales: gate.scaleArray)
+                        let actual = try XCTUnwrap(result)
                         let expected = reference(input: values, ids: [UInt32](repeating: 0, count: tokens),
                             gate: gate, up: nil, dtype: dtype, backend: .steel, rotate: false, limit: nil)
                         XCTAssertEqual(actual.shape, [tokens, n]); XCTAssertEqual(actual.dtype, dtype)

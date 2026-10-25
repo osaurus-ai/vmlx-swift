@@ -57,6 +57,7 @@ final class JANGHPrefillKernel {
 
     /// Local diagnostic for the portable verify-window kernel. Not a default.
     static let denseSteelSplitKEnabled: Bool = RuntimeEnvironment.value("VMLX_JANGH_STEEL_SPLITK") == "1"
+    private static let steelRequested: Bool = RuntimeEnvironment.value("VMLX_JANGH_PREFILL_BACKEND") == "steel"
 
     // Only immutable dense-bank owners opt in; routed/K2 callers retain their old tile.
     private let smallTileAdmission = JANGHDenseFastAdmission(enabled: true)
@@ -64,7 +65,7 @@ final class JANGHPrefillKernel {
     static var nativeBackend: Backend {
         // A conservative diagnostic can disable NAX on this machine. It never
         // enables instructions unavailable on the actual device.
-        if RuntimeEnvironment.value("VMLX_JANGH_PREFILL_BACKEND") == "steel" { return .steel }
+        if steelRequested { return .steel }
         #if os(macOS)
             guard #available(macOS 26.2, *) else { return .steel }
             return backend(forMetalArchitecture: GPU.deviceInfo().architecture)
