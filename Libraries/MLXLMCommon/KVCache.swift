@@ -175,6 +175,13 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     /// ``auxiliaryTokenHistory`` covering its offset. A disk record that
     /// lacks it is refused (re-prefill) instead of guessing the history.
     var requiresAuxiliaryTokenHistory: Bool { get }
+
+    /// Model-owned trailing hidden rows that travel with the cache (the
+    /// DeepSeek-V4.1 dSpark draft-window tail: the target-layer hidden of the
+    /// last committed positions). Optional and speed-only: a cache without it
+    /// is still exact, the drafter just starts with a shorter window. `nil`
+    /// for every other family.
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? { get set }
 }
 
 /// Trailing token history for ``HybridPoolCache/auxiliaryTokenHistory``:
@@ -199,6 +206,11 @@ public extension HybridPoolCache {
     }
 
     var requiresAuxiliaryTokenHistory: Bool { false }
+
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? {
+        get { nil }
+        set {}
+    }
 }
 
 /// One independently encoded row segment from a DSV4 compressor/indexer pool.

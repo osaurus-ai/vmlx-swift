@@ -1722,6 +1722,10 @@ private func restoreDeepseekV4Layer(
             var mutable = hybrid
             mutable.auxiliaryTokenHistory = comp.auxiliaryTokenHistory
         }
+        // dSpark draft-window tail: kept only when it ends exactly at the restored offset.
+        var mutable = hybrid
+        mutable.auxiliaryHiddenTail =
+            comp.auxiliaryHiddenTail?.endPosition == comp.offset ? comp.auxiliaryHiddenTail : nil
         return true
     }
     return apply(hybrid)
