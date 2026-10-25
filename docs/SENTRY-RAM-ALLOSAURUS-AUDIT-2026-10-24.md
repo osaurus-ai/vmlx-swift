@@ -435,3 +435,40 @@ not an attribution to this reporter or proof of OOM. No watchdog-disabling
 environment variable, blind retry, reduced RAM budget or sampler clamp is
 installed. Pinned attention/command-buffer behavior and bounded reproduction
 remain under investigation; current transport tests do not clear this row.
+
+### Follow-up diagnostics on the merged code
+
+Both scoped fixes are now merged: runtime #647 (`5055455f8`) and app #3185
+(`2f2e1158b`). The app merge tree equals the tested Release source; the runtime
+merge contains the tested pin. Subsequent diagnostics still use that exact
+Release artifact, locally on Max2.
+
+The explicit allocator maximum was also checked **during** native MTP, rather
+than inferred from the post-generation value. Under Safe Auto with a temporary
+64 MiB custom maximum, all 137 active-window polls report exactly 67,108,864
+bytes. The array response contains all 150 correct values, stops naturally,
+and generates 1,720 tokens at 55.34 tok/s. Activity Monitor shows 36.18 GiB in
+the active request. This is a custom-cap policy diagnostic, not default-speed
+qualification. The override is removed through Settings afterward; Save
+unloads the resident model, and Safe Auto/custom-nil is restored.
+
+A pinned-MLX attention diagnostic completes 81 combinations: FP16/BF16/FP32,
+32,769/65,537/131,075 keys, 8/64/512 query rows, and unmasked/causal/last-1,024
+masks, with 20 query heads, two KV heads and head dimension 128. No reported
+Metal error occurs. The largest measured warm forward is 36.83 ms and the MLX
+peak is 408,092,688 bytes. This is a bounded kernel-only diagnostic with no
+model or memory-policy override, not a reproduction of the unknown reporter's
+workload or clearance for older hardware. Six FP32 eight-query cases fail
+the original strict numerical oracle; those failures remain recorded. In
+particular, eight queries times GQA factor ten exceeds the vector-fused
+eligibility limit of 32, so those rows take the unfused fallback. Do not
+attribute their precision differences to the vector kernel without evidence.
+
+Read-only Sentry Logs queries for the exact interactivity message (90 days)
+and command-buffer failure text (30 days) return no records; a general query
+does return logs, so this is not evidence that Logs is entirely unavailable.
+Current source records generation begin/submit breadcrumbs, but the mapper's
+handled `generationFailure` path preserves the error to the caller without
+capturing a dedicated Sentry event. Absence of a recent fatal group therefore
+does not establish absence of handled GPU failures. No guessed RAM policy or
+blind GPU retry is introduced to compensate for the missing workload evidence.
