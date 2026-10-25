@@ -33,18 +33,36 @@ absent effort renders as low (50). The bundle reference default is high (75).
   don't match the config. It never runs without Engram.
 - Rows are read in place from the safetensors shards with concurrent `pread`: 64 lanes,
   256-row tasks, rows and scales together. The OS page cache keeps hot rows; nothing is wired.
-  The reads for layer 14 overlap the compute of layers 0–13. Cold random rows read about
-  130k rows/s this way, against 8–11k rows/s serially.
+  The reads for layer 14 overlap the compute of layers 0–13: the forward `asyncEval`s the
+  hidden state before it waits for them. Cold random rows read about 130k rows/s this way,
+  against 8–11k rows/s serially.
+- Chunked prefill passes the next forward's tokens on the history-holder cache, and each
+  chunk starts reading the next chunk's rows once its own are resolved (reference
+  `engram_lookahead`). The record is used only on an exact start/ids/history match.
 - The n-gram history travels with the cache (first compressed layer): copy, trim, metaState
   and disk records. A V4.1 disk record without history is a cache miss, never padded. The
   runtime holds no per-sequence state.
 
 ## KV cache size
 
-V4.1 compressed pools are 4-bit (about 0.625 B per element against 1.125 for 8-bit). The disk
-format records the width and refuses to restore into a cache of the other width.
-`VMLX_DSV41_KVBYTES=1` logs total cache bytes, bytes per token and pool bits after each
-prepare. Target: ~0.9 GB for a 1M-token context, resident and stored.
+Only the kv-source layers (2, 8, 14, 20; ratios 2, 2, 2, 1) hold pools: compressed KV
+(512 wide) and index keys (128 wide). Every other layer holds only its 128-row window.
+
+- Pools are 4-bit from the first row (reference `QuantGrowBuffer`): one contiguous slab per
+  pool, grown in 2048-row steps and written in place. There is no BF16 hot tier for V4.1.
+  Before 2026-10-25 every pool under 64 MiB stayed BF16, which measured 3.2 KB/token below
+  ~65k tokens (42k tokens: 139-160 MiB).
+- Row cost: 4-bit codes plus fp16 scale and minimum per 32 elements, 320 B per compressed row
+  and 80 B per index row, so 1000 B/token of pools against the reference's 900 (group 64 with
+  bf16 scale/bias). 42k tokens ≈ 52 MiB including the 10 MiB of windows; 1M ≈ 1.05 GB.
+- After a multi-token update the local window keeps only its last 128 rows (the reference's
+  `cache.window = raw[:, -win:]`); previously a 2048-token chunk left ~2175 rows per layer.
+- Disk records store each pool as one segment of its live 4-bit rows, about the resident size.
+  Older BF16 records are re-encoded on restore, with the same codes appending would produce.
+- `VMLX_DSV41_POOL_LAYOUT=segmented` restores the old BF16-hot-tier layout for A/B runs.
+- The disk format records the width and refuses to restore into a cache of the other width.
+  `VMLX_DSV41_KVBYTES=1` logs total cache bytes, bytes per token and pool bits after each
+  prepare.
 
 ## Long context: indexer
 
