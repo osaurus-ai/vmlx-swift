@@ -928,6 +928,10 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// True for DeepSeek-V4.1 caches: pools are encoded at append into one
     /// contiguous slab each (see ``DeepseekV4PoolStorage/contiguous``).
     public var contiguousPools: Bool { compPool.contiguous }
+    /// DeepSeek-V4.1: after a multi-token update keep only the last
+    /// `slidingWindow` local rows (``RotatingKVCache/compactToWindow()``), like the
+    /// reference `cache.window = raw[:, -win:]`.
+    public let compactLocalWindow: Bool
 
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
@@ -991,7 +995,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         poolBF16HotByteLimit: Int? = nil,
         requiresAuxiliaryTokenHistory: Bool = false,
         poolQuantizationBits: Int = 8,
-        contiguousPools: Bool = false
+        contiguousPools: Bool = false,
+        compactLocalWindow: Bool = false
     ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         let quantizationEnabled = poolQuantizationEnabled
@@ -1012,6 +1017,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             bits: poolQuantizationBits,
             contiguous: contiguousPools)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
+        self.compactLocalWindow = compactLocalWindow
         self.requiresAuxiliaryTokenHistory = requiresAuxiliaryTokenHistory
     }
 
@@ -1132,7 +1138,12 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     public var maxSize: Int? { local.maxSize }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        local.update(keys: keys, values: values)
+        let window = local.update(keys: keys, values: values)
+        if compactLocalWindow, keys.dim(2) > 1 {
+            // The returned window still feeds this forward's attention.
+            local.compactToWindow()
+        }
+        return window
     }
 
     /// Round-trip layout (kept stable for `TQDiskSerializer`):
@@ -1292,7 +1303,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             poolBF16HotByteLimit: compPool.hotByteLimit,
             requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory,
             poolQuantizationBits: compPool.bits,
-            contiguousPools: compPool.contiguous)
+            contiguousPools: compPool.contiguous,
+            compactLocalWindow: compactLocalWindow)
         dup.auxiliaryTokenHistory = auxiliaryTokenHistory
         let localState = local.state
         if !localState.isEmpty {

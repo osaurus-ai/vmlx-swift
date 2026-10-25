@@ -1756,7 +1756,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                         poolBF16HotByteLimit: v41Contiguous ? 0 : nil,
                         requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder,
                         poolQuantizationBits: poolBits,
-                        contiguousPools: v41Contiguous)
+                        contiguousPools: v41Contiguous,
+                        compactLocalWindow: config.isDeepseekV41)
                 }
                 return RotatingKVCache(
                     maxSize: config.slidingWindow, keep: 0)
@@ -1829,6 +1830,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             let chunkMask = flatMask.map { $0[..<step] }
             let chunkText = LMInput.Text(tokens: chunkTokens, mask: chunkMask)
             _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
+            if config.isDeepseekV41 { Self.compactSlidingWindows(cache) }
             MLX.eval(cache)
             flatTokens = flatTokens[step...]
             if let m = flatMask { flatMask = m[step...] }
@@ -1840,6 +1842,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             Self.logCacheBytes(cache, phase: "prepare")
         }
         return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
+    }
+
+    /// DeepSeek-V4.1 prefill: the sliding-only layers (ratio 0) hold plain rotating
+    /// caches; drop their chunk-length window tail after each chunk, as the V4.1
+    /// hybrid layers do inside `DeepseekV4Cache.update`.
+    static func compactSlidingWindows(_ cache: [KVCache]) {
+        for case let rotating as RotatingKVCache in cache { rotating.compactToWindow() }
     }
 
     /// `VMLX_DSV41_KVBYTES=1`: NSLog the summed retained cache bytes (pool codes + metadata +

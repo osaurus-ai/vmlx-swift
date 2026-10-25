@@ -1065,6 +1065,26 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return start + S <= effective
     }
 
+    /// Release the rows a multi-token update kept beyond the window.
+    ///
+    /// After an `S`-token concat update the buffers hold `maxSize - 1 + S` rows
+    /// (every query of that update needed its full window). No later update reads
+    /// more than the newest `maxSize`: the next concat keeps `maxSize - 1` and the
+    /// next in-place write trims to `maxSize` first. Keeping exactly those rows (a
+    /// gather, so the large buffer is really freed) leaves every later update and
+    /// `state` identical while the retained window stops scaling with the prefill
+    /// chunk. Opt-in (DeepSeek-V4.1); a no-op unless the buffers are in temporal
+    /// order and longer than the window.
+    public func compactToWindow() {
+        guard keep == 0, let keys, let values else { return }
+        let rows = keys.dim(2)
+        guard rows > maxCacheSize, idx == rows, values.dim(2) == rows else { return }
+        let tail = MLXArray(Int32(rows - maxCacheSize) ..< Int32(rows))
+        self.keys = take(keys, tail, axis: 2)
+        self.values = take(values, tail, axis: 2)
+        idx = maxCacheSize
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result =
             if keys.dim(2) == 1 && canUpdateInPlace(keys.dim(2)) {
