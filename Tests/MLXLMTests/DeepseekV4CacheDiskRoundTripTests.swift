@@ -241,12 +241,14 @@ struct DeepseekV4CacheDiskRoundTripTests {
         #expect(okQKV.offset == 6)
     }
 
-    @Test("non-q8 quantized pool segment poisons the record as an atomic miss")
+    @Test("malformed quantized pool segment poisons the record as an atomic miss")
     func nonQ8QuantizedPoolPoisonsRecord() {
-        // The disk schema for quantized pools is defined for 8-bit affine
-        // segments. Any other width must not degrade to a silently
-        // skipped layer (sibling .deepseekV4 layers would restore while
-        // this one stayed empty) — the record poisons to a required miss.
+        // The disk schema for quantized pools is defined for 8-bit (DSV4-0731)
+        // and packed 4-bit (DeepSeek-V4.1) affine segments with uint8 codes
+        // shaped [B, rows, groups, groupSize | groupSize/2]. A segment outside
+        // that schema must not degrade to a silently skipped layer (sibling
+        // .deepseekV4 layers would restore while this one stayed empty) — the
+        // record poisons to a required miss.
         let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
         Self.fillRotating(v4.local)
         let bogus = HybridPoolQuantizedSegment(
@@ -270,12 +272,18 @@ struct DeepseekV4CacheDiskRoundTripTests {
         #expect(target.offset == 0)
     }
 
-    @Test("serializer q8 contract matches DeepseekV4PoolStorage bits")
+    @Test("serializer pool-width contract matches DeepseekV4PoolStorage bits")
     func serializerBitsMatchPoolStorage() {
-        // The serializer accepts exactly 8-bit pool segments; the pool
-        // storage produces exactly 8-bit segments. Tie the two constants
-        // so one cannot drift without this test going red.
+        // The serializer accepts exactly the widths the pool storage can
+        // produce: 8-bit (DSV4-0731 default) and packed 4-bit (DeepSeek-V4.1).
+        // Tie the two sets so neither can drift without this test going red.
         #expect(DeepseekV4Cache.poolQuantizationBits == 8)
+        #expect(DeepseekV4Cache.supportedPoolQuantizationBits == HybridPoolQuantizedSchema.supportedBits)
+        #expect(HybridPoolQuantizedSchema.supportedBits == [4, 8])
+        // Both widths round-trip; see DeepseekV41PoolBitsFocusedTests
+        // ("disk serializer round-trips both 4-bit and 8-bit pools").
+        let fourBit = DeepseekV4Cache(slidingWindow: 16, compressRatio: 2, poolQuantizationBits: 4)
+        #expect(fourBit.hybridPoolQuantizationBits == 4)
     }
 
     private func assertStateEqual(

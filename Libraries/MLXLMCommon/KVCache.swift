@@ -260,6 +260,24 @@ public protocol QuantizedHybridPoolCache: HybridPoolCache {
         segments: [HybridPoolQuantizedSegment]
     )
     func hybridPoolRetainedByteCount(branch: HybridPoolBranch) -> Int
+    /// Code width this cache encodes pool rows with (8 for DSV4-0731, 4 for
+    /// DeepSeek-V4.1). A restored record must carry the same width.
+    var hybridPoolQuantizationBits: Int { get }
+}
+
+public extension QuantizedHybridPoolCache {
+    var hybridPoolQuantizationBits: Int { 8 }
+}
+
+/// Code widths the DSV4 quantized-pool disk schema accepts. 4-bit codes are
+/// packed two per byte along the group axis.
+public enum HybridPoolQuantizedSchema {
+    public static let supportedBits: Set<Int> = [4, 8]
+
+    /// Packed code columns per affine group for `bits`.
+    public static func packedGroupWidth(groupSize: Int, bits: Int) -> Int {
+        bits == 4 ? groupSize / 2 : groupSize
+    }
 }
 
 /// Cache implementations whose retained representation is smaller than their

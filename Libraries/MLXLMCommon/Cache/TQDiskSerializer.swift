@@ -754,7 +754,16 @@ public enum TQDiskSerializer {
                 guard segment.originalShape.count == 3,
                       segment.originalShape[1] > 0,
                       segment.groupSize > 0,
-                      segment.bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(segment.bits),
+                      segment.bits != 4 || segment.groupSize % 2 == 0,
+                      segment.originalShape[2] % segment.groupSize == 0,
+                      segment.codes.dtype == .uint8,
+                      segment.codes.shape == [
+                          segment.originalShape[0], segment.originalShape[1],
+                          segment.originalShape[2] / segment.groupSize,
+                          HybridPoolQuantizedSchema.packedGroupWidth(
+                              groupSize: segment.groupSize, bits: segment.bits),
+                      ],
                       let dtypeCode = dsv4PoolDTypeCode(segment.originalDType)
                 else { return false }
                 let prefix = "\(stem)_q_\(segmentIndex)"
@@ -1701,13 +1710,16 @@ public enum TQDiskSerializer {
                       shape[2] > 0,
                       groupSize > 0,
                       shape[2] % groupSize == 0,
-                      bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(bits),
+                      bits != 4 || groupSize % 2 == 0,
                       codes.dtype == .uint8,
                       scales.dtype == .float16,
                       biases.dtype == .float16
                 else { return [] }
                 let groups = shape[2] / groupSize
-                guard codes.shape == [shape[0], shape[1], groups, groupSize],
+                let packed = HybridPoolQuantizedSchema.packedGroupWidth(
+                    groupSize: groupSize, bits: bits)
+                guard codes.shape == [shape[0], shape[1], groups, packed],
                       scales.shape == [shape[0], shape[1], groups, 1],
                       biases.shape == scales.shape
                 else { return [] }

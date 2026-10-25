@@ -1664,6 +1664,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let mode: String = envMode ?? "sliding"
         // DeepSeek-V4.1: the first compressed layer's cache carries the Engram n-gram history.
+        // DeepSeek-V4.1 keeps compressed pools at 4 bits (reference: FP4 compressed KV) so 1M
+        // context fits; DSV4-0731 stays on its 8-bit pools.
+        let poolBits = config.isDeepseekV41 ? 4 : DeepseekV4Cache.poolQuantizationBits
         let engramHistoryHolder: Int? = config.engramLayerIds.isEmpty
             ? nil
             : (0..<config.numHiddenLayers).first {
@@ -1685,7 +1688,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     return DeepseekV4Cache(
                         slidingWindow: config.slidingWindow,
                         compressRatio: cr,
-                        requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder)
+                        requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder,
+                        poolQuantizationBits: poolBits)
                 }
                 return RotatingKVCache(
                     maxSize: config.slidingWindow, keep: 0)
@@ -1765,7 +1769,28 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             Memory.clearCache()
         }
 
+        if Self.kvBytesLogEnabled {
+            Self.logCacheBytes(cache, phase: "prepare")
+        }
         return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
+    }
+
+    /// `VMLX_DSV41_KVBYTES=1`: NSLog the summed retained cache bytes (pool codes + metadata +
+    /// rotating windows + incomplete-window buffers, via `retainedCacheByteCount`) after each
+    /// prepare/prefill, plus bytes/token, so the live footprint of 1M-context KV can be measured.
+    /// Read once; off by default.
+    static let kvBytesLogEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DSV41_KVBYTES"] == "1"
+
+    static func logCacheBytes(_ cache: [KVCache], phase: String) {
+        let bytes = CacheStoreBudget.cacheBytes(cache)
+        let tokens = cache.first?.offset ?? 0
+        let perToken = tokens > 0 ? Double(bytes) / Double(tokens) : 0
+        let bits = (cache.first { $0 is DeepseekV4Cache } as? DeepseekV4Cache)?
+            .hybridPoolQuantizationBits ?? 0
+        NSLog(
+            "VMLX DSV4 KV bytes [\(phase)]: \(bytes) bytes (\(String(format: "%.1f", Double(bytes) / 1_048_576)) MiB) "
+                + "over \(tokens) tokens = \(String(format: "%.1f", perToken)) B/token, pool bits \(bits)")
     }
 
     /// Weight sanitize — remap DSV4 bundle key names to match module

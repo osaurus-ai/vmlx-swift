@@ -34,17 +34,26 @@ final class DeepseekV4PoolStorage {
     static let segmentRows = 64
     static let slabMaxRows = 16 * 1024
     static let groupSize = 32
+    /// DSV4-0731 pool code width (unchanged default).
     static let bits = 8
+    /// Widths the storage (and the disk schema) can encode. 4-bit codes are
+    /// packed two per byte (low nibble = even element).
+    static let supportedBits: Set<Int> = [4, 8]
 
     let quantizationEnabled: Bool
     let hotByteLimit: Int
+    /// Code width for newly encoded rows. DeepSeek-V4.1 uses 4 (its reference
+    /// keeps compressed KV in FP4); DSV4-0731 keeps 8.
+    let bits: Int
     private(set) var hotPool: MLXArray?
     private(set) var quantizedSegments: [HybridPoolQuantizedSegment] = []
     private var emptySpec: (shape: [Int], dtype: DType)?
 
-    init(quantizationEnabled: Bool, hotByteLimit: Int) {
+    init(quantizationEnabled: Bool, hotByteLimit: Int, bits: Int = DeepseekV4PoolStorage.bits) {
+        precondition(Self.supportedBits.contains(bits), "DSV4 pool bits must be 4 or 8")
         self.quantizationEnabled = quantizationEnabled
         self.hotByteLimit = max(0, hotByteLimit)
+        self.bits = bits
     }
 
     var rowCount: Int {
@@ -265,7 +274,7 @@ final class DeepseekV4PoolStorage {
         if tail > 0 {
             let take = min(Self.segmentRows - tail, rows)
             quantizedSegments.append(
-                Self.quantize(value[0..., 0..<take, 0...]))
+                Self.quantize(value[0..., 0..<take, 0...], bits: bits))
             offset += take
             compactCompletedTail()
         }
@@ -277,13 +286,13 @@ final class DeepseekV4PoolStorage {
                 take *= 2
             }
             quantizedSegments.append(
-                Self.quantize(value[0..., offset..<(offset + take), 0...]))
+                Self.quantize(value[0..., offset..<(offset + take), 0...], bits: bits))
             offset += take
             compactSlabCascade()
         }
         if offset < rows {
             quantizedSegments.append(
-                Self.quantize(value[0..., offset..<rows, 0...]))
+                Self.quantize(value[0..., offset..<rows, 0...], bits: bits))
         }
     }
 
@@ -326,7 +335,8 @@ final class DeepseekV4PoolStorage {
     func copy() -> DeepseekV4PoolStorage {
         let result = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
-            hotByteLimit: hotByteLimit)
+            hotByteLimit: hotByteLimit,
+            bits: bits)
         result.hotPool = hotPool?[.ellipsis]
         result.emptySpec = emptySpec
         result.quantizedSegments = quantizedSegments.map { segment in
@@ -356,7 +366,7 @@ final class DeepseekV4PoolStorage {
                 }
             }
             let end = start + take
-            quantizedSegments.append(Self.quantize(value[0..., start..<end, 0...]))
+            quantizedSegments.append(Self.quantize(value[0..., start..<end, 0...], bits: bits))
             start = end
             compactSlabCascade()
         }
@@ -444,11 +454,13 @@ final class DeepseekV4PoolStorage {
         quantizedSegments = regrouped
     }
 
-    private static func quantize(_ value: MLXArray) -> HybridPoolQuantizedSegment {
+    static func quantize(_ value: MLXArray, bits: Int = DeepseekV4PoolStorage.bits) -> HybridPoolQuantizedSegment {
         let shape = value.shape
         let featureCount = shape.last ?? 0
         precondition(featureCount > 0, "DSV4 pool feature dimension must be non-zero")
         let effectiveGroupSize = featureCount % groupSize == 0 ? groupSize : featureCount
+        // Nibble packing needs an even group; an odd fallback group stays 8-bit.
+        let bits = (bits == 4 && effectiveGroupSize % 2 != 0) ? 8 : bits
         let groupCount = featureCount / effectiveGroupSize
         let groupedShape = Array(shape.dropLast()) + [groupCount, effectiveGroupSize]
         let grouped = value.asType(.float32).reshaped(groupedShape)
@@ -460,9 +472,12 @@ final class DeepseekV4PoolStorage {
             rawScales .> Float(1e-8),
             rawScales,
             MLXArray.ones(like: rawScales))
-        let codes = clip(
+        var codes = clip(
             MLX.round((grouped - minimums) / scales32),
             min: Float(0), max: qmax).asType(.uint8)
+        if bits == 4 {
+            codes = packNibbles(codes)
+        }
         let scales = scales32.asType(.float16)
         let biases = minimums.asType(.float16)
         asyncEval([codes, scales, biases])
@@ -476,8 +491,33 @@ final class DeepseekV4PoolStorage {
             originalDType: value.dtype)
     }
 
-    private static func dequantize(_ segment: HybridPoolQuantizedSegment) -> MLXArray {
-        (segment.codes.asType(.float32) * segment.scales.asType(.float32)
+    /// `[..., g]` uint8 codes in 0...15 -> `[..., g/2]` bytes, element 2k in the
+    /// low nibble and 2k+1 in the high nibble.
+    static func packNibbles(_ codes: MLXArray) -> MLXArray {
+        let shape = codes.shape
+        let pairs = codes.reshaped(Array(shape.dropLast()) + [shape.last! / 2, 2])
+        let lo = pairs[.ellipsis, 0]
+        let hi = pairs[.ellipsis, 1]
+        return (lo | (hi << UInt8(4))).asType(.uint8)
+    }
+
+    /// Inverse of ``packNibbles(_:)``: `[..., g/2]` bytes -> `[..., g]` codes.
+    static func unpackNibbles(_ packed: MLXArray) -> MLXArray {
+        let shape = packed.shape
+        let lo = packed & UInt8(0x0F)
+        let hi = (packed >> UInt8(4)) & UInt8(0x0F)
+        return stacked([lo, hi], axis: -1)
+            .reshaped(Array(shape.dropLast()) + [shape.last! * 2])
+    }
+
+    /// Codes as one value per element regardless of the storage width.
+    private static func elementCodes(_ codes: MLXArray, bits: Int) -> MLXArray {
+        bits == 4 ? unpackNibbles(codes) : codes
+    }
+
+    static func dequantize(_ segment: HybridPoolQuantizedSegment) -> MLXArray {
+        (elementCodes(segment.codes, bits: segment.bits).asType(.float32)
+            * segment.scales.asType(.float32)
             + segment.biases.asType(.float32))
             .reshaped(segment.originalShape)
             .asType(segment.originalDType)
@@ -516,7 +556,8 @@ final class DeepseekV4PoolStorage {
             let shape = arr.shape
             return arr.reshaped([shape[0] * shape[1]] + Array(shape.dropFirst(2)))
         }
-        let codes = take(flatten(segment.codes), linear, axis: 0)
+        let codes = elementCodes(
+            take(flatten(segment.codes), linear, axis: 0), bits: segment.bits)
         let scales = take(flatten(segment.scales), linear, axis: 0)
         let biases = take(flatten(segment.biases), linear, axis: 0)
         let width = segment.originalShape.last ?? 0
@@ -692,11 +733,16 @@ public struct DeepseekV4PoolView {
 // entirely (Python mirror: `if v4_cache is None and L < compress_ratio
 // → skip`).
 public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteCountProviding {
-    /// Bit width the pool storage encodes with. The disk serializer's
-    /// quantized-pool schema accepts exactly this width — pinned by
-    /// `DeepseekV4CacheDiskRoundTripTests.serializerBitsMatchPoolStorage`
-    /// so neither constant can drift alone.
+    /// Default (DSV4-0731) bit width the pool storage encodes with.
     public static var poolQuantizationBits: Int { DeepseekV4PoolStorage.bits }
+    /// Every width the pool storage can encode. The disk serializer's
+    /// quantized-pool schema accepts exactly these widths — pinned by
+    /// `DeepseekV4CacheDiskRoundTripTests.serializerBitsMatchPoolStorage`
+    /// so neither side can drift alone.
+    public static var supportedPoolQuantizationBits: Set<Int> { DeepseekV4PoolStorage.supportedBits }
+    /// This cache's pool code width: 8 for DSV4-0731, 4 for DeepSeek-V4.1
+    /// (its reference stores compressed KV in FP4).
+    public var hybridPoolQuantizationBits: Int { compPool.bits }
 
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
@@ -758,7 +804,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         compressRatio: Int,
         poolQuantizationEnabled: Bool? = nil,
         poolBF16HotByteLimit: Int? = nil,
-        requiresAuxiliaryTokenHistory: Bool = false
+        requiresAuxiliaryTokenHistory: Bool = false,
+        poolQuantizationBits: Int = 8
     ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         let quantizationEnabled = poolQuantizationEnabled
@@ -770,10 +817,12 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             ?? Self.resolvePoolBF16HotByteLimit()
         self.compPool = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
-            hotByteLimit: hotByteLimit)
+            hotByteLimit: hotByteLimit,
+            bits: poolQuantizationBits)
         self.idxPool = DeepseekV4PoolStorage(
             quantizationEnabled: quantizationEnabled,
-            hotByteLimit: hotByteLimit)
+            hotByteLimit: hotByteLimit,
+            bits: poolQuantizationBits)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
         self.requiresAuxiliaryTokenHistory = requiresAuxiliaryTokenHistory
     }
@@ -845,7 +894,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         indexerHeadDim: Int,
         slidingWindow: Int,
         activationBytes: Int = 2,
-        poolBF16HotByteLimit: Int? = nil
+        poolBF16HotByteLimit: Int? = nil,
+        poolQuantizationBits: Int = 8
     ) -> Int {
         precondition(contextLength >= 0)
         precondition(headDim > 0 && indexerHeadDim > 0)
@@ -858,8 +908,11 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
                 : features
             let elements = rows * features
             let affineGroups = rows * (features / group)
-            // UInt8 code + fp16 scale + fp16 minimum per affine group.
-            return elements + affineGroups * 2 * MemoryLayout<Float16>.size
+            // Packed code bytes (8-bit: one per element, 4-bit: one per two)
+            // + fp16 scale + fp16 minimum per affine group.
+            let codeBytes = poolQuantizationBits == 4 && group % 2 == 0
+                ? elements / 2 : elements
+            return codeBytes + affineGroups * 2 * MemoryLayout<Float16>.size
         }
 
         let hotByteLimit = poolBF16HotByteLimit
@@ -1049,7 +1102,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             compressRatio: compressRatio,
             poolQuantizationEnabled: hybridPoolQuantizationEnabled,
             poolBF16HotByteLimit: compPool.hotByteLimit,
-            requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory)
+            requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory,
+            poolQuantizationBits: compPool.bits)
         dup.auxiliaryTokenHistory = auxiliaryTokenHistory
         let localState = local.state
         if !localState.isEmpty {

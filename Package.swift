@@ -968,6 +968,7 @@ let package = Package(
                 "MinimumReasoningFloorFocusedTests.swift",
                 "DeepseekV41ChatEncoderFocusedTests.swift",
                 "EngramV41FocusedTests.swift",
+                "DeepseekV41PoolBitsFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
