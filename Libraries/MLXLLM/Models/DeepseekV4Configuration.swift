@@ -221,6 +221,16 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.engramNHeads = req(.engramNHeads, 0)
         self.engramHeadDim = req(.engramHeadDim, 0)
         self.engramMaxNgramSize = req(.engramMaxNgramSize, 1)
+        // DeepSeek-V4.1 has NO MoE hash routing — every layer uses the computed sqrtsoftplus gate (ref
+        // inference/model.py Gate.forward + jang_tools/dsv41 moe()). V4.1 omits `num_hash_layers`, so the
+        // DSV4 default (3) wrongly hash-routed layers 0-2 through a zero-init tid2eid table (idx all 0),
+        // seeding the hidden-state drift. When this is a V4.1 bundle (engram present) and the field is
+        // absent, force 0.
+        if !self.engramLayerIds.isEmpty,
+            (text.flatMap { try? $0.decode(Int.self, forKey: .numHashLayers) }) == nil,
+            (try? c.decode(Int.self, forKey: .numHashLayers)) == nil {
+            self.numHashLayers = 0
+        }
         self.activationQATEnabled = false
     }
 
