@@ -24,9 +24,9 @@ func runRowExactBench(modelPath: String) async throws {
     let widths = (env["BENCH_ROWEXACT_WIDTHS"] ?? "2,4,8").split(separator: ",").compactMap {
         Int($0)
     }
-    guard steps > 0, !widths.isEmpty, widths.allSatisfy({ $0 > 0 && $0 <= steps }) else {
+    guard steps > 0, !widths.isEmpty, widths.allSatisfy({ $0 > 1 && $0 <= steps }) else {
         throw NSError(domain: "RowExactBench", code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Non-empty positive widths must fit the reference stream"])
+            userInfo: [NSLocalizedDescriptionKey: "Non-empty staged verify widths >=2 must fit the reference stream"])
     }
     let promptText =
         env["BENCH_ROWEXACT_PROMPT"]
@@ -412,8 +412,8 @@ func runRowExactBench(modelPath: String) async throws {
             MLX.eval(rows)
             guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: w, blockLength: w)
             else {
-                print("[ROWEXACT] W=\(w) commit failed at \(p)")
-                break
+                throw NSError(domain: "RowExactBench", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "INVALID: staged commit failed at width \(w), position \(p)"] )
             }
             if p == 0 {
                 print(
