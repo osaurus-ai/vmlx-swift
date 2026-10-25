@@ -45,6 +45,76 @@ func runRowExactBench(modelPath: String) async throws {
         print("[ROWEXACT] model lacks native MTP / staged verify")
         return
     }
+    if let output = env["BENCH_ROWEXACT_IDENTITY_OUT"] {
+        let topology = ModelCacheTopologySnapshot(
+            cache: model.newCache(parameters: GenerateParameters()),
+            cacheComputationIdentity: context.model.cacheComputationIdentity)
+        var record: [String: Any] = [
+            "model": modelDir.lastPathComponent, "topology_tags": topology.topologyTags,
+            "scope": "actual loaded model cache identity; load only, generation_tps=NA",
+        ]
+        if let identity = context.model.cacheComputationIdentity {
+            record["compute_identity"] = identity
+        }
+        if let legacyPath = env["BENCH_ROWEXACT_LEGACY_IDENTITY"] {
+            let legacy =
+                try JSONSerialization.jsonObject(
+                    with: Data(contentsOf: URL(fileURLWithPath: legacyPath))) as? [String: Any]
+            guard legacy?["model"] as? String == modelDir.lastPathComponent,
+                let oldTags = legacy?["topology_tags"] as? [String], !oldTags.isEmpty,
+                let directory = env["BENCH_ROWEXACT_NAMESPACE_DIR"]
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 17,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "INVALID: legacy namespace probe metadata"
+                    ])
+            }
+            let base = "rowexact-unchanged-weights:" + modelDir.lastPathComponent
+            let oldKey = base + "|" + oldTags.joined(separator: "|")
+            let newKey = base + "|" + topology.topologyTags.joined(separator: "|")
+            let outcomes = Device.withDefaultDevice(.cpu) { () -> [Bool] in
+                let tokens = Array(1 ... 74)  // Deliberately not a page/chunk multiple.
+                let url = URL(fileURLWithPath: directory)
+                let old = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: oldKey)
+                old.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(11), 12])])
+                let oldPositive =
+                    old.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [11, 12]
+                let current = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: newKey)
+                let legacyMiss = current.fetch(tokens: tokens) == nil
+                current.store(tokens: tokens, arrays: ["sentinel": MLXArray([Float(21), 22])])
+                let restart = DiskCache(cacheDir: url, maxSizeBytes: 1 << 20, modelKey: newKey)
+                let currentHit =
+                    restart.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [21, 22]
+                let oldPreserved =
+                    old.fetch(tokens: tokens)?["sentinel"]?.asArray(Float.self) == [11, 12]
+                return [oldPositive, legacyMiss, currentHit, oldPreserved]
+            }
+            record["same_model_key"] = oldKey == newKey
+            record["same_noncompute_topology"] =
+                oldTags.filter { !$0.hasPrefix("compute=") }
+                == topology.topologyTags.filter { !$0.hasPrefix("compute=") }
+            record["old_positive_new_miss_new_restart_hit_old_preserved"] = outcomes
+            try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(
+                to: URL(fileURLWithPath: output))
+            guard oldKey != newKey, record["same_noncompute_topology"] as? Bool == true,
+                outcomes == [true, true, true, true]
+            else {
+                throw NSError(
+                    domain: "RowExactBench", code: 18,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Cache arithmetic namespaces are not isolated"
+                    ])
+            }
+        } else {
+            try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(
+                to: URL(fileURLWithPath: output))
+        }
+        print(
+            "[ROWEXACT-CACHE-MODEL] identity=\(context.model.cacheComputationIdentity ?? "nil") generation_tps=NA reason=load_only"
+        )
+        return
+    }
     // Match NativeMTPTokenIterator's AR dispatch: Qwen3.5 uses the ordinary
     // backbone, while families with a dedicated one-row path opt into it.
     func autoregressiveForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
