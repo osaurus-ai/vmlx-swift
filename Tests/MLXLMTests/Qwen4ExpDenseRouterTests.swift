@@ -1,6 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXRandom
@@ -155,6 +156,46 @@ struct Qwen4ExpDenseRouterTests {
             }
             #expect(cases == 15)
             print("[DenseRouterRows] exact_cases=\(cases) contiguous_batch_logit_mismatches=\(foldedMismatches)")
+        }
+    }
+
+    @Test("Captured router diagnostic compares actual batched math against each AR row")
+    func capturedRouterDiagnostic() throws {
+        guard let path = ProcessInfo.processInfo.environment["VMLX_ROUTER_CAPTURE_FIXTURE"] else {
+            return
+        }
+        try MLXMetalTestLock.withLock {
+            let arrays = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+            let window = try #require(arrays["verify_input"])
+            let ar = try #require(arrays["ar_input"])
+            let weight = try #require(arrays["weight"])
+            let rows = window.dim(1), hidden = window.dim(2)
+            #expect(rows == 7 && hidden == 2560)
+            #expect(bits(window[0..., 2..<3]) == bits(ar))
+            let view = asStrided(window, [rows, 1, hidden], strides: [hidden, 1, 1])
+            let batched = matmul(view, weight.transposed())
+            let oneRows = (0..<rows).map {
+                matmul(window[0..., $0..<($0 + 1)], weight.transposed())
+            }
+            let one = concatenated(oneRows, axis: 0)
+            let batchSoftmax = softmax(batched, axis: -1, precise: true)
+            let oneSoftmax = concatenated(oneRows.map { softmax($0, axis: -1, precise: true) }, axis: 0)
+            MLX.eval(batched, one, batchSoftmax, oneSoftmax)
+            print("[ROUTER-CAPTURE] input_dtype=\(window.dtype) weight_dtype=\(weight.dtype) matmul_equal=\(bits(batched) == bits(one)) softmax_equal=\(bits(batchSoftmax) == bits(oneSoftmax))")
+            for normalize in [false, true] {
+                let actual = try #require(Qwen4ExpCompiledMoE.denseRouterRows(
+                    window, weight: weight, topK: 10, normTopK: normalize))
+                let references = try (0..<rows).map { row in
+                    try #require(Qwen4ExpCompiledMoE.denseRouter(
+                        window[0..., row..<(row + 1)], weight: weight, topK: 10, normTopK: normalize))
+                }
+                let ids = concatenated(references.map(\.indices), axis: 1)
+                let scores = concatenated(references.map(\.scores), axis: 1)
+                MLX.eval(actual.indices, actual.scores, ids, scores)
+                print("[ROUTER-CAPTURE] normalized=\(normalize) ids_equal=\(bits(actual.indices) == bits(ids)) scores_equal=\(bits(actual.scores) == bits(scores))")
+                #expect(bits(actual.indices) == bits(ids))
+                #expect(bits(actual.scores) == bits(scores))
+            }
         }
     }
 

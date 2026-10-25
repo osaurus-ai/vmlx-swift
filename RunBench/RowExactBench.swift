@@ -388,7 +388,7 @@ func runRowExactBench(modelPath: String) async throws {
                 try MLX.save(arrays: ["ar_input": arInput, "verify_input": verifyInput, "weight": weight],
                     url: URL(fileURLWithPath: path))
             }
-            for ((name, x), (_, y)) in zip(aP, vP) {
+            for ((name, x), (_, y)) in zip(aP, vP) where name != "moe.router_weight" {
                 let d = abs(last(x, row: 0) - last(y, row: selectedRow))
                 print(String(format: "[ROWEXACT] selected-row at=%d layer=%d %@ maxdiff=%.4g nonzero=%d", at, first,
                              name, d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
