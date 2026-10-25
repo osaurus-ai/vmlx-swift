@@ -197,8 +197,13 @@ extension DiskCacheCompanionAccountingTests {
             _ what: String, fifo: URL, _ body: @escaping @Sendable () -> T
         ) -> T? {
             let outcome = Detached<T>()
+            // A detached OS thread has no task-local inheritance. Forward only
+            // this test's diagnostic observer; do not redirect process stderr.
+            let observer = RuntimeDiagnostics.observerForTesting
             Thread.detachNewThread {
-                outcome.value = body()
+                RuntimeDiagnostics.$observerForTesting.withValue(observer) {
+                    outcome.value = body()
+                }
                 outcome.done.signal()
             }
             if outcome.done.wait(timeout: .now() + 10) == .success {
@@ -232,7 +237,7 @@ extension DiskCacheCompanionAccountingTests {
                 }
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (results, log) = try Support.capturingStandardError {
+                let (results, log) = try Support.capturingRuntimeDiagnostics {
                     [fetchWithTimeout("fetch"), fetchWithTimeout("a second fetch")]
                 }
                 #expect(results == [true, true], "\(results)")
@@ -342,7 +347,7 @@ extension DiskCacheCompanionAccountingTests {
                     try #require(
                         try Support.legacyRows(root).isEmpty,
                         "INVALID: the index names the planted pair")
-                    let (_, log) = try Support.capturingStandardError { subject.clear() }
+                    let (_, log) = try Support.capturingRuntimeDiagnostics { subject.clear() }
 
                     #expect(
                         Support.companionBytes(root, named) == 0,

@@ -287,7 +287,7 @@ extension DiskCacheCompanionAccountingTests {
                     disk.usageBytes() > Self.cap, "INVALID: the fixture is not over the cap")
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
                 try Self.expectOnlyHostileRecordsGone(
@@ -299,7 +299,7 @@ extension DiskCacheCompanionAccountingTests {
 
                 // A second pass finds nothing to do.
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, again) = try Support.capturingStandardError {
+                let (_, again) = try Support.capturingRuntimeDiagnostics {
                     coordinator.enforceCombinedDiskQuota()
                 }
                 try Self.expectOnlyHostileRecordsGone(
@@ -645,7 +645,7 @@ extension DiskCacheCompanionAccountingTests {
                 }
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError { try run() }
+                let (_, log) = try Support.capturingRuntimeDiagnostics { try run() }
                 if pass == .companionOverCap { try admitDirectWrite() }
                 try Self.expectOnlyHostileRecordsGone(
                     disk: disk, root: root, real: real, controls: fixture.controls,
@@ -655,7 +655,7 @@ extension DiskCacheCompanionAccountingTests {
                 #expect(Set(legacyLeft.map(\.rowid)).isDisjoint(with: fixture.hostileLegacy))
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, again) = try Support.capturingStandardError { try run() }
+                let (_, again) = try Support.capturingRuntimeDiagnostics { try run() }
                 if pass == .companionOverCap { try admitDirectWrite() }
                 try Self.expectOnlyHostileRecordsGone(
                     disk: disk, root: root, real: real, controls: fixture.controls,
@@ -750,7 +750,7 @@ extension DiskCacheCompanionAccountingTests {
 
                 CacheCoordinator.resetImportedRootsForTesting()
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (coordinator, log) = try Support.capturingStandardError {
+                let (coordinator, log) = try Support.capturingRuntimeDiagnostics {
                     Self.coordinator(root: root, modelKey: modelKey)
                 }
                 let disk = try #require(coordinator.diskCache)
@@ -778,7 +778,7 @@ extension DiskCacheCompanionAccountingTests {
 
                 // The import, run directly.
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (summary, importLog) = try Support.capturingStandardError {
+                let (summary, importLog) = try Support.capturingRuntimeDiagnostics {
                     disk.reconcileCompanionAccounting(companions: [])
                 }
                 let counts = try #require(summary)
@@ -797,7 +797,7 @@ extension DiskCacheCompanionAccountingTests {
                 try #require(standalone.indexIsFromANewerBuild)
                 let extra = [Self.tokens(1_003, seed: 8_203), Self.tokens(1_291, seed: 8_204)]
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, storeLog) = try Support.capturingStandardError {
+                let (_, storeLog) = try Support.capturingRuntimeDiagnostics {
                     for tokens in extra {
                         Thread.sleep(forTimeInterval: 0.02)
                         standalone.store(tokens: tokens, arrays: Self.kv())
@@ -812,7 +812,7 @@ extension DiskCacheCompanionAccountingTests {
                 // The companion store's own cap, and both readers of the
                 // unlinked list.
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, readLog) = try Support.capturingStandardError {
+                let (_, readLog) = try Support.capturingRuntimeDiagnostics {
                     _ = disk.companionsOldestFirst()
                     _ = disk.legacyCompanions()
                     _ = disk.quotaEntries()
@@ -920,7 +920,7 @@ extension DiskCacheCompanionAccountingTests {
                 )
 
                 DiskCache.resetRateLimitedReportsForTesting()
-                let (_, log) = try Support.capturingStandardError {
+                let (_, log) = try Support.capturingRuntimeDiagnostics {
                     disk.reconcileCompanionAccounting(companions: [])
                 }
                 let lines = Self.invalidValueLines(log)
