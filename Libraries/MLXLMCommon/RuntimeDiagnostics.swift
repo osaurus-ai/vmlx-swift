@@ -25,14 +25,15 @@ public enum RuntimeDiagnostics {
 
     public static func write(_ data: Data) {
         guard !data.isEmpty else { return }
-        observerForTesting?(data)
         #if canImport(os)
             let savedErrno = errno
             defer { errno = savedErrno }
+            observerForTesting?(data)
             // Some optional diagnostic payloads include paths or decoded
             // tokens. Do not make these public unified-log fields.
             logger.info("\(String(decoding: data, as: UTF8.self), privacy: .private)")
         #else
+            observerForTesting?(data)
             FileHandle.standardError.write(data)
         #endif
     }

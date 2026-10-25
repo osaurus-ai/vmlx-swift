@@ -197,8 +197,13 @@ extension DiskCacheCompanionAccountingTests {
             _ what: String, fifo: URL, _ body: @escaping @Sendable () -> T
         ) -> T? {
             let outcome = Detached<T>()
+            // A detached OS thread has no task-local inheritance. Forward only
+            // this test's diagnostic observer; do not redirect process stderr.
+            let observer = RuntimeDiagnostics.observerForTesting
             Thread.detachNewThread {
-                outcome.value = body()
+                RuntimeDiagnostics.$observerForTesting.withValue(observer) {
+                    outcome.value = body()
+                }
                 outcome.done.signal()
             }
             if outcome.done.wait(timeout: .now() + 10) == .success {

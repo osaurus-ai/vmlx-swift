@@ -69,4 +69,33 @@ struct RuntimeDiagnosticsCaptureTests {
         }
         #expect(RuntimeDiagnostics.observerForTesting == nil)
     }
+
+    @Test func detachedWorkerExplicitlyForwardsTheScopedObserver() {
+        let (_, text) = DiskCacheAccountingTestSupport.capturingRuntimeDiagnostics {
+            let observer = RuntimeDiagnostics.observerForTesting
+            let done = DispatchSemaphore(value: 0)
+            Thread.detachNewThread {
+                RuntimeDiagnostics.$observerForTesting.withValue(observer) {
+                    RuntimeDiagnostics.write(Data("detached\n".utf8))
+                }
+                done.signal()
+            }
+            #expect(done.wait(timeout: .now() + 5) == .success)
+        }
+        #expect(text == "detached\n")
+        #expect(RuntimeDiagnostics.observerForTesting == nil)
+    }
+
+    #if canImport(os)
+        @Test func observerCannotChangeTheCallersErrno() {
+            let saved = errno
+            defer { errno = saved }
+            errno = E2BIG
+            RuntimeDiagnostics.$observerForTesting.withValue({ _ in errno = ERANGE }) {
+                RuntimeDiagnostics.write(Data("errno preservation\n".utf8))
+            }
+            #expect(errno == E2BIG)
+        }
+    #endif
+
 }
