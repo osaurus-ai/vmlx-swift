@@ -549,6 +549,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 drafterPath: URL(fileURLWithPath: selected.path),
                 blockSize: mtp.dflash2BlockSize)
         }
+        // DeepSeek-V4.1 bundles ship their own dSpark head in `dspark/`. It is speed-only and
+        // greedy-exact, and its wall-clock governor keeps it at or above AR, so it is on by default;
+        // Off (and only Off, or VMLX_DSV41_DSPARK=0) turns it off.
+        if let dspark = bundledDSparkDrafter(configData: configData, bundleDirectory: bundleDirectory) {
+            return .dspark(drafterPath: dspark)
+        }
         if let adapter = bundledUnoAdapter(configData: configData, bundleDirectory: bundleDirectory) {
             return .uno(
                 adapterPath: adapter,
@@ -626,6 +632,32 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 "Bundled Uno adapter not used (decoding autoregressively): \(reason, privacy: .public)")
             return nil
         }
+        return local
+    }
+
+    /// Model types that carry a dSpark head in `dspark/` (DeepSeek-V4.1 only; DSV4-0731 has none).
+    public static let dsparkModelTypes: Set<String> = ["deepseek_v41", "deepseek_v41_text"]
+
+    /// The bundle-local DeepSeek-V4.1 `dspark/` head (holding `dspark.safetensors`) when the bundle is
+    /// V4.1 and speculation is not switched off. `VMLX_DSV41_DSPARK=0` can only turn it off.
+    public func bundledDSparkDrafter(
+        configData: Data?, bundleDirectory: URL?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        guard mtp.mode != .off, !DSparkEnvironment.disabled(environment), let bundleDirectory,
+            let configData,
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        else { return nil }
+        let text = config["text_config"] as? [String: Any]
+        let types = [config["model_type"], text?["model_type"]].compactMap {
+            ($0 as? String)?.lowercased().replacingOccurrences(of: "-", with: "_")
+        }
+        guard types.contains(where: Self.dsparkModelTypes.contains) else { return nil }
+        let local = bundleDirectory.appendingPathComponent("dspark", isDirectory: true)
+        guard
+            FileManager.default.fileExists(
+                atPath: local.appendingPathComponent("dspark.safetensors").path)
+        else { return nil }
         return local
     }
 
