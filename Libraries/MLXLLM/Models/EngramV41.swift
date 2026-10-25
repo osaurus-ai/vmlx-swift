@@ -17,6 +17,7 @@
 // The wkv/q_weight/k_weight module weights live in the backbone shards (affine quant) and load through
 // the normal path; only the big embed table is disk-resident here.
 
+import Darwin
 import Foundation
 import MLX
 import MLXNN
@@ -166,13 +167,21 @@ final class EngramNgramHasher {
     }
 }
 
-// MARK: - Disk-resident FP8 embedding table
+// MARK: - SSD-resident FP8 embedding table (no mmap)
 
-/// One engram layer's FP8 table, memory-mapped from an engram/ shard. Row r = E4M3 bytes [dim],
-/// scaled per block of `block` by E8M0 scale bytes [sdim]. lookup() returns bf16 rows [count, dim].
+/// One engram layer's FP8 table, kept on SSD and read per touched row — NOT memory-mapped.
+///
+/// The engram embed tables are ~189 GB across the bundle's `engram/` shards; mapping them would
+/// either fault hundreds of MiB per gather into RSS or make throughput hostage to the filesystem
+/// page cache. Instead this mirrors `Qwen4ExpNGramTable`: each shard is held open `O_RDONLY` with
+/// `F_NOCACHE` and only the bytes of the rows a token actually hashes to are `pread` off disk. The
+/// model weights stay the only resident tensors (Activity Monitor RSS ≈ backbone size); the n-gram
+/// table is a sparse SSD lookup. Row r = E4M3 bytes [dim], scaled per block of `block` by E8M0 scale
+/// bytes [sdim]. `lookup()` returns bf16 rows [count, dim]; the dequant math is unchanged.
 final class EngramTable {
-    private let weightMap: Data      // mmapped shard bytes (whole file)
-    private let scaleMap: Data
+    private let wFd: Int32           // weight shard fd (O_RDONLY, F_NOCACHE)
+    private let sFd: Int32           // scale shard fd (== wFd when same file)
+    private let ownsScaleFd: Bool
     private let wOff: Int            // byte offset of this tensor's data in the file
     private let sOff: Int
     let dim: Int                     // 256
@@ -181,14 +190,45 @@ final class EngramTable {
 
     init(weightFile: URL, weightOffset: Int, weightShape: [Int],
          scaleFile: URL, scaleOffset: Int, scaleShape: [Int]) throws {
-        self.weightMap = try Data(contentsOf: weightFile, options: .alwaysMapped)
-        self.scaleMap = (scaleFile == weightFile) ? weightMap
-            : (try Data(contentsOf: scaleFile, options: .alwaysMapped))
+        func openNoCache(_ url: URL) throws -> Int32 {
+            let fd = Darwin.open(url.path, O_RDONLY)
+            guard fd >= 0 else { throw EngramTableError.openFailed(url, errno) }
+            _ = fcntl(fd, F_NOCACHE, 1)  // best-effort: keep the sparse table off the page cache
+            return fd
+        }
+        self.wFd = try openNoCache(weightFile)
+        if scaleFile == weightFile {
+            self.sFd = self.wFd
+            self.ownsScaleFd = false
+        } else {
+            do {
+                self.sFd = try openNoCache(scaleFile)
+            } catch {
+                Darwin.close(self.wFd)
+                throw error
+            }
+            self.ownsScaleFd = true
+        }
         self.wOff = weightOffset
         self.sOff = scaleOffset
         self.dim = weightShape[1]
         self.sdim = scaleShape[1]
         self.block = weightShape[1] / scaleShape[1]
+    }
+
+    deinit {
+        if ownsScaleFd { Darwin.close(sFd) }
+        Darwin.close(wFd)
+    }
+
+    /// pread exactly `count` bytes from `fd` at `offset` into `dst` (handles short reads).
+    private static func preadExactly(_ fd: Int32, _ dst: UnsafeMutableRawPointer, _ count: Int, _ offset: Int) {
+        var done = 0
+        while done < count {
+            let n = Darwin.pread(fd, dst.advanced(by: done), count - done, off_t(offset + done))
+            if n <= 0 { break }  // short/failed read leaves zeros; lookup degrades, never crashes
+            done += n
+        }
     }
 
     /// ids [...] (flattened externally) -> bf16 [count, dim]. Duplicate ids are read once.
@@ -205,20 +245,15 @@ final class EngramTable {
         let U = uniq.count
         var rowBytes = [UInt8](repeating: 0, count: U * dim)
         var scaleBytes = [UInt8](repeating: 0, count: U * sdim)
-        weightMap.withUnsafeBytes { (wp: UnsafeRawBufferPointer) in
-            scaleMap.withUnsafeBytes { (sp: UnsafeRawBufferPointer) in
-                let wb = wp.baseAddress!
-                let sb = sp.baseAddress!
-                rowBytes.withUnsafeMutableBytes { rdst in
-                    scaleBytes.withUnsafeMutableBytes { sdst in
-                        for (j, id) in uniq.enumerated() {
-                            let r = Int(id)
-                            memcpy(rdst.baseAddress!.advanced(by: j * dim),
-                                   wb.advanced(by: wOff + r * dim), dim)
-                            memcpy(sdst.baseAddress!.advanced(by: j * sdim),
-                                   sb.advanced(by: sOff + r * sdim), sdim)
-                        }
-                    }
+        rowBytes.withUnsafeMutableBytes { rdst in
+            scaleBytes.withUnsafeMutableBytes { sdst in
+                let rbase = rdst.baseAddress!
+                let sbase = sdst.baseAddress!
+                for (j, id) in uniq.enumerated() {
+                    let r = Int(id)
+                    // Only the touched rows are read off SSD (no whole-file mapping).
+                    Self.preadExactly(wFd, rbase.advanced(by: j * dim), dim, wOff + r * dim)
+                    Self.preadExactly(sFd, sbase.advanced(by: j * sdim), sdim, sOff + r * sdim)
                 }
             }
         }
@@ -229,6 +264,15 @@ final class EngramTable {
         let dequant = vals.reshaped(U, dim).asType(.bfloat16)
         let invArr = MLXArray(inv)
         return dequant[invArr]                                // [count, dim]
+    }
+}
+
+enum EngramTableError: Error, CustomStringConvertible {
+    case openFailed(URL, Int32)
+    var description: String {
+        switch self {
+        case let .openFailed(url, err): return "engram table open failed for \(url.lastPathComponent): errno \(err)"
+        }
     }
 }
 

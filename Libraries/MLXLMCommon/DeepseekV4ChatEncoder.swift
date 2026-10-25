@@ -120,7 +120,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
         context: [Message] = [],
         addBOS: Bool = true,
         toolChoiceRequired: Bool = false,
-        toolChoiceName: String? = nil
+        toolChoiceName: String? = nil,
+        reasoningBudget: Int? = nil
     ) -> String {
         // Preprocess: merge tool messages into user, sort tool_result
         // blocks by the order they were called in the prior assistant.
@@ -176,6 +177,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 thinkingMode: thinkingMode,
                 dropThinking: effectiveDrop,
                 reasoningEffort: reasoningEffort,
+                reasoningBudget: reasoningBudget,
                 toolChoiceRequired: toolChoiceRequired,
                 toolChoiceName: toolChoiceName
             )
@@ -247,7 +249,9 @@ public struct DeepseekV4ChatEncoder: Sendable {
             reasoningEffort: thinkingMode == .thinking ? effort : nil,
             dropEarlierReasoning: dropEarlierReasoning,
             toolChoiceRequired: toolChoiceRequired,
-            toolChoiceName: toolChoiceName
+            toolChoiceName: toolChoiceName,
+            reasoningBudget: thinkingMode == .thinking
+                ? Self.reasoningBudget(from: additionalContext) : nil
         )
         if !addGenerationPrompt {
             prompt = Self.removingTerminalGenerationRail(from: prompt)
@@ -398,6 +402,31 @@ public struct DeepseekV4ChatEncoder: Sendable {
         }
     }
 
+    /// Resolve the V4.1 numeric reasoning-effort budget (1-100) from the request, so EVERY UI
+    /// slider position takes effect — not just the three named anchors the enum carries. The host
+    /// surfaces a `none/minimal/low/medium/high/xhigh/max` ladder (and may pass an explicit
+    /// numeric effort); all map onto the bundle's `REASONING_EFFORT_TEMPLATE` budget. The three
+    /// contract anchors are low=50 / high=75 / max=100 (encoding.py REASONING_EFFORT_MAPPINGS);
+    /// the in-between rungs interpolate. Returns nil when no effort was requested (caller then uses
+    /// the enum default, i.e. low=50).
+    static func reasoningBudget(from context: [String: any Sendable]?) -> Int? {
+        guard let rawAny = context?["reasoning_effort"] else { return nil }
+        // Explicit numeric budget (Int or numeric string), clamped to the contract range.
+        if let i = rawAny as? Int { return max(1, min(100, i)) }
+        if let d = rawAny as? Double { return max(1, min(100, Int(d.rounded()))) }
+        guard let raw = (rawAny as? String)?.lowercased() else { return nil }
+        if let i = Int(raw) { return max(1, min(100, i)) }
+        switch raw {
+        case "none", "minimal": return 25
+        case "low": return 50
+        case "medium": return 62
+        case "high": return 75
+        case "xhigh": return 88
+        case "max": return 100
+        default: return nil
+        }
+    }
+
     private static func toolChoice(
         from raw: (any Sendable)?
     ) -> (required: Bool, name: String?) {
@@ -449,6 +478,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
         thinkingMode: DeepseekV4ThinkingMode,
         dropThinking: Bool,
         reasoningEffort: DeepseekV4ReasoningEffort?,
+        reasoningBudget: Int? = nil,
         toolChoiceRequired: Bool,
         toolChoiceName: String?
     ) -> String {
@@ -464,7 +494,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
         // preserving the low-reasoning default of surfaces that promise it.
         let effortPrefix: String = {
             guard index == 0 && thinkingMode == .thinking else { return "" }
-            let budget = Self.reasoningEffortBudget(reasoningEffort ?? .low)
+            // An explicit numeric budget (full UI ladder) wins; otherwise the named enum default.
+            let budget = reasoningBudget ?? Self.reasoningEffortBudget(reasoningEffort ?? .low)
             return String(format: Self.reasoningEffortTemplate, budget)
         }()
         if index == 0 && (!effortPrefix.isEmpty || msg.role == .system) {

@@ -1508,7 +1508,9 @@ public class DeepseekV4ModelInner: Module {
 
 // MARK: - Outer model
 
-public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
+    SafetensorsLoadKeyExcluding
+{
     /// The canonical SWA + CSA/HSA `DeepseekV4Cache` pool is path-dependent
     /// and has no B-wide wrapper. Preserve concurrent request queuing while
     /// decoding one DSV4 sequence at a time.
@@ -1518,6 +1520,30 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+
+    // MARK: - Resident weight loading (SafetensorsLoadKeyExcluding)
+    //
+    // The DSV4.1 JANG bundle's main-dir shards (backbone + prestacked routed
+    // experts, ~197 GB) are the AR-decode weights and MUST be resident: left
+    // lazy/mmap they page-fault on every GEMV, so throughput depends on the
+    // filesystem page cache (a warm bundle is fast, then falls to SSD-streaming
+    // speed once pages cool — and Activity Monitor shows far less than the model
+    // size). Forcing residency makes RSS ≈ the backbone size and keeps decode
+    // off the page-cache cliff. The huge FP8 engram embed table (engram/ subdir,
+    // ~189 GB) is NOT read by this generic load — EngramV41 mmaps it separately
+    // for its sparse n-gram lookups (197 + 189 cannot both be resident on 256 GB).
+    // We additionally exclude any engram-embed / MTP-draft keys that might appear
+    // in a main-dir shard so they never inflate the resident backbone set.
+    public var requiresResidentSafetensorsWeights: Bool { true }
+
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        let k = key.lowercased()
+        // Giant FP8 engram embedding table — owned/mmapped by EngramV41.
+        if k.contains(".engram.embed") { return true }
+        // dSpark / MTP draft tensors — loaded by the dSpark drafter, not the backbone.
+        if k.hasPrefix("mtp.") || k.contains(".mtp.") || k.contains("dspark") { return true }
+        return false
+    }
 
     public init(_ config: DeepseekV4Configuration) {
         self.config = config
