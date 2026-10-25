@@ -97,3 +97,27 @@ Private receipts/screenshots are under
 `native-positive-validation.receipt.json`, `native-positive-resource.receipt.json`,
 `native-v01-lifecycle-validation.receipt.json` and `native-final-index.receipt.json`
 in the last root. Raw prompts/history/Sentry data and images are not committed.
+
+
+## Final combined regression
+
+After syncing the independent diagnostic-capture repair (#654), combined
+source `d58ea5b02264404dfaa41bc2d5544401843a17e6` passes 47/47 XCTest and
+332/332 Swift Testing cases in 23 suites, zero failures. This includes the
+new two failed-open cases and the full disk/coordinator/accounting/hostile
+payload/write-behind/reader/architecture matrix. The standalone public
+actual-initializer allocation probe also passes again on this combined
+source: 200 failed opens retain zero SQLite bytes; valid open/clear/close
+returns to zero. No model generation occurs in those tests.
+
+The wider first run's 53 assertions and the intermediate capture candidate's
+FIFO failure remain retained; see the separate diagnostic-capture contract.
+No storage assertions were removed or relaxed. The DiskCache implementation
+matches the exact native-tested 2f19 pin. The additional internal diagnostic
+observer is qualified separately with scoped capture/errno/concurrency tests
+and six broken-stderr child controls; it is absent from the native app's
+pinned revision. The consumer continues to use the exact qualified pin.
+
+Combined receipts: `sqlite-combined-final-validation.receipt.json`,
+`sqlite-combined-final-9d4f155d821d.log`, and
+`sqlite-combined-public-probe.log` under the private campaign root above.
