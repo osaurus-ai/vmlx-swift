@@ -2392,10 +2392,10 @@ struct DiskCacheCompanionAccountingTests {
 
     // MARK: The payload sweep only ever removes our own regular files
 
-    /// Everything written to standard error while `body` runs. The suite is
-    /// serialized and these tests hold `MLXMetalTestLock`, so nothing else in
-    /// the process is expected to write meanwhile.
-    private static func capturingRuntimeDiagnostics<T>(_ body: () throws -> T) throws -> (T, String) {
+    /// Actual runtime diagnostic payloads emitted in this scope. Other tasks
+    /// have independent captures; the platform logger and privacy stay intact.
+    private static func capturingRuntimeDiagnostics<T>(_ body: () throws -> T) throws -> (T, String)
+    {
         try Support.capturingRuntimeDiagnostics(body)
     }
 

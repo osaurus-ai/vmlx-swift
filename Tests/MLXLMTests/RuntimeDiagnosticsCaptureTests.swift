@@ -49,10 +49,10 @@ struct RuntimeDiagnosticsCaptureTests {
 
     @Test func simultaneousTasksDoNotCaptureEachOthersMessages() async {
         let results = await withTaskGroup(of: (Int, String).self) { group in
-            for index in 0..<32 {
+            for index in 0 ..< 32 {
                 group.addTask {
                     let (_, text) = DiskCacheAccountingTestSupport.capturingRuntimeDiagnostics {
-                        for _ in 0..<64 {
+                        for _ in 0 ..< 64 {
                             RuntimeDiagnostics.write(Data("capture-\(index)\n".utf8))
                         }
                     }
@@ -91,9 +91,11 @@ struct RuntimeDiagnosticsCaptureTests {
             let saved = errno
             defer { errno = saved }
             errno = E2BIG
-            RuntimeDiagnostics.$observerForTesting.withValue({ _ in errno = ERANGE }) {
-                RuntimeDiagnostics.write(Data("errno preservation\n".utf8))
-            }
+            RuntimeDiagnostics.$observerForTesting.withValue(
+                { _ in errno = ERANGE },
+                operation: {
+                    RuntimeDiagnostics.write(Data("errno preservation\n".utf8))
+                })
             #expect(errno == E2BIG)
         }
     #endif
