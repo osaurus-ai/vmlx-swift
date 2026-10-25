@@ -144,7 +144,8 @@ struct Qwen4ExpDenseRouterTests {
                             let batched = try #require(
                                 Qwen4ExpCompiledMoE.denseRouterRows(
                                     window, weight: weight, topK: 10, normTopK: normalize))
-                            var rowIDs: [MLXArray] = [], rowScores: [MLXArray] = []
+                            var rowIDs: [MLXArray] = []
+                            var rowScores: [MLXArray] = []
                             for row in 0 ..< rows {
                                 let one = try #require(
                                     Qwen4ExpCompiledMoE.denseRouter(
@@ -193,7 +194,8 @@ struct Qwen4ExpDenseRouterTests {
             let window = try #require(arrays["verify_input"])
             let ar = try #require(arrays["ar_input"])
             let weight = try #require(arrays["weight"])
-            let rows = window.dim(1), hidden = window.dim(2)
+            let rows = window.dim(1)
+            let hidden = window.dim(2)
             #expect(rows == 7 && hidden == 2560)
             #expect(bits(window[0..., 2 ..< 3]) == bits(ar))
             let view = asStrided(window, [rows, 1, hidden], strides: [hidden, 1, 1])

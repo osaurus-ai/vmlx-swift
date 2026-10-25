@@ -532,7 +532,8 @@ enum Qwen4ExpCompiledMoE {
             window.dim(2) > 0, weight.dim(1) == window.dim(2),
             topK > 0, topK <= weight.dim(0)
         else { return nil }
-        let rows = window.dim(1), experts = weight.dim(0)
+        let rows = window.dim(1)
+        let experts = weight.dim(0)
         let key = DenseRouterRowsKey(
             geometry: DenseRouterKey(
                 hiddenSize: window.dim(2), experts: experts, topK: topK,
