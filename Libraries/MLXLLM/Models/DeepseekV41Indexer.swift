@@ -102,11 +102,12 @@ enum DeepseekV41IndexerMath {
         } else {
             let top = argPartition(-sc, kth: topkBlocks - 1, axis: -1)[0..., 0..<topkBlocks]
             let vals = takeAlong(sc, top, axis: -1)
-            // put_along_axis(zeros, top, vals > -inf): scatter via a one-hot over blocks.
-            let hit = (top.expandedDimensions(axis: -1) .== blockIds.expandedDimensions(axis: 0))
-                .asType(.int32)  // [C, k, nb]
-            let ok = (vals .> MLXArray(-Float.infinity)).asType(.int32).expandedDimensions(axis: -1)
-            keep = (hit * ok).sum(axis: 1) .> MLXArray(Int32(0))  // [C, nb]
+            // put_along_axis(zeros, top, vals > -inf). A one-hot over blocks here was
+            // [C, topkBlocks, nb] int32: ~4 GB per query chunk at 42k rows, and
+            // 1 GB per decode token at 1M.
+            keep = putAlong(
+                MLXArray.zeros([C, nb], dtype: .bool), top,
+                values: vals .> MLXArray(-Float.infinity), axis: -1)  // [C, nb]
         }
         let rows = repeated(keep.expandedDimensions(axis: -1), count: blockSize, axis: -1)
             .reshaped(C, nb * blockSize)
