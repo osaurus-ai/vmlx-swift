@@ -1376,6 +1376,12 @@ public class DeepseekV4ModelInner: Module {
     private var engramInit = false
     private let engramLock = NSLock()
 
+    /// dSpark MTP tap: when set, the staggered-hc loop records the mean-over-hc hidden
+    /// `(layerIndex, [1,S,d])` at every layer in `dsparkTargetLayers`. Used by DSparkV41Lane to seed
+    /// the drafter windows from a backbone forward. nil (default) = no recording, zero overhead.
+    public var dsparkTap: ((Int, MLXArray) -> Void)?
+    public var dsparkTargetLayers: Set<Int> = []
+
     init(config: DeepseekV4Configuration) {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
@@ -1449,6 +1455,11 @@ public class DeepseekV4ModelInner: Module {
                 let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
                 h = r.h
                 preMix = r.ffnPre
+                // dSpark MTP tap: record the mean-over-hc hidden at the draft target layers
+                // (ref model.py return_hidden = mean(h, axis=2) at dspark_target_layer_ids).
+                if let tap = dsparkTap, dsparkTargetLayers.contains(i) {
+                    tap(i, h.mean(axis: 2))
+                }
                 if ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil {
                     let ma = MLX.abs(h.asType(.float32)).mean(); MLX.eval(ma)
                     NSLog("VMLX-DBG layer\(i) out.meanAbs=\(ma.item(Float.self))")
@@ -1520,6 +1531,10 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+
+    /// dSpark MTP drafter lane (nil unless a `dspark/` draft was loaded + native MTP requested).
+    /// Not a Module child — it holds its own drafter whose params are evaluated at attach.
+    public var dsparkLane: DSparkV41Lane?
 
     // MARK: - Resident weight loading (SafetensorsLoadKeyExcluding)
     //

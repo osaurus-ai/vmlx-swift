@@ -445,3 +445,140 @@ extension DSparkV41Drafter {
         return drafter
     }
 }
+
+// MARK: - Lane (records target taps, seeds the drafter, drafts blocks)
+
+/// Bridges the backbone's mean-over-hc target-layer taps to the dSpark drafter, and drafts a block
+/// for the native-MTP speculative loop. Mirrors NemotronLiLiCorrLane, simplified for dSpark's
+/// window-seeded drafter: it keeps the last `window` positions of concatenated target-layer hidden
+/// and re-seeds the drafter windows from them per draft (correct; the window is only 128 rows).
+public final class DSparkV41Lane: @unchecked Sendable {
+    let drafter: DSparkV41Drafter
+    let cfg: DSparkV41Config
+    private let lock = NSLock()
+    private var pending: [Int: MLXArray] = [:]   // layer -> [1,S,d] for the in-flight forward
+    private var mainHidden: MLXArray?            // [1, N, d*nTargets] rolling (<= window rows)
+    private var mainStart = 0                    // absolute position of row 0 of mainHidden
+
+    init(drafter: DSparkV41Drafter, cfg: DSparkV41Config) {
+        self.drafter = drafter
+        self.cfg = cfg
+    }
+
+    /// Tap closure installed on DeepseekV4ModelInner for the duration of a backbone forward.
+    func tap(layer: Int, hidden: MLXArray) {
+        lock.lock(); pending[layer] = hidden; lock.unlock()
+    }
+
+    /// Commit the taps collected during a forward that appended rows at absolute `start`.
+    func finishForward(start: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard pending.count == cfg.targetLayerIds.count else { pending.removeAll(); return }
+        // [1,S,d] per target layer -> [1,S,d*nTargets] in target order.
+        let rows = concatenated(cfg.targetLayerIds.map { pending[$0]! }, axis: -1)
+        pending.removeAll()
+        let win = cfg.slidingWindow
+        if mainHidden == nil || start <= mainStart {
+            mainHidden = rows; mainStart = start
+        } else {
+            // supersede everything at >= start, then append.
+            let keepRows = start - mainStart
+            if let mh = mainHidden, keepRows > 0 {
+                mainHidden = concatenated([mh[0..., 0 ..< keepRows], rows], axis: 1)
+            } else {
+                mainHidden = rows; mainStart = start
+            }
+        }
+        // bound to the last `win` positions.
+        if let mh = mainHidden, mh.dim(1) > win {
+            let drop = mh.dim(1) - win
+            mainHidden = mh[0..., drop...]; mainStart += drop
+        }
+    }
+
+    /// Draft `depth` tokens after `nextToken` (at committed position = `position`).
+    func draft(nextToken: MLXArray, depth: Int, position: Int) -> MLXArray {
+        lock.lock()
+        let mh = mainHidden; let mStart = mainStart
+        lock.unlock()
+        let seedTok = Int(nextToken.reshaped(1).asType(.int32).item(Int32.self))
+        guard let mh, position >= 1 else {
+            return MLXArray(Array(repeating: Int32(cfg.noiseTokenId), count: depth))
+        }
+        // Windows must hold KV for [0..startPos] where startPos = position-1. Re-seed from the recorded
+        // target-layer hidden covering (mStart .. position). positions are absolute.
+        drafter.resetWindows()
+        let lo = Swift.max(mStart, position - cfg.slidingWindow)
+        let hiExcl = Swift.min(position, mStart + mh.dim(1))      // commit rows up to position-1 inclusive
+        guard hiExcl > lo else {
+            return MLXArray(Array(repeating: Int32(cfg.noiseTokenId), count: depth))
+        }
+        let seg = mh[0..., (lo - mStart) ..< (hiExcl - mStart)]   // [1, S', d*nTargets]
+        let positions = MLXArray(Array(stride(from: Int32(lo), to: Int32(hiExcl), by: 1)))
+        drafter.seedWindows(mainHidden: seg, positions: positions)
+        let out = drafter.draft(seedTok: seedTok, startPos: position - 1)  // [seedTok, d@+1 ... d@+bs]
+        // out[0] is the (already-known) seed; drafts are out[1...]; return `depth` of them.
+        let drafts = out.dropFirst().prefix(depth).map { Int32($0) }
+        return MLXArray(Array(drafts))
+    }
+}
+
+// MARK: - Attachment
+
+public enum DSparkV41Attachment {
+    public static func drafterDirectory(bundle: URL) -> URL? {
+        DSparkV41Drafter.resolveFile(bundle: bundle)?.deletingLastPathComponent()
+    }
+}
+
+// MARK: - DeepseekV4Model native-MTP conformance (dSpark block drafts)
+
+extension DeepseekV4Model {
+    /// Load the bundle's dSpark draft + build the lane. No-op if the bundle has no `dspark/` draft.
+    public func attachDSpark(bundle: URL) throws {
+        let cfg = DSparkV41Config(config)
+        guard let drafter = try DSparkV41Drafter.load(
+            bundle: bundle, config: cfg,
+            embed: { [unowned self] ids in self.model.embedTokens(ids) },
+            head: { [unowned self] x in self.lmHead(x) }) else { return }
+        self.dsparkLane = DSparkV41Lane(drafter: drafter, cfg: cfg)
+    }
+}
+
+extension DeepseekV4Model: NativeMTPModel {
+    public var nativeMTPAvailable: Bool { dsparkLane != nil }
+
+    public func makeNativeMTPCache() -> [KVCache] { [] }  // the drafter owns its own windows
+
+    public func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        let start = cache?.first?.offset ?? 0
+        if let lane = dsparkLane {
+            model.dsparkTargetLayers = Set(DSparkV41Config(config).targetLayerIds)
+            model.dsparkTap = { layer, h in lane.tap(layer: layer, hidden: h) }
+        }
+        let logits = self(inputs, cache: cache)
+        if let lane = dsparkLane {
+            model.dsparkTap = nil
+            lane.finishForward(start: start)
+        }
+        // Block-draft path doesn't consume hiddenStates; return a shaped placeholder.
+        let h = zeros([inputs.dim(0), inputs.dim(1), config.hiddenSize]).asType(logits.dtype)
+        return NativeMTPForwardResult(logits: logits, hiddenStates: h)
+    }
+
+    public func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        // dSpark is a block drafter; the recursive-head path is never taken.
+        NativeMTPForwardResult(logits: zeros([1, 1, config.vocabSize]), hiddenStates: hiddenStates)
+    }
+}
+
+extension DeepseekV4Model: NativeMTPBlockDraftModel {
+    public var nativeMTPUsesBlockDrafts: Bool { dsparkLane != nil }
+    public var nativeMTPBlockDraftDepthLimit: Int { DSparkV41Config(config).blockSize - 1 }
+    public var nativeMTPBlockDraftVocabularySize: Int { config.vocabSize }
+    public func nativeMTPBlockDraft(nextToken: MLXArray, depth: Int, targetCache: [KVCache]) -> MLXArray {
+        guard let lane = dsparkLane else { return MLXArray(Array(repeating: Int32(0), count: depth)) }
+        let position = targetCache.first?.offset ?? 0
+        return lane.draft(nextToken: nextToken, depth: depth, position: position)
+    }
+}
