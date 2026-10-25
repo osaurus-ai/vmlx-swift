@@ -402,6 +402,11 @@ enum Qwen4ExpCompiledMoE {
         let weightDType: DType
     }
 
+    private struct DenseRouterRowsKey: Hashable {
+        let geometry: DenseRouterKey
+        let rows: Int
+    }
+
     static let enabled: Bool = {
         let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MOE") ?? "1"
         return value != "0" && value.lowercased() != "false"
@@ -409,6 +414,7 @@ enum Qwen4ExpCompiledMoE {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var denseRouterRegions: [DenseRouterKey: Region] = [:]
+    nonisolated(unsafe) private static var denseRouterRowsRegions: [DenseRouterRowsKey: Region] = [:]
     nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReportRouter = false
     nonisolated(unsafe) private static var didReportShared = false
@@ -511,34 +517,52 @@ enum Qwen4ExpCompiledMoE {
         return value != "0" && value.lowercased() != "false"
     }()
 
-    /// The dense router for a verify window ([1, rows, K]) in ONE region call, row-for-row bitwise equal to the 1-row AR
-    /// step (`denseRouter` on [1, 1, K]). SPEED-CRITICAL + EXACTNESS-CRITICAL (2026-10-18):
-    /// - A contiguous [rows, 1, K] input does NOT work: MLX folds a batch of M = 1 rows into one M = rows product when
-    ///   the weight is unbatched (`matmul.cpp` "Collapse batches into M"), and on M5 an M = 2...15 product runs the
-    ///   `gemv_wide` kernel, whose reduction differs from the 1-row `gemv` (BENCH_ROWEXACT first mismatch at position
-    ///   21 on Allosaurus 0.2). That is why verify used to run this router once per row.
-    /// - The view below has the same values but strides [K, 1, 1]: MLX reads it as a "transposed" vector
-    ///   (`check_transpose`), which disables the fold, so every row runs the same `gemv` kernel as the AR step (kernel
-    ///   choice depends on the weight's layout and M / N / K only; the batch is the grid's z axis). softmax,
-    ///   argPartition and the elementwise tail are per row.
-    /// One router launch set per MoE layer instead of one per row: 48 layers x (rows - 1) fewer region calls per verify.
+    /// One compiled invocation, with the AR router's actual singleton shape for
+    /// every row. A strided M=1 batch still changed BF16 routing-score bits on
+    /// real Allosaurus activations, despite passing the original random probes.
+    /// Keep matmul, precise softmax, selection, and normalization together in
+    /// each row's graph; weights remain shared inputs, never copied per row.
     static func denseRouterRows(
         _ window: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
     ) -> (indices: MLXArray, scores: MLXArray)? {
-        // BF16 router weights only (Allosaurus 0.2, Flash-Next): with F32 weights (some JANG loaders) the F32 product
-        // of the view did not reproduce the 1-row product (unit test, 15/15 cases), so those keep the per-row router.
-        guard denseRouterRowsEnabled, window.ndim == 3, window.dim(0) == 1, window.dim(1) > 1,
-            window.dtype == .bfloat16, weight.dtype == .bfloat16
-        else {
-            return nil
+        guard denseRouterRowsEnabled, enabled, !CompiledDecodeTrace.isActive,
+            window.ndim == 3, window.dim(0) == 1, window.dim(1) > 1,
+            window.dtype == .bfloat16, weight.ndim == 2, weight.dtype == .bfloat16,
+            window.dim(2) > 0, weight.dim(1) == window.dim(2),
+            topK > 0, topK <= weight.dim(0)
+        else { return nil }
+        let rows = window.dim(1), experts = weight.dim(0)
+        let key = DenseRouterRowsKey(
+            geometry: DenseRouterKey(
+                hiddenSize: window.dim(2), experts: experts, topK: topK,
+                normTopK: normTopK, weightDType: weight.dtype), rows: rows)
+        lock.lock()
+        var region = denseRouterRowsRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                var indices: [MLXArray] = []
+                var scores: [MLXArray] = []
+                for row in 0 ..< rows {
+                    let input = args[0][0..., row ..< (row + 1), 0...]
+                    let gates = MLX.softmax(
+                        matmul(input, args[1].transposed()), axis: -1, precise: true)
+                    let kth = experts - topK
+                    let selected = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+                    var probabilities = MLX.takeAlong(gates, selected, axis: -1)
+                    if normTopK {
+                        probabilities = probabilities / probabilities.sum(axis: -1, keepDims: true)
+                    }
+                    indices.append(selected)
+                    scores.append(probabilities)
+                }
+                return [concatenated(indices, axis: 1), concatenated(scores, axis: 1)]
+            }
+            denseRouterRowsRegions[key] = region
         }
-        let rows = window.dim(1)
-        let hidden = window.dim(2)
-        let view = asStrided(window, [rows, 1, hidden], strides: [hidden, 1, 1])
-        guard let routed = denseRouter(view, weight: weight, topK: topK, normTopK: normTopK) else {
-            return nil
-        }
-        return (routed.indices.reshaped(1, rows, topK), routed.scores.reshaped(1, rows, topK))
+        lock.unlock()
+        let outputs = region!([window, weight])
+        guard outputs.count == 2 else { return nil }
+        return (outputs[0], outputs[1])
     }
 
     /// Shared expert with f16 affine metadata against bf16 activations (Allosaurus 0.2: 4-bit, f16 scales). `sharedExpert`
