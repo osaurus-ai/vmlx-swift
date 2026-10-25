@@ -463,6 +463,11 @@ the original strict numerical oracle; those failures remain recorded. In
 particular, eight queries times GQA factor ten exceeds the vector-fused
 eligibility limit of 32, so those rows take the unfused fallback. Do not
 attribute their precision differences to the vector kernel without evidence.
+The explicit `MLX_ENABLE_TF32=0` diagnostic repeats all 81 rows on the same
+binary with the same oracle: all pass. The failing default rows use unfused
+softmax/matmul, where TF32 is enabled by default. This isolates a precision
+control dependency; it is not a reproduction of the interactivity failure
+and does not justify changing the app's precision defaults.
 
 Read-only Sentry Logs queries for the exact interactivity message (90 days)
 and command-buffer failure text (30 days) return no records; a general query
@@ -472,3 +477,24 @@ handled `generationFailure` path preserves the error to the caller without
 capturing a dedicated Sentry event. Absence of a recent fatal group therefore
 does not establish absence of handled GPU failures. No guessed RAM policy or
 blind GPU retry is introduced to compensate for the missing workload evidence.
+
+### Controlled greedy observations, with rejected rows retained
+
+The current Release app also runs explicit greedy AR/adaptive controls. These
+are diagnostics, distinct from the bundle-default sampler rows above. Both
+arms receive identical prompts, seed and temperature-zero overrides; each
+arm is primed separately and the full answer, reasoning and token count are
+compared. Settings changes go through the real panel and unload residents.
+
+| Bundle / task | AR tok/s | Adaptive tok/s | Comparison result |
+|---|---:|---:|---|
+| v0.1 / 150-value array | 30.91 | 51.41 | Correct arrays; reasoning/counts differ |
+| v0.1 / 100 individual prints | 28.44 | 29.77 | Same answer/reasoning/611 tokens, but both violate the requested statement format |
+| v0.2 / 150-value array | 29.25 | 53.63 | Correct arrays; formatting/reasoning/counts differ |
+| v0.2 / 100 individual prints | 26.80 | 46.04 | Correct identical answer; reasoning/counts differ |
+
+All stop naturally, but no row establishes a quality-qualified exact-output
+speedup: the only fully identical pair fails its instruction requirement.
+Do not weaken the output validator, apply prompt/sampler masking, or present
+these as universal 50–100 tok/s qualification. The no-custom-cap Safe Auto
+profile and adaptive mode are restored after the controls.
