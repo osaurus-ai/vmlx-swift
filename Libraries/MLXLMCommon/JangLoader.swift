@@ -2712,6 +2712,9 @@ public struct JangLoader: Sendable {
             // no other tensor exposes, so it is absent from validInDims while the WRONG alternative
             // (8192) is present -- `inferFromUniqueValidInDim` then uniquely picks 4-bit/g128 and the
             // 8-bit weights dequantize to an empty output that collapses the forward.
+            let isDeepseekGroupedOProjFirstStage =
+                basePath.hasSuffix(".attn.wo_a") || basePath.hasSuffix(".self_attn.wo_a")
+                || basePath == "attn.wo_a"
             let declaredDefaultIfConsistent: (bits: Int, groupSize: Int)? = {
                 guard let d = declaredDefaultQuantization, d.bits > 0, d.groupSize > 0
                 else { return nil }
@@ -2846,13 +2849,18 @@ public struct JangLoader: Sendable {
                     knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
-            } else if let dd = declaredDefaultIfConsistent,
-                      { let g = inferFromUniqueValidInDim()
-                        return g == nil || g!.bits != dd.bits || g!.groupSize != dd.groupSize }()
+            } else if isDeepseekGroupedOProjFirstStage,
+                      let dd = declaredDefaultIfConsistent,
+                      let g = inferFromUniqueValidInDim(),
+                      g.bits != dd.bits || g.groupSize != dd.groupSize
             {
-                // The validInDims heuristic found nothing, or it CONTRADICTS a shape-consistent
-                // explicit default. Trust the producer's declared default over a membership guess
-                // against an admittedly incomplete validInDims set (fixes DSV4 wo_a -> 8-bit/g64).
+                // DSV4-family grouped o-proj first stage ONLY (`…attn.wo_a`): its input width
+                // groupFeat is absent from validInDims, so the unique-membership guess can
+                // CONTRADICT a shape-consistent explicit default (V4.1: 4-bit/g128 picked for
+                // 8-bit/g64 weights -> empty dequant -> collapsed forward). Trust the
+                // producer's default there. Scoped to the contradiction on `wo_a` so every
+                // other tensor, and any bundle where the guess already agreed (or found
+                // nothing), resolves exactly as before.
                 (bits, inferredGroupSize) = dd
             } else if let picked = inferFromUniqueValidInDim() {
                 (bits, inferredGroupSize) = picked

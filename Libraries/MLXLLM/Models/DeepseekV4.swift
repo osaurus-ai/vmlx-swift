@@ -1534,9 +1534,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     // for its sparse n-gram lookups (197 + 189 cannot both be resident on 256 GB).
     // We additionally exclude any engram-embed / MTP-draft keys that might appear
     // in a main-dir shard so they never inflate the resident backbone set.
-    public var requiresResidentSafetensorsWeights: Bool { true }
+    //
+    // V4.1 ONLY: DSV4-0731 keeps the loader's default policy (no forced eval of
+    // every shard, no key exclusions), exactly as before this conformance.
+    public var requiresResidentSafetensorsWeights: Bool { config.isDeepseekV41 }
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        guard config.isDeepseekV41 else { return false }
         let k = key.lowercased()
         // Giant FP8 engram embedding table — owned/mmapped by EngramV41.
         if k.contains(".engram.embed") { return true }
@@ -1731,7 +1735,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             // (`if compressRatio == 4, let idx = indexer`). Drop ALL indexer weights so the nil module
             // loads cleanly — sparse index selection only engages beyond the 128-token sliding window,
             // so a short-prompt text load is unaffected. Full long-context indexer is a V4.1 follow-up.
-            if rawKey.contains(".indexer.") { continue }
+            // V4.1 ONLY: DSV4-0731 ratio-4 layers DO build an indexer and must load its weights
+            // (dropping them would leave a random-init indexer choosing the top-k pool rows).
+            if config.isDeepseekV41, rawKey.contains(".indexer.") { continue }
             // DeepSeek-V4.1 vision tower (ViT `vision.*`, `aligner.*`, image delimiter embeddings).
             // Text load drops them; multimodal is served text-routed like the engine's VL path and is
             // a V4.1 follow-up in Swift.

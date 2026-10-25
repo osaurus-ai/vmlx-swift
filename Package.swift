@@ -966,6 +966,7 @@ let package = Package(
                 "AgenticTaskBenchConfinementFocusedTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
                 "MinimumReasoningFloorFocusedTests.swift",
+                "DeepseekV41ChatEncoderFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",

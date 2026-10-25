@@ -55,25 +55,30 @@ enum MinimumReasoningFloor {
         return max(0, parsed)
     }
 
-    /// Arming markers for the floor.
-    ///
-    /// EMPTY under the V4.1 (1017) numeric reasoning-effort contract. The floor
-    /// was a decode-side compensation for the 0731 text "enforced-low" preface,
-    /// which made the model close `<think>` on the first token. With the correct
-    /// V4.1 numeric budget contract the model self-modulates and emits a visible
-    /// thinking block on its own (verified against the vmlx-py reference:
-    /// "Say hello in exactly one word." → `<think>We need answer exactly one
-    /// word. "Hello" is one word.</think>Hello`). Keeping the floor armed under
-    /// the numeric contract is actively HARMFUL: on prompts with little to
-    /// reason about it forbids the natural `</think>` for 16 tokens and the
-    /// model degenerates into a repetition loop. Deliberately empty so
-    /// `railRequiresFloor` never arms; the mechanism below is retained for
-    /// A/B'ing via `VMLX_DSV4_REASONING_FLOOR` should a future rail need it.
-    static var enforcedEffortMarkers: [String] { [] }
+    /// First lines of the enforced-effort prefaces — the arming markers.
+    /// Derived from the encoder constants so a preface reword can never
+    /// desync the floor from the rails that require it.
+    static var enforcedEffortMarkers: [String] {
+        [
+            DeepseekV4ChatEncoder.reasoningEffortLowPreface,
+            DeepseekV4ChatEncoder.reasoningEffortHighPreface,
+            DeepseekV4ChatEncoder.reasoningEffortMaxPreface,
+        ].compactMap { $0.components(separatedBy: "\n").first }
+    }
+
+    /// DeepSeek-V4.1 (1017) renders a NUMERIC effort budget inside the System
+    /// token (`<｜System｜>Reasoning Effort: N (range 1-100, …)`) instead of the
+    /// 0731 text prefaces. The model self-modulates its think length under that
+    /// contract, and masking `</think>` there drives short prompts into
+    /// repetition loops, so the floor never arms on a V4.1 numeric head. The
+    /// 0731 markers above are unchanged, so DSV4-0731 keeps its floor.
+    static let deepseekV41NumericEffortMarker =
+        DeepseekV4Tokens.system + "Reasoning Effort: "
 
     static func railRequiresFloor(promptHead: String?, promptTail: String?) -> Bool {
         guard let promptTail, promptTail.hasSuffix("<think>") else { return false }
         guard let promptHead else { return false }
+        if promptHead.contains(deepseekV41NumericEffortMarker) { return false }
         return enforcedEffortMarkers.contains { promptHead.contains($0) }
     }
 

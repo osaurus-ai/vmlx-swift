@@ -37,8 +37,21 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     public var rmsNormEps: Float = 1e-6
     public var maxPositionEmbeddings: Int = 1_048_576
 
+    /// `text_config.model_type` (V4.1: `deepseek_v41_text`) or top-level
+    /// `model_type` (`deepseek_v4` / `deepseek_v41`). Nil when absent.
+    public var modelType: String? = nil
+
     // MARK: - DSA kv-source layers (DeepSeek-V4.1 only computes compress-KV here; others read shared)
     public var kvSourceLayerIds: [Int] = []
+
+    // MARK: - DeepSeek-V4.1 shared lightning indexer
+    /// Layers that own an indexer `index_k` projection; every other
+    /// compressed layer reuses the most recent source layer's `index_k`.
+    public var indexSourceLayerIds: [Int] = []
+    /// Layer whose index scores choose the candidate blocks (-1 = none).
+    public var candidateSourceLayerId: Int = -1
+    public var candidateTopkBlocks: Int = 0
+    public var candidateBlockSize: Int = 0
 
     // MARK: - Engram (DeepSeek-V4.1 n-gram-hash gated residual at engram_layer_ids)
     public var engramLayerIds: [Int] = []
@@ -147,7 +160,12 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case routedExpertBitPlan = "routed_expert_bit_plan"
         case quantization
         case textConfig = "text_config"
+        case modelType = "model_type"
         case kvSourceLayerIds = "kv_source_layer_ids"
+        case indexSourceLayerIds = "index_source_layer_ids"
+        case candidateSourceLayerId = "candidate_source_layer_id"
+        case candidateTopkBlocks = "candidate_topk_blocks"
+        case candidateBlockSize = "candidate_block_size"
         case engramLayerIds = "engram_layer_ids"
         case engramNHeads = "engram_n_heads"
         case engramHeadDim = "engram_head_dim"
@@ -221,7 +239,12 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.indexHeadDim = req(.indexHeadDim, 128)
         self.indexTopk = req(.indexTopk, 512)
         self.useAttnSink = req(.useAttnSink, true)
+        self.modelType = req(.modelType, nil as String?)
         self.kvSourceLayerIds = req(.kvSourceLayerIds, [])
+        self.indexSourceLayerIds = req(.indexSourceLayerIds, [])
+        self.candidateSourceLayerId = req(.candidateSourceLayerId, -1)
+        self.candidateTopkBlocks = req(.candidateTopkBlocks, 0)
+        self.candidateBlockSize = req(.candidateBlockSize, 0)
         self.engramLayerIds = req(.engramLayerIds, [])
         self.engramNHeads = req(.engramNHeads, 0)
         self.engramHeadDim = req(.engramHeadDim, 0)
@@ -287,6 +310,24 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         try c.encode(indexHeadDim, forKey: .indexHeadDim)
         try c.encode(indexTopk, forKey: .indexTopk)
         try c.encode(useAttnSink, forKey: .useAttnSink)
+        // DeepSeek-V4.1 fields. Encoded only when set so a 0731 config
+        // round-trips to the same keys it always produced.
+        if isDeepseekV41 { try c.encodeIfPresent(modelType, forKey: .modelType) }
+        if !kvSourceLayerIds.isEmpty { try c.encode(kvSourceLayerIds, forKey: .kvSourceLayerIds) }
+        if !indexSourceLayerIds.isEmpty {
+            try c.encode(indexSourceLayerIds, forKey: .indexSourceLayerIds)
+        }
+        if candidateSourceLayerId >= 0 {
+            try c.encode(candidateSourceLayerId, forKey: .candidateSourceLayerId)
+            try c.encode(candidateTopkBlocks, forKey: .candidateTopkBlocks)
+            try c.encode(candidateBlockSize, forKey: .candidateBlockSize)
+        }
+        if !engramLayerIds.isEmpty {
+            try c.encode(engramLayerIds, forKey: .engramLayerIds)
+            try c.encode(engramNHeads, forKey: .engramNHeads)
+            try c.encode(engramHeadDim, forKey: .engramHeadDim)
+            try c.encode(engramMaxNgramSize, forKey: .engramMaxNgramSize)
+        }
     }
 
     private struct MxtqBitsSpec: Decodable {
@@ -410,6 +451,14 @@ public struct DeepseekV4Configuration: Codable, Sendable {
 }
 
 extension DeepseekV4Configuration {
+    /// Explicit DeepSeek-V4.1 signal. Every V4.1-only behavior keys off this
+    /// so DSV4-0731 (`deepseek_v4`, no kv-source / engram fields) is untouched.
+    public var isDeepseekV41: Bool {
+        let mt = (modelType ?? "").lowercased()
+        return mt.hasPrefix("deepseek_v41") || !kvSourceLayerIds.isEmpty
+            || !engramLayerIds.isEmpty
+    }
+
     /// True for layers that carry the compressor (and, at ratio=4, the
     /// indexer). The `Compressor` + `Indexer` modules attach only to
     /// layers with `compress_ratio > 0`.
