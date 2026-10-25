@@ -822,6 +822,9 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// Travels with copies, trims, speculative restores and disk records so the draft windows can
     /// be rebuilt from the cache alone. Speed-only: nil or stale just means a shorter window.
     public var auxiliaryHiddenTail: HybridPoolHiddenTail?
+    /// dSpark verify capture requested for the next forward of this sequence (holder layer only).
+    /// Transient: never copied, checkpointed or persisted.
+    var dsparkVerifyCapture: DSV41VerifyCapture?
 
     public init(
         slidingWindow: Int,

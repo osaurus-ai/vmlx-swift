@@ -13,10 +13,13 @@
 //   2. checkpoints the cache in place, then runs ONE verify forward of [p0, d1...dW];
 //   3. accepts the longest prefix where d_{j+1} == argmax(row j);
 //   4. full accept: keeps the verify cache as it is (no refeed); the bonus argmax(row W) becomes the
-//      next p0. Partial accept: restores in place and runs one commit forward of exactly the emitted
-//      tokens [p0, d1...dk, truth_k].
+//      next p0. Partial accept with k > 0 (Python `commit_prefix`, M1 step 7): the target recorded
+//      the verify's per-token cache inputs, so the cache is restored in place and only the kept
+//      tokens [p0, d1...dk] are re-appended (window rows, compressor pooling), with no second
+//      forward; truth_k becomes the next p0. k == 0 (or `VMLX_DSV41_DSPARK_REFEED=1`, or a target
+//      without capture): restore in place and run one commit forward of [p0, truth_0...].
 // Every emitted token is a backbone argmax, so the output is greedy AR's (up to the usual caveat
-// that a multi-row forward rounds differently from a one-row decode step at an exact tie).
+// that a multi-row forward rounds differently from a one-row decode step, so a near-tie can flip).
 //
 // The width W tracks acceptance (EMA, 1...blockSize). Whether to speculate at all is decided by the
 // measured wall-clock cost per emitted token of speculative steps against AR steps
@@ -46,6 +49,26 @@ public protocol DSparkDraftSession: AnyObject {
     /// (pending, not in the cache); the cache offset is c+1. The windows are brought up to date from
     /// the committed hidden rows the cache carries. Returns `blockSize` token ids (one host sync).
     func draft(seed: Int, cache: [KVCache]) -> [Int]
+
+    /// Ask the target to record the next forward's per-token cache inputs (the verify forward).
+    /// Returns false when the target cannot commit a verified prefix in place.
+    func beginVerifyCapture(cache: [KVCache]) -> Bool
+    /// After a captured verify forward of n tokens that followed `checkpoint`: leave the cache
+    /// holding exactly the first `keep` (1...n) of them, as a forward of only those tokens would,
+    /// without running another forward and without replacing any cache object. Returns false
+    /// (cache untouched) when it cannot; the caller then restores and refeeds.
+    func commitVerifiedPrefix(
+        cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int) -> Bool
+    /// Drop whatever the capture still holds.
+    func endVerifyCapture(cache: [KVCache])
+}
+
+extension DSparkDraftSession {
+    public func beginVerifyCapture(cache: [KVCache]) -> Bool { false }
+    public func commitVerifiedPrefix(
+        cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
+    ) -> Bool { false }
+    public func endVerifyCapture(cache: [KVCache]) {}
 }
 
 // MARK: - Environment
@@ -58,6 +81,15 @@ public enum DSparkEnvironment {
     ) -> Bool {
         guard let raw = environment["VMLX_DSV41_DSPARK"]?.lowercased() else { return false }
         return ["0", "off", "false", "no"].contains(raw)
+    }
+
+    /// `VMLX_DSV41_DSPARK_REFEED=1`: partial accepts restore and refeed instead of committing the
+    /// verified prefix in place (A/B against the Python reference's old path).
+    public static func refeed(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        ["1", "true", "yes", "on"].contains(
+            environment["VMLX_DSV41_DSPARK_REFEED"]?.lowercased() ?? "")
     }
 
     /// `VMLX_DSV41_DSPARK_STATS=1`: one NSLog line per request (spec/AR steps, acceptance, ms/token).
@@ -159,6 +191,8 @@ public struct DSparkGenerationStats: Sendable, Equatable {
     /// Tokens committed by speculative steps (AR steps commit one each).
     public var specEmitted = 0
     public var fullAccepts = 0
+    /// Partial accepts committed in place (no second forward).
+    public var prefixCommits = 0
     public var commitForwards = 0
     public var specSeconds: Double = 0
     public var arSeconds: Double = 0
@@ -182,7 +216,8 @@ public struct DSparkGenerationStats: Sendable, Equatable {
         return
             "steps=\(steps) spec=\(specSteps) ar=\(arSteps) drafted=\(drafted) accepted=\(accepted) "
             + String(format: "accept=%.3f ", acceptanceRate)
-            + "fullAccept=\(fullAccepts) commitForwards=\(commitForwards) emitted=\(emitted) "
+            + "fullAccept=\(fullAccepts) prefixCommit=\(prefixCommits) commitForwards=\(commitForwards) "
+            + "emitted=\(emitted) "
             + String(format: "mean_emit=%.2f ", specSteps > 0 ? Double(specEmitted) / Double(specSteps) : 0)
             + "ms/tok spec=\(ms(specTok)) ar=\(ms(arTok)) "
             + "gov spec=\(ms(specSecondsPerToken)) ar=\(ms(arSecondsPerToken)) "
@@ -212,13 +247,18 @@ public struct DSparkDecoder {
     /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(blockSize * ema), 1, bs).
     public private(set) var acceptEMA: Double = 1.0
     let clock: () -> Double
+    /// Partial accepts restore + refeed instead of committing in place (`VMLX_DSV41_DSPARK_REFEED`).
+    public let refeed: Bool
+    private static let refeedFromEnvironment = DSparkEnvironment.refeed()
     private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double)?
 
     public init(
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
         governor: DSparkGovernor = DSparkGovernor(),
+        refeed: Bool? = nil,
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
+        self.refeed = refeed ?? Self.refeedFromEnvironment
         precondition(blockSize >= 1, "dSpark block size must be at least 1")
         self.session = session
         self.blockSize = blockSize
@@ -265,6 +305,10 @@ public struct DSparkDecoder {
         let feed = [seed] + proposed
         stats.drafted += proposed.count
 
+        // Ask the target to keep this forward's per-token cache inputs, so a partial accept can keep
+        // the verified prefix without a second forward.
+        let capturing = !refeed && session.beginVerifyCapture(cache: cache)
+        defer { if capturing { session.endVerifyCapture(cache: cache) } }
         let verifyStart = clock()
         let logits = forward(feed)
         let truth = argMax(logits[0], axis: -1).asType(.int32).asArray(Int32.self).map(Int.init)
@@ -276,20 +320,39 @@ public struct DSparkDecoder {
         acceptEMA = 0.7 * acceptEMA + 0.3 * (Double(k) / Double(Swift.max(1, proposed.count)))
 
         let fullAccept = k == proposed.count
-        var emit = fullAccept ? feed : [seed] + proposed.prefix(k) + [truth[k]]
         // Never commit past a stop token or the budget: the cache must end exactly where ordinary
         // decoding's would after returning these tokens.
-        var cut = Swift.min(emit.count, remaining)
-        if let stop = emit.firstIndex(where: { stopTokenIDs.contains($0) }) {
-            cut = Swift.min(cut, stop + 1)
+        func cut(_ tokens: [Int]) -> Int {
+            var n = Swift.min(tokens.count, remaining)
+            if let stop = tokens.firstIndex(where: { stopTokenIDs.contains($0) }) {
+                n = Swift.min(n, stop + 1)
+            }
+            return n
         }
+        var emit: [Int]
         let next: MLXArray
-        if fullAccept && cut == emit.count {
-            // The verify forward already wrote exact causal state for every emitted position.
+        // Verified tokens of `feed`: all of it on a full accept, else p0 plus the k accepted drafts.
+        let verified = fullAccept ? feed.count : k + 1
+        let keep = cut(Array(feed.prefix(verified)))
+        if fullAccept && keep == feed.count {
+            // No-refeed fast path: the verify forward already wrote exact causal state for every
+            // emitted position; argmax(row W) is the next p0.
             stats.fullAccepts += 1
+            emit = feed
             next = MLXArray([Int32(truth[proposed.count])])
+        } else if capturing, k > 0 || fullAccept,
+            session.commitVerifiedPrefix(cache: cache, checkpoint: checkpoint, keep: keep)
+        {
+            // Partial accept (or a cut block), committed in place (Python `commit_prefix`): the
+            // cache now holds exactly the first `keep` verify tokens; truth[keep - 1] is the next p0.
+            stats.prefixCommits += 1
+            emit = Array(feed.prefix(keep))
+            next = MLXArray([Int32(truth[keep - 1])])
         } else {
-            emit = Array(emit.prefix(cut))
+            // Restore and run one commit forward of exactly the emitted tokens (k == 0 keeps this:
+            // it commits two tokens for its second forward).
+            emit = fullAccept ? feed : [seed] + proposed.prefix(k) + [truth[k]]
+            emit = Array(emit.prefix(cut(emit)))
             checkpoint.restore()
             let commitStart = clock()
             let commit = forward(emit)

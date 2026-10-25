@@ -393,6 +393,11 @@ class DeepseekV4Attention: Module {
             (qResidual, q, kv) = preMath(x, cosT: cosT, sinT: sinT)
         }
 
+        // dSpark verify capture: this layer's cache inputs, so a verified prefix can be committed
+        // in place later (`commitCapturedPrefix`) without a second forward.
+        compressShare?.capture?.record(
+            layer: layerIdx, offset: offset, kv: kv, x: compressor != nil ? x : nil)
+
         // --- Cache update (sliding-window local) ---
         var keys = kv
         if let cache = cache {
@@ -445,11 +450,7 @@ class DeepseekV4Attention: Module {
                     if isV41, let idx = v41Indexer, idx.ownsK {
                         let r = rope
                         if let v4Cache {
-                            latentSink = { [unowned idx, weak v4Cache] latent, base in
-                                guard let v4Cache else { return }
-                                let k = idx.indexKeys(latent: latent, base: base, rope: r)
-                                _ = v4Cache.appendPooled(.indexer, value: k, isPrefill: true)
-                            }
+                            latentSink = indexKeySink(v4Cache)
                         } else {
                             latentSink = { [unowned idx] latent, base in
                                 freshIndexK.rows.append(
@@ -671,6 +672,34 @@ class DeepseekV4Attention: Module {
             // Failed compiled evaluation — fall through to eager.
         }
         return outMath(sdpaOut, cosT: cosT, sinT: sinT)
+    }
+
+    /// V4.1 index-key owner: append the shared index keys derived from newly completed compressor
+    /// latents to the cache's indexer pool. nil on every other layer.
+    func indexKeySink(_ v4Cache: DeepseekV4Cache) -> ((MLXArray, Int) -> Void)? {
+        guard config.isDeepseekV41, let idx = v41Indexer, idx.ownsK else { return nil }
+        let r = rope
+        return { [unowned idx, weak v4Cache] latent, base in
+            guard let v4Cache else { return }
+            let k = idx.indexKeys(latent: latent, base: base, rope: r)
+            _ = v4Cache.appendPooled(.indexer, value: k, isPrefill: true)
+        }
+    }
+
+    /// Python `DSV41.commit_prefix`, one layer: on the restored cache, append only the first `keep`
+    /// tokens of a captured forward, exactly as a forward of those tokens updates the cache (local
+    /// window rows, then the compressor: pending tail, completed groups, pool and index rows at the
+    /// same RoPE positions). The attention math itself is not rerun.
+    func commitCapturedPrefix(_ record: DSV41VerifyCapture.Layer, keep: Int, cache: KVCache) {
+        let rows = record.kv[0..., 0..., 0 ..< keep, 0...]
+        _ = cache.update(keys: rows, values: rows)
+        if compressRatio > 0, let comp = compressor, let x = record.x,
+            let v4Cache = cache as? DeepseekV4Cache
+        {
+            _ = comp(
+                x[0..., 0 ..< keep], rope: rope, v4Cache: v4Cache, startPos: record.offset,
+                latentSink: indexKeySink(v4Cache))
+        }
     }
 
     /// Python `_decode_out_math`: inverse RoPE + grouped o-proj + wo_b.
@@ -1570,6 +1599,13 @@ public class DeepseekV4ModelInner: Module {
                     ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
                 }) as? DeepseekV4Cache
             let tailStart = tailHolder?.offset ?? 0
+            // dSpark verify capture requested on this sequence (see `dsparkCommitPrefix`).
+            if let capture = (cache?.first(where: {
+                ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
+            }) as? DeepseekV4Cache)?.dsparkVerifyCapture {
+                capture.begin(tokens: L)
+                compressShare.capture = capture
+            }
             let tailLo = Swift.max(0, L - dsparkTailCapacity)
             var tailRows: [Int: MLXArray] = [:]
             for (i, layer) in layers.enumerated() {

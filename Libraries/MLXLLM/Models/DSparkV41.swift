@@ -527,11 +527,48 @@ extension DSparkV41Head {
     }
 }
 
+// MARK: - Verify capture (in-place partial-accept commit)
+
+/// Per-layer cache inputs of one captured forward (Python `capture_verify`: `verify_kv` and the
+/// compressor input). Lives on the sequence's holder cache between the verify forward and the
+/// commit; holds references only.
+final class DSV41VerifyCapture {
+    struct Layer {
+        /// Cache offset before this forward.
+        let offset: Int
+        /// Post-RoPE local KV rows `[B, 1, L, headDim]` (what the local window appended).
+        let kv: MLXArray
+        /// Attention input `[B, L, d]` on compressor (kv-source) layers, else nil.
+        let x: MLXArray?
+    }
+
+    private(set) var tokens = 0
+    private(set) var layers: [Int: Layer] = [:]
+    /// False once a layer ran more than once in the forward (sub-chunked attention) or the forward
+    /// count is wrong: such a capture cannot be replayed and the caller refeeds.
+    private(set) var valid = true
+    private var forwards = 0
+
+    func begin(tokens: Int) {
+        forwards += 1
+        self.tokens = tokens
+        layers.removeAll(keepingCapacity: true)
+        if forwards > 1 { valid = false }
+    }
+
+    func record(layer: Int, offset: Int, kv: MLXArray, x: MLXArray?) {
+        if layers[layer] != nil { valid = false }
+        layers[layer] = Layer(offset: offset, kv: kv, x: x)
+    }
+}
+
 // MARK: - Session (per-request draft windows)
 
 /// Per-request draft windows, synced from the cache's hidden tail by absolute position.
 final class DSparkV41Session: DSparkDraftSession {
     let head: DSparkV41Head
+    /// The target, for the in-place prefix commit (nil in head-only tests: refeed).
+    weak var model: DeepseekV4Model?
     /// Per-stage window rows `[1, n <= win, headDim]` for positions `winEnd - n ..< winEnd`.
     private(set) var windows: [MLXArray?]
     private(set) var winEnd = 0
@@ -581,6 +618,22 @@ final class DSparkV41Session: DSparkDraftSession {
         asyncEval(windows.compactMap { $0 })
     }
 
+    func beginVerifyCapture(cache: [KVCache]) -> Bool {
+        guard model != nil, let holder = Self.tailHolder(cache) else { return false }
+        holder.dsparkVerifyCapture = DSV41VerifyCapture()
+        return true
+    }
+
+    func commitVerifiedPrefix(
+        cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
+    ) -> Bool {
+        model?.dsparkCommitPrefix(cache: cache, checkpoint: checkpoint, keep: keep) ?? false
+    }
+
+    func endVerifyCapture(cache: [KVCache]) {
+        Self.tailHolder(cache)?.dsparkVerifyCapture = nil
+    }
+
     func draft(seed: Int, cache: [KVCache]) -> [Int] {
         let holder = Self.tailHolder(cache)
         let end = holder?.offset ?? (cache.first?.offset ?? 0)
@@ -627,7 +680,60 @@ extension DeepseekV4Model: DSparkSpeculativeModel {
     public func makeDSparkDraftSession() -> (any DSparkDraftSession)? {
         dsparkAttachLock.lock()
         defer { dsparkAttachLock.unlock() }
-        return dsparkHead.map { DSparkV41Session(head: $0) }
+        return dsparkHead.map {
+            let session = DSparkV41Session(head: $0)
+            session.model = self
+            return session
+        }
+    }
+
+    /// Python `DSV41.commit_prefix`: after a captured verify forward of n tokens that followed
+    /// `checkpoint`, leave `cache` holding exactly its first `keep` tokens, the state a forward of
+    /// only those tokens leaves, with no second forward. Restores in place, then per layer re-appends
+    /// the kept local-window rows and replays the compressor on the kept inputs (pending tail,
+    /// completed groups, compressed and index pool rows at the same RoPE positions). The Engram
+    /// n-gram history and the hidden tail keep their verify records up to start + keep. No cache
+    /// object is replaced. Returns false, with the cache untouched, when the capture is incomplete.
+    func dsparkCommitPrefix(
+        cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
+    ) -> Bool {
+        guard config.isDeepseekV41,
+            let holder = DSparkV41Session.tailHolder(cache),
+            let capture = holder.dsparkVerifyCapture, capture.valid,
+            keep >= 1, keep <= capture.tokens,
+            cache.count == model.layers.count,
+            capture.layers.count == model.layers.count
+        else { return false }
+        let records = (0 ..< model.layers.count).compactMap { capture.layers[$0] }
+        guard records.count == model.layers.count else { return false }
+        let start = records[0].offset
+        guard records.allSatisfy({ $0.offset == start }) else { return false }
+        // The verify forward's history and tail cover its own tokens; keep their first `keep`.
+        let history = holder.auxiliaryTokenHistory
+        let tail = holder.auxiliaryHiddenTail
+        checkpoint.restore()
+        guard holder.offset == start else {
+            preconditionFailure("dSpark commit: checkpoint offset \(holder.offset) != capture \(start)")
+        }
+        for (i, layer) in model.layers.enumerated() {
+            layer.selfAttn.commitCapturedPrefix(records[i], keep: keep, cache: cache[i])
+        }
+        let end = start + keep
+        if var history, history.endPosition >= end, history.startPosition <= end {
+            history.tokens.removeLast(history.endPosition - end)
+            history.endPosition = end
+            holder.auxiliaryTokenHistory = history
+        } else if history != nil {
+            preconditionFailure("dSpark commit: n-gram history does not cover the kept tokens")
+        }
+        if var tail, tail.endPosition >= end {
+            tail.truncate(toEnd: end)
+            holder.auxiliaryHiddenTail = tail.isEmpty ? nil : tail
+        } else {
+            holder.auxiliaryHiddenTail = tail
+        }
+        holder.dsparkVerifyCapture = nil
+        return true
     }
 
     public func dsparkCacheUnsupportedReason(_ cache: [KVCache]) -> String? {
