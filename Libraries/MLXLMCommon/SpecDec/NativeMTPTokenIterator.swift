@@ -4246,7 +4246,7 @@ extension NativeMTPTokenIterator {
             }
         }
 
-        mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
+    mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
         verifyCalls = Self.arSafetyWarmupCycles
         currentDepth = depth
         arSafetyMeanLoss.reset(afterCycle: verifyCalls)

@@ -48,7 +48,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
     ) throws -> (depths: [Int], throughput: [Int: Double], chooser: String?) {
         var parameters = GenerateParameters(maxTokens: 1024, temperature: temperature)
         parameters.draftStrategy = .nativeMTP(depth: 3)
-        parameters.nativeMTPDepthPolicy = .adaptive
+        parameters.nativeMTPDepthPolicy = .adaptive(maximumDepth: 5)
         var iterator = try NativeMTPClock.$testingNow.withValue(0) {
             try NativeMTPTokenIterator(
                 input: LMInput(tokens: MLXArray([1, 1, 1])), model: DepthDispatchTarget(),
