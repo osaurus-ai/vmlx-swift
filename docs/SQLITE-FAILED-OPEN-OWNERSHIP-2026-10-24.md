@@ -101,31 +101,34 @@ in the last root. Raw prompts/history/Sentry data and images are not committed.
 
 ## Final combined regression
 
-After syncing the independent diagnostic-capture repair (#654), combined
-source `d58ea5b02264404dfaa41bc2d5544401843a17e6` reported 47/47 XCTest
-and 332/332 Swift Testing cases in 23 suites with zero assertions, but its
-process-wide lock reset. That run is **INVALID as qualification**. A clean
-explicit `--no-parallel` run is required before promotion. This includes the
-new two failed-open cases and the full disk/coordinator/accounting/hostile
-payload/write-behind/reader/architecture matrix. The standalone public
-actual-initializer allocation probe also passes again on this combined
-source: 200 failed opens retain zero SQLite bytes; valid open/clear/close
-returns to zero. No model generation occurs in those tests.
+Final combined code `e1e55abb3c7775c65de0751553544460675e7736` passes
+47/47 XCTest and 332/332 Swift Testing cases in 23 suites, zero failures,
+with explicit `--no-parallel` scheduling and **zero process-wide lock resets**.
+Individual concurrency tests retain their parallel operations. The full
+matrix includes disk/index/coordinator/accounting/hostile payload/write-behind/
+reader/architecture tests and both new failed-open cases.
 
-The wider first run's 53 assertions and the intermediate capture candidate's
-FIFO failure remain retained; see the separate diagnostic-capture contract.
-No storage assertions were removed or relaxed. The DiskCache implementation
-matches the exact native-tested 2f19 pin. The additional internal diagnostic
-observer is qualified separately with scoped capture/errno/concurrency tests
-and six broken-stderr child controls; it is absent from the native app's
-pinned revision. The consumer continues to use the exact qualified pin.
+The standalone public actual-initializer probe also passes on the combined
+implementation: 200 failed opens retain zero SQLite bytes; valid open/clear/
+close returns to zero. No model generation occurs in those tests. All three
+new Swift probe/test/manifest files pass strict local swift-format603 lint.
 
-Combined receipts: `sqlite-combined-final-validation.receipt.json`,
-`sqlite-combined-final-9d4f155d821d.log`, and
-`sqlite-combined-public-probe.log` under the private campaign root above.
+An earlier combined d58ea5b02 run and an intermediate formatting run reported
+numeric passes but reset the process-wide test lock. They are **INVALID as
+qualification** and retained with corrected receipts. The proof runner now
+fails closed on any lock reset or recorded issue. The first 53-assertion run
+and intermediate FIFO capture failure are also retained; no storage assertion
+was removed or relaxed. See the independent diagnostic-capture contract.
 
+The DiskCache implementation matches the exact native-tested 2f19 pin.
+The additional internal diagnostic observer is qualified separately with
+capture/concurrency/errno tests and six broken-stderr child controls. It is
+absent from the native app's pinned revision; the consumer remains on its
+exact qualified revision. No quality, speed or historical crash failure is
+cleared by test-harness repairs.
 
-The final formatted diagnostic-capture changes are synced. Combined serial
-qualification is now pending; any numeric pass accompanied by a process-wide
-test-lock reset must be rejected. Native UI and isolated SQLite allocation
-receipts are independent of that runner failure and remain retained.
+Final receipt/log: `sqlite-serial-final-validation.receipt.json` and
+`sqlite-serial-final-9d4f155d821d.log`. Allocation receipt/log:
+`sqlite-combined-public-probe.log`. Earlier numeric results and explicit
+invalidity are retained in `sqlite-combined-final-validation.receipt.json`.
+All paths are under the private campaign root above.
