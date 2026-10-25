@@ -257,7 +257,8 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             !NativeMTPCopyProposer.enabled
         else {
             throw XCTSkip(
-                "Head dispatch requires VMLX_NATIVE_MTP_AR_SAFETY=0 and VMLX_NATIVE_MTP_COPY=0; real governor/copy qualification is separate")
+                "Head dispatch requires VMLX_NATIVE_MTP_AR_SAFETY=0 and VMLX_NATIVE_MTP_COPY=0; real governor/copy qualification is separate"
+            )
         }
     }
 
