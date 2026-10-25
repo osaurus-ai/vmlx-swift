@@ -102,8 +102,10 @@ in the last root. Raw prompts/history/Sentry data and images are not committed.
 ## Final combined regression
 
 After syncing the independent diagnostic-capture repair (#654), combined
-source `d58ea5b02264404dfaa41bc2d5544401843a17e6` passes 47/47 XCTest and
-332/332 Swift Testing cases in 23 suites, zero failures. This includes the
+source `d58ea5b02264404dfaa41bc2d5544401843a17e6` reported 47/47 XCTest
+and 332/332 Swift Testing cases in 23 suites with zero assertions, but its
+process-wide lock reset. That run is **INVALID as qualification**. A clean
+explicit `--no-parallel` run is required before promotion. This includes the
 new two failed-open cases and the full disk/coordinator/accounting/hostile
 payload/write-behind/reader/architecture matrix. The standalone public
 actual-initializer allocation probe also passes again on this combined
@@ -121,3 +123,9 @@ pinned revision. The consumer continues to use the exact qualified pin.
 Combined receipts: `sqlite-combined-final-validation.receipt.json`,
 `sqlite-combined-final-9d4f155d821d.log`, and
 `sqlite-combined-public-probe.log` under the private campaign root above.
+
+
+The final formatted diagnostic-capture changes are synced. Combined serial
+qualification is now pending; any numeric pass accompanied by a process-wide
+test-lock reset must be rejected. Native UI and isolated SQLite allocation
+receipts are independent of that runner failure and remain retained.
