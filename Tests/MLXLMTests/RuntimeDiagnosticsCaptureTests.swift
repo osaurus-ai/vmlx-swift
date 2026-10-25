@@ -49,10 +49,10 @@ struct RuntimeDiagnosticsCaptureTests {
 
     @Test func simultaneousTasksDoNotCaptureEachOthersMessages() async {
         let results = await withTaskGroup(of: (Int, String).self) { group in
-            for index in 0..<32 {
+            for index in 0 ..< 32 {
                 group.addTask {
                     let (_, text) = DiskCacheAccountingTestSupport.capturingRuntimeDiagnostics {
-                        for _ in 0..<64 {
+                        for _ in 0 ..< 64 {
                             RuntimeDiagnostics.write(Data("capture-\(index)\n".utf8))
                         }
                     }
