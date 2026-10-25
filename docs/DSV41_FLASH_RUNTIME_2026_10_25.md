@@ -133,9 +133,18 @@ The state is the same as ordinary decoding: the cache holds prompt plus committe
    where each dj+1 matches the argmax.
 4. k == W: keep the verify cache (no refeed), commit p0…dW, and argmax(row W) becomes the next p0.
    One forward per step.
-5. k < W: restore in place, run one commit forward of exactly [p0, d1…dk, truth_k], and take the
-   next p0 from its last row.
-6. A block is cut at the first stop token and at `maxTokens`. The cache never runs ahead of the
+5. 0 < k < W: commit in place (Python `commit_prefix`, jangq 95ef4ea), with no second forward.
+   - The verify forward ran with a capture on the holder cache. Each attention layer recorded its
+     post-RoPE local KV rows, and kv-source layers also recorded their compressor input.
+   - `DeepseekV4Model.dsparkCommitPrefix` restores the checkpoint in place. Per layer it re-appends
+     the first k+1 KV rows and replays the compressor on the kept inputs, with the same pending
+     tail, completed groups, compressed/index pool rows and RoPE positions as a forward of only
+     those tokens.
+   - The n-gram history and the hidden tail keep their verify records up to start + k + 1.
+   - It emits [p0, d1…dk]; truth_k (argmax of row k) becomes the next p0.
+6. k == 0, or `VMLX_DSV41_DSPARK_REFEED=1`: restore in place, run one commit forward of
+   [p0, truth_0], and take the next p0 from its last row.
+7. A block is cut at the first stop token and at `maxTokens`. The cache never runs ahead of the
    returned tokens, so the post-answer prefix-cache boundary stays valid.
 
 The governor is a port of `_Governor`. It keeps an EMA (α 0.3) of seconds per emitted token for
@@ -173,12 +182,13 @@ verify readback is one sync. The windows project only the new rows.
 |---|---|
 | `VMLX_DSV41_DSPARK=0` (`off`/`false`/`no`) | dSpark off everywhere. It can only turn dSpark off, never on over Off. |
 | `VMLX_DSV41_DSPARK_STATS=1` | one `[dSpark]` NSLog line per request: steps, spec/AR steps, drafted/accepted, acceptance, full accepts, commit forwards, mean emit, ms/token spec and AR (measured and governor EMA), draft/verify/commit ms, tok/s. A skipped request logs `[dSpark] off for this request: <reason>`. |
+| `VMLX_DSV41_DSPARK_REFEED=1` | partial accepts restore and refeed instead of committing in place (A/B) |
 | `VMLX_DSV41_DSPARK_PREFILL_STEP=<n>` | prefill outer chunk while the head is resident (default 1024; `DSV4_PREFILL_OUTER_CHUNK` still wins) |
 
 ### CPU tests (`MLXLMCommonFocusedTests`)
 
 - `DSparkSpeculationFocusedTests`:
-  - greedy identity against AR on a synthetic attention target (partial, zero and full acceptance), with caches equal to AR's;
+  - greedy identity against AR on a synthetic attention target (partial acceptance refed and committed in place, zero and full acceptance), with caches equal to AR's;
   - restore after the rotating window wrapped;
   - stop-token and budget cuts;
   - the governor under a synthetic clock (port of `dsv41_dspark_governor_test.py`);
@@ -186,6 +196,9 @@ verify readback is one sync. The windows project only the new rows.
   - `TokenIterator` end to end.
 - `DeepseekV41DSparkFocusedTests`:
   - `DeepseekV4Cache` in-place restore;
+  - `commitCapturedPrefix` on a V4.1 kv-source/index-owner layer at ratio 2 and 1: keeping all
+    tokens equals the verify's own state bit for bit, and keeping 1–5 equals a forward of only
+    those tokens (row counts and metadata exact, values within bf16 batch tolerance);
   - the tail through copy, trim and the disk record;
   - head load with every parameter verified;
   - incremental window sync equals one-shot sync;
@@ -200,7 +213,10 @@ verify readback is one sync. The windows project only the new rows.
    seconds). phys_footprint is about 206 GB (backbone plus 8.9 GB).
 2. With `VMLX_DSV41_DSPARK_STATS=1`, a thinking-off code prompt of about 300 tokens should give
    `accept` ≥ 0.6, `mean_emit` ≥ 3, `ar` steps only from probes, and decode about 45–50 tok/s
-   (Python reference: code 44.7, code2 39.3, structured 76.9, prose 28.6; AR about 30). Prose should
+   (Python reference with the in-place partial commit: code 57.5, code2 48.7, Rust 59.1, prose 28.8;
+   with refeed: code 44.9, code2 41.3; AR about 30). `prefixCommit` should account for most
+   non-full steps, and `commitForwards` only for the k == 0 ones. A/B with
+   `VMLX_DSV41_DSPARK_REFEED=1`. Prose should
    be at or above AR (27 tok/s): the governor shows mostly `ar` steps with spec probes.
 3. Identity: run the same greedy prompt with `VMLX_DSV41_DSPARK=0`. The tokens match the dSpark run
    up to the first near-tie. Check any divergence against the AR top-2 margin (expect < 0.05).
