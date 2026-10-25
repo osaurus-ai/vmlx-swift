@@ -1025,6 +1025,9 @@ public final class DiskCache: @unchecked Sendable {
         // Open SQLite database
         let dbPath = cacheDir.appendingPathComponent("cache_index.db").path
         if sqlite3_open(dbPath, &db) != SQLITE_OK {
+            // SQLite can return a live handle even when open fails. Release
+            // its connection resources before discarding the pointer.
+            if let db { sqlite3_close(db) }
             db = nil
             indexSchemaVersion = 0
             indexHasV2Columns = false
