@@ -412,7 +412,11 @@ final class DSparkV41Head: @unchecked Sendable {
     /// Draft from `seed` (the backbone's token at `startPos + 1`), windows holding committed KV for
     /// positions up to `startPos`. Returns the drafts for `startPos + 2 ... startPos + 1 + bs`
     /// (Python `DSpark.draft` without the seed). One host sync.
-    func draft(seed: Int, startPos: Int, windows: [MLXArray?]) -> [Int] {
+    /// `noise` `[bs, vocab]` + `inverseTemperature`: coupled sampled drafting (``markovChain``).
+    func draft(
+        seed: Int, startPos: Int, windows: [MLXArray?], noise: MLXArray? = nil,
+        inverseTemperature: Float = 1
+    ) -> [Int] {
         let cfg = config
         let bs = cfg.blockSize
         var ids = [Int32](repeating: Int32(cfg.noiseTokenId), count: bs)
@@ -431,7 +435,8 @@ final class DSparkV41Head: @unchecked Sendable {
         let xc = DeepseekV4Math.hcCollapse(x, pre: preMix)  // [1, bs, d]
         let logits = head(last.norm!(xc)).asType(.float32)[0]  // [bs, vocab]
         let drafted = Self.markovChain(
-            logits: logits, markovEmbed: markovEmbed, headT: markovHeadT, seed: seed)
+            logits: logits, markovEmbed: markovEmbed, headT: markovHeadT, seed: seed, noise: noise,
+            inverseTemperature: inverseTemperature)
         eval(drafted)
         return drafted.asArray(Int32.self).map(Int.init)
     }
@@ -439,14 +444,20 @@ final class DSparkV41Head: @unchecked Sendable {
     /// Markov-biased greedy chain over a drafted block, kept on the device (Python
     /// `markov_chain`): step i adds the Markov bias of the previous token (the seed for i = 0).
     /// logits `[bs, vocab]` f32, headT `[rank, vocab]` f32. Returns `[bs]` int32, unevaluated.
+    /// `noise` `[bs, vocab]` (sampled speculation): step i proposes
+    /// argmax(score * inverseTemperature + noise[i]) with the Gumbel noise the target samples that
+    /// position with (coupled drafting).
     static func markovChain(
-        logits: MLXArray, markovEmbed: MLXArray, headT: MLXArray, seed: Int
+        logits: MLXArray, markovEmbed: MLXArray, headT: MLXArray, seed: Int,
+        noise: MLXArray? = nil, inverseTemperature: Float = 1
     ) -> MLXArray {
         var tok = MLXArray([Int32(seed)])
         var toks: [MLXArray] = []
         for i in 0 ..< logits.dim(0) {
             let me = take(markovEmbed, tok, axis: 0).asType(.float32)  // [1, rank]
-            tok = argMax(logits[i] + matmul(me, headT)[0], axis: -1, keepDims: true).asType(.int32)
+            var score = logits[i] + matmul(me, headT)[0]
+            if let noise { score = score * inverseTemperature + noise[i] }
+            tok = argMax(score, axis: -1, keepDims: true).asType(.int32)
             toks.append(tok)
         }
         return concatenated(toks, axis: 0)
@@ -717,6 +728,17 @@ final class DSparkV41Session: DSparkDraftSession {
         sync(end: end, tail: holder?.auxiliaryHiddenTail)
         return head.draft(seed: seed, startPos: end - 1, windows: windows)
     }
+
+    func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int] {
+        let holder = Self.tailHolder(cache)
+        let end = holder?.offset ?? (cache.first?.offset ?? 0)
+        sync(end: end, tail: holder?.auxiliaryHiddenTail)
+        return head.draft(
+            seed: seed, startPos: end - 1, windows: windows, noise: noise,
+            inverseTemperature: inverseTemperature)
+    }
+
+    var vocabularySize: Int? { head.config.vocabSize }
 }
 
 // MARK: - DeepseekV4Model conformance

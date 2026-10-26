@@ -21,6 +21,9 @@
 //      [p0, truth_0...].
 // Every emitted token is a backbone argmax, so the output is greedy AR's (up to the usual caveat
 // that a multi-row forward rounds differently from a one-row decode step, so a near-tie can flip).
+// A sampled request (temperature > 0) replaces each argmax by the AR sampler's draw with Gumbel
+// noise keyed by the absolute position (``DSparkSampling``, Python `SpecSampler`), and the draft
+// sees the same noise, so the output is distributed as AR sampling's.
 //
 // The width W tracks acceptance (EMA, 1...blockSize). Whether to speculate at all is decided by the
 // measured wall-clock cost per emitted token of speculative steps against AR steps
@@ -51,6 +54,15 @@ public protocol DSparkDraftSession: AnyObject {
     /// the committed hidden rows the cache carries. Returns `blockSize` token ids (one host sync).
     func draft(seed: Int, cache: [KVCache]) -> [Int]
 
+    /// Coupled sampled drafting: as `draft(seed:cache:)`, but step i proposes
+    /// argmax(score_i * inverseTemperature + noise[i]), with `noise` `[blockSize, vocab]` the Gumbel
+    /// rows the target will sample positions c+2 ... c+1+blockSize with, so a draft close to the
+    /// target proposes the target's own sample instead of its argmax.
+    func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int]
+    /// The draft head's vocabulary (the width of its noise rows); nil drafts sampled requests
+    /// uncoupled (still exact: a draft is only kept when it equals the target's sample).
+    var vocabularySize: Int? { get }
+
     /// Ask the target to record the next forward's per-token cache inputs (the verify forward).
     /// Returns false when the target cannot commit a verified prefix in place.
     func beginVerifyCapture(cache: [KVCache]) -> Bool
@@ -65,6 +77,10 @@ public protocol DSparkDraftSession: AnyObject {
 }
 
 extension DSparkDraftSession {
+    public func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int] {
+        draft(seed: seed, cache: cache)
+    }
+    public var vocabularySize: Int? { nil }
     public func beginVerifyCapture(cache: [KVCache]) -> Bool { false }
     public func commitVerifiedPrefix(
         cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
@@ -84,9 +100,72 @@ public enum DSparkEnvironment {
         return ["0", "off", "false", "no"].contains(raw)
     }
 
+    /// `VMLX_DSV41_DSPARK_SAMPLED=0|off|false|no`: sampled requests (temperature > 0) decode AR
+    /// instead of with sampled speculation (``DSparkSampling``). Greedy requests are unaffected.
+    public static func sampledDisabled(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let raw = environment["VMLX_DSV41_DSPARK_SAMPLED"]?.lowercased() else { return false }
+        return ["0", "off", "false", "no"].contains(raw)
+    }
+
     /// `VMLX_DSV41_DSPARK_STATS=1`: one NSLog line per request (spec/AR steps, acceptance, ms/token).
     public static let statsEnabled =
         ProcessInfo.processInfo.environment["VMLX_DSV41_DSPARK_STATS"] == "1"
+}
+
+// MARK: - Sampled speculation
+
+/// Exact sampled speculation for dSpark (Python `SpecSampler`, temperature > 0).
+///
+/// The token at each target position is argmax(f(logits) + g) with g i.i.d. Gumbel noise, a draw
+/// from the distribution this request's AR sampler draws from: f is that sampler's transform
+/// (``GenerateParameters/sampler()``: ``TopPSampler`` log-probabilities at the temperature with
+/// top_p, min_p, top_k applied, or ``CategoricalSampler`` logits / T). The noise is keyed by the
+/// request seed and the ABSOLUTE position, so a position whose row was computed in one step and is
+/// decided in a later one replays the same sample, and noise that decided nothing committed stays
+/// independent of everything that was (fresh noise per step is biased: a re-sampled rejected
+/// position then follows the target conditioned on the draft's rejection). The draft sees the same
+/// noise (coupled drafting), so it proposes the target's sample whenever its own distribution is
+/// close, instead of its argmax.
+public struct DSparkSampling {
+    public let temperature: Float
+    public let seed: UInt64
+    /// The AR sampler's filters (nil: plain categorical at the temperature).
+    let filters: TopPSampler?
+
+    public init?(temperature: Float, topP: Float = 1, topK: Int = 0, minP: Float = 0, seed: UInt64?) {
+        guard temperature > 0, temperature.isFinite else { return nil }
+        self.temperature = temperature
+        self.seed = seed ?? UInt64.random(in: 0 ... UInt64(UInt32.max))
+        let filtered = (topP > 0 && topP < 1) || topK > 0 || minP > 0
+        filters = filtered
+            ? TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP) : nil
+    }
+
+    /// nil for a greedy request.
+    public init?(parameters: GenerateParameters) {
+        self.init(
+            temperature: parameters.temperature, topP: parameters.topP, topK: parameters.topK,
+            minP: parameters.minP, seed: parameters.randomSeed)
+    }
+
+    func key(position: Int) -> MLXArray {
+        MLXRandom.key(
+            (seed &* 2_654_435_761 &+ UInt64(position) &* 40503 &+ 1) & 0x7FFF_FFFF_FFFF_FFFF)
+    }
+
+    /// Gumbel rows `[count, vocab]` f32 for absolute positions `first ..< first + count`.
+    public func noise(first: Int, count: Int, vocab: Int) -> MLXArray {
+        stacked((0 ..< count).map { MLXRandom.gumbel([vocab], key: key(position: first + $0)) })
+    }
+
+    /// The AR sampler's draw for each row of `logits` `[n, vocab]` with `noise` `[n, vocab]`:
+    /// sampled ids `[n]` int32.
+    public func pick(_ logits: MLXArray, noise: MLXArray) -> MLXArray {
+        let z = filters?.filteredLogprobs(logits) ?? logits.asType(.float32) * (1 / temperature)
+        return argMax(z + noise, axis: -1).asType(.int32)
+    }
 }
 
 // MARK: - Wall-clock governor
@@ -193,6 +272,8 @@ public struct DSparkGenerationStats: Sendable, Equatable {
     public var commitSeconds: Double = 0
     public var specSecondsPerToken: Double?
     public var arSecondsPerToken: Double?
+    /// Sampled speculation (``DSparkSampling``) rather than greedy.
+    public var sampled = false
 
     public init() {}
 
@@ -206,7 +287,8 @@ public struct DSparkGenerationStats: Sendable, Equatable {
         let total = specSeconds + arSeconds
         let tps = total > 0 ? Double(emitted) / total : 0
         return
-            "steps=\(steps) spec=\(specSteps) ar=\(arSteps) drafted=\(drafted) accepted=\(accepted) "
+            "\(sampled ? "sampled " : "")steps=\(steps) spec=\(specSteps) ar=\(arSteps) drafted=\(drafted) "
+            + "accepted=\(accepted) "
             + String(format: "accept=%.3f ", acceptanceRate)
             + "fullAccept=\(fullAccepts) prefixCommit=\(prefixCommits) commitForwards=\(commitForwards) "
             + "emitted=\(emitted) "
@@ -234,6 +316,8 @@ public struct DSparkDecoder {
     public let session: any DSparkDraftSession
     public let blockSize: Int
     public let stopTokenIDs: Set<Int>
+    /// Sampled speculation (temperature > 0); nil decodes greedily.
+    public let sampling: DSparkSampling?
     public private(set) var governor: DSparkGovernor
     public private(set) var stats = DSparkGenerationStats()
     /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(blockSize * ema), 1, bs).
@@ -244,6 +328,7 @@ public struct DSparkDecoder {
 
     public init(
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
+        sampling: DSparkSampling? = nil,
         governor: DSparkGovernor = DSparkGovernor(),
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
@@ -251,6 +336,8 @@ public struct DSparkDecoder {
         self.session = session
         self.blockSize = blockSize
         self.stopTokenIDs = stopTokenIDs
+        self.sampling = sampling
+        stats.sampled = sampling != nil
         self.governor = governor
         self.clock = clock
     }
@@ -286,8 +373,21 @@ public struct DSparkDecoder {
 
         stats.specSteps += 1
         let w = Swift.min(width, remaining - 1)
+        // The seed's absolute position (pending: the cache holds everything before it). A sampled
+        // step decides positions position+1 ... with the noise rows keyed by those positions.
+        let position = cache.map(\.offset).max() ?? 0
+        var noise: MLXArray?
         let draftStart = clock()
-        let drafts = session.draft(seed: seed, cache: cache)
+        let drafts: [Int]
+        if let sampling, let vocab = session.vocabularySize {
+            let rows = sampling.noise(first: position + 1, count: blockSize + 1, vocab: vocab)
+            noise = rows
+            drafts = session.draft(
+                seed: seed, cache: cache, noise: rows[..<blockSize],
+                inverseTemperature: 1 / sampling.temperature)
+        } else {
+            drafts = session.draft(seed: seed, cache: cache)
+        }
         stats.draftSeconds += clock() - draftStart
         let proposed = Array(drafts.prefix(w))
         let feed = [seed] + proposed
@@ -299,7 +399,17 @@ public struct DSparkDecoder {
         defer { if capturing { session.endVerifyCapture(cache: cache) } }
         let verifyStart = clock()
         let logits = forward(feed)
-        let truth = argMax(logits[0], axis: -1).asType(.int32).asArray(Int32.self).map(Int.init)
+        let truth: [Int]
+        if let sampling {
+            // The target's samples for positions position+1 ... position+feed.count.
+            let rows = logits[0]
+            let vocab = rows.dim(-1)
+            let n = noise.flatMap { $0.dim(-1) == vocab ? $0[..<feed.count] : nil }
+                ?? sampling.noise(first: position + 1, count: feed.count, vocab: vocab)
+            truth = sampling.pick(rows, noise: n).asArray(Int32.self).map(Int.init)
+        } else {
+            truth = argMax(logits[0], axis: -1).asType(.int32).asArray(Int32.self).map(Int.init)
+        }
         stats.verifySeconds += clock() - verifyStart
 
         var k = 0
@@ -346,7 +456,14 @@ public struct DSparkDecoder {
             let commitStart = clock()
             let commit = forward(emit)
             commitWidth = emit.count
-            next = argMax(commit[0, -1], axis: -1).asType(.int32).reshaped(1)
+            if let sampling {
+                // The next pending token is position + emit.count's sample.
+                let row = commit[0, -1].reshaped(1, -1)
+                next = sampling.pick(
+                    row, noise: sampling.noise(first: position + emit.count, count: 1, vocab: row.dim(-1)))
+            } else {
+                next = argMax(commit[0, -1], axis: -1).asType(.int32).reshaped(1)
+            }
             asyncEval(next)
             stats.commitSeconds += clock() - commitStart
             stats.commitForwards += 1
