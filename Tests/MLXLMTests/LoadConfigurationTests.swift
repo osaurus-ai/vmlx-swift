@@ -146,6 +146,106 @@ struct LoadConfigurationTests {
         #expect(s.memoryLimit == target)
     }
 
+    @Test(
+        "Unlimited total budget resets stale limits; finite budgets remain explicit",
+        arguments: [
+            ResidentCap.fraction(0.60), .absolute(32 << 30),
+            .absolute(1 << 20), .absolute(96 << 30),
+        ])
+    func unlimitedTotalBudgetTransition(finite: ResidentCap) throws {
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        let priorCacheLimit = MLX.Memory.cacheLimit
+        defer {
+            MLX.Memory.memoryLimit = priorMemoryLimit
+            MLX.Memory.cacheLimit = priorCacheLimit
+        }
+        let physical: UInt64 = 128 << 30
+        let recommended = 80 << 30
+        // The backend constructor uses min(0.95 * RAM, 1.5 * working set).
+        // Supplying facts exercises that existing default without allocations.
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        let requestedFinite = try #require(finite.resolve(physicalMemory: physical))
+        let expectedFinite = max(1 << 30, min(Int(requestedFinite), recommended))
+        MLX.Memory.cacheLimit = 64 << 20
+
+        applyLoadProcessMemoryLimit(
+            finite, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedFinite)
+        let restored = applyLoadProcessMemoryLimit(
+            .unlimited, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(restored == expectedNative)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+
+        // Returning from No Automatic Limits must apply the selected cap too.
+        applyLoadProcessMemoryLimit(
+            finite, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedFinite)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+    }
+
+    @Test("Unlimited total budget uses the native physical-memory ceiling")
+    func unlimitedTotalBudgetUsesNativePhysicalCeiling() {
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        defer { MLX.Memory.memoryLimit = priorMemoryLimit }
+        let physical: UInt64 = 128 << 30
+        let recommended = 112 << 30
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        MLX.Memory.memoryLimit = 64 << 30
+        let restored = applyLoadProcessMemoryLimit(
+            .unlimited, physicalMemory: physical, recommendedWorkingSetBytes: recommended)
+        #expect(restored == expectedNative)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+    }
+
+    @Test("Decision loader applies Strict to unlimited to finite against the real allocator")
+    func decisionLoaderClearsStaleTotalLimit() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("decision-limit-transition-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(#"{"model_type":"llama"}"#.utf8)
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        let priorMemoryLimit = MLX.Memory.memoryLimit
+        let priorCacheLimit = MLX.Memory.cacheLimit
+        defer {
+            MLX.Memory.memoryLimit = priorMemoryLimit
+            MLX.Memory.cacheLimit = priorCacheLimit
+        }
+        let physical = HostPhysicalMemory.bytes
+        let recommended = try #require(MLX.GPU.maxRecommendedWorkingSetBytes())
+        let expectedNative = Int(min(0.95 * Double(physical), 1.5 * Double(recommended)))
+        let expectedStrict = max(1 << 30, min(Int(Double(physical) * 0.60), recommended))
+        var strict = LoadConfiguration(
+            maxResidentBytes: .absolute(64 << 20), memoryLimit: .fraction(0.60))
+        strict.keepModelInMemory = false
+        MLX.Memory.cacheLimit = 32 << 20
+        let strictResources = DecisionLoadResources(directory: directory, configuration: strict)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedStrict)
+        #expect(MLX.Memory.cacheLimit == 64 << 20)
+        #expect(strictResources.previousAllocatorCacheLimit == 32 << 20)
+        // The owner restores only the load-time pool, matching its contract.
+        MLX.Memory.cacheLimit = try #require(strictResources.previousAllocatorCacheLimit)
+
+        var unlimited = LoadConfiguration.off
+        unlimited.keepModelInMemory = false
+        let unlimitedResources = DecisionLoadResources(
+            directory: directory, configuration: unlimited)
+        #expect(MemoryStatus.snapshot().memoryLimit == expectedNative)
+        #expect(MLX.Memory.cacheLimit == 32 << 20)
+        #expect(unlimitedResources.previousAllocatorCacheLimit == nil)
+
+        var finite = LoadConfiguration(
+            maxResidentBytes: .unlimited, memoryLimit: .absolute(2 << 30))
+        finite.keepModelInMemory = false
+        let finiteResources = DecisionLoadResources(directory: directory, configuration: finite)
+        #expect(MemoryStatus.snapshot().memoryLimit == max(1 << 30, min(2 << 30, recommended)))
+        #expect(MLX.Memory.cacheLimit == 32 << 20)
+        #expect(finiteResources.previousAllocatorCacheLimit == nil)
+        withExtendedLifetime((strictResources, unlimitedResources, finiteResources)) {}
+    }
+
     @Test("Resident-pool policy clears stale process-wide MLX limits",
           arguments: ["deepseek_v4", "glm5_next", "glm5_next_text"])
     func residentPoolPolicyClearsStaleProcessLimits(modelType: String) {

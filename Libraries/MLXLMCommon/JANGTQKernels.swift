@@ -1084,7 +1084,7 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
     private init() {}
 
     public func loadSidecar(from sidecarPath: URL) throws {
-        let loaded = try MLX.loadArrays(url: sidecarPath)
+        let (loaded, _) = try ResidentSafetensorsReader.loadWeights(url: sidecarPath)
         lock.lock()
         defer { lock.unlock() }
         for (name, arr) in loaded {
@@ -1142,7 +1142,7 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
     /// entries (or doesn't exist).
     public static func sniffCodebookBits(at sidecarPath: URL) -> Int? {
         guard FileManager.default.fileExists(atPath: sidecarPath.path),
-              let arrays = try? MLX.loadArrays(url: sidecarPath)
+              let (arrays, _) = try? ResidentSafetensorsReader.loadWeights(url: sidecarPath)
         else { return nil }
         var counts = [Int: Int]()
         for name in arrays.keys where name.hasPrefix("codebook.") {

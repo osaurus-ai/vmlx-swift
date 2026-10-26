@@ -23,9 +23,10 @@ public final class DecisionLoadResources {
         } else {
             priorAllocatorCap = nil
         }
-        if native == nil, let raw = limit.applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
-        {
-            Memory.memoryLimit = max(1024 * 1024 * 1024, min(raw, workingSet))
+        if native == nil {
+            applyLoadProcessMemoryLimit(
+                limit, physicalMemory: facts.physicalMemory,
+                recommendedWorkingSetBytes: workingSet)
         }
         let wire = SystemWireBudget.snapshot()
         lease =

@@ -3196,7 +3196,7 @@ public struct JangLoader: Sendable {
 
         var allWeights: [String: MLXArray] = [:]
         for file in files {
-            let (weights, _) = try loadArraysAndMetadata(url: file)
+            let (weights, _) = try ResidentSafetensorsReader.loadWeights(url: file)
             for (key, array) in weights {
                 if array.dtype == .uint8 {
                     allWeights[key] = repackUint8ToUint32(array)
@@ -3219,10 +3219,10 @@ public struct JangLoader: Sendable {
         newShape.append(4)
 
         let reshaped = array.reshaped(newShape)
-        let b0 = reshaped[0..., 0].asType(.uint32)
-        let b1 = reshaped[0..., 1].asType(.uint32) << 8
-        let b2 = reshaped[0..., 2].asType(.uint32) << 16
-        let b3 = reshaped[0..., 3].asType(.uint32) << 24
+        let b0 = reshaped[.ellipsis, 0].asType(.uint32)
+        let b1 = reshaped[.ellipsis, 1].asType(.uint32) << 8
+        let b2 = reshaped[.ellipsis, 2].asType(.uint32) << 16
+        let b3 = reshaped[.ellipsis, 3].asType(.uint32) << 24
         return b0 | b1 | b2 | b3
     }
 

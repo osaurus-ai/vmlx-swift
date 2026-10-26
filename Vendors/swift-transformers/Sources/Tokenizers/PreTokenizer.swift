@@ -177,10 +177,15 @@ class MetaspacePreTokenizer: PreTokenizer {
     /// The metaspace prepend scheme, see https://github.com/huggingface/tokenizers/pull/1357
     let prependScheme: PrependScheme
 
+    /// Whether replacement characters delimit independent BPE pre-tokens.
+    /// A serialized false permits merges across whitespace runs.
+    let shouldSplit: Bool
+
     required init(config: Config) {
         addPrefixSpace = config.addPrefixSpace.boolean(or: false)
         replacement = config.replacement.string(or: " ")
         stringReplacement = config.strRep.string(or: replacement)
+        shouldSplit = config.split.boolean(or: true)
 
         // prepend_scheme supersedes add_prefix_space per tokenizers PR #1357.
         // When prepend_scheme is explicit, use it directly.
@@ -216,7 +221,8 @@ class MetaspacePreTokenizer: PreTokenizer {
 
         // Split in `MergedWithNext` mode, although usually the input to this function is already pre-tokenized
         // https://github.com/huggingface/tokenizers/blob/accd0650b802f2180df40ef1def3bce32156688e/tokenizers/src/pre_tokenizers/metaspace.rs#L127
-        return (prepend + normalized).split(by: replacement, behavior: .mergedWithNext)
+        let prepared = prepend + normalized
+        return shouldSplit ? prepared.split(by: replacement, behavior: .mergedWithNext) : [prepared]
     }
 }
 
