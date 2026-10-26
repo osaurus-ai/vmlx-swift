@@ -448,6 +448,19 @@ public enum DeepseekV4Math {
         return max(0, v)
     }()
 
+    /// DeepSeek-V4.1 prompt-suffix pruning in chunked prefill (`DeepseekV4Model.prepare`):
+    /// the layers after the last kv-source / Engram / candidate-source layer run only the
+    /// prompt rows the end of the prompt still depends on. `VMLX_DSV41_SUFFIX_PRUNE=0` (or
+    /// false/off/no) runs every row through every layer. Default on.
+    public static let suffixPruneEnabled: Bool =
+        suffixPruneFlag(ProcessInfo.processInfo.environment["VMLX_DSV41_SUFFIX_PRUNE"])
+
+    static func suffixPruneFlag(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        return !["0", "false", "off", "no"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+
     /// Python `_layerwise_prefill_materialization_enabled` parity: bound the
     /// lazy cross-layer graph during multi-token prefill once the final
     /// context exceeds the standalone-proven safe curve. Barriers cost

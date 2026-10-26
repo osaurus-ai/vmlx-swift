@@ -1316,7 +1316,8 @@ class DeepseekV4DecoderLayer: Module {
         inputIds: MLXArray?,
         preMix: MLXArray,
         compressShare: DSV41CompressShare? = nil,
-        imageMask: MLXArray? = nil
+        imageMask: MLXArray? = nil,
+        attnPieces: [Int]? = nil
     ) -> (h: MLXArray, ffnPre: MLXArray) {
         // ---- Attention HC (collapse with INCOMING preMix) ----
         let residualA = h
@@ -1324,7 +1325,22 @@ class DeepseekV4DecoderLayer: Module {
         let normedA = inputLayerNorm(DeepseekV4Math.hcCollapse(h, pre: preMix))
         let attnOut: MLXArray
         let sub = DeepseekV4Math.attnSubchunkTokens
-        if let cache, sub > 0, normedA.dim(1) >= 2 * sub {
+        if let cache, let attnPieces, attnPieces.count > 1 {
+            // Prompt-suffix pruning: the kept rows run in the forward's own sub-chunk partition
+            // (the first piece may be the tail of a sub-chunk), so every piece ends where an
+            // unpruned layer's sub-chunk ends and finds its selection / candidates.
+            var outs: [MLXArray] = []
+            var s = 0
+            for n in attnPieces {
+                let xs = normedA[0..., s ..< (s + n)]
+                let subMask = createAttentionMask(h: xs, cache: cache)
+                outs.append(selfAttn(xs, mask: subMask, cache: cache, compressShare: compressShare))
+                s += n
+            }
+            attnOut = concatenated(outs, axis: 1)
+        } else if attnPieces != nil {
+            attnOut = selfAttn(normedA, mask: mask, cache: cache, compressShare: compressShare)
+        } else if let cache, sub > 0, normedA.dim(1) >= 2 * sub {
             var outs: [MLXArray] = []
             var s = 0
             let chunkLen = normedA.dim(1)
@@ -1503,6 +1519,61 @@ public class DeepseekV4ModelInner: Module {
     /// Rows the tail keeps (the dSpark attention window).
     var dsparkTailCapacity = 128
 
+    // MARK: Prompt-suffix pruning (reference `Model.prune_from` / `prune_rows`)
+
+    /// First layer prompt-suffix pruning may shorten: past the last kv-source layer (its compressor
+    /// and index keys need every row), every Engram layer and the candidate source. The layers from
+    /// here on hold only their sliding window and read the shared pool / index keys / candidates.
+    /// nil for DSV4-0731 (no staggered mHC) and when no layer qualifies.
+    var suffixPruneFrom: Int? {
+        guard !config.engramLayerIds.isEmpty, config.isDeepseekV41 else { return nil }
+        let owners = config.kvSourceLayerIds + config.engramLayerIds + [config.candidateSourceLayerId]
+        let from = (owners.max() ?? -1) + 1
+        return from < layers.count ? from : nil
+    }
+
+    /// Trailing rows layer `layer` must run so the logits at `promptEnd - 1` and every window at
+    /// `promptEnd` are exact. A window of `window` rows reaches `window - 1` rows back, so a layer's
+    /// first `window - 1` kept rows see a partial window and the layer above must not read them;
+    /// the last layer needs its whole window: `1 + (numLayers - layer) * (window - 1)` (DSV4.1:
+    /// layer 39 128 rows, layer 21 2414).
+    static func suffixPruneKeep(layer: Int, numLayers: Int, window: Int) -> Int {
+        1 + (numLayers - layer) * (window - 1)
+    }
+
+    /// A pruned layer's cache must hold nothing but its window, which pruning restarts.
+    static func canRestartWindow(_ cache: KVCache) -> Bool {
+        if let v4 = cache as? DeepseekV4Cache {
+            return v4.holdsOnlyLocalWindow && v4.dsparkVerifyCapture == nil
+        }
+        return type(of: cache) == RotatingKVCache.self
+    }
+
+    static func restartWindow(_ cache: KVCache, at position: Int) {
+        if let v4 = cache as? DeepseekV4Cache {
+            v4.restartLocalWindow(at: position)
+        } else if let rotating = cache as? RotatingKVCache {
+            rotating.restartWindow(at: position)
+        }
+    }
+
+    /// Attention pieces for the rows `from ..< length` of a forward whose attention runs in
+    /// sub-chunks of `unit` rows from its start: the first piece is the tail of its sub-chunk.
+    static func suffixPrunePieces(from: Int, length: Int, unit: Int) -> [Int] {
+        var pieces: [Int] = []
+        var s = from
+        while s < length {
+            let e = min(length, (s / unit + 1) * unit)
+            pieces.append(e - s)
+            s = e
+        }
+        return pieces
+    }
+
+    /// Test hook: called after every pruned forward with its start position and the rows each
+    /// layer ran (0 = skipped).
+    var suffixPruneObserver: ((_ start: Int, _ rows: [Int]) -> Void)?
+
     /// Hoisted per-token debug switch (was an environment read per layer per token).
     private static let layerDebugEnabled =
         ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil
@@ -1621,8 +1692,16 @@ public class DeepseekV4ModelInner: Module {
     /// `vision` (DeepSeek-V4.1 image prefill chunks only): the embedding stream with the image
     /// spans spliced in, the image mask for `bias_vl` routing and the Engram masks. nil is the
     /// text forward, unchanged.
+    ///
+    /// `promptEnd` (DeepSeek-V4.1 chunked prefill only, see `DeepseekV4Model.prepare`): absolute
+    /// position where the pruned prefill forwards end; this forward ends at or before it. The
+    /// layers from ``suffixPruneFrom`` then run only the trailing rows the last row before
+    /// `promptEnd` still depends on (``suffixPruneKeep``). Every layer's window at `promptEnd`
+    /// matches a full prefill; the returned rows are exact only for the last position, and only
+    /// when this forward ends at `promptEnd` (prepare discards them).
     func callAsFunction(
-        _ inputs: MLXArray, cache: [KVCache]?, vision: DeepseekV41VisionChunk?
+        _ inputs: MLXArray, cache: [KVCache]?, vision: DeepseekV41VisionChunk?,
+        promptEnd: Int? = nil
     ) -> MLXArray {
         // embed: (B, L) → (B, L, hiddenSize)
         var h = vision?.embeddings ?? embedTokens(inputs)
@@ -1682,9 +1761,62 @@ public class DeepseekV4ModelInner: Module {
                 capture.begin(tokens: L)
                 compressShare.capture = capture
             }
-            let tailLo = Swift.max(0, L - dsparkTailCapacity)
-            var tailRows: [Int: MLXArray] = [:]
+            // Prompt-suffix pruning (reference `Model.__call__` `prompt_end`).
+            let start = firstCache?.offset ?? 0
+            let end = start + L
+            var pruneFrom = Int.max
+            if let promptEnd, let cache, let from = suffixPruneFrom, L > 1, B == 1,
+                promptEnd >= end, compressShare.capture == nil, cache.count == layers.count,
+                cache[from...].allSatisfy({ Self.canRestartWindow($0) && $0.offset == start })
+            {
+                pruneFrom = from
+            }
+            // The forward's attention partition: sub-chunks from its start when wide enough
+            // (as `callStaggered`), else one piece. Pruned layers keep it (selections are per piece).
+            let sub = DeepseekV4Math.attnSubchunkTokens
+            let attnUnit = sub > 0 && L >= 2 * sub ? sub : L
+            var cur = L  // rows `h` holds: positions end - cur ..< end
+            var layerInputs = inputs
+            var layerImageMask = vision?.imageMask
+            var prunedRows: [Int] = []
+            // dSpark tail: the target layers' rows for the last `dsparkTailCapacity` positions,
+            // with their absolute start (pruned layers may hold fewer rows than the forward).
+            var tailRows: [Int: (rows: MLXArray, start: Int)] = [:]
             for (i, layer) in layers.enumerated() {
+                var layerMask = mask
+                var attnPieces: [Int]? = nil
+                if i >= pruneFrom, let promptEnd, let cache {
+                    let keep = Self.suffixPruneKeep(
+                        layer: i, numLayers: layers.count, window: config.slidingWindow)
+                    let lo = Swift.max(start, promptEnd - keep)
+                    if lo >= end {
+                        // Nothing this forward computes reaches the prompt end through this layer
+                        // (nor any later one: they keep fewer rows). Their windows restart empty at
+                        // the end. The first rows a later forward runs on them are their kept start,
+                        // whose short-window outputs nothing reads (the reference runs one row here).
+                        for j in i ..< layers.count { Self.restartWindow(cache[j], at: end) }
+                        prunedRows += Array(repeating: 0, count: layers.count - i)
+                        break
+                    }
+                    let n = end - lo
+                    if n < L {
+                        // Rows before the kept suffix never reach this layer: its window restarts
+                        // at the suffix (the reference sets `cache.window = None`).
+                        Self.restartWindow(cache[i], at: lo)
+                    }
+                    if n < cur {
+                        h = h[0..., (cur - n)..., 0..., 0...]
+                        preMix = preMix[0..., (cur - n)..., 0...]
+                        layerInputs = layerInputs[0..., (cur - n)...]
+                        layerImageMask = layerImageMask.map { $0[0..., (cur - n)...] }
+                        cur = n
+                    }
+                    attnPieces = Self.suffixPrunePieces(from: L - n, length: L, unit: attnUnit)
+                    if n < L { layerMask = createAttentionMask(h: h, cache: cache[i]) }
+                    prunedRows.append(n)
+                } else if pruneFrom < Int.max {
+                    prunedRows.append(L)
+                }
                 if let eng = layer.engram {
                     if i > 0 && chunkTokens > 1 {
                         // Queue the layers before this one on the GPU so its rows' SSD reads
@@ -1703,12 +1835,17 @@ public class DeepseekV4ModelInner: Module {
                     }
                 }
                 if tailHolder != nil, dsparkTapLayers.contains(i) {
+                    let tailLo = Swift.max(0, cur - dsparkTailCapacity)
                     let hTail = tailLo == 0 ? h : h[0..., tailLo..., 0..., 0...]
-                    tailRows[i] = hTail.mean(axis: 2).asType(.bfloat16)  // [1, n, d]
+                    tailRows[i] = (
+                        hTail.mean(axis: 2).asType(.bfloat16),  // [1, n, d]
+                        tailStart + (L - cur) + tailLo
+                    )
                 }
                 let r = layer.callStaggered(
-                    h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix,
-                    compressShare: compressShare, imageMask: vision?.imageMask)
+                    h, mask: layerMask, cache: cache?[i], inputIds: layerInputs, preMix: preMix,
+                    compressShare: compressShare, imageMask: layerImageMask,
+                    attnPieces: attnPieces)
                 h = r.h
                 preMix = r.ffnPre
                 if Self.layerDebugEnabled {
@@ -1719,12 +1856,21 @@ public class DeepseekV4ModelInner: Module {
                 layerStats.append(contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
             }
             if let tailHolder, tailRows.count == dsparkTapLayers.count {
-                let rows = concatenated(dsparkTapLayers.map { tailRows[$0]! }, axis: -1)[0]
-                var tail = tailHolder.auxiliaryHiddenTail
-                    ?? HybridPoolHiddenTail(capacity: dsparkTailCapacity)
-                tail.record(rows: rows, startPosition: tailStart + tailLo)
-                tailHolder.auxiliaryHiddenTail = tail
+                // Unpruned: every target layer has the same rows. Pruned: the rows all of them hold.
+                let common = tailRows.values.map(\.start).max() ?? tailStart
+                let rows = concatenated(
+                    dsparkTapLayers.map { layer -> MLXArray in
+                        let t = tailRows[layer]!
+                        return t.start == common ? t.rows : t.rows[0..., (common - t.start)...]
+                    }, axis: -1)[0]
+                if rows.dim(0) > 0 {
+                    var tail = tailHolder.auxiliaryHiddenTail
+                        ?? HybridPoolHiddenTail(capacity: dsparkTailCapacity)
+                    tail.record(rows: rows, startPosition: common)
+                    tailHolder.auxiliaryHiddenTail = tail
+                }
             }
+            if pruneFrom < Int.max { suffixPruneObserver?(start, prunedRows) }
             // Final collapse uses the last layer's ffnPre (ref `Block.hc_pre(h, pre_mix)`); V4.1 has NO
             // learned hc_head (those weights are absent from the bundle).
             out = DeepseekV4Math.hcCollapse(h, pre: preMix)
@@ -1803,6 +1949,20 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     /// Module child: its weights load and evaluate at attach. nil for DSV4-0731, always.
     var dsparkHead: DSparkV41Head?
     let dsparkAttachLock = NSLock()
+
+    /// DeepSeek-V4.1 prompt-suffix pruning in `prepare` / `prepareImages`
+    /// (``DeepseekV4Math/suffixPruneEnabled``, `VMLX_DSV41_SUFFIX_PRUNE`). Per instance for A/B tests.
+    var suffixPruneEnabled = DeepseekV4Math.suffixPruneEnabled
+
+    /// Where this prepare's own chunk forwards end, when they may prune (V4.1 only): the caller's
+    /// final forward over the remainder stays unpruned and needs every window exact at its start,
+    /// so the pruned forwards target that position, never the end of the input.
+    private func suffixPruneEnd(cache: [KVCache], consumed: Int) -> Int? {
+        guard suffixPruneEnabled, consumed > 0, model.suffixPruneFrom != nil,
+            let first = cache.first
+        else { return nil }
+        return first.offset + consumed
+    }
 
     // MARK: - Resident weight loading (SafetensorsLoadKeyExcluding)
     //
@@ -2004,6 +2164,15 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             ? nil
             : cache.first { ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true }
                 as? DeepseekV4Cache
+        // Tokens the loop below forwards (the rest goes to the caller's final forward).
+        var consumed = 0
+        var left = flatTokens.size
+        while left > prefillStepSize {
+            let step = min(outerStep, left - 1)
+            consumed += step
+            left -= step
+        }
+        let pruneEnd = suffixPruneEnd(cache: cache, consumed: consumed)
         while flatTokens.size > prefillStepSize {
             try Task.checkCancellation()
             // Always leave >= 1 token so the caller's final forward yields
@@ -2021,7 +2190,12 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 engramHolder.engramLookaheadTokens =
                     flatTokens[step ..< (step + nextCount)].asType(.int32).asArray(Int32.self)
             }
-            _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
+            if let pruneEnd {
+                // The chunk's logits are discarded: only the cache matters.
+                _ = model(chunkTokens, cache: cache, vision: nil, promptEnd: pruneEnd)
+            } else {
+                _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
+            }
             if config.isDeepseekV41 { Self.compactSlidingWindows(cache) }
             MLX.eval(cache)
             flatTokens = flatTokens[step...]
@@ -2083,6 +2257,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         } as? DeepseekV4Cache
         var flatMask: MLXArray? = nil
         if let m = input.text.mask { flatMask = m.ndim >= 2 ? m.reshaped([-1]) : m }
+        let pruneEnd = suffixPruneEnd(cache: cache, consumed: chunks.last?.upperBound ?? 0)
 
         for (index, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
@@ -2119,7 +2294,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 engramHolder.engramLookaheadTokens = nextHasImage
                     ? nil : tokens[next].map { Int32(truncatingIfNeeded: $0) }
             }
-            _ = model(ids, cache: cache.isEmpty ? nil : cache, vision: visionChunk)
+            _ = model(
+                ids, cache: cache.isEmpty ? nil : cache, vision: visionChunk, promptEnd: pruneEnd)
             Self.compactSlidingWindows(cache)
             MLX.eval(cache)
             PrefillProgressReporter.reportCompletedUnits(chunk.upperBound)
