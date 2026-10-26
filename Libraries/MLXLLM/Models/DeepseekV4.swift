@@ -869,6 +869,18 @@ class DeepseekV4MoEGate: Module {
             zeros([isHashLayer ? config.vocabSize : 1, isHashLayer ? topK : 1])
     }
 
+    /// fp32 router logits `x.astype(f32) @ weight.astype(f32).T`. DeepSeek-V4.1 decode (one token)
+    /// reads the bf16 rows directly in MLX's GEMV order (`DeepseekV41RouterGEMV`, bit-identical,
+    /// `VMLX_DSV41_ROUTER_KERNEL=0` restores the cast + matmul); everything else is the stock graph.
+    func routerLogits(_ x: MLXArray) -> MLXArray {
+        if config.isDeepseekV41, let logits = DeepseekV41RouterGEMV.logits(x, weight: weight) {
+            return logits
+        }
+        let xF32 = x.asType(.float32)
+        let wF32 = weight.asType(.float32)
+        return xF32.matmul(wF32.transposed())
+    }
+
     /// Returns (indices, weights) where indices has shape (B, L, topK)
     /// and weights has shape (B, L, topK).
     ///
@@ -887,9 +899,7 @@ class DeepseekV4MoEGate: Module {
         // Compute the gate logits in fp32 even on hash layers — the
         // hash path needs them to score the (deterministic) selected
         // experts.
-        let xF32 = x.asType(.float32)
-        let wF32 = weight.asType(.float32)
-        let logits = xF32.matmul(wF32.transposed())
+        let logits = routerLogits(x)
         if isHashLayer, let ids = inputIds {
             let scores = DeepseekV4Math.sqrtSoftplus(logits)
             // Hash routing: tid2eid is (vocab, topK) — pre-stamped at

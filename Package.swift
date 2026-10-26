@@ -972,6 +972,7 @@ let package = Package(
                 "DeepseekV41IndexerFocusedTests.swift",
                 "DeepseekV41FusedIndexScoresFocusedTests.swift",
                 "DeepseekV41MPPIndexScoresFocusedTests.swift",
+                "DeepseekV41DecodeFusionFocusedTests.swift",
                 "DeepseekV41KVBytesFocusedTests.swift",
                 "DeepseekV41PrefillLookaheadFocusedTests.swift",
                 "DeepseekV41PoolLayoutAttentionTests.swift",
