@@ -42,7 +42,8 @@ final class SerializedMetaspaceContractTests: XCTestCase {
             "post_processor": ["type": "TemplateProcessing", "single": single, "pair": single],
         ]
         return try PreTrainedTokenizer(
-            tokenizerConfig: Config(["tokenizer_class": "GPT2Tokenizer", "unk_token": "<unk>"] as [NSString: Any]),
+            tokenizerConfig: Config(
+                ["tokenizer_class": "GPT2Tokenizer", "unk_token": "<unk>"] as [NSString: Any]),
             tokenizerData: Config(data))
     }
 
@@ -73,7 +74,9 @@ final class SerializedMetaspaceContractTests: XCTestCase {
         let whole = try tokenizer(split: false, vocabulary: vocab, merges: ranks)
         let separated = try tokenizer(split: true, vocabulary: vocab, merges: ranks)
         XCTAssertEqual(whole.encode(text: "     ", addSpecialTokens: false), [465])
-        XCTAssertEqual(separated.encode(text: "     ", addSpecialTokens: false), Array(repeating: 152_343, count: 5))
+        XCTAssertEqual(
+            separated.encode(text: "     ", addSpecialTokens: false),
+            Array(repeating: 152_343, count: 5))
     }
 
     func testPrependFirstDoesNotRestartAfterAddedTokens() throws {

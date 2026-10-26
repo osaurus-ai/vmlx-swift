@@ -21,9 +21,11 @@ struct Gemma4ToolFallbackRoutingSourceTests {
         let source = try macroSource()
         #expect(!source.contains("gemmaToolSchemasPresent"))
         #expect(!source.contains("chat-template tools -> Gemma4WithTools fallback engaged"))
-        #expect(source.components(separatedBy: "let isGemma = hasGemma4NativeToolSentinels").count == 3,
+        #expect(
+            source.components(separatedBy: "let isGemma = hasGemma4NativeToolSentinels").count == 3,
             "Both generation-prompt variants must use exact markers only inside failure handling")
-        #expect(source.components(separatedBy: "if hasGemma4NativeToolSentinels {").count == 3,
+        #expect(
+            source.components(separatedBy: "if hasGemma4NativeToolSentinels {").count == 3,
             "Both missing-template handlers must retain family-specific structural fallbacks")
     }
 
