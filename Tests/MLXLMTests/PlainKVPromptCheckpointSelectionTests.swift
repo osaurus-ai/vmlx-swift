@@ -252,7 +252,7 @@ final class PlainKVPromptCheckpointSelectionTests: XCTestCase {
                     cachePrefixTokenCounts: [history.count])
             }
             if variant == "draft" { params.draftStrategy = .nativeMTP(depth: 1, verifierMode: nil) }
-            if variant == "affine" { params.kvMode = .affine }
+            if variant == "affine" { params.kvMode = .affine(bits: 4, groupSize: 64) }
             if variant == "quantized" { params.kvBits = 4 }
             if variant == "hybrid" { candidate.setHybrid(true, requiresRecurrentSSMCompanion: false) }
             if variant == "companion" { candidate.setPagedBoundaryCompanionRequired(true) }
