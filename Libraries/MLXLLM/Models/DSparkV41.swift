@@ -508,8 +508,14 @@ extension DSparkV41Head {
                     columnScales: name == "down_proj" ? try tensor("\(pre).jt_cs") : nil)
             }
             let routed: [any WeightedRoutedExpertLayer] = try (0 ..< cfg.nStages).map { i in
-                try JANGTRoutedExpertLayer(
-                    gate: try proj(i, "gate_proj"), up: try proj(i, "up_proj"), down: try proj(i, "down_proj"),
+                let gate = try proj(i, "gate_proj")
+                // The router picks among nRoutedExperts; the kernels index the banks by those ids.
+                guard gate.experts == cfg.nRoutedExperts else {
+                    throw LoadError.unexpected("JANGHT dSpark: mtp.\(i) has \(gate.experts) experts, "
+                        + "config declares \(cfg.nRoutedExperts)")
+                }
+                return try JANGTRoutedExpertLayer(
+                    gate: gate, up: try proj(i, "up_proj"), down: try proj(i, "down_proj"),
                     hiddenSize: cfg.hiddenSize, intermediateSize: cfg.moeInterDim,
                     activationLimit: cfg.swigluLimit > 0 ? cfg.swigluLimit : nil)
             }

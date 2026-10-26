@@ -465,8 +465,17 @@ public struct JANGTProjection {
         // per row would have columns silently dropped in decode (the encoder default is 8).
         guard inputs % 128 == 0, packed.dim(1) % 8 == 0,
               packed.dim(2) == JANGTCode.wordsPerRow(inputs: inputs, k: k),
-              outlierColumnIndices.dim(1) <= 32
+              outlierColumnIndices.dim(1) <= 32,
+              outlierWeights.shape == [packed.dim(0), packed.dim(1), outlierColumnIndices.dim(1)],
+              columnScales.map({ $0.shape == [packed.dim(0), inputs] }) ?? true
         else { throw JANGHFormatContract.ValidationError.invalid("JANGT projection geometry mismatch") }
+        // The kernels read x at each outlier column: every index is padding (-1) or a real input column.
+        let hasIndices = outlierColumnIndices.size > 0
+        let low = hasIndices ? outlierColumnIndices.min().item(Int32.self) : -1
+        let high = hasIndices ? outlierColumnIndices.max().item(Int32.self) : -1
+        guard low >= -1, high < Int32(inputs) else {
+            throw JANGHFormatContract.ValidationError.invalid("JANGT outlier column index out of range")
+        }
         self.k = k
         self.inputs = inputs
         self.outputs = packed.dim(1)
@@ -479,7 +488,6 @@ public struct JANGTProjection {
         self.outlierWeights = outlierWeights.asType(.float16)
         self.columnScales = columnScales?.asType(.float32)
         // Python `unit()`: n_out counts only when any column index is real (>= 0).
-        let anyReal = outlierColumnIndices.max().item(Int32.self) >= 0
-        self.outlierColumns = anyReal ? outlierColumnIndices.dim(1) : 0
+        self.outlierColumns = high >= 0 ? outlierColumnIndices.dim(1) : 0
     }
 }
