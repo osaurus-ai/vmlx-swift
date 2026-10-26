@@ -387,6 +387,9 @@ final class EngramTable: @unchecked Sendable {
                         return
                     }
                     // Bounded fan-out: `lanes` workers pull task indices; each task is one chunk.
+                    // The buffers outlive every worker (group.wait below) and each task writes its
+                    // own disjoint rows, so the pointers are shared under that contract.
+                    let io = EngramIOBuffers(ids: ub, rows: rbase, scales: sbase)
                     let group = DispatchGroup()
                     let next = ManagedAtomicCounter()
                     let workers = min(lanes, tasks)
@@ -396,7 +399,7 @@ final class EngramTable: @unchecked Sendable {
                                 let t = next.increment() - 1
                                 if t >= tasks { break }
                                 let lo = t * chunk
-                                self.readRange(ub, lo, min(lo + chunk, U), rbase, sbase)
+                                self.readRange(io.ids, lo, min(lo + chunk, U), io.rows, io.scales)
                             }
                         }
                     }
@@ -732,19 +735,21 @@ final class EngramRuntime: @unchecked Sendable {
             }
             let group = DispatchGroup()
             let box = Chunk.Box()
+            let layerIds = ids
             if background {
                 group.enter()
-                chained.append((table, ids, group, box))
+                chained.append((table, layerIds, group, box))
             } else if j == 0 {
-                box.raw = table.readLookup(ids)
+                box.raw = table.readLookup(layerIds)
             } else {
-                Self.prefetchQueue.async(group: group) { box.raw = table.readLookup(ids) }
+                Self.prefetchQueue.async(group: group) { box.raw = table.readLookup(layerIds) }
             }
             chunk.add(layer: lid, table: table, group: group, box: box)
         }
         if !chained.isEmpty {
+            let reads = chained
             Self.prefetchQueue.async {
-                for read in chained {
+                for read in reads {
                     read.box.raw = read.table.readLookup(read.ids)
                     read.group.leave()
                 }
@@ -752,4 +757,12 @@ final class EngramRuntime: @unchecked Sendable {
         }
         return chunk
     }
+}
+
+/// The buffers of one `EngramTable.readRaw` call, shared with its I/O workers. They outlive every
+/// worker (the call waits on the group) and each worker writes disjoint rows.
+private struct EngramIOBuffers: @unchecked Sendable {
+    let ids: UnsafeBufferPointer<Int64>
+    let rows: UnsafeMutableRawPointer
+    let scales: UnsafeMutableRawPointer
 }

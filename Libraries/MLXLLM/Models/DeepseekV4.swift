@@ -1565,7 +1565,7 @@ public class DeepseekV4ModelInner: Module {
     /// History fallback for cache lists without a `DeepseekV4Cache` (e.g. `DSV4_KV_MODE=full`),
     /// keyed WEAKLY by the first cache object so an ended sequence's entry disappears with it and a
     /// reused address can never inherit another conversation's history.
-    private let engramFallbackHistory = NSMapTable<AnyObject, DeepseekV4Cache>.weakToStrongObjects()
+    private let engramFallbackHistory = DSV41WeakKeyMap<DeepseekV4Cache>()
 
     /// dSpark target layers (DeepSeek-V4.1 `dspark_target_layer_ids`) whose INPUT hidden (mean over
     /// hc, after Engram) every forward records into the cache's draft-window tail. Empty (the
@@ -1684,11 +1684,11 @@ public class DeepseekV4ModelInner: Module {
         var holder = cache?.first(where: { $0 is DeepseekV4Cache }) as? DeepseekV4Cache
         if holder == nil, let first = cache?.first {
             engramLock.lock()
-            if let existing = engramFallbackHistory.object(forKey: first as AnyObject) {
+            if let existing = engramFallbackHistory.value(for: first as AnyObject) {
                 holder = existing
             } else {
                 let box = DeepseekV4Cache(slidingWindow: 1, compressRatio: 1)
-                engramFallbackHistory.setObject(box, forKey: first as AnyObject)
+                engramFallbackHistory.set(box, for: first as AnyObject)
                 holder = box
             }
             engramLock.unlock()
@@ -2686,5 +2686,27 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+/// Values keyed WEAKLY by object identity (Foundation's `NSMapTable.weakToStrongObjects()` is not in
+/// swift-corelibs-foundation). An entry dies with its key; dead entries are dropped on each access.
+/// Callers serialize access (the model's engram lock).
+final class DSV41WeakKeyMap<Value: AnyObject> {
+    private struct Entry {
+        weak var key: AnyObject?
+        let value: Value
+    }
+    private var entries: [ObjectIdentifier: Entry] = [:]
+
+    func value(for key: AnyObject) -> Value? {
+        entries = entries.filter { $0.value.key != nil }
+        guard let entry = entries[ObjectIdentifier(key)], entry.key === key else { return nil }
+        return entry.value
+    }
+
+    func set(_ value: Value, for key: AnyObject) {
+        entries = entries.filter { $0.value.key != nil }
+        entries[ObjectIdentifier(key)] = Entry(key: key, value: value)
     }
 }

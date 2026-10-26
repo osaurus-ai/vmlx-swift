@@ -101,7 +101,11 @@ enum DeepseekV41FusedMoE {
 
     /// GPU architecture generation and size letter (`applegpu_g17d` -> (17, "d")), as MLX parses it.
     static let architecture: (gen: Int, size: Character) = {
-        let name = GPU.deviceInfo().architecture
+        #if canImport(Metal)
+            let name = GPU.deviceInfo().architecture
+        #else
+            let name = ""  // no Metal device: the fused kernels are never admitted
+        #endif
         let digits = name.split(separator: "_").last.map { s in
             s.drop(while: { !$0.isNumber }).prefix(while: { $0.isNumber })
         }
