@@ -372,7 +372,7 @@ images in the request. Without them nothing changes:
 | `VMLX_CACHE_FETCH_TRACE=1` | existing salt trace: `[vmlx][cache/salt] ... media=<12 hex> image=[[1521, 3, 14, 14] bfloat16 grids=1x39x39 ...]` |
 | `VMLX_DSV41_DSPARK_STATS=1` | existing: shows `[dSpark] off for this request: media inputs` on an image prefill |
 
-### CPU tests (`DeepseekV41VisionFocusedTests`, 21 tests)
+### CPU tests (`DeepseekV41VisionFocusedTests`, 22 tests)
 
 - **Python parity**:
   - grid plans and token counts for 12 sizes match `plan_image_grid`;
@@ -381,6 +381,9 @@ images in the request. Without them nothing changes:
     patch SHA-256) in 4 cases;
   - red and blue 64x64 images give 39x39 patches and 184 tokens;
   - PNG decodes round-trip exactly through `ciImage` and file URLs.
+- **Bundle contract** (safetensors headers only): every tower parameter maps to a BF16 bundle
+  tensor of the same name and shape (266 tensors), and every layer has a `bias_vl` of the gate
+  bias's shape.
 - **Tower**: on tiny deterministic weights, ViT + Aligner match the NumPy port of the vision.py
   math within 2e-5. Span rows are laid out START / rows + NEW_LINE / END.
 - **Prompt**: `encode_messages` goldens for the image turn, the follow-up, a mid-conversation

@@ -289,6 +289,44 @@ struct DeepseekV41VisionFocusedTests {
         }
     }
 
+    @Test("every tower parameter matches a bundle tensor name and shape (safetensors header only)")
+    func bundleTensorContract() throws {
+        let bundle = URL(fileURLWithPath: "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX")
+        let index = bundle.appendingPathComponent("model.safetensors.index.json")
+        guard FileManager.default.fileExists(atPath: index.path) else { return }
+        let config = try JSONDecoder().decode(
+            DeepseekV4Configuration.self, from: Data(contentsOf: bundle.appendingPathComponent("config.json")))
+        let vision = try #require(config.vision)
+        #expect(vision == Self.bundleVision)
+        let map = try #require(
+            (try JSONSerialization.jsonObject(with: Data(contentsOf: index)) as? [String: Any])?["weight_map"]
+                as? [String: String])
+        var headers: [String: [String: EngramSafetensors.Entry]] = [:]
+        func entry(_ key: String) throws -> EngramSafetensors.Entry? {
+            guard let file = map[key] else { return nil }
+            if headers[file] == nil {
+                headers[file] = try EngramSafetensors.header(bundle.appendingPathComponent(file)).entries
+            }
+            return headers[file]?[key]
+        }
+        let tower = DeepseekV41VisionModel(config: vision)
+        let params = tower.parameters().flattened()
+        #expect(params.count == 2 + 32 * 8 + 1 + 4 + 3)
+        for (key, value) in params {
+            let e = try entry(key)
+            #expect(e?.shape == value.shape, "\(key): bundle \(e?.shape ?? []) vs module \(value.shape)")
+            #expect(e?.dtype == "BF16", "\(key)")
+        }
+        // The bundle carries no tower tensor the module would leave unloaded.
+        let bundleTower = Set(map.keys.filter { DeepseekV41VisionModel.ownsBundleKey($0) })
+        #expect(bundleTower == Set(params.map(\.0)))
+        // One VL routing bias per layer, shaped like the gate bias.
+        for layer in 0 ..< config.numHiddenLayers {
+            let e = try entry("layers.\(layer).ffn.gate.bias_vl")
+            #expect(e?.shape == [config.nRoutedExperts], "layer \(layer)")
+        }
+    }
+
     // MARK: Prompt assembly (bundle encoder goldens)
 
     /// `encoding.py encode_messages(..., reasoning_effort="high", return_multi_modal_data=True)`.
