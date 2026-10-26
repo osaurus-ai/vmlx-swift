@@ -27,7 +27,8 @@ Measured live in osaurus (M5 Ultra 256 GB, Release, dSpark on). The first V4.1 b
 
 Measured and rejected: attention sub-chunks of 1024 or none instead of 512 (49k / 100k 708 / 586 and
 678 / 605 vs 720 / 625 pp/s); expert dedup across verify rows (repeats already hit the GPU caches);
-admitting the fused shapes with a warm-up forward inside the dSpark attach (osaurus died loading the model).
+admitting the fused shapes with a warm-up forward inside the dSpark attach (not kept: the governor fix is simpler;
+the load failure seen during that test came from a second ~200 GB model loaded at the same time, not from the warm-up).
 Live now: dSpark decode code / code2 / structured / prose 68.0 / 61.6 / 110.1 / 40.0 tok/s, TTFT 0.21–0.29 s.
 
 ## Family isolation (DSV4-0731 must not change)
