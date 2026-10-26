@@ -505,6 +505,12 @@ struct DeepseekV41DecodeFusionFocusedTests {
                 let r = layer.callStaggered(h, mask: mask, cache: cache, inputIds: nil, preMix: preMix, compressShare: share)
                 h = r.h
                 preMix = r.ffnPre
+                // The model loop's per-layer submit (DeepseekV4ModelInner), same statement.
+                if DeepseekV4ModelInner.layerSubmit, L <= DeepseekV4ModelInner.layerSubmitMaxRows,
+                    i < layers.count - 1
+                {
+                    asyncEval(h, preMix)
+                }
             }
             return h + preMix.sum().asType(h.dtype) * 0
         }
@@ -656,6 +662,30 @@ struct DeepseekV41DecodeFusionFocusedTests {
         }
     }
 
+    /// The hc stage and the per-layer submit are read per call, so they can be A/B'd in one process on one
+    /// stack, alternating to cancel GPU-clock drift (router / MoE are baked into compiled regions).
+    @Test("in-process A/B of the hc stage and the per-layer submit (VMLX_DSV41_DEC_BENCH=1)")
+    func layerToggleBench() throws {
+        guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            let stack = try LayerStack(c, context: 2048)
+            let saved = (DeepseekV41HCStage.enabled, DeepseekV4ModelInner.layerSubmit)
+            defer { DeepseekV41HCStage.enabled = saved.0; DeepseekV4ModelInner.layerSubmit = saved.1 }
+            var r: [String: [Double]] = [:]
+            for _ in 0 ..< 6 {
+                for (hc, sub) in [(false, false), (true, false), (false, true), (true, true)] {
+                    DeepseekV41HCStage.enabled = hc; DeepseekV4ModelInner.layerSubmit = sub
+                    r["hc=\(hc ? 1 : 0) submit=\(sub ? 1 : 0)", default: []].append(stack.decodeMsPerLayer(steps: 12))
+                }
+            }
+            for k in r.keys.sorted() {
+                let v = r[k]!.sorted()
+                print(String(format: "[dsv41-dec-bench] A/B router=%d moe=%d %@: median %.3f ms/layer (min %.3f)",
+                    DeepseekV41RouterGEMV.enabled ? 1 : 0, DeepseekV41FusedMoE.enabled ? 1 : 0, k, v[v.count / 2], v[0]))
+            }
+        }
+    }
+
     /// Compiled decode regions bake the kernel choice in at their first trace, so compare configurations
     /// in separate processes: run with VMLX_DSV41_ROUTER_KERNEL / VMLX_DSV41_FUSED_MOE /
     /// VMLX_DSV41_HC_STAGE set to 0 or 1 and compare the printed lines.
@@ -668,9 +698,9 @@ struct DeepseekV41DecodeFusionFocusedTests {
             let ms = min(a.total, b.total)
             print(String(format: "[dsv41-dec-bench] layer decode host graph build %.3f ms/layer", min(a.build, b.build)))
             print(String(format:
-                "[dsv41-dec-bench] layer decode router=%d moe=%d hc=%d: %.3f ms/layer (x40 = %.1f ms/token, %.1f tok/s layer-bound)",
+                "[dsv41-dec-bench] layer decode router=%d moe=%d hc=%d submit=%d: %.3f ms/layer (x40 = %.1f ms/token, %.1f tok/s layer-bound)",
                 DeepseekV41RouterGEMV.enabled ? 1 : 0, DeepseekV41FusedMoE.enabled ? 1 : 0,
-                DeepseekV41HCStage.enabled ? 1 : 0,
+                DeepseekV41HCStage.enabled ? 1 : 0, DeepseekV4ModelInner.layerSubmit ? 1 : 0,
                 ms, ms * 40, 1000 / (ms * 40)))
         }
     }
