@@ -979,6 +979,7 @@ let package = Package(
                 "LogitProcessorIndependentCopyTests.swift",
                 "DSparkSpeculationFocusedTests.swift",
                 "DeepseekV41DSparkFocusedTests.swift",
+                "DeepseekV41VisionFocusedTests.swift",
             ]
         ),
         .testTarget(
