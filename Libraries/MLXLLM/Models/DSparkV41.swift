@@ -187,15 +187,15 @@ final class DSparkV41Attention: Module {
     /// Window rows for committed positions: rope(kv_norm(wkv(main_x))) `[1, S, headDim]` bf16
     /// (Python `DSparkAttention.seed`).
     func windowRows(mainX: MLXArray, positions: MLXArray) -> MLXArray {
-        rope(kvNorm(wkv(mainX)), positions).asType(.bfloat16)
+        rope(kvNorm(DeepseekV41FP8Rows.apply(wkv, mainX)), positions).asType(.bfloat16)
     }
 
     /// Queries x `[1, bs, d]` attend to (window ++ own KV), every query to every key (Python
     /// `attend` + `sparse_attention`, fp32 scores and accumulation with the learned sink).
     func attend(_ x: MLXArray, positions: MLXArray, window: MLXArray?) -> MLXArray {
         let bs = x.dim(1)
-        let q = rope(wqB(qNorm(wqA(x))).reshaped(1, bs, nHeads, headDim), positions)
-        let kv = rope(kvNorm(wkv(x)), positions)  // [1, bs, headDim]
+        let q = rope(DeepseekV41FP8Rows.apply(wqB, qNorm(DeepseekV41FP8Rows.apply(wqA, x))).reshaped(1, bs, nHeads, headDim), positions)
+        let kv = rope(kvNorm(DeepseekV41FP8Rows.apply(wkv, x)), positions)  // [1, bs, headDim]
         let full = window.map { concatenated([$0, kv.asType($0.dtype)], axis: 1) } ?? kv
         let qf = q[0].asType(.float32)  // [bs, H, D]
         let kf = full[0].asType(.float32)  // [L, D]
@@ -210,12 +210,13 @@ final class DSparkV41Attention: Module {
         let og = o.reshaped(bs, nGroups, -1).transposed(1, 0, 2)  // [g, bs, gd]
         let lowRank: MLXArray
         if let woAScales {  // mxfp8: one quantized matmul per group, weights read once for the bs rows
-            lowRank = quantizedMM(og, woA, scales: woAScales, biases: nil, transpose: true,
-                                  groupSize: 32, bits: 8, mode: .mxfp8).transposed(1, 0, 2)
+            lowRank = (DeepseekV41FP8Rows.rows(og, weight: woA, scales: woAScales)
+                ?? quantizedMM(og, woA, scales: woAScales, biases: nil, transpose: true,
+                               groupSize: 32, bits: 8, mode: .mxfp8)).transposed(1, 0, 2)
         } else {
             lowRank = matmul(og, woA.transposed(0, 2, 1)).transposed(1, 0, 2)  // [bs, g, r]
         }
-        return woB(lowRank.reshaped(1, bs, -1))
+        return DeepseekV41FP8Rows.apply(woB, lowRank.reshaped(1, bs, -1))
     }
 }
 
@@ -280,13 +281,13 @@ final class DSparkV41MoE: Module {
         } else {  // JANGT: the kernels apply the route weights and reduce (input dtype)
             y = (switchMLP as! any WeightedRoutedExpertLayer).callRouted(xf, indices: idx, scores: w).asType(.float32)
         }
-        var sg = sw1(xf).asType(.float32)
-        var su = sw3(xf).asType(.float32)
+        var sg = DeepseekV41FP8Rows.apply(sw1, xf).asType(.float32)
+        var su = DeepseekV41FP8Rows.apply(sw3, xf).asType(.float32)
         if lim > 0 {
             su = clip(su, min: -lim, max: lim)
             sg = minimum(sg, MLXArray(lim))
         }
-        y = y + sw2((MLXNN.silu(sg) * su).asType(.bfloat16)).asType(.float32)
+        y = y + DeepseekV41FP8Rows.apply(sw2, (MLXNN.silu(sg) * su).asType(.bfloat16)).asType(.float32)
         return y.asType(x.dtype).reshaped(B, S, D)
     }
 }

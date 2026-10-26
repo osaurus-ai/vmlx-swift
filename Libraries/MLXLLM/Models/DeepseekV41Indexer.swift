@@ -272,7 +272,7 @@ final class DeepseekV41Indexer: Module {
         // Every visible row fits the budget: the reference's top-k is arange(T) -> all rows.
         if rows <= topK { return (nil, nil) }
 
-        var q = wqB(qResidual).reshaped(B, L, nHeads, headDim).transposed(0, 2, 1, 3)
+        var q = DeepseekV41FP8Rows.apply(wqB, qResidual).reshaped(B, L, nHeads, headDim).transposed(0, 2, 1, 3)
         let (cosT, sinT) = rope.cosSin(offset: startPos, length: L)
         q = DeepseekV4Math.applyPartialRoPE(
             q, cos: cosT.expandedDimensions(axes: [0, 1]), sin: sinT.expandedDimensions(axes: [0, 1]),

@@ -315,8 +315,8 @@ class DeepseekV4Attention: Module {
         // wq_a(x): (B, L, qLoraRank) → q_norm on qLoraRank → wq_b:
         // (B, L, numHeads*headDim). Keep the post-qnorm residual — the
         // Indexer uses it as its own Q source.
-        let qResidual = qNorm(wqA(x))
-        var q = wqB(qResidual)
+        let qResidual = qNorm(DeepseekV41FP8Rows.apply(wqA, x))
+        var q = DeepseekV41FP8Rows.apply(wqB, qResidual)
         q = q.reshaped(B, L, numHeads, headDim)
         // DSV4 applies a per-head unit-weight RMSNorm to Q here (mirrors its Python
         // `mx.fast.rms_norm(q, ones, eps)`). DeepSeek-V4.1 does NOT — its reference only q_norms the
@@ -333,7 +333,7 @@ class DeepseekV4Attention: Module {
         q = q.transposed(0, 2, 1, 3)
 
         // --- KV projection (single latent head) ---
-        var kv = kvNorm(wkv(x))
+        var kv = kvNorm(DeepseekV41FP8Rows.apply(wkv, x))
         kv = kv.reshaped(B, L, 1, headDim).transposed(0, 2, 1, 3)
 
         // --- Partial RoPE on last ropeDim dims of Q and K ---
@@ -747,7 +747,14 @@ class DeepseekV4Attention: Module {
             let wBiases = qwo.biases?.reshaped(oGroups, oLoraRank, -1)
                 .expandedDimensions(axis: 1)
             // mode: mxfp8 for DeepSeek-V4.1 JANGHT (the release FP8 repacked byte-exact, no biases); affine otherwise.
-            let outQ = MLX.quantizedMM(
+            // A few mxfp8 rows (dSpark verify): the multi-row QMV, each group's weights read once for all rows.
+            let rowsOut = qwo.mode == .mxfp8 && wBiases == nil
+                ? DeepseekV41FP8Rows.rows(
+                    xT.reshaped(oGroups, B * L, groupFeat),
+                    weight: qwo.weight.reshaped(oGroups, oLoraRank, -1),
+                    scales: qwo.scales.reshaped(oGroups, oLoraRank, -1))
+                : nil
+            let outQ = rowsOut?.reshaped(oGroups, B, L, oLoraRank) ?? MLX.quantizedMM(
                 xT, wPacked, scales: wScales, biases: wBiases,
                 transpose: true, groupSize: qwo.groupSize, bits: qwo.bits, mode: qwo.mode)
             oA = outQ.transposed(1, 2, 0, 3).reshaped(
@@ -760,7 +767,7 @@ class DeepseekV4Attention: Module {
             oA = einsum("bsgd,grd->bsgr", oReshape, woaW)
                 .reshaped(B, L, oGroups * oLoraRank)
         }
-        return woB(oA)
+        return DeepseekV41FP8Rows.apply(woB, oA)
     }
 }
 
@@ -1134,9 +1141,9 @@ class DeepseekV4MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let g = gateProj(x)
-        let u = upProj(x)
-        return downProj(DeepseekV4Math.dsv4SwiGLU(gate: g, up: u, limit: swigluLimit))
+        let g = DeepseekV41FP8Rows.apply(gateProj, x)
+        let u = DeepseekV41FP8Rows.apply(upProj, x)
+        return DeepseekV41FP8Rows.apply(downProj, DeepseekV4Math.dsv4SwiGLU(gate: g, up: u, limit: swigluLimit))
     }
 }
 

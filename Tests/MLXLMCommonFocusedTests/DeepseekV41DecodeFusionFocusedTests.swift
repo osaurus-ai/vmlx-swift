@@ -283,7 +283,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
 
     /// The stock routed + shared graph (what `DeepseekV4MoE.experts` runs without the kernels).
     static func stockExperts(_ moe: DeepseekV4MoE, _ x: MLXArray, _ idx: MLXArray, _ sc: MLXArray) -> MLXArray {
-        let routed = moe.switchMLP(x, idx, preDownScores: sc)
+        let routed = (moe.switchMLP as! SwitchGLU)(x, idx, preDownScores: sc)
         return DeepseekV4Math.addSharedExpertFP32(
             DeepseekV4Math.reduceRoutedExpertsFP32(routed), shared: moe.sharedExperts(x), outputDType: x.dtype)
     }
@@ -294,7 +294,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
         try Device.withDefaultDevice(.gpu) {
             for layer in [3, 10] {
                 let moe = try DSV41Synth.moe(c, layer: layer, seed: UInt64(layer))
-                let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+                let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP as! SwitchGLU, shared: moe.sharedExperts))
                 for rows in 1 ... 8 {
                     for seed in UInt64(1) ... 3 {
                         let x = DSV41Synth.hidden(rows: rows, c, seed: seed &* 31 &+ UInt64(rows))
@@ -353,7 +353,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
             let x9 = DSV41Synth.hidden(rows: 9, c, seed: 9)
             let (i9, s9) = moeOn.gate(x9, inputIds: nil)
             #expect(DeepseekV41FusedMoE.apply(
-                x9, indices: i9, scores: s9, switchMLP: moeOn.switchMLP, shared: moeOn.sharedExperts,
+                x9, indices: i9, scores: s9, switchMLP: moeOn.switchMLP as! SwitchGLU, shared: moeOn.sharedExperts,
                 limit: c.swigluLimit, stock: { Self.stockExperts(moeOn, x9, i9, s9) }) == nil)
         }
     }
@@ -379,7 +379,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
         guard let c = DSV41Synth.config else { return }
         try Device.withDefaultDevice(.gpu) {
             let moe = try DSV41Synth.moe(c, layer: 10, seed: 5)
-            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP as! SwitchGLU, shared: moe.sharedExperts))
             for rows in [2, 4, 8] {
                 for sharedCount in [0, 2, 4, 6] {
                     let x = DSV41Synth.hidden(rows: rows, c, seed: UInt64(40 + rows))
@@ -401,7 +401,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
         guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
         try Device.withDefaultDevice(.gpu) {
             let moe = try DSV41Synth.moe(c, layer: 10)
-            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP as! SwitchGLU, shared: moe.sharedExperts))
             let layers = 40
             for rows in [4, 8] {
                 for sharedCount in [0, 2, 4] {
@@ -431,7 +431,7 @@ struct DeepseekV41DecodeFusionFocusedTests {
         guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
         try Device.withDefaultDevice(.gpu) {
             let moe = try DSV41Synth.moe(c, layer: 10)
-            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP as! SwitchGLU, shared: moe.sharedExperts))
             let layers = 40
             for rows in [1, 2, 4, 6, 8] {
                 let wide = rows >= 2 && DeepseekV41FusedMoE.architecture.gen >= 15
