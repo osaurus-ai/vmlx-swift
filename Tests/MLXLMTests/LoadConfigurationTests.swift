@@ -146,9 +146,12 @@ struct LoadConfigurationTests {
         #expect(s.memoryLimit == target)
     }
 
-    @Test("Unlimited total budget resets stale limits; finite budgets remain explicit",
-          arguments: [ResidentCap.fraction(0.60), .absolute(32 << 30),
-                      .absolute(1 << 20), .absolute(96 << 30)])
+    @Test(
+        "Unlimited total budget resets stale limits; finite budgets remain explicit",
+        arguments: [
+            ResidentCap.fraction(0.60), .absolute(32 << 30),
+            .absolute(1 << 20), .absolute(96 << 30),
+        ])
     func unlimitedTotalBudgetTransition(finite: ResidentCap) throws {
         let priorMemoryLimit = MLX.Memory.memoryLimit
         let priorCacheLimit = MLX.Memory.cacheLimit
