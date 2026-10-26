@@ -171,6 +171,21 @@ enum DSV41Synth {
         return times[times.count / 2]
     }
 
+    /// Interleaved A/B: alternate the bodies rep by rep and keep each one's minimum (robust to other GPU
+    /// clients and clock drift).
+    static func abMinMs(reps: Int = 30, _ bodies: [() -> [MLXArray]]) -> [Double] {
+        for b in bodies { for _ in 0 ..< 2 { eval(b()) } }
+        var best = [Double](repeating: .infinity, count: bodies.count)
+        for _ in 0 ..< reps {
+            for (k, b) in bodies.enumerated() {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                eval(b())
+                best[k] = min(best[k], (CFAbsoluteTimeGetCurrent() - t0) * 1_000)
+            }
+        }
+        return best
+    }
+
     static func bitEqual(_ a: MLXArray, _ b: MLXArray) -> Bool {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         return arrayEqual(a, b).item(Bool.self)
@@ -307,8 +322,9 @@ struct DeepseekV41DecodeFusionFocusedTests {
             // its first trace, so one module only ever runs with the kernels on, the other off.
             let moeOn = try DSV41Synth.moe(c, layer: 12, seed: 99)
             let moeOff = try DSV41Synth.moe(c, layer: 12, seed: 99)
-            let saved = DeepseekV41FusedMoE.enabled
-            defer { DeepseekV41FusedMoE.enabled = saved }
+            let saved = (DeepseekV41FusedMoE.enabled, DeepseekV41FusedMoE.maxRows)
+            defer { DeepseekV41FusedMoE.enabled = saved.0; DeepseekV41FusedMoE.maxRows = saved.1 }
+            DeepseekV41FusedMoE.maxRows = DeepseekV41FusedMoE.maxSupportedRows
             DeepseekV41FusedMoE.resetVerdicts()
             // A prefill chunk first, as in a real request: it warms the decode region, whose first trace
             // must still wait for the single-row admission (else the stock graph is baked in for good).
@@ -342,6 +358,74 @@ struct DeepseekV41DecodeFusionFocusedTests {
         }
     }
 
+    /// Verify-block routing with shared experts: row r takes `shared` experts from a common pool (the
+    /// same ids for every row, in rotated slot order) and the rest of its 6 from a row-private range.
+    static func overlappingRoutes(rows: Int, topK: Int, shared: Int, experts: Int, seed: UInt64)
+        -> (MLXArray, MLXArray)
+    {
+        var ids: [UInt32] = []
+        for r in 0 ..< rows {
+            var row: [UInt32] = (0 ..< shared).map { UInt32((7 + $0 * 13) % experts) }
+            row += (0 ..< (topK - shared)).map { UInt32((200 + r * topK + $0) % experts) }
+            let k = r % topK
+            ids += Array(row[k...] + row[..<k])
+        }
+        let scores = MLXRandom.uniform(low: 0.1, high: 0.5, [1, rows, topK], key: MLXRandom.key(seed))
+        return (MLXArray(ids, [1, rows, topK]), scores)
+    }
+
+    @Test("fused MoE stays bit-identical when verify rows share experts")
+    func fusedMoEOverlapBitExact() throws {
+        guard let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            let moe = try DSV41Synth.moe(c, layer: 10, seed: 5)
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            for rows in [2, 4, 8] {
+                for sharedCount in [0, 2, 4, 6] {
+                    let x = DSV41Synth.hidden(rows: rows, c, seed: UInt64(40 + rows))
+                    let (idx, sc) = Self.overlappingRoutes(
+                        rows: rows, topK: c.numExpertsPerTok, shared: sharedCount, experts: c.nRoutedExperts, seed: 3)
+                    let ref = Self.stockExperts(moe, x, idx, sc)
+                    let got = DeepseekV41FusedMoE.run(
+                        x, indices: idx, scores: sc, layer: l, limit: c.swigluLimit,
+                        wide: DeepseekV41FusedMoE.architecture.gen >= 15)
+                    eval(got, ref)
+                    #expect(DSV41Synth.bitEqual(got, ref), "rows \(rows) shared \(sharedCount)")
+                }
+            }
+        }
+    }
+
+    @Test("fused MoE vs stock when verify rows share experts (VMLX_DSV41_DEC_BENCH=1)")
+    func fusedMoEOverlapBench() throws {
+        guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            let moe = try DSV41Synth.moe(c, layer: 10)
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            let layers = 40
+            for rows in [4, 8] {
+                for sharedCount in [0, 2, 4] {
+                    let xs = (0 ..< layers).map { DSV41Synth.hidden(rows: rows, c, seed: UInt64(1900 + $0)) }
+                    // Different experts per layer so no layer's weights are cache-hot from the previous one.
+                    let routes = (0 ..< layers).map { k -> (MLXArray, MLXArray) in
+                        let r = Self.overlappingRoutes(rows: rows, topK: c.numExpertsPerTok, shared: sharedCount,
+                            experts: c.nRoutedExperts, seed: UInt64(k))
+                        return ((r.0 + UInt32(k * 11)) % UInt32(c.nRoutedExperts), r.1)
+                    }
+                    eval(routes.flatMap { [$0.0, $0.1] })
+                    let t = DSV41Synth.abMinMs([
+                        { zip(xs, routes).map { Self.stockExperts(moe, $0, $1.0, $1.1) } },
+                        { zip(xs, routes).map {
+                            DeepseekV41FusedMoE.run($0, indices: $1.0, scores: $1.1, layer: l, limit: c.swigluLimit, wide: true)
+                        } },
+                    ]).map { $0 / Double(layers) }
+                    print(String(format: "[dsv41-dec-bench] experts rows=%d shared=%d/6: stock %.4f, fused %.4f ms/layer",
+                        rows, sharedCount, t[0], t[1]))
+                }
+            }
+        }
+    }
+
     @Test("fused MoE microbenchmark at 1-8 rows (VMLX_DSV41_DEC_BENCH=1)")
     func fusedMoEBench() throws {
         guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
@@ -354,14 +438,13 @@ struct DeepseekV41DecodeFusionFocusedTests {
                 let xs = (0 ..< layers).map { DSV41Synth.hidden(rows: rows, c, seed: UInt64(900 + $0)) }
                 let routes = xs.map { moe.gate($0, inputIds: nil) }
                 eval(routes.flatMap { [$0.0, $0.1] })
-                let stock = DSV41Synth.timeMs {
-                    zip(xs, routes).map { Self.stockExperts(moe, $0, $1.0, $1.1) }
-                } / Double(layers)
-                let fused = DSV41Synth.timeMs {
-                    zip(xs, routes).map {
+                let t = DSV41Synth.abMinMs([
+                    { zip(xs, routes).map { Self.stockExperts(moe, $0, $1.0, $1.1) } },
+                    { zip(xs, routes).map {
                         DeepseekV41FusedMoE.run($0, indices: $1.0, scores: $1.1, layer: l, limit: c.swigluLimit, wide: wide)
-                    }
-                } / Double(layers)
+                    } },
+                ]).map { $0 / Double(layers) }
+                let (stock, fused) = (t[0], t[1])
                 print(String(format: "[dsv41-dec-bench] experts per layer rows=%d: stock %.4f ms, fused %.4f ms (%.2fx)",
                     rows, stock, fused, stock / fused))
             }
@@ -552,6 +635,9 @@ struct DeepseekV41DecodeFusionFocusedTests {
             func set(_ on: Bool) {
                 DeepseekV41RouterGEMV.enabled = on; DeepseekV41FusedMoE.enabled = on; DeepseekV41HCStage.enabled = on
             }
+            let savedRows = DeepseekV41FusedMoE.maxRows
+            defer { DeepseekV41FusedMoE.maxRows = savedRows }
+            DeepseekV41FusedMoE.maxRows = DeepseekV41FusedMoE.maxSupportedRows  // exercise every verify size
             DeepseekV41FusedMoE.resetVerdicts(); DeepseekV41HCStage.resetVerdicts()
             let idx = [8, 9, 20, 21, 24]
             set(true); let on = try LayerStack(c, indices: idx, context: 700)

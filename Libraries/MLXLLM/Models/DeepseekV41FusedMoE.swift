@@ -8,6 +8,7 @@
 // experts' gate and up projections plus the shared expert's w1/w3 as slot 6 in one grid and applies the
 // clamped SwiGLU (times the route weight on the routed slots); kernel 2 runs the six routed down
 // projections, sums them in fp32 in slot order and adds the shared expert's down projection.
+// Default: 1-6 rows (see `maxRows`).
 //
 // The stock path is ~14 dispatches per layer (fp32 casts aside): two gather_qmv for gate/up, the scored
 // SwiGLU, a gather_qmv for down, a cast + column sum, three shared-expert qmv, the shared SwiGLU and the
@@ -46,8 +47,18 @@ enum DeepseekV41FusedMoE {
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
-    /// Decode and dSpark verify blocks. Above this the stock path (and its sorted gather) is better.
-    static let maxRows = 8
+    /// Rows the kernels serve by default. Interleaved min-of-30 microbenchmarks (M5 Ultra, 40 layers):
+    /// 1 row 1.22-1.27x the stock graph, 2 rows 1.03-1.07x, 4 rows 0.96-1.05x (1.10-1.14x when rows share
+    /// 2-4 of their 6 experts, as adjacent tokens do), 6 rows 0.95-1.00x, 8 rows 0.94-0.97x: an 8-row
+    /// block is bandwidth-bound on ~48 distinct experts and the stock gather is marginally better there.
+    /// `VMLX_DSV41_FUSED_MOE_MAX_ROWS` (1-8) overrides; tests raise it to 8.
+    nonisolated(unsafe) static var maxRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_FUSED_MOE_MAX_ROWS"].flatMap(Int.init)
+        return min(8, max(1, raw ?? 6))
+    }()
+
+    /// The largest block the kernels can serve (`VMLX_DSV41_FUSED_MOE_MAX_ROWS` upper bound).
+    static let maxSupportedRows = 8
 
     // MARK: - Admission
 
@@ -565,7 +576,7 @@ enum DeepseekV41FusedMoE {
               }
               for (int i = 0; i < 4; i++) {
                 const float v = float(T(a[i]));
-                tot[i] = e == 0 ? v + 0.0f : v + tot[i];
+                tot[i] = e == 0 ? v + 0.0f : (v + 0.0f) + tot[i];
               }
             }
             device T* yr = y + size_t(r) * D;
