@@ -21,11 +21,14 @@ Measured live in osaurus (M5 Ultra 256 GB, Release, dSpark on). The first V4.1 b
 | MLX's GPU `argpartition` sorts whole rows | exact block top-k for prefill rows >= 65536 keys | in the row above |
 | the fused scorer ran on simdgroup fp32 | M5 matrix units, bf16 operands (`DeepseekV41MPPIndexScores`) | 4.1–4.5x kernel; 49k 701 → 720, 100k 595 → 625 pp/s |
 | layers 21–39 computed every prompt row although only the trailing rows reach the prompt end | prompt-suffix pruning (`suffixPruneKeep`, `restartLocalWindow`, row-range selection lookup) | 42k 744 → 1346, 49k 710 → 1317, 100k 594 → 1117 pp/s |
+| a decode step was ~105-150 dispatches per layer and the GPU waited for the host to build the whole token | router logits from bf16 rows in MLX's GEMV order, routed + shared MoE in 2 dispatches, the hc stage in 2 per sublayer, per-layer submit (`DeepseekV41RouterGEMV`, `DeepseekV41FusedMoE`, `DeepseekV41HCStage`; each shape admitted after a bitwise check; `VMLX_DSV41_{ROUTER_KERNEL,FUSED_MOE,HC_STAGE,LAYER_SUBMIT}=0`) | AR 32.2–33.7 → 38.5–40.4 tok/s, text identical |
+| the first verify at each width paid the fused-kernel admission and trace recording (~210 ms), so the governor judged speculation slower than AR and the first reply ran mostly AR | the governor ignores a step that ran a forward width for the first time in the process (`DSparkForwardWidths`) | first reply code 51.4 → 68.0 tok/s |
 | V4.1 pools used the 0731 segmented BF16 hot tier (>3 KB/token) and windows kept ~2175 rows after a chunk | 4-bit contiguous pools from the first row, windows trimmed to 128 | 903 MiB at 1,039,360 tokens (911 B/token) |
 
 Measured and rejected: attention sub-chunks of 1024 or none instead of 512 (49k / 100k 708 / 586 and
-678 / 605 vs 720 / 625 pp/s). Still open: the fused decode kernels the Python runtime has (AR 29 → 39 tok/s
-there); Swift decode is 63 / 53 / 100 / 30 tok/s on code / code2 / structured / prose.
+678 / 605 vs 720 / 625 pp/s); expert dedup across verify rows (repeats already hit the GPU caches);
+admitting the fused shapes with a warm-up forward inside the dSpark attach (osaurus died loading the model).
+Live now: dSpark decode code / code2 / structured / prose 68.0 / 61.6 / 110.1 / 40.0 tok/s, TTFT 0.21–0.29 s.
 
 ## Family isolation (DSV4-0731 must not change)
 
