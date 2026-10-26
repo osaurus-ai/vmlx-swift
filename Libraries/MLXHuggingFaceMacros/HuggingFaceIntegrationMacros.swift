@@ -80,11 +80,25 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             // import VMLXTokenizers
             //
             { (huggingFaceTokenizer: VMLXTokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
-                struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer {
+                struct TokenizerBridge: MLXLMCommon.GenerationPromptControllableTokenizer,
+                    MLXLMCommon.DeepseekV4ChatFamilyConfigurableTokenizer
+                {
                     private let upstream: any VMLXTokenizers.Tokenizer
+                    // DSV4-0731 and DeepSeek-V4.1 share the BOS/EOS sniffed below but
+                    // not their prompt contract. The loader sets this from the bundle's
+                    // config.json; an unset bridge keeps the 0731 contract.
+                    private var deepseekV4ChatFamily: MLXLMCommon.DeepseekV4ChatFamily = .deepseekV4
 
                     init(_ upstream: any VMLXTokenizers.Tokenizer) {
                         self.upstream = upstream
+                    }
+
+                    func settingDeepseekV4ChatFamily(
+                        _ family: MLXLMCommon.DeepseekV4ChatFamily
+                    ) -> any MLXLMCommon.Tokenizer {
+                        var copy = self
+                        copy.deepseekV4ChatFamily = family
+                        return copy
                     }
 
                     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -378,7 +392,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 tools: chatTemplateTools,
                                 additionalContext: adjustedContext,
-                                addGenerationPrompt: true)
+                                addGenerationPrompt: true,
+                                family: deepseekV4ChatFamily)
                             return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
@@ -746,7 +761,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 messages: messages,
                                 tools: chatTemplateTools,
                                 additionalContext: adjustedContext,
-                                addGenerationPrompt: addGenerationPrompt)
+                                addGenerationPrompt: addGenerationPrompt,
+                                family: deepseekV4ChatFamily)
                             return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
@@ -936,7 +952,17 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         // import VMLXTokenizers
                         //
                         let upstream = try await VMLXTokenizers.AutoTokenizer.from(modelFolder: directory)
-                        let adapted = #adaptHuggingFaceTokenizer(upstream)
+                        var adapted = #adaptHuggingFaceTokenizer(upstream)
+                        // Thread the DSV4 prompt-contract family from the bundle config:
+                        // 0731 and V4.1 are indistinguishable by tokenizer alone.
+                        let deepseekV4ChatFamily = MLXLMCommon.DeepseekV4ChatFamily.detect(
+                            modelDirectory: directory)
+                        if deepseekV4ChatFamily != .deepseekV4,
+                            let configurable = adapted
+                                as? any MLXLMCommon.DeepseekV4ChatFamilyConfigurableTokenizer
+                        {
+                            adapted = configurable.settingDeepseekV4ChatFamily(deepseekV4ChatFamily)
+                        }
                         // Only file-backed metadata plus the upstream lossless decoder
                         // can qualify a vocabulary. The standalone adaptor stays nil.
                         guard upstream.incrementalByteLevelDecoder != nil,

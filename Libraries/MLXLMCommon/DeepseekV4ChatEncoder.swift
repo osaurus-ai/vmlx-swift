@@ -34,6 +34,9 @@ public enum DeepseekV4Tokens {
     public static let eos = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
     public static let user = "<\u{FF5C}User\u{FF5C}>"
     public static let assistant = "<\u{FF5C}Assistant\u{FF5C}>"
+    /// DeepSeek-V4.1 only (`encoding/encoding.py` `SYSTEM_SP_TOKEN`). The 0731
+    /// contract never renders it.
+    public static let system = "<\u{FF5C}System\u{FF5C}>"
     public static let latestReminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
     public static let thinkStart = "<think>"
     public static let thinkEnd = "</think>"
@@ -67,11 +70,124 @@ public enum DeepseekV4ReasoningEffort: String, Sendable {
     case max
 }
 
+/// Which DeepSeek-V4 prompt contract a bundle was trained on.
+///
+/// DSV4-0731 (`model_type: deepseek_v4`) and DeepSeek-V4.1-1017
+/// (`model_type: deepseek_v41`, text decoder `deepseek_v41_text`) share the
+/// BOS/EOS tokens the tokenizer bridges sniff, but their wire formats differ:
+/// V4.1 renders a numeric reasoning-effort budget inside `<｜System｜>`,
+/// leads system messages with `<｜System｜>`, supports mid-conversation system
+/// turns, and names its DSML tags `" calls"` / `" invoke"` / `" parameter"`
+/// (leading space). The family therefore has to come from the bundle's
+/// config, never from the tokenizer. `.deepseekV4` is the default everywhere
+/// so a caller that does not thread a family keeps the 0731 bytes exactly.
+public enum DeepseekV4ChatFamily: String, Sendable, Hashable {
+    case deepseekV4 = "deepseek_v4"
+    case deepseekV41 = "deepseek_v41"
+
+    /// Map a config `model_type` (top-level or `text_config.model_type`).
+    /// Anything that is not explicitly V4.1 stays on the 0731 contract.
+    public init(modelType: String?) {
+        let normalized = (modelType ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        if normalized == "deepseek_v41" || normalized == "deepseek_v41_text"
+            || normalized.hasPrefix("deepseek_v41_")
+        {
+            self = .deepseekV41
+        } else {
+            self = .deepseekV4
+        }
+    }
+
+    /// Resolve from raw `config.json` bytes: top-level `model_type`, then
+    /// `text_config.model_type`.
+    public static func detect(configData: Data) -> DeepseekV4ChatFamily {
+        guard let object = try? JSONSerialization.jsonObject(with: configData)
+            as? [String: Any]
+        else { return .deepseekV4 }
+        if DeepseekV4ChatFamily(modelType: object["model_type"] as? String) == .deepseekV41 {
+            return .deepseekV41
+        }
+        let text = object["text_config"] as? [String: Any]
+        return DeepseekV4ChatFamily(modelType: text?["model_type"] as? String)
+    }
+
+    /// Resolve from a bundle directory's `config.json`.
+    public static func detect(modelDirectory: URL) -> DeepseekV4ChatFamily {
+        guard let data = try? Data(
+            contentsOf: modelDirectory.appendingPathComponent("config.json"))
+        else { return .deepseekV4 }
+        return detect(configData: data)
+    }
+
+    /// DSML outer block tag name (`<｜DSML｜{name}>`).
+    public var dsmlCallsBlockName: String {
+        self == .deepseekV41 ? " calls" : "tool_calls"
+    }
+
+    /// DSML per-call tag name.
+    public var dsmlInvokeTagName: String {
+        self == .deepseekV41 ? " invoke" : "invoke"
+    }
+
+    /// DSML per-parameter tag name.
+    public var dsmlParameterTagName: String {
+        self == .deepseekV41 ? " parameter" : "parameter"
+    }
+}
+
+/// A tokenizer bridge that routes DSV4-family prompts through
+/// ``DeepseekV4ChatEncoder`` and can be told which prompt contract the bundle
+/// uses. Tokenizer loaders that know the model directory call
+/// ``settingDeepseekV4ChatFamily(_:)`` after construction; bridges that are
+/// never told keep the 0731 contract.
+public protocol DeepseekV4ChatFamilyConfigurableTokenizer: Tokenizer {
+    func settingDeepseekV4ChatFamily(_ family: DeepseekV4ChatFamily) -> any Tokenizer
+}
+
 // MARK: - Encoder
 
 public struct DeepseekV4ChatEncoder: Sendable {
 
-    public init() {}
+    /// Prompt contract to render. Defaults to DSV4-0731 so existing callers
+    /// are byte-for-byte unchanged; V4.1 must be requested explicitly.
+    public let family: DeepseekV4ChatFamily
+
+    public init(family: DeepseekV4ChatFamily = .deepseekV4) {
+        self.family = family
+    }
+
+    // MARK: DeepSeek-V4.1 reasoning-effort contract
+
+    // V4.1 (1017) renders a NUMERIC budget inside the System token, per the
+    // bundle's `encoding/encoding.py` (`REASONING_EFFORT_TEMPLATE` +
+    // `render_reasoning_effort`), at index 0 in thinking mode only. The 0731
+    // text prefaces below are the wrong contract for V4.1 (the model was never
+    // trained on them and meta-reasons about "complying with a thinking
+    // block", degenerating into repetition loops on prompts such as "Say hello
+    // in exactly one word."). They stay the 0731 contract.
+    static let deepseekV41ReasoningEffortTemplate =
+        "Reasoning Effort: %d (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+
+    /// low/high/max → numeric budget (encoding.py `REASONING_EFFORT_MAPPINGS`).
+    static func deepseekV41ReasoningEffortBudget(_ effort: DeepseekV4ReasoningEffort) -> Int {
+        switch effort {
+        case .low: return 50
+        case .high: return 75
+        case .max: return 100
+        }
+    }
+
+    /// Budget used when a V4.1 request carries no effort at all.
+    ///
+    /// The bundle reference defaults to `"high"` (75, encoding.py
+    /// `DEFAULT_REASONING_EFFORT`). vmlx deliberately keeps the host UX of
+    /// "absent effort ≡ low" (50) so the default reasoning chip ("Low") and
+    /// the rendered contract agree, matching the 0731 nil ≡ .low rule. Pass an
+    /// explicit effort (or numeric budget) to get the reference default.
+    public static let deepseekV41DefaultReasoningBudget = 50
 
     // `high`/`max` are verbatim 0731 `REASONING_EFFORT_PROMPTS` values —
     // part of the model's prompt contract; never reword or interchange them.
@@ -132,8 +248,12 @@ public struct DeepseekV4ChatEncoder: Sendable {
         context: [Message] = [],
         addBOS: Bool = true,
         toolChoiceRequired: Bool = false,
-        toolChoiceName: String? = nil
+        toolChoiceName: String? = nil,
+        reasoningBudget: Int? = nil
     ) -> String {
+        // `reasoningBudget` is the DeepSeek-V4.1 numeric effort (1-100). It
+        // wins over `reasoningEffort` on the V4.1 contract and is ignored on
+        // the 0731 contract, which has no numeric budget.
         // Preprocess: merge tool messages into user, sort tool_result
         // blocks by the order they were called in the prior assistant.
         var processedMessages = Self.mergeToolMessages(messages)
@@ -156,7 +276,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let rendered: [Message]
         let contextLen: Int
         if thinkingMode == .thinking && effectiveDrop {
-            rendered = Self.dropThinkingMessages(full)
+            rendered = Self.dropThinkingMessages(full, family: family)
             contextLen = rendered.count - processedMessages.count
         } else {
             rendered = full
@@ -171,7 +291,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
             let requiredToolName =
                 Self.normalizedToolChoiceName(toolChoiceName)
                 ?? Self.singleAvailableToolName(in: finalRendered)
-            let reminder = Self.requiredToolChoiceReminder(toolName: requiredToolName)
+            let reminder = Self.requiredToolChoiceReminder(
+                toolName: requiredToolName, family: family)
             if let tailIndex = finalRendered.lastIndex(where: {
                 $0.role == .user || $0.role == .developer
             }), tailIndex >= contextLen {
@@ -188,6 +309,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 thinkingMode: thinkingMode,
                 dropThinking: effectiveDrop,
                 reasoningEffort: reasoningEffort,
+                reasoningBudget: reasoningBudget,
                 toolChoiceRequired: toolChoiceRequired,
                 toolChoiceName: toolChoiceName
             )
@@ -213,11 +335,18 @@ public struct DeepseekV4ChatEncoder: Sendable {
     ///
     /// Keeping this conversion in MLXLMCommon avoids a second, subtly different
     /// DSV4 prompt implementation in the Hugging Face tokenizer bridge.
+    ///
+    /// `family` selects the prompt contract (resolve it from the bundle with
+    /// ``DeepseekV4ChatFamily/detect(modelDirectory:)``). The default is the
+    /// 0731 contract. On `.deepseekV41` the effort accepts the full host ladder
+    /// (`none/minimal/low/medium/high/xhigh/max`) or an explicit 1-100 number;
+    /// see ``reasoningBudget(from:)``.
     public static func renderOpenAIChat(
         messages: [[String: any Sendable]],
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?,
-        addGenerationPrompt: Bool
+        addGenerationPrompt: Bool,
+        family: DeepseekV4ChatFamily = .deepseekV4
     ) throws -> String {
         var nativeMessages = try messages.map(Self.messageFromOpenAI)
 
@@ -253,13 +382,15 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let (toolChoiceRequired, toolChoiceName) = Self.toolChoice(
             from: additionalContext?["tool_choice"])
 
-        var prompt = DeepseekV4ChatEncoder().encode(
+        var prompt = DeepseekV4ChatEncoder(family: family).encode(
             messages: nativeMessages,
             thinkingMode: thinkingMode,
             reasoningEffort: thinkingMode == .thinking ? effort : nil,
             dropEarlierReasoning: dropEarlierReasoning,
             toolChoiceRequired: toolChoiceRequired,
-            toolChoiceName: toolChoiceName
+            toolChoiceName: toolChoiceName,
+            reasoningBudget: (family == .deepseekV41 && thinkingMode == .thinking)
+                ? Self.reasoningBudget(from: additionalContext) : nil
         )
         if !addGenerationPrompt {
             prompt = Self.removingTerminalGenerationRail(from: prompt)
@@ -410,6 +541,34 @@ public struct DeepseekV4ChatEncoder: Sendable {
         }
     }
 
+    /// Resolve the DeepSeek-V4.1 numeric reasoning-effort budget (1-100) from
+    /// the request so every host slider position takes effect, not just the
+    /// three named anchors the enum carries. Contract anchors are low=50 /
+    /// high=75 / max=100 (encoding.py `REASONING_EFFORT_MAPPINGS`); the
+    /// in-between rungs of the host ladder interpolate. An explicit Int /
+    /// Double / numeric string is clamped to 1...100. Returns nil when no
+    /// effort was requested (the encoder then uses
+    /// ``deepseekV41DefaultReasoningBudget``). V4.1 only; the 0731 contract
+    /// never consults this.
+    public static func reasoningBudget(from context: [String: any Sendable]?) -> Int? {
+        guard let rawAny = context?["reasoning_effort"] else { return nil }
+        if let i = rawAny as? Int { return max(1, min(100, i)) }
+        if let d = rawAny as? Double, d.isFinite { return max(1, min(100, Int(d.rounded()))) }
+        guard let raw = (rawAny as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return nil }
+        if let i = Int(raw) { return max(1, min(100, i)) }
+        switch raw {
+        case "none", "minimal": return 25
+        case "low": return 50
+        case "medium": return 62
+        case "high": return 75
+        case "xhigh": return 88
+        case "max": return 100
+        default: return nil
+        }
+    }
+
     private static func toolChoice(
         from raw: (any Sendable)?
     ) -> (required: Bool, name: String?) {
@@ -461,17 +620,38 @@ public struct DeepseekV4ChatEncoder: Sendable {
         thinkingMode: DeepseekV4ThinkingMode,
         dropThinking: Bool,
         reasoningEffort: DeepseekV4ReasoningEffort?,
+        reasoningBudget: Int? = nil,
         toolChoiceRequired: Bool,
         toolChoiceName: String?
     ) -> String {
         let msg = messages[index]
-        let lastUserIdx = Self.findLastUserIndex(messages)
+        let lastUserIdx = Self.findLastUserIndex(messages, family: family)
+        let isV41 = family == .deepseekV41
         var out = ""
 
-        // Reasoning-effort preface only at index 0 in thinking mode. Every
-        // rail injects its preface — including low (nil ≡ .low), which the
-        // official contract leaves empty; see reasoningEffortLowPreface.
-        if index == 0 && thinkingMode == .thinking {
+        if isV41 {
+            // DeepSeek-V4.1 (encoding.py `render_message`): the numeric budget
+            // at index 0 in thinking mode, and the System token LEADS the
+            // conversation when there is an effort prefix OR the first message
+            // is a system message. An explicit numeric budget (host ladder)
+            // wins over the named enum; nil ≡ the documented vmlx default.
+            var effortPrefix = ""
+            if index == 0 && thinkingMode == .thinking {
+                let budget = max(1, min(100,
+                    reasoningBudget
+                        ?? reasoningEffort.map(Self.deepseekV41ReasoningEffortBudget)
+                        ?? Self.deepseekV41DefaultReasoningBudget))
+                effortPrefix = String(format: Self.deepseekV41ReasoningEffortTemplate, budget)
+            }
+            if index == 0 && (!effortPrefix.isEmpty || msg.role == .system) {
+                out += DeepseekV4Tokens.system
+            }
+            out += effortPrefix
+        } else if index == 0 && thinkingMode == .thinking {
+            // DSV4-0731: reasoning-effort preface only at index 0 in thinking
+            // mode. Every rail injects its preface — including low (nil ≡
+            // .low), which the official contract leaves empty; see
+            // reasoningEffortLowPreface.
             switch reasoningEffort ?? .low {
             case .low:
                 out += Self.reasoningEffortLowPreface
@@ -484,12 +664,18 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
         switch msg.role {
         case .system:
+            // V4.1 mid-conversation system message: its own System token lead
+            // (at index 0 the lead was emitted above). 0731 has no System token.
+            if isV41 && index > 0 {
+                out += DeepseekV4Tokens.system
+            }
             out += msg.content ?? ""
             if let tools = msg.tools, !tools.isEmpty {
                 out += "\n\n" + Self.renderTools(
                     tools,
                     toolChoiceRequired: toolChoiceRequired,
-                    toolChoiceName: toolChoiceName
+                    toolChoiceName: toolChoiceName,
+                    family: family
                 )
             }
             if let rf = msg.responseFormat {
@@ -503,7 +689,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 s += "\n\n" + Self.renderTools(
                     tools,
                     toolChoiceRequired: toolChoiceRequired,
-                    toolChoiceName: toolChoiceName
+                    toolChoiceName: toolChoiceName,
+                    family: family
                 )
             }
             if let rf = msg.responseFormat {
@@ -542,11 +729,13 @@ public struct DeepseekV4ChatEncoder: Sendable {
             // Render tool calls (if any) in DSML format.
             if let tcs = msg.toolCalls, !tcs.isEmpty {
                 let blocks = tcs.map { tc in
-                    Self.renderToolCallInvoke(name: tc.name, arguments: tc.arguments)
+                    Self.renderToolCallInvoke(
+                        name: tc.name, arguments: tc.arguments, family: family)
                 }
                 let joined = blocks.joined(separator: "\n")
+                let block = family.dsmlCallsBlockName
                 toolCallContent =
-                    "\n\n<\(DeepseekV4Tokens.dsml)tool_calls>\n\(joined)\n</\(DeepseekV4Tokens.dsml)tool_calls>"
+                    "\n\n<\(DeepseekV4Tokens.dsml)\(block)>\n\(joined)\n</\(DeepseekV4Tokens.dsml)\(block)>"
             }
 
             let content = msg.content ?? ""
@@ -590,7 +779,11 @@ public struct DeepseekV4ChatEncoder: Sendable {
                     : DeepseekV4Tokens.thinkEnd
                 out += taskSP
             }
-        } else if msg.role == .user || msg.role == .developer || msg.role == .latestReminder {
+        } else if msg.role == .user || msg.role == .developer || msg.role == .latestReminder
+            // V4.1: a mid-conversation system message behaves like a user
+            // turn for the assistant generation header (encoding.py:731).
+            || (isV41 && msg.role == .system && index > 0)
+        {
             out += DeepseekV4Tokens.assistant
             // Decision tree for the final tail tag:
             //   dropThinking=false + thinking → `<think>` (open)
@@ -638,17 +831,57 @@ public struct DeepseekV4ChatEncoder: Sendable {
         You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
         """
 
+    /// DeepSeek-V4.1 `TOOLS_TEMPLATE` (encoding.py:481): identical prose, but
+    /// the DSML tag names carry a leading space (`<｜DSML｜ calls>`,
+    /// `<｜DSML｜ invoke …>`, `<｜DSML｜ parameter …>`).
+    static let deepseekV41ToolsTemplate: String = {
+        let f = DeepseekV4ChatFamily.deepseekV41
+        let d = DeepseekV4Tokens.dsml
+        let calls = f.dsmlCallsBlockName
+        let invoke = f.dsmlInvokeTagName
+        let parameter = f.dsmlParameterTagName
+        return """
+            ## Tools
+
+            You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<\(d)\(calls)>" block like the following:
+
+            <\(d)\(calls)>
+            <\(d)\(invoke) name="$TOOL_NAME">
+            <\(d)\(parameter) name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</\(d)\(parameter)>
+            ...
+            </\(d)\(invoke)>
+            <\(d)\(invoke) name="$TOOL_NAME2">
+            ...
+            </\(d)\(invoke)>
+            </\(d)\(calls)>
+
+            String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+            If thinking_mode is enabled (triggered by \(DeepseekV4Tokens.thinkStart)), you MUST output your complete reasoning inside \(DeepseekV4Tokens.thinkStart)...\(DeepseekV4Tokens.thinkEnd) BEFORE any tool calls or final response.
+
+            Otherwise, output directly after \(DeepseekV4Tokens.thinkEnd) with tool calls or final response.
+
+            ### Available Tool Schemas
+
+            %@
+
+            You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+            """
+    }()
+
     static func renderTools(
         _ tools: [[String: any Sendable]],
         toolChoiceRequired: Bool = false,
-        toolChoiceName: String? = nil
+        toolChoiceName: String? = nil,
+        family: DeepseekV4ChatFamily = .deepseekV4
     ) -> String {
         let schemas = tools.map { Self.functionSpec(from: $0) }
         let schemaJson = schemas.map { $0.jsonSerialized() }
         let schemasBlock = schemaJson.joined(separator: "\n")
         // Python's triple-quoted TOOLS_TEMPLATE includes a terminal newline.
         // Preserve it: it is the native separator before the next User token.
-        var rendered = toolsTemplate.replacingOccurrences(of: "%@", with: schemasBlock) + "\n"
+        let template = family == .deepseekV41 ? deepseekV41ToolsTemplate : toolsTemplate
+        var rendered = template.replacingOccurrences(of: "%@", with: schemasBlock) + "\n"
         if toolChoiceRequired {
             let requiredToolName =
                 Self.normalizedToolChoiceName(toolChoiceName)
@@ -658,14 +891,17 @@ public struct DeepseekV4ChatEncoder: Sendable {
             } ?? ""
             rendered +=
                 "\n\nThe current assistant response MUST be a tool call. "
-                + "Start with a \"<\(DeepseekV4Tokens.dsml)tool_calls>\" block "
+                + "Start with a \"<\(DeepseekV4Tokens.dsml)\(family.dsmlCallsBlockName)>\" block "
                 + "and do not answer in prose before the tool result."
                 + namedInstruction
         }
         return rendered
     }
 
-    static func requiredToolChoiceReminder(toolName: String? = nil) -> Message {
+    static func requiredToolChoiceReminder(
+        toolName: String? = nil,
+        family: DeepseekV4ChatFamily = .deepseekV4
+    ) -> Message {
         let namedInstruction = toolName.map {
             " Use the `\($0)` function."
         } ?? ""
@@ -673,7 +909,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
             role: .latestReminder,
             content:
                 "The active API tool_choice is required for this assistant turn. "
-                + "Call exactly one available tool now using a <\(DeepseekV4Tokens.dsml)tool_calls> block. "
+                + "Call exactly one available tool now using a <\(DeepseekV4Tokens.dsml)\(family.dsmlCallsBlockName)> block. "
                 + "Do not answer in prose before the tool result."
                 + namedInstruction
         )
@@ -734,9 +970,25 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// Render a single `<｜DSML｜invoke>` block for one tool call.
     /// `arguments` is a JSON string (OpenAI convention) or already-decoded
     /// dict. Python reference accepts either.
-    public static func renderToolCallInvoke(name: String, arguments: String) -> String {
+    public static func renderToolCallInvoke(
+        name: String,
+        arguments: String,
+        family: DeepseekV4ChatFamily = .deepseekV4
+    ) -> String {
+        var arguments = arguments
+        if family == .deepseekV41,
+            let data = arguments.data(using: .utf8),
+            let inner = try? JSONSerialization.jsonObject(
+                with: data, options: [.fragmentsAllowed]) as? String,
+            let innerData = inner.data(using: .utf8),
+            (try? JSONSerialization.jsonObject(with: innerData)) is [String: Any]
+        {
+            // V4.1 `encode_arguments_to_dsml` tolerates double-encoded JSON
+            // argument strings (encoding.py:533-544). 0731 does not.
+            arguments = inner
+        }
         if let ordered = orderedJSONParameters(arguments) {
-            return renderToolCallInvoke(name: name, orderedParameters: ordered)
+            return renderToolCallInvoke(name: name, orderedParameters: ordered, family: family)
         }
         let params: [String: Any]
         if let data = arguments.data(using: .utf8),
@@ -749,7 +1001,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
             // the DSML envelope still round-trips.
             params = ["arguments": arguments]
         }
-        return renderToolCallInvoke(name: name, params: params)
+        return renderToolCallInvoke(name: name, params: params, family: family)
     }
 
     private struct OrderedJSONParameter {
@@ -887,13 +1139,17 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
     private static func renderToolCallInvoke(
         name: String,
-        orderedParameters: [OrderedJSONParameter]
+        orderedParameters: [OrderedJSONParameter],
+        family: DeepseekV4ChatFamily = .deepseekV4
     ) -> String {
+        let d = DeepseekV4Tokens.dsml
+        let parameterTag = family.dsmlParameterTagName
+        let invokeTag = family.dsmlInvokeTagName
         let inner = orderedParameters.map { parameter in
-            "<\(DeepseekV4Tokens.dsml)parameter name=\"\(parameter.name)\" string=\"\(parameter.isString ? "true" : "false")\">\(parameter.value)</\(DeepseekV4Tokens.dsml)parameter>"
+            "<\(d)\(parameterTag) name=\"\(parameter.name)\" string=\"\(parameter.isString ? "true" : "false")\">\(parameter.value)</\(d)\(parameterTag)>"
         }.joined(separator: "\n")
         return
-            "<\(DeepseekV4Tokens.dsml)invoke name=\"\(name)\">\n\(inner)\n</\(DeepseekV4Tokens.dsml)invoke>"
+            "<\(d)\(invokeTag) name=\"\(name)\">\n\(inner)\n</\(d)\(invokeTag)>"
     }
 
     /// Render with the model's own argument order when it is known.
@@ -904,10 +1160,11 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// can reproduce the original spelling. Names absent from `order` are appended in sorted order
     /// so an incomplete order can never silently drop a parameter.
     public static func renderToolCallInvoke(
-        name: String, params: [String: Any], order: [String]?
+        name: String, params: [String: Any], order: [String]?,
+        family: DeepseekV4ChatFamily = .deepseekV4
     ) -> String {
         guard let order, !order.isEmpty else {
-            return renderToolCallInvoke(name: name, params: params)
+            return renderToolCallInvoke(name: name, params: params, family: family)
         }
         let ordered = order.filter { params[$0] != nil }
         let remainder = params.keys.filter { !ordered.contains($0) }.sorted()
@@ -929,10 +1186,18 @@ public struct DeepseekV4ChatEncoder: Sendable {
                             encoding: .utf8)) ?? "\(v)"
                 }
                 return OrderedJSONParameter(name: key, value: value, isString: isString)
-            })
+            },
+            family: family)
     }
 
-    public static func renderToolCallInvoke(name: String, params: [String: Any]) -> String {
+    public static func renderToolCallInvoke(
+        name: String,
+        params: [String: Any],
+        family: DeepseekV4ChatFamily = .deepseekV4
+    ) -> String {
+        let d = DeepseekV4Tokens.dsml
+        let parameterTag = family.dsmlParameterTagName
+        let invokeTag = family.dsmlInvokeTagName
         var paramBlocks: [String] = []
         // Encode each param — string params carry `string="true"` and
         // a raw value; all other JSON types serialize as JSON with
@@ -966,12 +1231,12 @@ public struct DeepseekV4ChatEncoder: Sendable {
                         encoding: .utf8)) ?? "\(v)"
             }
             let line =
-                "<\(DeepseekV4Tokens.dsml)parameter name=\"\(k)\" string=\"\(isString ? "true" : "false")\">\(value)</\(DeepseekV4Tokens.dsml)parameter>"
+                "<\(d)\(parameterTag) name=\"\(k)\" string=\"\(isString ? "true" : "false")\">\(value)</\(d)\(parameterTag)>"
             paramBlocks.append(line)
         }
         let inner = paramBlocks.joined(separator: "\n")
         return
-            "<\(DeepseekV4Tokens.dsml)invoke name=\"\(name)\">\n\(inner)\n</\(DeepseekV4Tokens.dsml)invoke>"
+            "<\(d)\(invokeTag) name=\"\(name)\">\n\(inner)\n</\(d)\(invokeTag)>"
     }
 
     // MARK: - Multi-turn helpers (drop_thinking, tool-merge)
@@ -979,8 +1244,11 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// Strip `reasoning_content` from all assistant messages BEFORE the
     /// last user message. Keep user/system/tool/latest_reminder always.
     /// Mirrors `_drop_thinking_messages` in encoding_dsv4.py.
-    static func dropThinkingMessages(_ messages: [Message]) -> [Message] {
-        let lastUserIdx = findLastUserIndex(messages)
+    static func dropThinkingMessages(
+        _ messages: [Message],
+        family: DeepseekV4ChatFamily = .deepseekV4
+    ) -> [Message] {
+        let lastUserIdx = findLastUserIndex(messages, family: family)
         let keepRoles: Set<MessageRole> = [.user, .system, .tool, .latestReminder]
         var result: [Message] = []
         for (idx, msg) in messages.enumerated() {
@@ -1087,7 +1355,31 @@ public struct DeepseekV4ChatEncoder: Sendable {
         return out
     }
 
-    static func findLastUserIndex(_ messages: [Message]) -> Int {
+    static func findLastUserIndex(
+        _ messages: [Message],
+        family: DeepseekV4ChatFamily = .deepseekV4
+    ) -> Int {
+        if family == .deepseekV41 {
+            // encoding.py `find_last_user_index`: mid-conversation system
+            // messages count as user turns, and a user message whose content
+            // blocks are ONLY tool results does not start a new turn.
+            for idx in (0..<messages.count).reversed() {
+                let r = messages[idx].role
+                guard r == .user || r == .developer || (r == .system && idx > 0) else {
+                    continue
+                }
+                if let blocks = messages[idx].contentBlocks, !blocks.isEmpty,
+                    !blocks.contains(where: {
+                        if case .text = $0 { return true }
+                        return false
+                    })
+                {
+                    continue
+                }
+                return idx
+            }
+            return -1
+        }
         for idx in (0..<messages.count).reversed() {
             let r = messages[idx].role
             if r == .user || r == .developer { return idx }

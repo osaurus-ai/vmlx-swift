@@ -537,6 +537,11 @@ public actor BatchEngine {
             )
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
+        if parameters.draftStrategy?.usesDSpark == true {
+            // dSpark is a speed-only strategy (greedy-exact) whose cycle owns the target cache; a
+            // shared batched slot decodes the same tokens autoregressively.
+            parameters.draftStrategy = nil
+        }
 
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
@@ -746,6 +751,21 @@ public actor BatchEngine {
                 input: input,
                 parameters: parameters,
                 promptTail: promptTail)
+        }
+        // dSpark runs inside TokenIterator on the solo path (its verify/restore cycle owns the target
+        // cache). With another request in flight it decodes as an ordinary batched AR slot: same
+        // tokens, no speculation.
+        if parameters.draftStrategy?.usesDSpark == true {
+            if canStartExclusiveSoloPath {
+                return startSoloFastPath(
+                    input: input,
+                    parameters: parameters,
+                    promptTail: promptTail)
+            }
+            Self.logger.notice(
+                "BatchEngine.generate dSpark request decodes autoregressively: the engine is serving another request and drafting is an exclusive solo path."
+            )
+            parameters.draftStrategy = nil
         }
         if parameters.draftStrategy?.usesDFlash2 == true,
             DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil

@@ -66,9 +66,19 @@ enum MinimumReasoningFloor {
         ].compactMap { $0.components(separatedBy: "\n").first }
     }
 
+    /// DeepSeek-V4.1 (1017) renders a NUMERIC effort budget inside the System
+    /// token (`<｜System｜>Reasoning Effort: N (range 1-100, …)`) instead of the
+    /// 0731 text prefaces. The model self-modulates its think length under that
+    /// contract, and masking `</think>` there drives short prompts into
+    /// repetition loops, so the floor never arms on a V4.1 numeric head. The
+    /// 0731 markers above are unchanged, so DSV4-0731 keeps its floor.
+    static let deepseekV41NumericEffortMarker =
+        DeepseekV4Tokens.system + "Reasoning Effort: "
+
     static func railRequiresFloor(promptHead: String?, promptTail: String?) -> Bool {
         guard let promptTail, promptTail.hasSuffix("<think>") else { return false }
         guard let promptHead else { return false }
+        if promptHead.contains(deepseekV41NumericEffortMarker) { return false }
         return enforcedEffortMarkers.contains { promptHead.contains($0) }
     }
 

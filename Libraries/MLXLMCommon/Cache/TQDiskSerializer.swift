@@ -754,7 +754,16 @@ public enum TQDiskSerializer {
                 guard segment.originalShape.count == 3,
                       segment.originalShape[1] > 0,
                       segment.groupSize > 0,
-                      segment.bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(segment.bits),
+                      segment.bits != 4 || segment.groupSize % 2 == 0,
+                      segment.originalShape[2] % segment.groupSize == 0,
+                      segment.codes.dtype == .uint8,
+                      segment.codes.shape == [
+                          segment.originalShape[0], segment.originalShape[1],
+                          segment.originalShape[2] / segment.groupSize,
+                          HybridPoolQuantizedSchema.packedGroupWidth(
+                              groupSize: segment.groupSize, bits: segment.bits),
+                      ],
                       let dtypeCode = dsv4PoolDTypeCode(segment.originalDType)
                 else { return false }
                 let prefix = "\(stem)_q_\(segmentIndex)"
@@ -811,6 +820,21 @@ public enum TQDiskSerializer {
         putOptional("dsv4_\(i)_buf_idx_kv", idxBuf.kv)
         putOptional("dsv4_\(i)_buf_idx_gate", idxBuf.gate)
         result["__dsv4_\(i)_nilmask__"] = MLXArray(nilMask)
+        // DeepSeek-V4.1 only: the Engram n-gram tail that must accompany this
+        // prefix. Written only when present, so 0731 records are unchanged.
+        if let history = dsv4.auxiliaryTokenHistory {
+            result["__dsv4_\(i)_aux_hist_end__"] = metaInt32(Int32(history.endPosition))
+            result["dsv4_\(i)_aux_hist"] = MLXArray(
+                history.tokens.isEmpty ? [Int32(0)] : history.tokens)
+            result["__dsv4_\(i)_aux_hist_count__"] = metaInt32(Int32(history.tokens.count))
+        }
+        // DeepSeek-V4.1 dSpark draft-window tail (speed-only; absent records restore without it).
+        if let tail = dsv4.auxiliaryHiddenTail?.joined() {
+            result["dsv4_\(i)_dspark_tail"] = tail.rows
+            result["__dsv4_\(i)_dspark_tail_start__"] = metaInt32(Int32(tail.start))
+            result["__dsv4_\(i)_dspark_tail_cap__"] = metaInt32(
+                Int32(dsv4.auxiliaryHiddenTail?.capacity ?? tail.rows.dim(0)))
+        }
 
         result[kindKey(for: i)] = kindArray(.deepseekV4)
     }
@@ -996,6 +1020,11 @@ public enum TQDiskSerializer {
         public let bufCompGate: MLXArray?
         public let bufIdxKV: MLXArray?
         public let bufIdxGate: MLXArray?
+        /// DeepSeek-V4.1 Engram n-gram tail (``HybridPoolCache/auxiliaryTokenHistory``).
+        /// Absent for DSV4-0731 records, which never write it.
+        public var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        /// DeepSeek-V4.1 dSpark draft-window tail (``HybridPoolCache/auxiliaryHiddenTail``).
+        public var auxiliaryHiddenTail: HybridPoolHiddenTail? = nil
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):
@@ -1690,13 +1719,16 @@ public enum TQDiskSerializer {
                       shape[2] > 0,
                       groupSize > 0,
                       shape[2] % groupSize == 0,
-                      bits == 8,
+                      HybridPoolQuantizedSchema.supportedBits.contains(bits),
+                      bits != 4 || groupSize % 2 == 0,
                       codes.dtype == .uint8,
                       scales.dtype == .float16,
                       biases.dtype == .float16
                 else { return [] }
                 let groups = shape[2] / groupSize
-                guard codes.shape == [shape[0], shape[1], groups, groupSize],
+                let packed = HybridPoolQuantizedSchema.packedGroupWidth(
+                    groupSize: groupSize, bits: bits)
+                guard codes.shape == [shape[0], shape[1], groups, packed],
                       scales.shape == [shape[0], shape[1], groups, 1],
                       biases.shape == scales.shape
                 else { return [] }
@@ -1722,7 +1754,22 @@ public enum TQDiskSerializer {
            quantizedIdx?.isEmpty == true
         { return nil }
 
-        return DeepseekV4LayerComponents(
+        var auxiliaryTokenHistory: HybridPoolTokenHistory? = nil
+        if let endArray = arrays["__dsv4_\(i)_aux_hist_end__"],
+           let end = readMetaInt32(endArray),
+           let countArray = arrays["__dsv4_\(i)_aux_hist_count__"],
+           let count = readMetaInt32(countArray),
+           let tokensArray = arrays["dsv4_\(i)_aux_hist"]
+        {
+            let tokens = tokensArray.asType(.int32).asArray(Int32.self)
+            guard count >= 0, Int(count) <= tokens.count, Int(count) <= Int(end) else {
+                return nil
+            }
+            auxiliaryTokenHistory = HybridPoolTokenHistory(
+                endPosition: Int(end), tokens: Array(tokens.prefix(Int(count))))
+        }
+
+        var components = DeepseekV4LayerComponents(
             keys: keys, values: values,
             keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
             offset: Int(m[3]), idx: Int(m[4]),
@@ -1736,6 +1783,16 @@ public enum TQDiskSerializer {
             bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate", slot: 3),
             bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),
             bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate", slot: 5))
+        components.auxiliaryTokenHistory = auxiliaryTokenHistory
+        if let rows = arrays["dsv4_\(i)_dspark_tail"], rows.ndim == 2, rows.dim(0) > 0,
+           let startArray = arrays["__dsv4_\(i)_dspark_tail_start__"],
+           let start = readMetaInt32(startArray), start >= 0
+        {
+            let cap = arrays["__dsv4_\(i)_dspark_tail_cap__"].flatMap(readMetaInt32).map(Int.init)
+            components.auxiliaryHiddenTail = HybridPoolHiddenTail(
+                capacity: Swift.max(cap ?? rows.dim(0), rows.dim(0)), start: Int(start), rows: rows)
+        }
+        return components
     }
 
     /// 2026-05-06 (ZAYA1 CCA-attention port):

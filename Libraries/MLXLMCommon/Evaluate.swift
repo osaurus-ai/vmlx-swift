@@ -1711,6 +1711,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     private var unoARStretchLength = UnoWidthPlan.arStretch
     /// Uno counters for the request (nil when the request did not run Uno).
     public var unoGenerationStats: UnoGenerationStats? { uno?.stats }
+    /// DeepSeek-V4.1 dSpark speculation (`DraftStrategy.dspark`); nil when not requested or not servable.
+    private var dspark: DSparkDecoder?
+    /// Tokens a dSpark step committed that `next()` has not returned yet (all already in the cache).
+    private var dsparkQueue: [Int] = []
+    private var dsparkStartOffset = 0
+    private var dsparkFinished = false
+    /// dSpark counters for the request (nil when the request did not run dSpark).
+    public var dsparkGenerationStats: DSparkGenerationStats? { dspark?.stats }
     private var compiledStepCount = 0
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``). Created
@@ -1895,6 +1903,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
+        // dSpark: attach the draft head BEFORE prefill, so the prefill runs with the head resident
+        // (its chunk size accounts for it) and records the draft-window tail into the cache.
+        Self.attachDSparkIfRequested(model: model, parameters: parameters)
         let requiresFreshToolSelection =
             input.cacheRestorePolicy == .freshRequiredToolSelection
         self.disableDiskBackedRequiredToolRestore =
@@ -2497,6 +2508,122 @@ public struct TokenIterator: TokenIteratorProtocol {
                 adapterPath: adapterPath, blockSize: blockSize, input: input,
                 parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
         }
+        if effectiveParameters.draftStrategy?.usesDSpark == true {
+            // The PREFILLED input decides: a media request whose every media item is inside the
+            // restored prefix prefills a text-only tail (`inputForPrepare` carries no media) and
+            // dSpark serves it; a request that prefilled media decodes autoregressively. For a
+            // text-only request the two inputs carry the same (absent) media.
+            setupDSpark(
+                input: inputForPrepare, parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
+        }
+    }
+
+    /// Load the dSpark head for a greedy `.dspark` request (once per model; a sampled request never
+    /// pays for the 8.3 GB head). Failures are logged and the request decodes AR.
+    static func attachDSparkIfRequested(model: any LanguageModel, parameters: GenerateParameters) {
+        guard let directory = parameters.draftStrategy?.dsparkDrafterPath,
+            parameters.temperature <= 0,
+            !DSparkEnvironment.disabled(),
+            let target = model as? any DSparkSpeculativeModel,
+            target.dsparkBlockSize == nil
+        else { return }
+        do {
+            if try !target.attachDSparkDraft(directory: directory) {
+                logger.info("dSpark head not attached: this model does not use one")
+            }
+        } catch {
+            logger.error(
+                "dSpark head failed to load from \(directory.path, privacy: .public) (decoding autoregressively): \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    /// Enable dSpark for this request when it can be served exactly; otherwise log why and decode AR.
+    private mutating func setupDSpark(
+        input: LMInput, parameters: GenerateParameters, stopTokenIDs: Set<Int>
+    ) {
+        let reason: String? = {
+            if DSparkEnvironment.disabled() { return "VMLX_DSV41_DSPARK disables it" }
+            guard let target = model as? any DSparkSpeculativeModel else {
+                return "model \(type(of: model)) has no dSpark pathway"
+            }
+            guard let blockSize = target.dsparkBlockSize, let session = target.makeDSparkDraftSession()
+            else { return "no dSpark head is attached" }
+            if uno != nil { return "Uno is active" }
+            if parameters.temperature > 0 { return "sampled decoding (dSpark verifies greedily)" }
+            if processor != nil {
+                return "logit processors (penalties / reasoning budget / JSON schema) need per-token sampling"
+            }
+            if compiledForward != nil { return "compiled decode is active" }
+            if needsCacheQuantization { return "KV quantization is active" }
+            if state != nil || input.image != nil || input.video != nil { return "media inputs" }
+            if let why = target.dsparkCacheUnsupportedReason(cache) { return why }
+            dspark = DSparkDecoder(
+                session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs)
+            dsparkStartOffset = cache.map(\.offset).max() ?? 0
+            return nil
+        }()
+        if let reason {
+            Self.logger.info(
+                "dSpark requested but not used for this request (decoding autoregressively): \(reason, privacy: .public)")
+            if DSparkEnvironment.statsEnabled {
+                NSLog("[dSpark] off for this request: \(reason)")
+            }
+        }
+    }
+
+    /// One dSpark step: return a queued token, or run a step from the pending token `y`. Nil hands
+    /// this step to ordinary decoding (the governor chose AR, or a block cannot fit).
+    private mutating func dsparkNext() -> Int? {
+        if !dsparkQueue.isEmpty {
+            let token = dsparkQueue.removeFirst()
+            tokenCount += 1
+            lastForwardedTokenId = token
+            return token
+        }
+        guard var decoder = dspark else { return nil }
+        defer { dspark = decoder }
+        // Waits for the previous step's last forward; the decoder closes that step's timing here.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
+        let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        let model = self.model
+        let cache = self.cache
+        let step = decoder.step(seed: seed, cache: cache, remaining: remaining) { ids in
+            let tokens = MLXArray(ids.map { Int32($0) }).reshaped(1, ids.count)
+            return model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
+        }
+        guard case .committed(let committed, let next) = step else { return nil }
+        dsparkQueue = Array(committed.dropFirst())
+        y = .init(tokens: next)
+        tokenCount += 1
+        lastForwardedTokenId = seed
+        // Same cadence as ordinary decoding: once per 256 tokens, when this step crosses a boundary.
+        if (tokenCount + dsparkQueue.count) / 256 > (tokenCount - 1) / 256 {
+            Memory.clearCache()
+        }
+        return seed
+    }
+
+    /// A dSpark step commits whole blocks (cut at stop tokens and the budget), so the cache can only
+    /// run ahead of the returned tokens when the consumer stops early (a stop string, a cancel).
+    /// Trim that back where the trim is exact; a DSV4 pool cache cannot trim exactly, and the
+    /// post-answer store then refuses the offset/key mismatch instead of storing it.
+    private mutating func finishDSpark() {
+        guard dspark != nil, !dsparkFinished else { return }
+        dsparkFinished = true
+        dspark?.finish()
+        if DSparkEnvironment.statsEnabled, let stats = dspark?.stats {
+            NSLog("[dSpark] \(stats.summary)")
+        }
+        let expected = dsparkStartOffset + tokenCount
+        if cache.contains(where: { $0.offset > expected }),
+            cache.allSatisfy({ $0.isTrimmable && !($0 is any HybridPoolCache) })
+        {
+            for layer in cache where layer.offset > expected {
+                _ = layer.trim(layer.offset - expected)
+            }
+        }
+        dsparkQueue.removeAll()
     }
 
     /// Enable Uno for this request when it can be served exactly; otherwise log why and decode AR.
@@ -3181,6 +3308,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {
         nanTrace?.finish(totalSteps: tokenCount)
+        finishDSpark()
     }
 
     // Whether cache quantization is needed (skip the function call entirely when not)
@@ -3391,6 +3519,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         if uno != nil, let token = unoNext() {
             return token
         }
+        if dspark != nil, let token = dsparkNext() {
+            return token
+        }
 
         let previousY = y
         if (processor as? JSONSchemaLogitProcessor)?.isTerminated == true {
@@ -3461,6 +3592,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         includeGeneratedBoundary: Bool
     ) {
         reconcileUnoCache()
+        finishDSpark()
         MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count)
         defer {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count)

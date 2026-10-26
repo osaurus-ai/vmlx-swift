@@ -164,6 +164,53 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     /// Per-branch incomplete-window buffer state.
     func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?)
     func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?)
+
+    /// Model-owned per-sequence token history that must travel with the
+    /// cache (DeepSeek-V4.1 Engram n-gram tail). `nil` for every other
+    /// family. Copies, trims and disk round-trips carry it so a restored
+    /// prefix hashes its suffix exactly like an uninterrupted run.
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? { get set }
+
+    /// True when a restored layer is only valid together with
+    /// ``auxiliaryTokenHistory`` covering its offset. A disk record that
+    /// lacks it is refused (re-prefill) instead of guessing the history.
+    var requiresAuxiliaryTokenHistory: Bool { get }
+
+    /// Model-owned trailing hidden rows that travel with the cache (the
+    /// DeepSeek-V4.1 dSpark draft-window tail: the target-layer hidden of the
+    /// last committed positions). Optional and speed-only: a cache without it
+    /// is still exact, the drafter just starts with a shorter window. `nil`
+    /// for every other family.
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? { get set }
+}
+
+/// Trailing token history for ``HybridPoolCache/auxiliaryTokenHistory``:
+/// `tokens[k]` belongs to absolute position `endPosition - tokens.count + k`.
+public struct HybridPoolTokenHistory: Sendable, Equatable {
+    public var endPosition: Int
+    public var tokens: [Int32]
+
+    public init(endPosition: Int, tokens: [Int32]) {
+        self.endPosition = endPosition
+        self.tokens = tokens
+    }
+
+    /// First absolute position covered.
+    public var startPosition: Int { endPosition - tokens.count }
+}
+
+public extension HybridPoolCache {
+    var auxiliaryTokenHistory: HybridPoolTokenHistory? {
+        get { nil }
+        set {}
+    }
+
+    var requiresAuxiliaryTokenHistory: Bool { false }
+
+    var auxiliaryHiddenTail: HybridPoolHiddenTail? {
+        get { nil }
+        set {}
+    }
 }
 
 /// One independently encoded row segment from a DSV4 compressor/indexer pool.
@@ -225,6 +272,24 @@ public protocol QuantizedHybridPoolCache: HybridPoolCache {
         segments: [HybridPoolQuantizedSegment]
     )
     func hybridPoolRetainedByteCount(branch: HybridPoolBranch) -> Int
+    /// Code width this cache encodes pool rows with (8 for DSV4-0731, 4 for
+    /// DeepSeek-V4.1). A restored record must carry the same width.
+    var hybridPoolQuantizationBits: Int { get }
+}
+
+public extension QuantizedHybridPoolCache {
+    var hybridPoolQuantizationBits: Int { 8 }
+}
+
+/// Code widths the DSV4 quantized-pool disk schema accepts. 4-bit codes are
+/// packed two per byte along the group axis.
+public enum HybridPoolQuantizedSchema {
+    public static let supportedBits: Set<Int> = [4, 8]
+
+    /// Packed code columns per affine group for `bits`.
+    public static func packedGroupWidth(groupSize: Int, bits: Int) -> Int {
+        bits == 4 ? groupSize / 2 : groupSize
+    }
 }
 
 /// Cache implementations whose retained representation is smaller than their
@@ -1010,6 +1075,38 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let effective = grown ? min(capacity + step, maxCacheSize) : capacity
         let start = (idx >= effective) ? keep : idx
         return start + S <= effective
+    }
+
+    /// Release the rows a multi-token update kept beyond the window.
+    ///
+    /// After an `S`-token concat update the buffers hold `maxSize - 1 + S` rows
+    /// (every query of that update needed its full window). No later update reads
+    /// more than the newest `maxSize`: the next concat keeps `maxSize - 1` and the
+    /// next in-place write trims to `maxSize` first. Keeping exactly those rows (a
+    /// gather, so the large buffer is really freed) leaves every later update and
+    /// `state` identical while the retained window stops scaling with the prefill
+    /// chunk. Opt-in (DeepSeek-V4.1); a no-op unless the buffers are in temporal
+    /// order and longer than the window.
+    public func compactToWindow() {
+        guard keep == 0, let keys, let values else { return }
+        let rows = keys.dim(2)
+        guard rows > maxCacheSize, idx == rows, values.dim(2) == rows else { return }
+        let tail = MLXArray(Int32(rows - maxCacheSize) ..< Int32(rows))
+        self.keys = take(keys, tail, axis: 2)
+        self.values = take(values, tail, axis: 2)
+        idx = maxCacheSize
+    }
+
+    /// Drop every cached row and continue at absolute position `position` with an empty
+    /// window. The next update starts the window there (RoPE and mask positions follow
+    /// `offset`). DeepSeek-V4.1 prompt-suffix pruning: a late layer whose earlier prompt rows
+    /// nothing reads computes only a trailing range of a prefill chunk.
+    public func restartWindow(at position: Int) {
+        precondition(position >= offset, "restartWindow cannot move a window backwards")
+        keys = nil
+        values = nil
+        idx = 0
+        offset = position
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {

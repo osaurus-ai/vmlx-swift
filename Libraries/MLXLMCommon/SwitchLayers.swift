@@ -755,3 +755,30 @@ enum SwitchLayerRuntime {
         ProcessInfo.processInfo.environment["VMLX_QUANTIZED_OUTPUT_PROMOTE"] == "1"
     }()
 }
+
+extension SwitchGLU {
+    /// The three resident projections when all are affine/fp `QuantizedSwitchLinear` banks, for model
+    /// kernels that read the expert banks directly (DeepSeek-V4.1 fused decode MoE); nil otherwise.
+    public var quantizedProjections:
+        (gate: QuantizedSwitchLinear, up: QuantizedSwitchLinear, down: QuantizedSwitchLinear)?
+    {
+        guard let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            let down = downProj as? QuantizedSwitchLinear
+        else { return nil }
+        return (gate, up, down)
+    }
+}
+
+extension QuantizedSwitchLinear {
+    /// Packed `[experts, out, in * bits / 32]` words.
+    public var packedWeight: MLXArray { weight }
+    /// `[experts, out, in / groupSize]` group scales.
+    public var groupScales: MLXArray { scales }
+    /// `[experts, out, in / groupSize]` affine group biases (nil for fp modes).
+    public var groupBiases: MLXArray? { biases }
+    /// The optional additive projection bias `[experts, out]`.
+    public var projectionBias: MLXArray? { bias }
+    public var inputDimension: Int { inputDims }
+    public var outputDimension: Int { outputDims }
+}

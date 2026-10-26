@@ -1665,7 +1665,20 @@ private func canRestoreDeepseekV4Layer(
     guard validPool(comp.poolComp), validPool(comp.poolIdx) else { return false }
 
     if comp.quantizedPoolComp != nil || comp.quantizedPoolIdx != nil {
-        guard layer is QuantizedHybridPoolCache else { return false }
+        guard let quantized = layer as? QuantizedHybridPoolCache else { return false }
+        // A record encoded at another width (e.g. 8-bit DSV4-0731 pools into a
+        // 4-bit DeepSeek-V4.1 cache) is refused rather than mixed.
+        let bits = quantized.hybridPoolQuantizationBits
+        let segments = (comp.quantizedPoolComp ?? []) + (comp.quantizedPoolIdx ?? [])
+        guard segments.allSatisfy({ $0.bits == bits }) else { return false }
+    }
+    // DeepSeek-V4.1: a prefix is only reusable with the Engram n-gram tail
+    // that ends exactly at its offset. Refuse (re-prefill) rather than let
+    // the suffix hash against a guessed/padded history.
+    if hybrid.requiresAuxiliaryTokenHistory, comp.offset > 0 {
+        guard let history = comp.auxiliaryTokenHistory,
+              history.endPosition == comp.offset
+        else { return false }
     }
     return true
 }
@@ -1705,6 +1718,14 @@ private func restoreDeepseekV4Layer(
         hybrid.setHybridBuffers(
             branch: .indexer,
             kv: comp.bufIdxKV, gate: comp.bufIdxGate)
+        if hybrid.requiresAuxiliaryTokenHistory || comp.auxiliaryTokenHistory != nil {
+            var mutable = hybrid
+            mutable.auxiliaryTokenHistory = comp.auxiliaryTokenHistory
+        }
+        // dSpark draft-window tail: kept only when it ends exactly at the restored offset.
+        var mutable = hybrid
+        mutable.auxiliaryHiddenTail =
+            comp.auxiliaryHiddenTail?.endPosition == comp.offset ? comp.auxiliaryHiddenTail : nil
         return true
     }
     return apply(hybrid)
