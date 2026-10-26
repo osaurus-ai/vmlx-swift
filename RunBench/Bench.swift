@@ -7659,22 +7659,26 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print("Model: \(type(of: context.model))")
     print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "json (default)")")
     print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
-    guard genericAgentic || context.configuration.toolCallFormat == .dsml else {
+    // DeepSeek-V4 stamps DSML + think_xml; V4.1 (model_type deepseek_v41) its own DSML revision + deepseek_r1.
+    let isV41 = modelTypeForTemplateSmoke(modelPath: modelPath) == "deepseek_v41"
+    let expectedToolFormat: ToolCallFormat = isV41 ? .dsmlV41 : .dsml
+    let expectedReasoning = isV41 ? "deepseek_r1" : "think_xml"
+    guard genericAgentic || context.configuration.toolCallFormat == expectedToolFormat else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 1,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "DSV4 agentic row requires DSML tool-call format, got \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")",
+                    "DSV4 agentic row requires \(expectedToolFormat) tool-call format, got \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")",
             ])
     }
-    guard genericAgentic || context.configuration.reasoningParserName == "think_xml" else {
+    guard genericAgentic || context.configuration.reasoningParserName == expectedReasoning else {
         throw NSError(
             domain: "BENCH_DSV4_AGENTIC_TOOL",
             code: 2,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "DSV4 agentic row requires think_xml reasoning parser, got \(context.configuration.reasoningParserName ?? "nil")",
+                    "DSV4 agentic row requires \(expectedReasoning) reasoning parser, got \(context.configuration.reasoningParserName ?? "nil")",
             ])
     }
 
@@ -7750,6 +7754,7 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
             "<think>", "</think>", "<tool_call>", "<|tool_call>",
             "[TOOL_CALLS]", "<｜tool▁calls｜>", "<｜tool▁call▁begin｜>",
             "<\u{FF5C}DSML\u{FF5C}tool_calls>", "<\u{FF5C}DSML\u{FF5C}invoke",
+            "<\u{FF5C}DSML\u{FF5C} calls>", "<\u{FF5C}DSML\u{FF5C} invoke",
         ].filter { text.contains($0) }
     }
 
