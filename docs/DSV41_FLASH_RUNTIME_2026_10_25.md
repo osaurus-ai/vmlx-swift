@@ -194,8 +194,11 @@ The shared test `randomize` no longer randomizes RoPE `invFreq`. The process-wid
 by the RoPE configuration, so per-layer random tables made positions depend on which layer filled the
 memo last.
 
-Measured (M5 Ultra, DeepSeek-V4.1-Flash): TODO cold prefill 1.6k / 6.5k / 42k / 100k pp/s with
-`VMLX_DSV41_SUFFIX_PRUNE=1` vs `=0`, retrieval answer, TTFT.
+Measured (M5 Ultra 256 GB, osaurus Release, dSpark on, cold unique text): 1.6k / 6.5k / 42k / 49k / 100k
+= 851 / 1282 / 1346 / 1317 / 1117 pp/s with pruning, against 843 / 918 / 744 / 710 / 594 without; the
+retrieval answer is correct at 42k, 49k and 100k. Decode (63.0 / 52.6 / 100.0 / 30.2 tok/s), TTFT
+0.26-0.39 s, Red / Apple / Blue, tools, SSD hit (3420 cached, 0.32 s) and the 206 GB footprint are
+unchanged. 1.6k gains nothing: layer 21 keeps 2414 rows.
 
 ## GPU verification checklist (for the fixes above)
 
