@@ -2591,12 +2591,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         guard var decoder = dspark else { return nil }
         defer { dspark = decoder }
-        // Waits for the previous step's last forward; the decoder closes that step's timing here.
-        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
         let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        // The governor chooses before the pending token is read: an AR step returns to the ordinary decode step,
+        // which submits the next forward before it waits for this token.
+        guard decoder.begin(remaining: remaining) else { return nil }
+        // Waits for the previous step's last forward.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
         let model = self.model
         let cache = self.cache
-        let step = decoder.step(seed: seed, cache: cache, remaining: remaining) { ids in
+        let step = decoder.speculate(seed: seed, cache: cache, remaining: remaining) { ids in
             let tokens = MLXArray(ids.map { Int32($0) }).reshaped(1, ids.count)
             return model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
         }

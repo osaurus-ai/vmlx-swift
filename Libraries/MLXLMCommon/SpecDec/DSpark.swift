@@ -325,6 +325,8 @@ public struct DSparkDecoder {
     let clock: () -> Double
     /// The step in flight; `timed` is false when it ran a forward width this process had not run yet.
     private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double, timed: Bool)?
+    /// Start time of the step ``begin(remaining:)`` opened.
+    private var stepStart: Double = 0
 
     public init(
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
@@ -358,14 +360,37 @@ public struct DSparkDecoder {
         seed: Int, cache: [KVCache], remaining: Int,
         forward: ([Int]) -> MLXArray
     ) -> Step {
+        guard begin(remaining: remaining) else { return .autoregressive }
+        return speculate(seed: seed, cache: cache, remaining: remaining, forward: forward)
+    }
+
+    /// Start a step: close the previous step's timing and let the governor choose. Returns true when this step
+    /// speculates (then call ``speculate(seed:cache:remaining:forward:)`` with the pending token); false when the
+    /// caller takes one ordinary decode step. Neither needs the pending token's value, so an AR step never waits for
+    /// it: the caller's ordinary step submits the next forward before reading the previous token, as plain decoding
+    /// does (reading it here first left the GPU idle while each AR step's graph was built).
+    public mutating func begin(remaining: Int) -> Bool {
         stats.steps += 1
         let now = clock()
         closeLastStep(now: now)
-        let mode = governor.choose()
-        // A block needs room for at least the seed plus one draft, and no stop token may be pending.
-        guard mode == .spec, remaining >= 2, !stopTokenIDs.contains(seed),
-            let checkpoint = SpeculativeCacheListCheckpoint(cache)
-        else {
+        stepStart = now
+        // A block needs room for at least the seed plus one draft.
+        guard governor.choose() == .spec, remaining >= 2 else {
+            stats.arSteps += 1
+            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1))
+            return false
+        }
+        return true
+    }
+
+    /// The speculative step ``begin(remaining:)`` chose, from the pending token `seed` (read back by the caller).
+    public mutating func speculate(
+        seed: Int, cache: [KVCache], remaining: Int,
+        forward: ([Int]) -> MLXArray
+    ) -> Step {
+        let now = stepStart
+        // No stop token may be pending.
+        guard !stopTokenIDs.contains(seed), let checkpoint = SpeculativeCacheListCheckpoint(cache) else {
             stats.arSteps += 1
             last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1))
             return .autoregressive
