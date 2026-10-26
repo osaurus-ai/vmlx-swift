@@ -2082,6 +2082,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     /// Checkpoint tensor names owned by custom banks (JANGHT routed experts); never generic-loaded.
     let excludedTensorNames: Set<String>
 
+    /// DeepSeek-V4.1 JANGHT bundles store the hyper-connection parameters (`hc_*_fn / base / scale`), the
+    /// attention sinks and the router biases in F32, which the reference computes with in F32 (the mixes
+    /// projection, the routing scores the expert top-k reads). The loader's generic bf16 materialisation
+    /// would round them (and the fused hc stage only admits F32 hc parameters), so these bundles keep
+    /// every tensor as stored, as the affine V4.1 bundles already do.
+    public var preservesCheckpointParameterDTypes: Bool { config.isDeepseekV41 && !excludedTensorNames.isEmpty }
+
     public convenience init(_ config: DeepseekV4Configuration) {
         self.init(config, routedExperts: [:], excludedTensorNames: [])
     }
