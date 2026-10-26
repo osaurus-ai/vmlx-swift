@@ -111,6 +111,14 @@ tokens at 13×13, one image prefill chunk, dSpark off for the media turn); text 
 cached, 0.5 s; blue image → "Blue", cache miss. Text decode unchanged (code 70.1, code2 58.6, structured 104.8,
 prose 34.4 tok/s), footprint 205.9 GB with the vision tower.
 
+Group-64 pools (`b34b1789`, reference `QuantGrowBuffer` group): KV at 42k tokens 48.9 MiB including the 40
+full sliding windows (~10.5 MB) and slab slack, i.e. 900 B/token marginal → ~0.91 GB at 1M context. Quality
+and speed unchanged (long-context retrieval correct, Red / Apple / Blue, code 65.6 tok/s).
+
+DSV4-0731 regression on the same build (`DeepSeek-V4-Flash-0731-JANG`): decode 42 tok/s, prefill 660–1024
+pp/s, tools / multiturn / reasoning / SSD L2 pass, image input rejected (text-only bundle). `xhigh` effort is
+rejected by the 0731 contract (low/high/max), identical to `main`.
+
 Before these fixes (PR head `661e9173`, AR): decode 26.8 tok/s, 1.2k prefill 488 pp/s, tool calls broken,
 KV ~3.3 KB/token.
 
