@@ -122,6 +122,8 @@ jangq 3c64d3a / dc09b99):
   fp32, one pass) for prefill index scoring (> 8 rows, >= 32 keys); `VMLX_DSV41_FUSED_INDEX=0` keeps the stock path.
 - `DeepseekV41IndexerMath.topK`: block top-k for rows of 65536+ keys (top-512 blocks of 64 by maximum, then the
   exact selection over their entries) instead of MLX's full-row sort.
+Final build (`1cf69395`, block top-k for prefill rows only): cold prefill 1.6k / 6.5k / 42k / 49k / 100k = 843 / 918 /
+727 / 700 / 594 pp/s, retrieval correct; decode code / code2 / structured / prose 67.7 / 52.8 / 105.6 / 32.6 tok/s.
 Same build A/B (`a436089e`): 49k tokens 593 → 680 pp/s, 100k 458 → 593 pp/s, retrieval correct in all runs;
 42k in the full acceptance 627 → 727 pp/s. Decode unchanged (code 67.4, code2 50.4, structured 105.6, prose
 32.5 tok/s). The per-layer eval barrier inherited from 0731 (above 24,576 tokens) costs only ~3%
