@@ -1097,6 +1097,18 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         idx = maxCacheSize
     }
 
+    /// Drop every cached row and continue at absolute position `position` with an empty
+    /// window. The next update starts the window there (RoPE and mask positions follow
+    /// `offset`). DeepSeek-V4.1 prompt-suffix pruning: a late layer whose earlier prompt rows
+    /// nothing reads computes only a trailing range of a prefill chunk.
+    public func restartWindow(at position: Int) {
+        precondition(position >= offset, "restartWindow cannot move a window backwards")
+        keys = nil
+        values = nil
+        idx = 0
+        offset = position
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result =
             if keys.dim(2) == 1 && canUpdateInPlace(keys.dim(2)) {

@@ -1350,6 +1350,24 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
 
     public var isTrimmable: Bool { local.isTrimmable }
 
+    /// True when this cache holds nothing but its local window: no pool rows, no incomplete
+    /// compressor/indexer buffers, no pending pool inputs, no Engram history. The DeepSeek-V4.1
+    /// layers after the last kv-source / Engram / candidate-source layer are always like this.
+    var holdsOnlyLocalWindow: Bool {
+        compPool.rowCount == 0 && idxPool.rowCount == 0
+            && compBufferKV == nil && compBufferGate == nil
+            && idxBufferKV == nil && idxBufferGate == nil
+            && compPending.inputs.isEmpty && idxPending.inputs.isEmpty
+            && !requiresAuxiliaryTokenHistory
+    }
+
+    /// Prompt-suffix pruning: empty the local window and continue at absolute `position`
+    /// (``RotatingKVCache/restartWindow(at:)``). Only for a cache that ``holdsOnlyLocalWindow``.
+    func restartLocalWindow(at position: Int) {
+        precondition(holdsOnlyLocalWindow, "restartLocalWindow on a DeepSeek-V4 cache that holds pool state")
+        local.restartWindow(at: position)
+    }
+
     /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
     /// Proportional pool-row truncation matching `llama.cpp dsv4_clear_rows`.
     /// Pre-fix this only delegated to `local.trim(n)` — the contaminated
