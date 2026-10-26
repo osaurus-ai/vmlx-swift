@@ -42,14 +42,109 @@ struct DeepseekV41DSparkFocusedTests {
         }
     }
 
+    // MARK: Pool layouts
+
+    /// The two DeepSeek-V4.1 pool layouts `DeepseekV4Model.makeCaches` builds: one contiguous 4-bit
+    /// slab per pool written in place (default), and `VMLX_DSV41_POOL_LAYOUT=segmented`.
+    enum Layout: String, CaseIterable, Sendable, CustomTestStringConvertible {
+        case segmented, contiguous
+        var testDescription: String { rawValue }
+    }
+
+    /// A V4.1 holder-layer cache with `layout`'s pool storage, as `makeCaches` configures it
+    /// (`hotByteLimit` overrides the segmented layout's BF16 hot tier).
+    static func v41Cache(
+        slidingWindow: Int, compressRatio: Int, layout: Layout, hotByteLimit: Int? = nil
+    ) -> DeepseekV4Cache {
+        DeepseekV4Cache(
+            slidingWindow: slidingWindow, compressRatio: compressRatio,
+            poolBF16HotByteLimit: layout == .contiguous ? 0 : hotByteLimit,
+            requiresAuxiliaryTokenHistory: true, poolQuantizationBits: 4,
+            contiguousPools: layout == .contiguous, compactLocalWindow: true)
+    }
+
+    @Test("pool checkpoint survives in-place appends and slab growth; restore hides the rejected rows",
+          arguments: Layout.allCases, [0, 64 << 20])
+    func poolStorageCheckpoint(layout: Layout, hotByteLimit: Int) {
+        Device.withDefaultDevice(.cpu) {
+            let contiguous = layout == .contiguous
+            func storage() -> DeepseekV4PoolStorage {
+                DeepseekV4PoolStorage(
+                    quantizationEnabled: true, hotByteLimit: hotByteLimit, bits: 4,
+                    contiguous: contiguous)
+            }
+            #expect(storage().contiguous == contiguous)
+            let grow = DeepseekV4PoolStorage.contiguousGrowRows
+            let base = Self.random([1, grow - 2, 64], seed: 600, scale: 1)
+            let rejected = Self.random([1, 5, 64], seed: 601, scale: 1)
+            let kept = Self.random([1, 3, 64], seed: 602, scale: 1)
+            let baseOnly = storage()
+            baseOnly.append(base)
+            // The reference never saw the rejected rows.
+            let want = storage()
+            want.append(base)
+            want.append(kept)
+
+            let s = storage()
+            s.append(base)
+            let ck = s.snapshot()
+            let capacityBefore = s.retainedByteCount
+            s.append(rejected[0..., 0 ..< 1])  // contiguous: in place, inside the slab
+            s.append(rejected[0..., 1...])  // contiguous: past capacity, the slab grows
+            #expect(s.rowCount == grow + 3)
+            if contiguous { #expect(s.retainedByteCount > capacityBefore) }
+            s.load(ck)
+            // Only the checkpoint's rows are visible, through every reader.
+            #expect(s.rowCount == grow - 2)
+            #expect(Self.equal(s.materialized(), baseOnly.materialized()))
+            #expect(s.quantizedSegments.reduce(0) { $0 + $1.rowCount }
+                == baseOnly.quantizedSegments.reduce(0) { $0 + $1.rowCount })
+            var tiled = 0
+            s.forEachDequantizedTile(maxRows: 512) { start, tile in tiled = max(tiled, start + tile.dim(1)) }
+            #expect(tiled == grow - 2)
+            s.load(ck)  // restoring the same checkpoint again changes nothing
+            #expect(s.rowCount == grow - 2)
+
+            // Appends after the restore overwrite the rejected rows (contiguous: grown slab, in place).
+            s.append(kept)
+            #expect(Self.equal(s.materialized(), want.materialized()))
+            let idx = MLXArray([Int32(grow - 3), Int32(grow - 2), Int32(grow)]).reshaped(1, 3)
+            #expect(Self.equal(s.gatherDequantizedRows(idx), want.gatherDequantizedRows(idx)))
+
+            // A second verify inside the grown slab's capacity.
+            let ck2 = s.snapshot()
+            s.append(rejected[0..., 0 ..< 2])
+            s.load(ck2)
+            s.append(kept[0..., 0 ..< 1])
+            want.append(kept[0..., 0 ..< 1])
+            #expect(Self.equal(s.materialized(), want.materialized()))
+            #expect(s.snapshotRowsIntact(ck))
+
+            if contiguous {
+                // A drop below a checkpoint's rows lets later appends rewrite them: that checkpoint
+                // is no longer intact; one at or below the drop still is.
+                let ck3 = s.snapshot()
+                s.trimTrailingRows(2)
+                s.append(rejected[0..., 0 ..< 2])
+                #expect(!s.snapshotRowsIntact(ck3))
+                #expect(!s.snapshotRowsIntact(ck2))
+                #expect(s.snapshotRowsIntact(ck))
+                // Replacing the content invalidates every non-empty checkpoint.
+                let ck4 = s.snapshot()
+                s.replace(with: base)
+                #expect(!s.snapshotRowsIntact(ck4))
+            }
+        }
+    }
+
     // MARK: DeepseekV4Cache in-place restore
 
-    @Test("DeepseekV4Cache restore returns every field to the pre-verify state in place")
-    func dsv4CacheRestore() {
+    @Test("DeepseekV4Cache restore returns every field to the pre-verify state in place",
+          arguments: Layout.allCases)
+    func dsv4CacheRestore(layout: Layout) {
         Device.withDefaultDevice(.cpu) {
-            let cache = DeepseekV4Cache(
-                slidingWindow: 8, compressRatio: 2, poolQuantizationEnabled: true,
-                poolBF16HotByteLimit: 0, requiresAuxiliaryTokenHistory: true, poolQuantizationBits: 4)
+            let cache = Self.v41Cache(slidingWindow: 8, compressRatio: 2, layout: layout, hotByteLimit: 0)
+            #expect(cache.contiguousPools == (layout == .contiguous))
             // Committed state past the window (not trimmable any more).
             _ = cache.update(keys: Self.random([1, 1, 10, 64], seed: 1), values: Self.random([1, 1, 10, 64], seed: 2))
             for i in 0 ..< 3 {
@@ -76,8 +171,10 @@ struct DeepseekV41DSparkFocusedTests {
             let pendingBefore = cache.pendingPoolTokenCount(.compressor)
             #expect(pendingBefore == 1)
             let ck = cache.speculativeCheckpoint()
+            let poolRows = cache.getPooled(.compressor)?.dim(1)
 
             // A rejected verify block: every field moves.
+            cache.engramLookaheadTokens = [7, 8, 9]
             _ = cache.update(keys: Self.random([1, 1, 5, 64], seed: 30), values: Self.random([1, 1, 5, 64], seed: 31))
             _ = cache.appendPooled(.compressor, value: Self.random([1, 3, 64], seed: 32), isPrefill: false)
             _ = cache.appendPooled(.indexer, value: Self.random([1, 3, 64], seed: 33), isPrefill: false)
@@ -93,6 +190,9 @@ struct DeepseekV41DSparkFocusedTests {
 
             cache.restoreSpeculativeCheckpoint(ck)
             #expect(cache.offset == 13)
+            #expect(cache.getPooled(.compressor)?.dim(1) == poolRows)
+            // The next-chunk Engram lookahead belonged to the rejected forward.
+            #expect(cache.engramLookaheadTokens == nil && cache.engramLookahead == nil)
             #expect(cache.pendingPoolTokenCount(.compressor) == pendingBefore)
             #expect(cache.auxiliaryTokenHistory == before.auxiliaryTokenHistory)
             #expect(cache.auxiliaryHiddenTail?.endPosition == 13)
@@ -106,33 +206,44 @@ struct DeepseekV41DSparkFocusedTests {
         }
     }
 
-    @Test("the hidden tail travels with copy, trim and the disk record")
-    func tailTravelsWithCache() {
+    @Test("the hidden tail travels with copy, trim and the disk record", arguments: Layout.allCases)
+    func tailTravelsWithCache(layout: Layout) {
         Device.withDefaultDevice(.cpu) {
-            let src = DeepseekV4Cache(
-                slidingWindow: 16, compressRatio: 2, requiresAuxiliaryTokenHistory: true,
-                poolQuantizationBits: 4)
+            let src = Self.v41Cache(slidingWindow: 16, compressRatio: 2, layout: layout)
             _ = src.local.update(keys: MLXArray.ones([1, 1, 6, 8]), values: MLXArray.ones([1, 1, 6, 8]))
+            _ = src.appendPooled(.compressor, value: Self.random([1, 3, 64], seed: 42), isPrefill: true)
+            _ = src.appendPooled(.indexer, value: Self.random([1, 3, 64], seed: 43), isPrefill: true)
             src.recordAuxiliaryTokens([1, 2, 3, 4, 5, 6], startPos: 0)
             let rows = Self.random([6, 12], seed: 41)
             src.auxiliaryHiddenTail = HybridPoolHiddenTail(capacity: 8, start: 0, rows: rows)
+            let pool = src.getPooled(.compressor)
 
             let dup = src.copy() as! DeepseekV4Cache
             #expect(Self.equal(dup.auxiliaryHiddenTail?.joined()?.rows, rows))
+            #expect(Self.equal(dup.getPooled(.compressor), pool))
 
             let encoded = TQDiskSerializer.serialize(cache: [src])
-            let dst = DeepseekV4Cache(
-                slidingWindow: 16, compressRatio: 2, requiresAuxiliaryTokenHistory: true,
-                poolQuantizationBits: 4)
+            let dst = Self.v41Cache(slidingWindow: 16, compressRatio: 2, layout: layout)
             var target: [any KVCache] = [dst]
             #expect(restoreFromDiskArrays(encoded, into: &target) == 6)
             #expect(dst.auxiliaryHiddenTail?.startPosition == 0)
             #expect(dst.auxiliaryHiddenTail?.capacity == 8)
             #expect(Self.equal(dst.auxiliaryHiddenTail?.joined()?.rows, rows))
+            #expect(Self.equal(dst.getPooled(.compressor), pool))
+            // The restored cache checkpoints and restores in place like a live one.
+            let ck = dst.speculativeCheckpoint()
+            _ = dst.appendPooled(.compressor, value: Self.random([1, 2, 64], seed: 44), isPrefill: false)
+            var tail = dst.auxiliaryHiddenTail!
+            tail.record(rows: Self.random([2, 12], seed: 45), startPosition: 6)
+            dst.auxiliaryHiddenTail = tail
+            dst.restoreSpeculativeCheckpoint(ck)
+            #expect(Self.equal(dst.getPooled(.compressor), pool))
+            #expect(Self.equal(dst.auxiliaryHiddenTail?.joined()?.rows, rows))
 
             src.trim(2)
             #expect(src.auxiliaryHiddenTail?.endPosition == 4)
             #expect(Self.equal(src.auxiliaryHiddenTail?.joined()?.rows, rows[0 ..< 4]))
+            #expect(src.getPooled(.compressor)?.dim(1) == 2)
         }
     }
 
@@ -151,10 +262,8 @@ struct DeepseekV41DSparkFocusedTests {
         return DeepseekV4Attention(config: c, layerIdx: 0)
     }
 
-    static func commitCache() -> DeepseekV4Cache {
-        DeepseekV4Cache(
-            slidingWindow: 4, compressRatio: 2, requiresAuxiliaryTokenHistory: true,
-            poolQuantizationBits: 4)
+    static func commitCache(_ layout: Layout) -> DeepseekV4Cache {
+        v41Cache(slidingWindow: 4, compressRatio: 2, layout: layout)
     }
 
     static func run(_ attn: DeepseekV4Attention, _ x: MLXArray, _ cache: DeepseekV4Cache,
@@ -169,9 +278,22 @@ struct DeepseekV41DSparkFocusedTests {
     }
 
     /// Prompt prefix, then two single-token steps (deferred pool tokens, wrapped window).
-    static func primed(_ attn: DeepseekV4Attention, _ xs: MLXArray) -> DeepseekV4Cache {
-        let cache = commitCache()
+    /// `nearCapacity` pads both pools to just under the contiguous slab's capacity, so the verify
+    /// forward's pool rows grow (reallocate) the slab after the checkpoint.
+    static func primed(
+        _ attn: DeepseekV4Attention, _ xs: MLXArray, _ layout: Layout, nearCapacity: Bool = false
+    ) -> DeepseekV4Cache {
+        let cache = commitCache(layout)
         run(attn, xs[0..., 0 ..< 7], cache)
+        if nearCapacity {
+            for (branch, seed) in [(DeepseekV4Cache.BranchKey.compressor, UInt64(70)), (.indexer, 71)] {
+                let rows = cache.getPooled(branch)?.dim(1) ?? 0
+                _ = cache.appendPooled(
+                    branch,
+                    value: random([1, DeepseekV4PoolStorage.contiguousGrowRows - 1 - rows, 64], seed: seed),
+                    isPrefill: true)
+            }
+        }
         run(attn, xs[0..., 7 ..< 8], cache)
         run(attn, xs[0..., 8 ..< 9], cache)
         return cache
@@ -184,20 +306,39 @@ struct DeepseekV41DSparkFocusedTests {
     }
 
     @Test("commit_prefix(all) equals the captured verify's own state bit for bit; partial keeps match a forward of only the kept tokens",
-          arguments: [2, 1])
-    func commitPrefixMatchesForward(ratio: Int) {
+          arguments: [2, 1], Layout.allCases)
+    func commitPrefixMatchesForward(ratio: Int, layout: Layout) {
+        commitPrefixCase(ratio: ratio, layout: layout, nearCapacity: false)
+    }
+
+    @Test("commit_prefix across a contiguous slab growth matches a forward of only the kept tokens",
+          arguments: Layout.allCases)
+    func commitPrefixAcrossSlabGrowth(layout: Layout) {
+        commitPrefixCase(ratio: 2, layout: layout, nearCapacity: true)
+    }
+
+    func commitPrefixCase(ratio: Int, layout: Layout, nearCapacity: Bool) {
         Device.withDefaultDevice(.cpu) {
             let attn = Self.commitLayer(ratio: ratio)
             let xs = Self.random([1, 15, 64], seed: 500 + UInt64(ratio), scale: 1)
             let verify = xs[0..., 9 ..< 15]  // [p0, d1..d5]
 
             // Reference: the verify forward's own state.
-            let full = Self.primed(attn, xs)
+            let full = Self.primed(attn, xs, layout, nearCapacity: nearCapacity)
+            let grow = DeepseekV4PoolStorage.contiguousGrowRows
+            if nearCapacity {
+                // The verify forward's pool rows cross the slab capacity.
+                #expect((full.getPooled(.compressor)?.dim(1) ?? 0) <= grow)
+            }
             Self.run(attn, verify, full)
+            if nearCapacity {
+                #expect((full.getPooled(.compressor)?.dim(1) ?? 0) > grow)
+                #expect((full.getPooled(.indexer)?.dim(1) ?? 0) > grow)
+            }
             let fullState = Self.snapshot(full)
 
             for keep in 1 ... 6 {
-                let cache = Self.primed(attn, xs)
+                let cache = Self.primed(attn, xs, layout, nearCapacity: nearCapacity)
                 let objects = ObjectIdentifier(cache)
                 let ck = SpeculativeCacheListCheckpoint([cache])!
                 let capture = DSV41VerifyCapture()
@@ -215,7 +356,7 @@ struct DeepseekV41DSparkFocusedTests {
                     for (a, b) in zip(got.state, fullState.state) { #expect(Self.equal(a, b)) }
                 }
                 // A forward of only the kept tokens.
-                let only = Self.primed(attn, xs)
+                let only = Self.primed(attn, xs, layout, nearCapacity: nearCapacity)
                 Self.run(attn, verify[0..., 0 ..< keep], only)
                 let want = Self.snapshot(only)
                 #expect(got.offset == want.offset, "keep \(keep)")
