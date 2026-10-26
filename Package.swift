@@ -975,6 +975,7 @@ let package = Package(
                 "DeepseekV41KVBytesFocusedTests.swift",
                 "DeepseekV41PrefillLookaheadFocusedTests.swift",
                 "DeepseekV41PoolLayoutAttentionTests.swift",
+                "DeepseekV41SuffixPruneFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",

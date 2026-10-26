@@ -624,17 +624,21 @@ struct DeepseekV41VisionFocusedTests {
         return dir
     }
 
-    /// Every parameter of `model` set from a seeded generator (norm-like vectors near 1).
+    /// Every parameter of `model` set from a seeded generator (norm-like vectors near 1), except the
+    /// RoPE frequency tables: `invFreq` is a module array, and the process-wide cos/sin memo is keyed
+    /// by the RoPE configuration, not by `invFreq`, so randomized per-layer tables made a layer's
+    /// positions depend on which layer (or concurrently running test) last filled the memo.
     static func randomize(_ model: Module, seed: UInt64) {
         var updates: [(String, MLXArray)] = []
-        for (i, (key, value)) in model.parameters().flattened().sorted(by: { $0.0 < $1.0 }).enumerated() {
+        for (i, (key, value)) in model.parameters().flattened().sorted(by: { $0.0 < $1.0 }).enumerated()
+        where !key.hasSuffix("invFreq") {
             var a = DeepseekV41DSparkFocusedTests.random(value.shape, seed: seed &+ UInt64(i), scale: 0.08)
             if key.hasSuffix("norm.weight") || key.hasSuffix("layernorm.weight") || key.hasSuffix("_weight") {
                 a = a + 1
             }
             updates.append((key, a.asType(value.dtype)))
         }
-        try! model.update(parameters: ModuleParameters.unflattened(updates), verify: [.all])
+        try! model.update(parameters: ModuleParameters.unflattened(updates), verify: [])
         eval(model)
     }
 
