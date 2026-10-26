@@ -37,12 +37,59 @@ final class DSV41CompressShare {
     var indexK: DeepseekV4PoolView?
     /// Most recent index-source layer's selection per query sub-chunk (keyed by the sub-chunk's
     /// start position: attention runs in sub-chunks INSIDE a layer, and every layer uses the same
-    /// partition). Value `[1, L, k]` int32, or nil = every visible row.
-    var selections: [Int: MLXArray?] = [:]
+    /// partition). Value `[1, L, k]` int32, or nil = every visible row. Read through
+    /// ``selection(offset:rows:)``.
+    private(set) var selections: [Int: (rows: Int, value: MLXArray?)] = [:]
     /// Candidate-source layer's row mask `[L, T]` bool, per query sub-chunk.
-    var candidates: [Int: MLXArray] = [:]
+    private(set) var candidates: [Int: (rows: Int, value: MLXArray)] = [:]
     /// dSpark verify capture for this forward (nil unless the sequence asked for one).
     var capture: DSV41VerifyCapture?
+
+    func setSelection(_ topK: MLXArray?, offset: Int, rows: Int) {
+        selections[offset] = (rows, topK)
+    }
+
+    func setCandidates(_ mask: MLXArray, offset: Int, rows: Int) {
+        candidates[offset] = (rows, mask)
+    }
+
+    /// The selection for the queries at `offset ..< offset + rows`: the entry stored for exactly
+    /// these rows, or (prompt-suffix pruning, where a late layer runs only the trailing rows of a
+    /// sub-chunk) the trailing rows of the latest entry that ends at the same position. Selections
+    /// are per query row, so a trailing slice is what the layer would have selected for those rows.
+    /// `.none` when nothing covers the rows; `.some(nil)` = every visible row.
+    func selection(offset: Int, rows: Int) -> MLXArray?? {
+        guard let (key, entry) = Self.covering(selections, offset: offset, rows: rows) else {
+            return .none
+        }
+        guard let value = entry.value, key != offset else { return .some(entry.value) }
+        return .some(value[0..., (offset - key)...])
+    }
+
+    /// The candidate-row mask for the queries at `offset ..< offset + rows` (same rule as
+    /// ``selection(offset:rows:)``).
+    func candidates(offset: Int, rows: Int) -> MLXArray? {
+        guard let (key, entry) = Self.covering(candidates, offset: offset, rows: rows) else {
+            return nil
+        }
+        return key == offset ? entry.value : entry.value[(offset - key)...]
+    }
+
+    /// Exact key first (every unpruned forward). Otherwise the entry with the largest start before
+    /// `offset` that ends at `offset + rows`: within one forward the later writer of a sub-chunk
+    /// always starts at or after the earlier one (a deeper layer keeps fewer rows).
+    private static func covering<V>(
+        _ map: [Int: (rows: Int, value: V)], offset: Int, rows: Int
+    ) -> (Int, (rows: Int, value: V))? {
+        if let entry = map[offset], entry.rows == rows { return (offset, entry) }
+        let end = offset + rows
+        var best: Int? = nil
+        for (key, entry) in map where key < offset && key + entry.rows == end {
+            if best.map({ key > $0 }) ?? true { best = key }
+        }
+        guard let best, let entry = map[best] else { return nil }
+        return (best, entry)
+    }
 }
 
 /// Index keys produced without a cache (cache-less prefill), collected by the latent sink.

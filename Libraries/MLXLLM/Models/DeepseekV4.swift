@@ -486,13 +486,14 @@ class DeepseekV4Attention: Module {
                         if let idx = v41Indexer, let indexK = compressShare?.indexK {
                             let sel = idx.select(
                                 x: x, qResidual: qResidual, indexK: indexK, startPos: offset,
-                                rope: rope, candidates: compressShare?.candidates[offset])
-                            compressShare?.selections[offset] = .some(sel.topK)
-                            if idx.isCandidateSource {
-                                compressShare?.candidates[offset] = sel.candidates
+                                rope: rope,
+                                candidates: compressShare?.candidates(offset: offset, rows: L))
+                            compressShare?.setSelection(sel.topK, offset: offset, rows: L)
+                            if idx.isCandidateSource, let cand = sel.candidates {
+                                compressShare?.setCandidates(cand, offset: offset, rows: L)
                             }
                             topK = sel.topK
-                        } else if let entry = compressShare?.selections[offset] {
+                        } else if let entry = compressShare?.selection(offset: offset, rows: L) {
                             topK = entry
                         }
                     } else if compressRatio == 4, let idx = indexer {
