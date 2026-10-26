@@ -42,8 +42,9 @@ struct DeepseekV41KVBytesFocusedTests {
 
     /// Reference row bytes: 4-bit codes + bf16 scale and bias per 64 (mx.quantize, GROUP_SIZE 64).
     static func pythonRowBytes(_ d: Int) -> Int { d / 2 + (d / 64) * 4 }
-    /// vmlx row bytes: 4-bit codes + fp16 scale and minimum per 32.
-    static func swiftRowBytes(_ d: Int) -> Int { d / 2 + (d / 32) * 4 }
+    /// vmlx row bytes: 4-bit codes + fp16 scale and minimum per 64 (`v41GroupSize`, same bytes as
+    /// the reference's bf16 scale and bias per 64).
+    static func swiftRowBytes(_ d: Int) -> Int { d / 2 + (d / DeepseekV4PoolStorage.v41GroupSize) * 4 }
 
     struct Geometry {
         let layers: Int
@@ -145,8 +146,7 @@ struct DeepseekV41KVBytesFocusedTests {
             let bytes = CacheStoreBudget.cacheBytes(caches)
             #expect(bytes == g.swiftBytes(tokens), "\(bytes) vs formula \(g.swiftBytes(tokens))")
 
-            // Live per-token pool bytes against the reference: only the finer
-            // group (32 vs 64) costs more.
+            // Live per-token pool bytes against the reference: identical (group 64 both).
             let swiftPerToken = g.sources.reduce(0.0) {
                 $0 + (Double(Self.swiftRowBytes(g.headDim) + Self.swiftRowBytes(g.indexDim)) / Double($1.1))
             }
@@ -154,15 +154,15 @@ struct DeepseekV41KVBytesFocusedTests {
                 $0 + (Double(Self.pythonRowBytes(g.headDim) + Self.pythonRowBytes(g.indexDim)) / Double($1.1))
             }
             #expect(pythonPerToken == 900)
-            #expect(swiftPerToken == 1000)
+            #expect(swiftPerToken == 900)
             let swiftWindows = g.layers * 2 * g.window * g.headDim * 2
             let pythonWindows = g.layers * g.window * g.headDim * 2
             let swiftPools = bytes - swiftWindows
             let pythonPools = g.pythonBytes(tokens) - pythonWindows
             #expect(
-                Double(swiftPools) <= 1.17 * Double(pythonPools),
+                Double(swiftPools) <= 1.07 * Double(pythonPools),
                 "pools \(swiftPools) B vs reference \(pythonPools) B")
-            #expect(Double(g.swiftBytes(1 << 20)) < 1.07e9, "1M tokens: \(g.swiftBytes(1 << 20)) B")
+            #expect(Double(g.swiftBytes(1 << 20)) < 0.97e9, "1M tokens: \(g.swiftBytes(1 << 20)) B")
 
             // Root cause: the segmented layout kept every pool under 64 MiB in BF16.
             let old = DeepseekV4Model.makeCaches(
@@ -230,7 +230,8 @@ struct DeepseekV41KVBytesFocusedTests {
             #expect(storage.rowCount == n)
             #expect(storage.quantizedSegments.count == 1)
             #expect(storage.hotPool == nil)
-            let expected = DeepseekV4PoolStorage.dequantize(DeepseekV4PoolStorage.quantize(all, bits: 4))
+            let expected = DeepseekV4PoolStorage.dequantize(
+                DeepseekV4PoolStorage.quantize(all, bits: 4, groupSize: DeepseekV4PoolStorage.v41GroupSize))
             let full = storage.materialized()!
             #expect(MLX.abs(full - expected).max().item(Float.self) == 0)
             #expect(storage.retainedByteCount
@@ -262,7 +263,8 @@ struct DeepseekV41KVBytesFocusedTests {
             let after = storage.materialized()!
             let want = concatenated([all[0..., 0 ..< (n - 1), 0...], tail], axis: 1)
             #expect(MLX.abs(after - DeepseekV4PoolStorage.dequantize(
-                DeepseekV4PoolStorage.quantize(want, bits: 4))).max().item(Float.self) == 0)
+                DeepseekV4PoolStorage.quantize(want, bits: 4, groupSize: DeepseekV4PoolStorage.v41GroupSize)))
+                .max().item(Float.self) == 0)
         }
     }
 

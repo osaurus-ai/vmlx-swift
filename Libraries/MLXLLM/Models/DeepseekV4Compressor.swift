@@ -34,6 +34,10 @@ final class DeepseekV4PoolStorage {
     static let segmentRows = 64
     static let slabMaxRows = 16 * 1024
     static let groupSize = 32
+    /// DeepSeek-V4.1 4-bit contiguous pools: one fp16 scale/minimum per 64 elements, as the
+    /// reference `QuantGrowBuffer` (`mx.quantize`, GROUP_SIZE 64) - 288 B per 512-wide row,
+    /// 900 B/token across the four kv-source pools (~0.9 GB at 1M). DSV4-0731 keeps 32.
+    static let v41GroupSize = 64
     /// DSV4-0731 pool code width (unchanged default).
     static let bits = 8
     /// Widths the storage (and the disk schema) can encode. 4-bit codes are
@@ -52,6 +56,10 @@ final class DeepseekV4PoolStorage {
     /// serializer sees a single compact segment. DSV4-0731 keeps the segmented
     /// hot-tier layout (`false`).
     let contiguous: Bool
+    /// Affine group for newly encoded rows (``v41GroupSize`` for the V4.1 contiguous 4-bit
+    /// layout, ``groupSize`` otherwise). Encoded segments carry their own group, so records of
+    /// another group still decode; restore re-encodes them once.
+    let groupSize: Int
     private(set) var hotPool: MLXArray?
     private(set) var segmentStore: [HybridPoolQuantizedSegment] = []
     private var emptySpec: (shape: [Int], dtype: DType)?
@@ -65,13 +73,15 @@ final class DeepseekV4PoolStorage {
 
     init(
         quantizationEnabled: Bool, hotByteLimit: Int, bits: Int = DeepseekV4PoolStorage.bits,
-        contiguous: Bool = false
+        contiguous: Bool = false, groupSize: Int? = nil
     ) {
         precondition(Self.supportedBits.contains(bits), "DSV4 pool bits must be 4 or 8")
         self.quantizationEnabled = quantizationEnabled
         self.hotByteLimit = max(0, hotByteLimit)
         self.bits = bits
         self.contiguous = contiguous && quantizationEnabled
+        self.groupSize = groupSize
+            ?? ((self.contiguous && bits == 4) ? Self.v41GroupSize : Self.groupSize)
     }
 
     /// Encoded segments as the disk serializer and inspection code read them.
@@ -327,7 +337,7 @@ final class DeepseekV4PoolStorage {
         } else if contiguous {
             // A BF16 state (older record, generic `state` setter) is encoded
             // exactly as appending its rows would have encoded them.
-            slab = Self.quantize(value, bits: bits)
+            slab = Self.quantize(value, bits: bits, groupSize: groupSize)
             slabRows = value.dim(1)
         } else if !quantizationEnabled || value.nbytes <= hotByteLimit {
             hotPool = value
@@ -341,7 +351,7 @@ final class DeepseekV4PoolStorage {
         emptySpec = nil
 
         if contiguous {
-            appendContiguous(Self.quantize(value, bits: bits))
+            appendContiguous(Self.quantize(value, bits: bits, groupSize: groupSize))
             return
         }
 
@@ -366,7 +376,7 @@ final class DeepseekV4PoolStorage {
         if tail > 0 {
             let take = min(Self.segmentRows - tail, rows)
             segmentStore.append(
-                Self.quantize(value[0..., 0..<take, 0...], bits: bits))
+                Self.quantize(value[0..., 0..<take, 0...], bits: bits, groupSize: groupSize))
             offset += take
             compactCompletedTail()
         }
@@ -378,13 +388,13 @@ final class DeepseekV4PoolStorage {
                 take *= 2
             }
             segmentStore.append(
-                Self.quantize(value[0..., offset..<(offset + take), 0...], bits: bits))
+                Self.quantize(value[0..., offset..<(offset + take), 0...], bits: bits, groupSize: groupSize))
             offset += take
             compactSlabCascade()
         }
         if offset < rows {
             segmentStore.append(
-                Self.quantize(value[0..., offset..<rows, 0...], bits: bits))
+                Self.quantize(value[0..., offset..<rows, 0...], bits: bits, groupSize: groupSize))
         }
     }
 
@@ -426,6 +436,8 @@ final class DeepseekV4PoolStorage {
             slabRows = 0
             guard let first = segments.first else { return }
             let joinable = segments.allSatisfy { Self.compatible(first, $0) } && first.bits == bits
+                && first.groupSize == Self.effectiveGroupSize(features: first.originalShape.last ?? 0,
+                                                               groupSize: groupSize)
             let joined: HybridPoolQuantizedSegment
             if joinable {
                 joined = segments.count == 1 ? first : Self.concatenate(segments)
@@ -433,7 +445,8 @@ final class DeepseekV4PoolStorage {
                 // A record of another width or group: re-encode once.
                 let parts = segments.map(Self.dequantize)
                 joined = Self.quantize(
-                    parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), bits: bits)
+                    parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), bits: bits,
+                    groupSize: groupSize)
             }
             MLX.eval([joined.codes, joined.scales, joined.biases])
             slab = joined
@@ -528,7 +541,8 @@ final class DeepseekV4PoolStorage {
             quantizationEnabled: quantizationEnabled,
             hotByteLimit: hotByteLimit,
             bits: bits,
-            contiguous: contiguous)
+            contiguous: contiguous,
+            groupSize: groupSize)
         if contiguous {
             // The copy holds only the live rows (fresh handles over the same
             // buffer). The source keeps appending in place; MLX refuses to
@@ -565,7 +579,7 @@ final class DeepseekV4PoolStorage {
             let live = liveSlab().map(Self.dequantize)
             let merged = Self.dequantize(rows)
             slab = Self.quantize(
-                live.map { concatenated([$0, merged], axis: 1) } ?? merged, bits: bits)
+                live.map { concatenated([$0, merged], axis: 1) } ?? merged, bits: bits, groupSize: groupSize)
             slabRows = slabRows + k
             return
         }
@@ -624,7 +638,7 @@ final class DeepseekV4PoolStorage {
                 }
             }
             let end = start + take
-            segmentStore.append(Self.quantize(value[0..., start..<end, 0...], bits: bits))
+            segmentStore.append(Self.quantize(value[0..., start..<end, 0...], bits: bits, groupSize: groupSize))
             start = end
             compactSlabCascade()
         }
@@ -712,11 +726,19 @@ final class DeepseekV4PoolStorage {
         segmentStore = regrouped
     }
 
-    static func quantize(_ value: MLXArray, bits: Int = DeepseekV4PoolStorage.bits) -> HybridPoolQuantizedSegment {
+    /// The group a feature width actually encodes with (the whole row when it doesn't divide).
+    static func effectiveGroupSize(features: Int, groupSize: Int) -> Int {
+        features > 0 && features % groupSize == 0 ? groupSize : features
+    }
+
+    static func quantize(
+        _ value: MLXArray, bits: Int = DeepseekV4PoolStorage.bits,
+        groupSize: Int = DeepseekV4PoolStorage.groupSize
+    ) -> HybridPoolQuantizedSegment {
         let shape = value.shape
         let featureCount = shape.last ?? 0
         precondition(featureCount > 0, "DSV4 pool feature dimension must be non-zero")
-        let effectiveGroupSize = featureCount % groupSize == 0 ? groupSize : featureCount
+        let effectiveGroupSize = effectiveGroupSize(features: featureCount, groupSize: groupSize)
         // Nibble packing needs an even group; an odd fallback group stays 8-bit.
         let bits = (bits == 4 && effectiveGroupSize % 2 != 0) ? 8 : bits
         let groupCount = featureCount / effectiveGroupSize
