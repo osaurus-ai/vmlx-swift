@@ -239,7 +239,8 @@ public struct DSparkDecoder {
     /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(blockSize * ema), 1, bs).
     public private(set) var acceptEMA: Double = 1.0
     let clock: () -> Double
-    private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double)?
+    /// The step in flight; `timed` is false when it ran a forward width this process had not run yet.
+    private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double, timed: Bool)?
 
     public init(
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
@@ -279,7 +280,7 @@ public struct DSparkDecoder {
             let checkpoint = SpeculativeCacheListCheckpoint(cache)
         else {
             stats.arSteps += 1
-            last = (.ar, 1, now)
+            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1))
             return .autoregressive
         }
 
@@ -318,6 +319,7 @@ public struct DSparkDecoder {
         }
         var emit: [Int]
         let next: MLXArray
+        var commitWidth: Int? = nil
         // Verified tokens of `feed`: all of it on a full accept, else p0 plus the k accepted drafts.
         let verified = fullAccept ? feed.count : k + 1
         let keep = cut(Array(feed.prefix(verified)))
@@ -343,13 +345,18 @@ public struct DSparkDecoder {
             checkpoint.restore()
             let commitStart = clock()
             let commit = forward(emit)
+            commitWidth = emit.count
             next = argMax(commit[0, -1], axis: -1).asType(.int32).reshaped(1)
             asyncEval(next)
             stats.commitSeconds += clock() - commitStart
             stats.commitForwards += 1
         }
         stats.specEmitted += emit.count
-        last = (.spec, emit.count, now)
+        var newWidth = DSparkForwardWidths.firstUse(feed.count)
+        if let commitWidth {
+            newWidth = DSparkForwardWidths.firstUse(commitWidth) || newWidth
+        }
+        last = (.spec, emit.count, now, !newWidth)
         return .committed(emit, next: next)
     }
 
@@ -362,7 +369,9 @@ public struct DSparkDecoder {
     private mutating func closeLastStep(now: Double) {
         guard let last else { return }
         let seconds = Swift.max(0, now - last.start)
-        governor.record(last.mode, seconds: seconds, emitted: last.emitted)
+        if last.timed {
+            governor.record(last.mode, seconds: seconds, emitted: last.emitted)
+        }
         switch last.mode {
         case .spec: stats.specSeconds += seconds
         case .ar: stats.arSeconds += seconds
@@ -370,5 +379,22 @@ public struct DSparkDecoder {
         stats.specSecondsPerToken = governor.spec
         stats.arSecondsPerToken = governor.ar
         self.last = nil
+    }
+}
+
+/// Forward widths (rows per forward) this process has run. A model's first forward at a new width pays
+/// one-time costs: compiled decode regions record their trace, and DeepSeek-V4.1's fused decode kernels
+/// run a bitwise admission check against the stock path, an eager evaluation per layer (one first
+/// verify took ~210 ms instead of ~25). Timing such a step made speculation look slower than AR, so the
+/// first reply ran mostly AR (live: code 51.4 tok/s vs 62-110 on later prompts); the governor skips it.
+enum DSparkForwardWidths {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var seen = Set<Int>()
+
+    /// True the first time `rows` is reported in this process.
+    static func firstUse(_ rows: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return seen.insert(rows).inserted
     }
 }
