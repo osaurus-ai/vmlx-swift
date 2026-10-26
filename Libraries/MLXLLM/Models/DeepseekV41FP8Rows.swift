@@ -50,7 +50,10 @@ enum DeepseekV41FP8Rows {
     /// `x` `[..., M, K]` through the mxfp8 weight `[N, K/4]` (scales `[N, K/32]`), or batched weights `[B, N, K/4]`
     /// with `x` `[B, M, K]` (the grouped wo_a): `[..., M, N]`, or nil when the call is not served here.
     static func rows(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
-        guard requested, x.ndim >= 2 else { return nil }
+        guard requested, x.ndim >= 2,
+            // METAL-ONLY: case 1. Guards the Metal kernel; other devices keep quantizedMM.
+            Device.defaultDevice().deviceType == .gpu
+        else { return nil }
         let m = x.dim(-2)
         let k = x.dim(-1)
         guard let config = configuration(rows: m) else { return nil }
@@ -130,6 +133,7 @@ enum DeepseekV41FP8Rows {
     }
 
     /// One kernel; the template arguments specialize it per shape.
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device `rows` returns nil and the caller keeps quantizedMM.
     private static let kernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_fp8_rows_qmv", inputNames: ["x", "w", "scales"], outputNames: ["y"], source: source,
         header: header)
