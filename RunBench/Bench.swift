@@ -642,6 +642,10 @@ struct Bench {
             try await runSpeedProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DSV41_LONG"] ?? "0") == "1" {
+            try await runDSV41LongContext(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_DSPARK_DRAFTS"] ?? "0") == "1" {
             try await runDSparkDraftDump(modelPath: modelPath)
             return
