@@ -746,9 +746,10 @@ class DeepseekV4Attention: Module {
                 .expandedDimensions(axis: 1)
             let wBiases = qwo.biases?.reshaped(oGroups, oLoraRank, -1)
                 .expandedDimensions(axis: 1)
+            // mode: mxfp8 for DeepSeek-V4.1 JANGHT (the release FP8 repacked byte-exact, no biases); affine otherwise.
             let outQ = MLX.quantizedMM(
                 xT, wPacked, scales: wScales, biases: wBiases,
-                transpose: true, groupSize: qwo.groupSize, bits: qwo.bits)
+                transpose: true, groupSize: qwo.groupSize, bits: qwo.bits, mode: qwo.mode)
             oA = outQ.transposed(1, 2, 0, 3).reshaped(
                 B, L, oGroups * oLoraRank)
         } else {
@@ -949,7 +950,9 @@ class DeepseekV4MoE: Module, UnaryLayer {
     let config: DeepseekV4Configuration
     let layerIdx: Int
     let topK: Int
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    /// SwitchGLU (affine bundles) or a weighted routed-expert layer (JANGHT bundles: JANGTRoutedExpertLayer over the
+    /// mapped trellis banks, Hadamard rotation + trellis decode + clamped SwiGLU + routing-weighted down in its kernels).
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     var gate: DeepseekV4MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
     /// Python `_decode_moe_region` parity: one compiled region per layer
@@ -962,11 +965,14 @@ class DeepseekV4MoE: Module, UnaryLayer {
     private let regionLock = NSLock()
     private var moeDecodeRegion: DeepseekV4CompiledRegion? = nil
     fileprivate var moeRegionWarm = false
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
+    init(config: DeepseekV4Configuration, layerIdx: Int, routedExperts: (any WeightedRoutedExpertLayer)? = nil) {
         self.config = config
         self.layerIdx = layerIdx
         self.topK = config.numExpertsPerTok
         let limit = config.swigluLimit
+        if let routedExperts {
+            self._switchMLP.wrappedValue = routedExperts
+        } else {
         // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
         // Symmetric DSV4 limited-SwiGLU — `silu(min(gate, limit)) *
         // clip(up, -limit, +limit)`. We pass a 2-arg `glue` closure to
@@ -988,6 +994,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
                 DeepseekV4Math.dsv4ScoredSwiGLU(
                     gate: gate, up: up, scores: scores, limit: limit)
             })
+        }
         self.gate = DeepseekV4MoEGate(config: config, layerIdx: layerIdx)
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
             hiddenSize: config.hiddenSize,
@@ -995,24 +1002,35 @@ class DeepseekV4MoE: Module, UnaryLayer {
             swigluLimit: limit)
     }
 
+    /// The routing-weighted sum over the top-k experts: SwitchGLU (scores applied before down, f32 reduction) or a
+    /// weighted routed-expert layer (its kernels apply the scores; returns the reduced sum in the input dtype, like the
+    /// Python runtime's JTMixedSwitchGLU.routed). Either is summed in f32 with the shared expert by the caller.
+    fileprivate func routedSum(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray {
+        if let affine = switchMLP as? SwitchGLU {
+            return DeepseekV4Math.reduceRoutedExpertsFP32(affine(x, indices, preDownScores: scores))
+        }
+        return (switchMLP as! any WeightedRoutedExpertLayer).callRouted(x, indices: indices, scores: scores)
+    }
+
     fileprivate func moeMath(_ x: MLXArray, inputIds: MLXArray?) -> (y: MLXArray, indices: MLXArray) {
         let (indices, scores) = gate(x, inputIds: inputIds)
         return (experts(x, indices: indices, scores: scores), indices)
     }
 
-    /// Routed + shared experts after the gate. DeepSeek-V4.1 at decode / verify sizes (<= 8 rows) runs
-    /// the two-dispatch fused kernels (`DeepseekV41FusedMoE`, bit-identical to this graph and admitted
-    /// per shape against it; `VMLX_DSV41_FUSED_MOE=0` keeps the graph). Everything else is the graph.
+    /// Routed + shared experts after the gate. DeepSeek-V4.1 with affine SwitchGLU experts at decode / verify sizes
+    /// (<= 8 rows) runs the two-dispatch fused kernels (`DeepseekV41FusedMoE`, bit-identical to this graph and admitted
+    /// per shape against it; `VMLX_DSV41_FUSED_MOE=0` keeps the graph). JANGT routed experts run their own kernels
+    /// through `routedSum`. Everything else is the graph.
     fileprivate func experts(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
         func stock() -> MLXArray {
-            let routed = switchMLP(x, indices, preDownScores: scores)
-            return DeepseekV4Math.addSharedExpertFP32(
-                DeepseekV4Math.reduceRoutedExpertsFP32(routed),
+            DeepseekV4Math.addSharedExpertFP32(
+                routedSum(x, indices, scores),
                 shared: sharedExperts(x), outputDType: x.dtype)
         }
         if config.isDeepseekV41, x.dim(1) <= DeepseekV41FusedMoE.maxRows,
+            let affine = switchMLP as? SwitchGLU,
             let fused = DeepseekV41FusedMoE.apply(
-                x, indices: indices, scores: scores, switchMLP: switchMLP, shared: sharedExperts,
+                x, indices: indices, scores: scores, switchMLP: affine, shared: sharedExperts,
                 limit: config.swigluLimit, stock: stock)
         {
             return fused
@@ -1033,9 +1051,8 @@ class DeepseekV4MoE: Module, UnaryLayer {
         if let imageMask {
             // DeepSeek-V4.1 prefill chunk carrying image tokens: eager, VL-routed gate.
             let (indices, scores) = gate(x, inputIds: gate.isHashLayer ? inputIds : nil, imageMask: imageMask)
-            let routed = switchMLP(x, indices, preDownScores: scores)
             return DeepseekV4Math.addSharedExpertFP32(
-                DeepseekV4Math.reduceRoutedExpertsFP32(routed),
+                routedSum(x, indices, scores),
                 shared: sharedExperts(x), outputDType: x.dtype)
         }
         let profileStages = deepseekV4StageProfileEnabled && x.dim(1) == 1
@@ -1047,8 +1064,9 @@ class DeepseekV4MoE: Module, UnaryLayer {
         if DeepseekV4Math.compileRegionsEnabled, !profileStages,
             x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil),
             // V4.1: admit the fused kernels eagerly before the region records its trace.
-            !(config.isDeepseekV41 && DeepseekV41FusedMoE.awaitingAdmission(
-                x, topK: topK, switchMLP: switchMLP, shared: sharedExperts))
+            !(config.isDeepseekV41 && (switchMLP as? SwitchGLU).map {
+                DeepseekV41FusedMoE.awaitingAdmission(x, topK: topK, switchMLP: $0, shared: sharedExperts)
+            } == true)
         {
             let region = deepseekV4CachedRegion(regionLock, &moeDecodeRegion) {
                 vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
@@ -1087,8 +1105,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
             moeRegionWarm = true
             return y
         }
-        let routed = switchMLP(x, indices, preDownScores: scores)
-        var y = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
+        var y = routedSum(x, indices, scores)
         finishStage("routed", [y])
         finishStage("route_reduce", [y])
         let shared = sharedExperts(x)
@@ -1322,10 +1339,10 @@ class DeepseekV4DecoderLayer: Module {
     private let regionLock = NSLock()
     private var tailDecodeRegion: DeepseekV4CompiledRegion? = nil
 
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
+    init(config: DeepseekV4Configuration, layerIdx: Int, routedExperts: (any WeightedRoutedExpertLayer)? = nil) {
         self.layerIdx = layerIdx
         self._selfAttn.wrappedValue = DeepseekV4Attention(config: config, layerIdx: layerIdx)
-        self._mlp.wrappedValue = DeepseekV4MoE(config: config, layerIdx: layerIdx)
+        self._mlp.wrappedValue = DeepseekV4MoE(config: config, layerIdx: layerIdx, routedExperts: routedExperts)
         self._inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -1735,12 +1752,12 @@ public class DeepseekV4ModelInner: Module {
         return (chunk, startLookahead)
     }
 
-    init(config: DeepseekV4Configuration) {
+    init(config: DeepseekV4Configuration, routedExperts: [Int: any WeightedRoutedExpertLayer] = [:]) {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         self.layers = (0..<config.numHiddenLayers).map {
-            DeepseekV4DecoderLayer(config: config, layerIdx: $0)
+            DeepseekV4DecoderLayer(config: config, layerIdx: $0, routedExperts: routedExperts[$0])
         }
         self._hcHead.wrappedValue = DeepseekV4HyperHead(config: config)
         self._norm.wrappedValue = RMSNorm(
@@ -2045,6 +2062,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
         guard config.isDeepseekV41 else { return false }
+        // JANGHT: the routed trellis banks are mapped by the JANGH preparation (exact checkpoint names).
+        if excludedTensorNames.contains(key) { return true }
         let k = key.lowercased()
         // Giant FP8 engram embedding table — owned/mmapped by EngramV41.
         if k.contains(".engram.embed") { return true }
@@ -2053,7 +2072,17 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         return false
     }
 
-    public init(_ config: DeepseekV4Configuration) {
+    /// Checkpoint tensor names owned by custom banks (JANGHT routed experts); never generic-loaded.
+    let excludedTensorNames: Set<String>
+
+    public convenience init(_ config: DeepseekV4Configuration) {
+        self.init(config, routedExperts: [:], excludedTensorNames: [])
+    }
+
+    /// `routedExperts`: per-layer weighted routed-expert layers replacing the affine SwitchGLU (DeepSeek-V4.1 JANGHT).
+    public init(_ config: DeepseekV4Configuration, routedExperts: [Int: any WeightedRoutedExpertLayer],
+                excludedTensorNames: Set<String>) {
+        self.excludedTensorNames = excludedTensorNames
         var config = config
         if config.vision != nil,
             !(config.isDeepseekV41 && DeepseekV41VisionConfiguration.enabled())
@@ -2064,7 +2093,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // Single latent KV head per layer — report kvHeads as [1]*L so
         // the cache allocator sizes per-layer caches correctly.
         self.kvHeads = Array(repeating: 1, count: config.numHiddenLayers)
-        self.model = DeepseekV4ModelInner(config: config)
+        self.model = DeepseekV4ModelInner(config: config, routedExperts: routedExperts)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabSize, bias: false)
         if let vision = config.vision {

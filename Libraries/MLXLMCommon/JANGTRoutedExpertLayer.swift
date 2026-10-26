@@ -126,6 +126,46 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         super.init()
     }
 
+    /// A pure-trellis layer from in-memory projections (tensors not served by the mapped banks, e.g. the DeepSeek-V4.1
+    /// dSpark draft's `dspark/dspark.safetensors`): the same folded signs and kernels as the banked trellis branches.
+    public init(gate: JANGTProjection, up: JANGTProjection, down d: JANGTProjection,
+                hiddenSize: Int, intermediateSize: Int, activationLimit: Float?) throws {
+        if let activationLimit, !activationLimit.isFinite || activationLimit <= 0 {
+            throw JANGHFormatContract.ValidationError.invalid("invalid JANGT activation limit")
+        }
+        guard gate.inputs == hiddenSize, gate.outputs == intermediateSize, up.inputs == hiddenSize,
+            up.outputs == intermediateSize, up.experts == gate.experts, up.k == gate.k,
+            d.inputs == intermediateSize, d.outputs == hiddenSize, d.experts == gate.experts
+        else { throw JANGHFormatContract.ValidationError.invalid("JANGT projection geometry mismatch") }
+        let signs = gate.signs * Self.keepMask(width: hiddenSize, columns: gate.outlierColumnIndices[0 ..< 1])[0]
+        eval(signs)
+        gateUp = .trellis(gate: gate, up: up, signs: signs)
+        if gate.outlierColumns > 0 {
+            let g = gate.outlierColumnIndices, u = up.outlierColumnIndices
+            let first = g[0 ..< 1]
+            let shared = g.shape == u.shape && (g .== first).all().item(Bool.self)
+                && (g .== u).all().item(Bool.self) && (first .>= MLXArray(Int32(0))).all().item(Bool.self)
+            if shared { sharedOutlierColumns = first.reshaped(-1).asType(.int32) }
+        }
+        let cs = d.columnScales ?? MLXArray.ones([d.experts, intermediateSize], dtype: .float32)
+        let dSigns = cs * d.signs.expandedDimensions(axis: 0)
+            * Self.keepMask(width: intermediateSize, columns: d.outlierColumnIndices)
+        eval(dSigns)
+        down = .trellis(d, signs: dSigns)
+        var bytes = 0, params = 0
+        for p in [gate, up, d] {
+            bytes += p.packed.nbytes + p.scale.nbytes + p.signs.nbytes + p.outlierColumnIndices.nbytes
+                + p.outlierWeights.nbytes + (p.columnScales?.nbytes ?? 0)
+            params += p.experts * p.outputs * p.inputs
+        }
+        self.hiddenSize = hiddenSize
+        self.intermediateSize = intermediateSize
+        self.limit = activationLimit ?? 0
+        supplementalWeightBytes = bytes
+        supplementalParameterCount = params
+        super.init()
+    }
+
     /// (R, width) float32: 0 at each row's outlier columns (-1 entries are padding), else 1.
     static func keepMask(width: Int, columns: MLXArray) -> MLXArray {
         let positions = MLXArray(0 ..< Int32(width)).reshaped(1, width, 1)

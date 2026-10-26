@@ -248,6 +248,15 @@ struct JANGHConfigurationPartition: Sendable {
                 continue
             }
             var components = name.split(separator: ".", omittingEmptySubsequences: false)
+            // DeepSeek-V4.1 JANGHT: stacked routed banks at `layers.L.ffn.experts.{gate,up,down}_proj` (the release
+            // checkpoint namespace; the dSpark `mtp.*` banks are loaded by the draft, not here). That type only.
+            if modelType == "deepseek_v41" {
+                guard components.count == 5, components[0] == "layers", let layer = Int(components[1]), layer >= 0,
+                    String(layer) == String(components[1]), components[2] == "ffn", components[3] == "experts",
+                    ["gate_proj", "up_proj", "down_proj"].contains(String(components[4]))
+                else { throw Failure.invalid("unsupported deepseek_v41 custom module path \(name)") }
+                continue
+            }
             // Nemotron-H latent MoE (Nemotron 3.5 Bolt): gate-less relu2 banks at
             // `backbone.layers.L.mixer.switch_mlp.{fc1,fc2}`; admitted for that model type only.
             if modelType == "nemotron_h" {
