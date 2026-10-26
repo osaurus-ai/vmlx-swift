@@ -222,7 +222,9 @@ struct DeepseekV4MoERequestScopedIdsTests {
         let jangtq = try Self.source("Libraries/MLXLLM/Models/DeepseekV4JANGTQ.swift")
 
         for src in [dsv4, jangtq] {
-            #expect(src.contains("func callAsFunction(_ x: MLXArray, inputIds: MLXArray?)"))
+            // DeepSeek-V4.1 adds an optional image mask after the ids (VL routing); the ids stay an argument.
+            #expect(src.contains("func callAsFunction(_ x: MLXArray, inputIds: MLXArray?)")
+                || src.contains("func callAsFunction(_ x: MLXArray, inputIds: MLXArray?, imageMask: MLXArray? = nil)"))
             // The decoder layer must pass them down, not assign them onto `mlp`.
             #expect(src.contains("mlp(") && src.contains("inputIds: inputIds"))
             #expect(src.range(of: #"mlp\.\w+\s*=\s*inputIds"#, options: .regularExpression) == nil)
