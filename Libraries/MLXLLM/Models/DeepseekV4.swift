@@ -838,6 +838,10 @@ class DeepseekV4MoEGate: Module {
     /// Hash routing lookup table (token_id → expert_id), shape (vocab,).
     /// Only populated for hash layers.
     @ParameterInfo(key: "tid2eid") var tid2eid: MLXArray
+    /// DeepSeek-V4.1 VL routing bias (`gate.bias_vl`), used instead of `bias` for image tokens
+    /// (release `Gate.forward`). Present only when the V4.1 vision tower is built; nil (and
+    /// absent from the parameters) for DSV4-0731 and text-only V4.1.
+    @ParameterInfo(key: "bias_vl") var biasVl: MLXArray?
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
@@ -852,6 +856,9 @@ class DeepseekV4MoEGate: Module {
         self.scalingFactorArray = MLXArray([config.routedScalingFactor])
         self._weight.wrappedValue = zeros([nRoutedExperts, config.hiddenSize])
         self._bias.wrappedValue = zeros([nRoutedExperts])
+        if config.isDeepseekV41, config.vision != nil {
+            self._biasVl.wrappedValue = zeros([nRoutedExperts])
+        }
         // Hash routing table: bundle ships (vocab, topK) — already
         // pre-stamped with which `topK` experts each token id should
         // route to, so the gate just gathers without computing scores.
@@ -873,7 +880,9 @@ class DeepseekV4MoEGate: Module {
     /// selected experts to the same weight, throwing away the
     /// information the gate matmul + sqrtsoftplus produced and
     /// flattening the routing geometry the model was trained with.
-    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> (MLXArray, MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, inputIds: MLXArray?, imageMask: MLXArray? = nil
+    ) -> (MLXArray, MLXArray) {
         // Compute the gate logits in fp32 even on hash layers — the
         // hash path needs them to score the (deterministic) selected
         // experts.
@@ -895,6 +904,22 @@ class DeepseekV4MoEGate: Module {
                 weights = weights / denom
             }
             weights = weights * routedScalingFactor
+            return (indices.asType(.uint32), weights)
+        }
+
+        // DeepSeek-V4.1 image tokens select with `bias_vl` (ref `mx.where(image_mask, bias_vl,
+        // bias)`). Eager: the per-token bias is a different graph from the compiled selector's.
+        if let imageMask, let biasVl {
+            let tokenBias = which(imageMask.expandedDimensions(axis: -1), biasVl, bias)
+            let scores = sqrt(log1p(exp(logits)))
+            let indices = argPartition(-(scores + tokenBias), kth: topK - 1, axis: -1)[
+                .ellipsis, 0 ..< topK
+            ].asType(.int32)
+            var weights = takeAlong(scores, indices, axis: -1)
+            if topK > 1 && normTopkProb {
+                weights = weights / weights.sum(axis: -1, keepDims: true)
+            }
+            weights = weights * scalingFactorArray
             return (indices.asType(.uint32), weights)
         }
 
@@ -977,7 +1002,15 @@ class DeepseekV4MoE: Module, UnaryLayer {
     // `inputIds` is request-scoped and MUST stay an argument: this module is
     // shared across every concurrent request through the model, so parking the
     // ids on `self` lets one request route another's tokens.
-    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?, imageMask: MLXArray? = nil) -> MLXArray {
+        if let imageMask {
+            // DeepSeek-V4.1 prefill chunk carrying image tokens: eager, VL-routed gate.
+            let (indices, scores) = gate(x, inputIds: gate.isHashLayer ? inputIds : nil, imageMask: imageMask)
+            let routed = switchMLP(x, indices, preDownScores: scores)
+            return DeepseekV4Math.addSharedExpertFP32(
+                DeepseekV4Math.reduceRoutedExpertsFP32(routed),
+                shared: sharedExperts(x), outputDType: x.dtype)
+        }
         let profileStages = deepseekV4StageProfileEnabled && x.dim(1) == 1
 
         // Decode (L==1) routes through the per-layer compiled MoE region.
@@ -1281,7 +1314,8 @@ class DeepseekV4DecoderLayer: Module {
         cache: KVCache?,
         inputIds: MLXArray?,
         preMix: MLXArray,
-        compressShare: DSV41CompressShare? = nil
+        compressShare: DSV41CompressShare? = nil,
+        imageMask: MLXArray? = nil
     ) -> (h: MLXArray, ffnPre: MLXArray) {
         // ---- Attention HC (collapse with INCOMING preMix) ----
         let residualA = h
@@ -1309,7 +1343,7 @@ class DeepseekV4DecoderLayer: Module {
         let residualF = hA
         let (fPre, fPost, fComb) = ffnHC.mixes(hA)
         let normedF = postAttentionLayerNorm(DeepseekV4Math.hcCollapse(hA, pre: aPre))
-        let ffnOut = mlp(normedF, inputIds: inputIds)
+        let ffnOut = mlp(normedF, inputIds: inputIds, imageMask: imageMask)
         let hF = ffnHC.expand(blockOut: ffnOut, residual: residualF, post: fPost, comb: fComb)
         return (h: hF, ffnPre: fPre)
     }
@@ -1486,7 +1520,7 @@ public class DeepseekV4ModelInner: Module {
     /// instead of reading again. The returned closure starts the lookahead for the next forward
     /// when `prepare` asked for one; call it once this forward's rows are resolved.
     private func engramChunk(
-        _ inputs: MLXArray, cache: [KVCache]?
+        _ inputs: MLXArray, cache: [KVCache]?, keep: [Bool]? = nil
     ) -> (chunk: EngramRuntime.Chunk, startLookahead: () -> Void)? {
         guard !config.engramLayerIds.isEmpty else { return nil }
         engramLock.lock()
@@ -1508,7 +1542,10 @@ public class DeepseekV4ModelInner: Module {
 
         let startPos = cache?.first?.offset ?? 0
         let ids = inputs.reshaped(-1).asType(.int32).asArray(Int32.self)
-        let comp = runtime.hasher.compress(ids)
+        // Image tokens (keep == false) become DEAD: they take part in no n-gram and block the
+        // n-grams that would span them (release `engram_mask = ~image_mask`). The DEAD ids are
+        // recorded in the cache-carried history like any other compressed id.
+        let comp = runtime.hasher.compress(ids, keep: keep)
 
         var holder = cache?.first(where: { $0 is DeepseekV4Cache }) as? DeepseekV4Cache
         if holder == nil, let first = cache?.first {
@@ -1577,8 +1614,17 @@ public class DeepseekV4ModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunction(inputs, cache: cache, vision: nil)
+    }
+
+    /// `vision` (DeepSeek-V4.1 image prefill chunks only): the embedding stream with the image
+    /// spans spliced in, the image mask for `bias_vl` routing and the Engram masks. nil is the
+    /// text forward, unchanged.
+    func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, vision: DeepseekV41VisionChunk?
+    ) -> MLXArray {
         // embed: (B, L) → (B, L, hiddenSize)
-        var h = embedTokens(inputs)
+        var h = vision?.embeddings ?? embedTokens(inputs)
         // Tile to mHC copies: (B, L, hiddenSize) → (B, L, hcMult, hiddenSize).
         // Python tiles via broadcast; Swift uses `repeated` along axis -2.
         h = h.expandedDimensions(axis: -2)  // (B, L, 1, H)
@@ -1601,7 +1647,7 @@ public class DeepseekV4ModelInner: Module {
 
         // DeepSeek-V4.1 Engram n-gram rows for this chunk (one hash set shared by all engram layers;
         // deeper layers' table reads overlap the forward of the layers before them).
-        let engram = engramChunk(inputs, cache: cache)
+        let engram = engramChunk(inputs, cache: cache, keep: vision?.keep)
         let engramRows = engram?.chunk
         let lastEngramLayer = config.engramLayerIds.max() ?? -1
 
@@ -1648,7 +1694,7 @@ public class DeepseekV4ModelInner: Module {
                     guard let rows = engramRows?.rows(layer: i) else {
                         fatalError("DeepSeek-V4.1 engram rows missing for engram layer \(i)")
                     }
-                    h = eng(h, rows: rows, textMask: nil)
+                    h = eng(h, rows: rows, textMask: vision?.textMask)
                     if i == lastEngramLayer {
                         // This forward's reads are done: request the next chunk's rows now,
                         // so they read while the rest of this chunk computes.
@@ -1659,7 +1705,9 @@ public class DeepseekV4ModelInner: Module {
                     let hTail = tailLo == 0 ? h : h[0..., tailLo..., 0..., 0...]
                     tailRows[i] = hTail.mean(axis: 2).asType(.bfloat16)  // [1, n, d]
                 }
-                let r = layer.callStaggered(h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix, compressShare: compressShare)
+                let r = layer.callStaggered(
+                    h, mask: mask, cache: cache?[i], inputIds: inputs, preMix: preMix,
+                    compressShare: compressShare, imageMask: vision?.imageMask)
                 h = r.h
                 preMix = r.ffnPre
                 if Self.layerDebugEnabled {
@@ -1729,7 +1777,7 @@ public class DeepseekV4ModelInner: Module {
 // MARK: - Outer model
 
 public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
-    SafetensorsLoadKeyExcluding
+    SafetensorsLoadKeyExcluding, ModalityBearing
 {
     /// The canonical SWA + CSA/HSA `DeepseekV4Cache` pool is path-dependent
     /// and has no B-wide wrapper. Preserve concurrent request queuing while
@@ -1740,6 +1788,15 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+    /// DeepSeek-V4.1 vision tower + aligner + image delimiters (bundle `vision.*`, `aligner.*`,
+    /// `image_*`). nil for DSV4-0731, for V4.1 bundles without a `vision_config`, and for a
+    /// text-only construction (`VMLX_DSV41_VL=0`).
+    @ModuleInfo(key: "v41_vision") var v41Vision: DeepseekV41VisionModel?
+
+    /// Lanes this instance carries: the vision lane exists only when the V4.1 tower was built.
+    public var modalities: Set<ModelRuntimeRequestModality> {
+        v41Vision == nil ? [.text] : [.text, .vision]
+    }
 
     /// DeepSeek-V4.1 dSpark draft head (`dspark/`), attached on the first `.dspark` request. Not a
     /// Module child: its weights load and evaluate at attach. nil for DSV4-0731, always.
@@ -1775,6 +1832,12 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public init(_ config: DeepseekV4Configuration) {
+        var config = config
+        if config.vision != nil,
+            !(config.isDeepseekV41 && DeepseekV41VisionConfiguration.enabled())
+        {
+            config.vision = nil  // text-only construction: no tower, no bias_vl
+        }
         self.config = config
         // Single latent KV head per layer — report kvHeads as [1]*L so
         // the cache allocator sizes per-layer caches correctly.
@@ -1782,6 +1845,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         self.model = DeepseekV4ModelInner(config: config)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabSize, bias: false)
+        if let vision = config.vision {
+            self._v41Vision.wrappedValue = DeepseekV41VisionModel(config: vision)
+        }
     }
 
     /// Build per-layer caches.
@@ -1906,22 +1972,17 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = windowSize ?? 512
-        let sub = DeepseekV4Math.attnSubchunkTokens
-        let outerStep: Int
-        if sub > 0 {
-            let env = ProcessInfo.processInfo.environment
-            // With the 8.3 GB dSpark head resident, 2048-token chunks push active memory plus the
-            // allocator cache past Metal's working set and prefill slows ~30% (RUNTIME_SERVING.md);
-            // 1024 measured best with the head resident.
-            let dsparkResident = dsparkHead != nil
-            let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init)
-                ?? (dsparkResident
-                    ? env["VMLX_DSV41_DSPARK_PREFILL_STEP"].flatMap(Int.init) ?? 1024 : 2048)
-            outerStep = max(prefillStepSize, requested)
-        } else {
-            outerStep = prefillStepSize
+        // DeepSeek-V4.1 with its vision tower, on a request whose tokens hold image spans. Every
+        // other input (DSV4-0731, text-only V4.1, an image request whose images are all inside the
+        // restored cache prefix) takes the text prefill below, unchanged.
+        if let image = input.image, let vision = v41Vision,
+            let result = try prepareImages(
+                input, image: image, vision: vision, cache: cache, windowSize: windowSize)
+        {
+            return result
         }
+        let prefillStepSize = windowSize ?? 512
+        let outerStep = prefillOuterStep(prefillStepSize)
 
         let tokensShape = input.text.tokens.shape
         if tokensShape.count >= 2 && tokensShape[0] != 1 {
@@ -1973,6 +2034,108 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         }
         return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
     }
+
+    /// Outer prefill chunk width: with in-layer attention sub-chunking the outer chunk widens to
+    /// 2048 (1024 with the dSpark head resident) so MoE sees a wider batch.
+    private func prefillOuterStep(_ prefillStepSize: Int) -> Int {
+        let sub = DeepseekV4Math.attnSubchunkTokens
+        guard sub > 0 else { return prefillStepSize }
+        let env = ProcessInfo.processInfo.environment
+        // With the 8.3 GB dSpark head resident, 2048-token chunks push active memory plus the
+        // allocator cache past Metal's working set and prefill slows ~30% (RUNTIME_SERVING.md);
+        // 1024 measured best with the head resident.
+        let dsparkResident = dsparkHead != nil
+        let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init)
+            ?? (dsparkResident
+                ? env["VMLX_DSV41_DSPARK_PREFILL_STEP"].flatMap(Int.init) ?? 1024 : 2048)
+        return max(prefillStepSize, requested)
+    }
+
+    /// DeepSeek-V4.1 image prefill (engine `SingleBatchGenerator._prefill` + `_model_call`): the
+    /// prompt is chunked so no chunk splits an image span, each image is encoded by the ViT +
+    /// Aligner in the chunk that holds it and spliced at its chunk-relative position, image tokens
+    /// route with `bias_vl` and stay out of Engram. Returns the text-only remainder (<= one prefill
+    /// step) for the caller's final forward, or nil when `input`'s tokens carry no image span
+    /// (every image is already inside the restored prefix), which is then an ordinary text prefill.
+    func prepareImages(
+        _ input: LMInput, image: LMInput.ProcessedImage, vision: DeepseekV41VisionModel,
+        cache: [KVCache], windowSize: Int?, outerStep outerStepOverride: Int? = nil
+    ) throws -> PrepareResult? {
+        let tokensShape = input.text.tokens.shape
+        if tokensShape.count >= 2 && tokensShape[0] != 1 {
+            fatalError(
+                "DeepseekV4Model.prepare expects single-sequence input (batch=1), "
+                    + "got shape \(tokensShape).")
+        }
+        let flat = input.text.tokens.reshaped([-1])
+        let tokens = flat.asType(.int32).asArray(Int32.self).map(Int.init)
+        let spans = try DeepseekV41VisionLayout.spans(
+            tokens: tokens, imageTokenId: vision.config.imageTokenId,
+            grids: DeepseekV41VisionLayout.grids(frames: image.frames ?? [], config: vision.config))
+        guard !spans.isEmpty else { return nil }
+        let prefillStepSize = windowSize ?? 512
+        let chunks = try DeepseekV41VisionLayout.prefillChunks(
+            tokenCount: tokens.count, stepSize: prefillStepSize,
+            outerStep: outerStepOverride ?? prefillOuterStep(prefillStepSize), spans: spans)
+        let engramHolder = cache.first {
+            ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
+        } as? DeepseekV4Cache
+        var flatMask: MLXArray? = nil
+        if let m = input.text.mask { flatMask = m.ndim >= 2 ? m.reshaped([-1]) : m }
+
+        for (index, chunk) in chunks.enumerated() {
+            try Task.checkCancellation()
+            let ids = flat[chunk.lowerBound ..< chunk.upperBound][.newAxis, 0...]
+            let inChunk = spans.filter {
+                $0.start >= chunk.lowerBound && $0.end <= chunk.upperBound
+            }
+            var visionChunk: DeepseekV41VisionChunk? = nil
+            if !inChunk.isEmpty {
+                let text = model.embedTokens(ids)
+                let rows = inChunk.map { span in
+                    (start: span.start - chunk.lowerBound,
+                     rows: vision.spanRows(
+                        patches: image.pixels[span.patchRows], grid: span.grid, dtype: text.dtype))
+                }
+                visionChunk = DeepseekV41VisionChunk.make(
+                    textEmbeddings: text, spans: rows, length: chunk.count)
+                if Self.visionLogEnabled {
+                    NSLog(
+                        "VMLX DSV4.1 VL prefill chunk [\(chunk.lowerBound), \(chunk.upperBound)): "
+                            + inChunk.map { "image \($0.imageIndex) at \($0.start - chunk.lowerBound) "
+                                + "(\($0.grid.llmH)x\($0.grid.llmW), \($0.grid.tokenCount) tokens)" }
+                            .joined(separator: ", "))
+                }
+            }
+            if let engramHolder {
+                // Engram rows of the next forward (next chunk, or the caller's final forward) read
+                // while this one computes; only for a text-only next forward (image tokens hash DEAD).
+                let next = index + 1 < chunks.count
+                    ? chunks[index + 1] : chunk.upperBound ..< tokens.count
+                let nextHasImage = spans.contains {
+                    $0.start < next.upperBound && $0.end > next.lowerBound
+                }
+                engramHolder.engramLookaheadTokens = nextHasImage
+                    ? nil : tokens[next].map { Int32(truncatingIfNeeded: $0) }
+            }
+            _ = model(ids, cache: cache.isEmpty ? nil : cache, vision: visionChunk)
+            Self.compactSlidingWindows(cache)
+            MLX.eval(cache)
+            PrefillProgressReporter.reportCompletedUnits(chunk.upperBound)
+            Memory.clearCache()
+        }
+        let consumed = chunks.last!.upperBound
+        if Self.kvBytesLogEnabled {
+            Self.logCacheBytes(cache, phase: "prepare-vl")
+        }
+        return .tokens(LMInput.Text(
+            tokens: flat[consumed...], mask: flatMask.map { $0[consumed...] }))
+    }
+
+    /// `VMLX_DSV41_VL_LOG=1`: NSLog each image prefill chunk (image index, chunk-relative start,
+    /// LLM grid, span tokens). Off by default.
+    static let visionLogEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DSV41_VL_LOG"] == "1"
 
     /// DeepSeek-V4.1 prefill: the sliding-only layers (ratio 0) hold plain rotating
     /// caches; drop their chunk-length window tail after each chunk, as the V4.1
@@ -2030,10 +2193,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let projForW = ["w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"]
         for (rawKey, value) in weights {
             if rawKey.hasPrefix("mtp.") { continue }
-            // DeepSeek-V4.1 adds a per-expert VL routing bias `gate.bias_vl` (used only for image
-            // tokens). The V4 MoE gate has only `bias`; drop bias_vl so text loading succeeds (wiring
-            // the VL routing bias into the gate is a V4.1 follow-up).
-            if rawKey.hasSuffix(".bias_vl") { continue }
+            // DeepSeek-V4.1 per-expert VL routing bias `gate.bias_vl` (image tokens only). Loaded
+            // into `mlp.gate.bias_vl` when the vision tower is built; dropped for a text-only load.
+            if rawKey.hasSuffix(".bias_vl"), v41Vision == nil { continue }
             // DeepSeek-V4.1 per-layer Engram module weights (`layers.N.engram.{wkv,q_weight,k_weight}`)
             // are affine-quantized in the backbone and load into EngramModule at engram_layer_ids
             // (1, 14); the big FP8 n-gram TABLE (`layers.N.engram.embed.*`) is disk-resident in the
@@ -2048,12 +2210,15 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             // V4.1 ONLY: DSV4-0731 ratio-4 layers DO build an indexer and must load its weights
             // (dropping them would leave a random-init indexer choosing the top-k pool rows).
             // (V4.1 now maps them to the shared lightning indexer below instead of dropping.)
-            // DeepSeek-V4.1 vision tower (ViT `vision.*`, `aligner.*`, image delimiter embeddings).
-            // Text load drops them; multimodal is served text-routed like the engine's VL path and is
-            // a V4.1 follow-up in Swift.
+            // DeepSeek-V4.1 vision tower (ViT `vision.*`, `aligner.*`, image delimiter embeddings):
+            // loaded into `v41_vision.*` when the tower is built, dropped for a text-only load.
             if rawKey.hasPrefix("vision.") || rawKey.hasPrefix("aligner.")
                 || rawKey.hasPrefix("image_start") || rawKey.hasPrefix("image_end")
-                || rawKey.hasPrefix("image_newline") { continue }
+                || rawKey.hasPrefix("image_newline")
+            {
+                if v41Vision != nil { out["v41_vision.\(rawKey)"] = value }
+                continue
+            }
 
             // Top-level (no `layers.N.` prefix).
             if rawKey == "embed.weight" || rawKey == "embed.scales"

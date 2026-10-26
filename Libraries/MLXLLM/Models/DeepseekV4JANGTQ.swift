@@ -185,6 +185,10 @@ public final class DeepseekV4JANGTQModel:
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
     public init(_ config: DeepseekV4Configuration, mxtqBits: Int? = nil, mxtqSeed: Int = 42) {
+        // The DeepSeek-V4.1 vision tower is wired into the affine `DeepseekV4Model` only; a JANGTQ
+        // build stays text-only (no tower, no bias_vl), exactly as before.
+        var config = config
+        config.vision = nil
         self.config = config
         self.kvHeads = Array(repeating: 1, count: config.numHiddenLayers)
         self.model = DeepseekV4ModelInnerJANGTQ(

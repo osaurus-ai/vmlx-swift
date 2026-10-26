@@ -661,7 +661,10 @@ public enum LLMTypeRegistry {
             }
         }
 
-        let config = try decodeDeepseekV4Configuration(data: data)
+        var config = try decodeDeepseekV4Configuration(data: data)
+        // DeepSeek-V4.1 builds its vision tower only when the caller wants the vision lane
+        // (nil = everything the bundle offers); `VMLX_DSV41_VL=0` is checked by the model.
+        if let requesting, !requesting.contains(.vision) { config.vision = nil }
         let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
         let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
         let weightFormat = check?.weightFormat?.lowercased()
