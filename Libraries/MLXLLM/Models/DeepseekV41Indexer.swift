@@ -234,29 +234,35 @@ final class DeepseekV41Indexer: Module {
         let w = (weightsProj(x) * MLXArray(
             pow(Float(headDim), -0.5) * pow(Float(nHeads), -0.5)))[0]  // [L, h]
 
-        // Prefill (> 8 query rows, >= 32 keys, on the GPU): the fused kernel scores each query chunk in
-        // one pass, fp32, without the [C, h, T] intermediate; its chunk keeps [C, T] fp32 near 1 GB.
-        // Decode and dSpark verify (<= 8 rows) keep the stock bf16 path below, unchanged.
-        let fused = DeepseekV41FusedIndexScores.eligible(queries: L, keys: rows)
+        // Prefill (> 8 query rows, >= 32 keys, on the GPU): a fused kernel scores each query chunk in one
+        // pass without the [C, h, T] intermediate; its chunk keeps [C, T] fp32 near 1 GB. Preferred: the
+        // bf16 operands on the M5 matrix units (`DeepseekV41MPPIndexScores`, `VMLX_DSV41_INDEX_MPP=0` off);
+        // then the fp32 simdgroup-MMA kernel on the same values upcast; then the stock path. Decode and
+        // dSpark verify (<= 8 rows) keep the stock bf16 path below, unchanged.
+        let path = DeepseekV41MPPIndexScores.prefillPath(
+            queries: L, keys: rows, heads: nHeads, dim: headDim)
+        let fused = path != .stock
         let chunk = fused
             ? DeepseekV41FusedIndexScores.queryChunk(queries: L, keys: rows)
             : DeepseekV41IndexerMath.queryChunk(heads: nHeads, rows: rows)
         let tileRows = max(1024, min(rows, (1 << 26) / max(1, nHeads * chunk)))
-        // Fused operands, built once per call: the stock path's bf16 rounding of q / k / w, held in
-        // fp32 (reference: `q.astype(f32)`, `index_k.astype(f32)`, `w.astype(f32)` of the bf16 values).
+        // Fused operands, built once per call: the stock path's bf16 rounding of q / k / w (the reference
+        // scores in bf16), passed as bf16 to the matrix units or held in fp32 for the fp32 kernel
+        // (reference: `q.astype(f32)`, `index_k.astype(f32)`, `w.astype(f32)` of the bf16 values).
+        let operandType: DType = path == .matrixUnits ? .bfloat16 : .float32
         var fusedQ: MLXArray? = nil
         var fusedK: MLXArray? = nil
         var fusedW: MLXArray? = nil
         if fused {
-            fusedQ = qs.asType(.bfloat16).asType(.float32).expandedDimensions(axis: 0)  // [1, L, h, d]
-            fusedW = w.asType(.bfloat16).asType(.float32).expandedDimensions(axis: 0)  // [1, L, h]
+            fusedQ = qs.asType(.bfloat16).asType(operandType).expandedDimensions(axis: 0)  // [1, L, h, d]
+            fusedW = w.asType(.bfloat16).asType(operandType).expandedDimensions(axis: 0)  // [1, L, h]
             var keyTiles: [MLXArray] = []
             indexK.forEachDequantizedTile(maxRows: rows) { start, tile in
                 guard start < rows else { return }
                 keyTiles.append(tile[0..., 0 ..< (min(rows, start + tile.dim(1)) - start)])
             }
             let keys = keyTiles.count == 1 ? keyTiles[0] : concatenated(keyTiles, axis: 1)
-            fusedK = keys.asType(.bfloat16).asType(.float32)  // [1, rows, d]
+            fusedK = keys.asType(.bfloat16).asType(operandType)  // [1, rows, d]
         }
         var idxParts: [MLXArray] = []
         var candParts: [MLXArray] = []
@@ -268,9 +274,18 @@ final class DeepseekV41Indexer: Module {
             var fusedScores: MLXArray? = nil
             if let fusedQ, let fusedK, let fusedW {
                 // Scale 1.0: `w` already carries d^-0.5 * h^-0.5.
-                fusedScores = DeepseekV41FusedIndexScores.poolIndexScores(
-                    q: fusedQ[0..., c ..< e], poolKeys: fusedK, headW: fusedW[0..., c ..< e],
-                    scale: 1.0)?[0]  // [C, rows]
+                let qc = fusedQ[0..., c ..< e]
+                let wc = fusedW[0..., c ..< e]
+                if path == .matrixUnits {
+                    fusedScores = DeepseekV41MPPIndexScores.poolIndexScores(
+                        q: qc, poolKeys: fusedK, headW: wc, scale: 1.0)?[0]  // [C, rows]
+                }
+                if fusedScores == nil {
+                    // fp32 kernel; bf16 operands upcast exactly (no-ops on the fp32 path).
+                    fusedScores = DeepseekV41FusedIndexScores.poolIndexScores(
+                        q: qc.asType(.float32), poolKeys: fusedK.asType(.float32),
+                        headW: wc.asType(.float32), scale: 1.0)?[0]  // [C, rows]
+                }
             }
             var tiles: [MLXArray] = []
             if fusedScores == nil {
