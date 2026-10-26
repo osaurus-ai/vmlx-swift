@@ -203,6 +203,101 @@ struct DeepseekV41DecodeFusionFocusedTests {
         }
     }
 
+    // MARK: - Fused MoE (gate/up + SwiGLU, down + sum + shared)
+
+    /// The stock routed + shared graph (what `DeepseekV4MoE.experts` runs without the kernels).
+    static func stockExperts(_ moe: DeepseekV4MoE, _ x: MLXArray, _ idx: MLXArray, _ sc: MLXArray) -> MLXArray {
+        let routed = moe.switchMLP(x, idx, preDownScores: sc)
+        return DeepseekV4Math.addSharedExpertFP32(
+            DeepseekV4Math.reduceRoutedExpertsFP32(routed), shared: moe.sharedExperts(x), outputDType: x.dtype)
+    }
+
+    @Test("fused MoE kernels are bit-identical to the stock graph at 1-8 rows (2- and 3-bit gate/up)")
+    func fusedMoEBitExact() throws {
+        guard let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            for layer in [3, 10] {
+                let moe = try DSV41Synth.moe(c, layer: layer, seed: UInt64(layer))
+                let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+                for rows in 1 ... 8 {
+                    for seed in UInt64(1) ... 3 {
+                        let x = DSV41Synth.hidden(rows: rows, c, seed: seed &* 31 &+ UInt64(rows))
+                        let (idx, sc) = moe.gate(x, inputIds: nil)
+                        let ref = Self.stockExperts(moe, x, idx, sc)
+                        let wide = rows >= 2 && DeepseekV41FusedMoE.architecture.gen >= 15
+                        let got = DeepseekV41FusedMoE.run(
+                            x, indices: idx, scores: sc, layer: l, limit: c.swigluLimit, wide: wide)
+                        eval(got, ref)
+                        let peak = MLX.abs(ref.asType(.float32)).max().item(Float.self)
+                        #expect(peak.isFinite && peak > 1e-3, "non-degenerate reference (peak \(peak))")
+                        let same = DSV41Synth.bitEqual(got, ref)
+                        #expect(same, "layer \(layer) rows \(rows) seed \(seed): max |d| \(DSV41Synth.maxAbsDiff(got, ref))")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("MoE forward with the fused kernels on equals the forward with them off (admission included)")
+    func fusedMoEForwardParity() throws {
+        guard let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            let moe = try DSV41Synth.moe(c, layer: 12, seed: 99)
+            let saved = DeepseekV41FusedMoE.enabled
+            defer { DeepseekV41FusedMoE.enabled = saved }
+            DeepseekV41FusedMoE.resetVerdicts()
+            for rows in [1, 1, 1, 2, 4, 6, 8, 1] {  // repeated rows: eager admit, then the compiled region
+                let x = DSV41Synth.hidden(rows: rows, c, seed: UInt64(700 + rows))
+                DeepseekV41FusedMoE.enabled = true
+                let on = moe(x, inputIds: nil)
+                DeepseekV41FusedMoE.enabled = false
+                let off = moe(x, inputIds: nil)
+                eval(on, off)
+                #expect(DSV41Synth.bitEqual(on, off), "rows \(rows)")
+            }
+            DeepseekV41FusedMoE.enabled = true
+            for rows in [1, 2, 4, 6, 8] {
+                let wide = rows >= 2 && DeepseekV41FusedMoE.architecture.gen >= 15
+                let key = DeepseekV41FusedMoE.Key(
+                    rows: rows, hidden: c.hiddenSize, inter: c.moeIntermediateSize, topK: c.numExpertsPerTok,
+                    gateBits: 2, downBits: 3, sharedBits: 8, wide: wide)
+                #expect(DeepseekV41FusedMoE.verdict(key) == true, "rows \(rows) admitted")
+            }
+            // 9+ rows (prefill) never take the kernels.
+            let x9 = DSV41Synth.hidden(rows: 9, c, seed: 9)
+            let (i9, s9) = moe.gate(x9, inputIds: nil)
+            #expect(DeepseekV41FusedMoE.apply(
+                x9, indices: i9, scores: s9, switchMLP: moe.switchMLP, shared: moe.sharedExperts,
+                limit: c.swigluLimit, stock: { Self.stockExperts(moe, x9, i9, s9) }) == nil)
+        }
+    }
+
+    @Test("fused MoE microbenchmark at 1-8 rows (VMLX_DSV41_DEC_BENCH=1)")
+    func fusedMoEBench() throws {
+        guard DSV41Synth.benchEnabled, let c = DSV41Synth.config else { return }
+        try Device.withDefaultDevice(.gpu) {
+            let moe = try DSV41Synth.moe(c, layer: 10)
+            let l = try #require(DeepseekV41FusedMoE.layer(moe.switchMLP, shared: moe.sharedExperts))
+            let layers = 40
+            for rows in [1, 2, 4, 6, 8] {
+                let wide = rows >= 2 && DeepseekV41FusedMoE.architecture.gen >= 15
+                let xs = (0 ..< layers).map { DSV41Synth.hidden(rows: rows, c, seed: UInt64(900 + $0)) }
+                let routes = xs.map { moe.gate($0, inputIds: nil) }
+                eval(routes.flatMap { [$0.0, $0.1] })
+                let stock = DSV41Synth.timeMs {
+                    zip(xs, routes).map { Self.stockExperts(moe, $0, $1.0, $1.1) }
+                } / Double(layers)
+                let fused = DSV41Synth.timeMs {
+                    zip(xs, routes).map {
+                        DeepseekV41FusedMoE.run($0, indices: $1.0, scores: $1.1, layer: l, limit: c.swigluLimit, wide: wide)
+                    }
+                } / Double(layers)
+                print(String(format: "[dsv41-dec-bench] experts per layer rows=%d: stock %.4f ms, fused %.4f ms (%.2fx)",
+                    rows, stock, fused, stock / fused))
+            }
+        }
+    }
+
     /// Per-op stock costs at decode / verify sizes, 40 chained layers per timed graph.
     @Test("stock per-op decode costs (VMLX_DSV41_DEC_BENCH=1)")
     func stockCosts() throws {

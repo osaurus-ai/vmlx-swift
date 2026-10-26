@@ -997,11 +997,27 @@ class DeepseekV4MoE: Module, UnaryLayer {
 
     fileprivate func moeMath(_ x: MLXArray, inputIds: MLXArray?) -> (y: MLXArray, indices: MLXArray) {
         let (indices, scores) = gate(x, inputIds: inputIds)
-        let routed = switchMLP(x, indices, preDownScores: scores)
-        let y = DeepseekV4Math.addSharedExpertFP32(
-            DeepseekV4Math.reduceRoutedExpertsFP32(routed),
-            shared: sharedExperts(x), outputDType: x.dtype)
-        return (y, indices)
+        return (experts(x, indices: indices, scores: scores), indices)
+    }
+
+    /// Routed + shared experts after the gate. DeepSeek-V4.1 at decode / verify sizes (<= 8 rows) runs
+    /// the two-dispatch fused kernels (`DeepseekV41FusedMoE`, bit-identical to this graph and admitted
+    /// per shape against it; `VMLX_DSV41_FUSED_MOE=0` keeps the graph). Everything else is the graph.
+    fileprivate func experts(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
+        func stock() -> MLXArray {
+            let routed = switchMLP(x, indices, preDownScores: scores)
+            return DeepseekV4Math.addSharedExpertFP32(
+                DeepseekV4Math.reduceRoutedExpertsFP32(routed),
+                shared: sharedExperts(x), outputDType: x.dtype)
+        }
+        if config.isDeepseekV41, x.dim(1) <= DeepseekV41FusedMoE.maxRows,
+            let fused = DeepseekV41FusedMoE.apply(
+                x, indices: indices, scores: scores, switchMLP: switchMLP, shared: sharedExperts,
+                limit: config.swigluLimit, stock: stock)
+        {
+            return fused
+        }
+        return stock()
     }
 
     // `UnaryLayer` conformance. Hash layers need the token ids, so anything
@@ -1063,6 +1079,11 @@ class DeepseekV4MoE: Module, UnaryLayer {
 
         let (indices, scores) = gate(x, inputIds: ids)
         finishStage("gate", [indices, scores])
+        if !profileStages, config.isDeepseekV41 {
+            let y = experts(x, indices: indices, scores: scores)
+            moeRegionWarm = true
+            return y
+        }
         let routed = switchMLP(x, indices, preDownScores: scores)
         var y = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
         finishStage("routed", [y])
