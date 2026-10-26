@@ -106,6 +106,11 @@ M5 Ultra 256 GB, Osaurus Release, DSpark on (default), thinking off, unique cold
 | KV bytes at 42k (`VMLX_DSV41_KVBYTES=1`) | 53.1 MiB = 1.32 KB/token incl. fixed windows (4-bit pools, group 32); ~1.1–1.3 GB at 1M |
 | DSpark stats (code, per request) | accept 0.5–0.7, mean emit 2.8–3.9, prefix commits 5–6 vs commit forwards 0–2, spec 14–20 ms/token vs AR 28–30 |
 
+Multimodal, live on the vision branch (`7dc30630`): red 112×112 PNG → "Red" (928-token prompt, 184 image-span
+tokens at 13×13, one image prefill chunk, dSpark off for the media turn); text follow-up → "Apple", 930/944 tokens
+cached, 0.5 s; blue image → "Blue", cache miss. Text decode unchanged (code 70.1, code2 58.6, structured 104.8,
+prose 34.4 tok/s), footprint 205.9 GB with the vision tower.
+
 Before these fixes (PR head `661e9173`, AR): decode 26.8 tok/s, 1.2k prefill 488 pp/s, tool calls broken,
 KV ~3.3 KB/token.
 
