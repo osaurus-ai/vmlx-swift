@@ -3630,6 +3630,27 @@ public struct TokenIterator: TokenIteratorProtocol {
             : promptTokenIds.count
         defer { diskSeedSnapshot = nil }
 
+        // A plain text KV prompt and its processor-declared history boundary
+        // differ only by the template's actual generation rail. Persist that
+        // common prefix once; an exact retry replays the rail instead of
+        // writing another full-context payload. Publication remains best
+        // effort and uses the existing writer/clear/failure contract.
+        let shorterPlainPrompt = Self.shorterPlainKVPromptCheckpoint(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, parameters: cacheInitParameters,
+            hasAuxiliaryState: state != nil, hasCompiledForward: compiledForward != nil,
+            snapshot: promptCacheSnapshot)
+        if let selected = shorterPlainPrompt {
+            let tokens = Array(promptTokenIds.prefix(selected.boundary))
+            if !coordinator.hasDurableDiskEntry(
+                tokens: tokens, mediaSalt: cacheSaltPlan.salt(forBoundary: selected.boundary))
+            {
+                store(
+                    tokens: tokens, cache: selected.cache, kvBits: nil, kvMode: .none,
+                    isResumeBoundary: true, ownsSnapshot: true)
+            }
+        }
+
         if let promptCacheSnapshot {
             // Prompt-boundary disk entries must remain raw KV even when the
             // live decode path uses TurboQuant/affine KV. Cold decode delays
@@ -3643,7 +3664,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
                 cache: promptCacheSnapshot,
                 requested: kvMode)
-            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
+            if shorterPlainPrompt == nil, !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 store(
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
@@ -3750,6 +3771,10 @@ public struct TokenIterator: TokenIteratorProtocol {
 
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
+                    // Already attempted above, including an in-flight or
+                    // refused publication. Do not turn failure into a second
+                    // write or claim a durable hit; later lookup may miss.
+                    if boundary == shorterPlainPrompt?.boundary { continue }
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
                     if usesCanonicalHybridBoundary, !isStableBoundary {
@@ -3883,6 +3908,52 @@ public struct TokenIterator: TokenIteratorProtocol {
         store(
             tokens: generatedBoundaryTokens, cache: cache, kvBits: kvBits, kvMode: kvMode,
             isPostAnswer: true)
+    }
+
+    /// Select only a real template rail backed by a matching, trim-safe plain
+    /// KV snapshot. No guessed suffix length or model-name eligibility.
+    static func shorterPlainKVPromptCheckpoint(
+        coordinator: CacheCoordinator,
+        promptTokenIds: [Int],
+        input: LMInput,
+        parameters: GenerateParameters?,
+        hasAuxiliaryState: Bool,
+        hasCompiledForward: Bool = false,
+        snapshot: [KVCache]?
+    ) -> (boundary: Int, cache: [KVCache])? {
+        guard coordinator.config.enableDiskCache, !coordinator.config.usePagedCache,
+            coordinator.canPersistBoundaries, !coordinator.isHybrid,
+            !coordinator.requiresRecurrentSSMCompanion, !coordinator.requiresPagedBoundaryCompanion,
+            !coordinator.isPagedIncompatible, !hasAuxiliaryState, !hasCompiledForward,
+            input.cachePromptIntent == .generation, input.cacheRestorePolicy == .standard,
+            input.canonicalRequiredToolContext == nil,
+            !input.hasMediaContent, !input.requiresPostPrepareCacheKey, input.text.mask == nil,
+            let parameters, parameters.draftStrategy == nil,
+            parameters.kvMode == .none, parameters.kvBits == nil,
+            let snapshot, !snapshot.isEmpty
+        else { return nil }
+        let suffix = coordinator.genPromptSuffixTokens
+        let boundary = promptTokenIds.count - suffix.count
+        guard !suffix.isEmpty, boundary > 0,
+            suffix.elementsEqual(promptTokenIds.suffix(suffix.count)),
+            input.cachePrefixTokenCounts.contains(boundary),
+            !input.cacheStablePrefixTokenCounts.contains(boundary),
+            snapshot.allSatisfy({ layer in
+                guard Swift.type(of: layer) == KVCacheSimple.self,
+                    layer.offset == promptTokenIds.count
+                else { return false }
+                let arrays = layer.state
+                return arrays.count == 2 && arrays.allSatisfy {
+                    $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == promptTokenIds.count
+                        && ($0.dtype == .float16 || $0.dtype == .bfloat16 || $0.dtype == .float32)
+                }
+            })
+        else { return nil }
+        let selected = snapshot.map { $0.copy() }
+        guard trimPromptCache(selected, numTokens: suffix.count) == suffix.count,
+            selected.allSatisfy({ $0.offset == boundary && $0.state.allSatisfy { $0.dim(2) == boundary } })
+        else { return nil }
+        return (boundary, selected)
     }
 
     /// Align the post-answer boundary key with what the cache actually
