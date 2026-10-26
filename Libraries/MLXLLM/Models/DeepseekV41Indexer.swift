@@ -205,8 +205,30 @@ final class DeepseekV41Indexer: Module {
         let w = (weightsProj(x) * MLXArray(
             pow(Float(headDim), -0.5) * pow(Float(nHeads), -0.5)))[0]  // [L, h]
 
-        let chunk = DeepseekV41IndexerMath.queryChunk(heads: nHeads, rows: rows)
+        // Prefill (> 8 query rows, >= 32 keys, on the GPU): the fused kernel scores each query chunk in
+        // one pass, fp32, without the [C, h, T] intermediate; its chunk keeps [C, T] fp32 near 1 GB.
+        // Decode and dSpark verify (<= 8 rows) keep the stock bf16 path below, unchanged.
+        let fused = DeepseekV41FusedIndexScores.eligible(queries: L, keys: rows)
+        let chunk = fused
+            ? DeepseekV41FusedIndexScores.queryChunk(queries: L, keys: rows)
+            : DeepseekV41IndexerMath.queryChunk(heads: nHeads, rows: rows)
         let tileRows = max(1024, min(rows, (1 << 26) / max(1, nHeads * chunk)))
+        // Fused operands, built once per call: the stock path's bf16 rounding of q / k / w, held in
+        // fp32 (reference: `q.astype(f32)`, `index_k.astype(f32)`, `w.astype(f32)` of the bf16 values).
+        var fusedQ: MLXArray? = nil
+        var fusedK: MLXArray? = nil
+        var fusedW: MLXArray? = nil
+        if fused {
+            fusedQ = qs.asType(.bfloat16).asType(.float32).expandedDimensions(axis: 0)  // [1, L, h, d]
+            fusedW = w.asType(.bfloat16).asType(.float32).expandedDimensions(axis: 0)  // [1, L, h]
+            var keyTiles: [MLXArray] = []
+            indexK.forEachDequantizedTile(maxRows: rows) { start, tile in
+                guard start < rows else { return }
+                keyTiles.append(tile[0..., 0 ..< (min(rows, start + tile.dim(1)) - start)])
+            }
+            let keys = keyTiles.count == 1 ? keyTiles[0] : concatenated(keyTiles, axis: 1)
+            fusedK = keys.asType(.bfloat16).asType(.float32)  // [1, rows, d]
+        }
         var idxParts: [MLXArray] = []
         var candParts: [MLXArray] = []
         var c = 0
@@ -214,14 +236,24 @@ final class DeepseekV41Indexer: Module {
             let e = min(L, c + chunk)
             let qi = qs[c ..< e]
             let wi = w[c ..< e]
-            var tiles: [MLXArray] = []
-            indexK.forEachDequantizedTile(maxRows: tileRows) { start, tile in
-                guard start < rows else { return }
-                let end = min(rows, start + tile.dim(1))
-                tiles.append(DeepseekV41IndexerMath.scores(
-                    q: qi, k: tile[0, 0 ..< (end - start)], w: wi))
+            var fusedScores: MLXArray? = nil
+            if let fusedQ, let fusedK, let fusedW {
+                // Scale 1.0: `w` already carries d^-0.5 * h^-0.5.
+                fusedScores = DeepseekV41FusedIndexScores.poolIndexScores(
+                    q: fusedQ[0..., c ..< e], poolKeys: fusedK, headW: fusedW[0..., c ..< e],
+                    scale: 1.0)?[0]  // [C, rows]
             }
-            var sc = tiles.count == 1 ? tiles[0] : concatenated(tiles, axis: -1)  // [C, rows]
+            var tiles: [MLXArray] = []
+            if fusedScores == nil {
+                indexK.forEachDequantizedTile(maxRows: tileRows) { start, tile in
+                    guard start < rows else { return }
+                    let end = min(rows, start + tile.dim(1))
+                    tiles.append(DeepseekV41IndexerMath.scores(
+                        q: qi, k: tile[0, 0 ..< (end - start)], w: wi))
+                }
+            }
+            var sc = fusedScores
+                ?? (tiles.count == 1 ? tiles[0] : concatenated(tiles, axis: -1))  // [C, rows]
             let lens = DeepseekV41IndexerMath.visibleLengths(
                 startPos: startPos, chunkStart: c, count: e - c, ratio: ratio)
             sc = DeepseekV41IndexerMath.maskInvisible(sc, lens: lens)

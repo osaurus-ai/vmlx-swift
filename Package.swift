@@ -970,6 +970,7 @@ let package = Package(
                 "EngramV41FocusedTests.swift",
                 "DeepseekV41PoolBitsFocusedTests.swift",
                 "DeepseekV41IndexerFocusedTests.swift",
+                "DeepseekV41FusedIndexScoresFocusedTests.swift",
                 "DeepseekV41KVBytesFocusedTests.swift",
                 "DeepseekV41PrefillLookaheadFocusedTests.swift",
                 "DeepseekV41PoolLayoutAttentionTests.swift",
