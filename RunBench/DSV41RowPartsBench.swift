@@ -65,7 +65,9 @@ func runDSV41RowParts(modelPath: String) async throws {
         LMInput(tokens: MLXArray(promptTokens.map { Int32($0) }).reshaped(1, -1)), cache: cache,
         windowSize: GenerateParameters().prefillStepSize)
     {
-    case .tokens(let rest): eval(model(rest, cache: cache, state: nil).logits)
+    case .tokens(let rest):
+        // `prepare` returns the remainder flat; the model takes [1, L] (the iterator adds the batch axis).
+        eval(model(LMInput.Text(tokens: rest.tokens.reshaped(1, -1)), cache: cache, state: nil).logits)
     case .logits(let out): eval(out.logits)
     }
     print("[ROWPARTS] layers=\(layers) prompt=\(promptTokens.count) head=\(session != nil)")

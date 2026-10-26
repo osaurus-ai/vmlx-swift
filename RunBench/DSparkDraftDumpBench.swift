@@ -42,7 +42,8 @@ func runDSparkDraftDump(modelPath: String) async throws {
         windowSize: GenerateParameters().prefillStepSize)
     {
     case .tokens(let rest):
-        logits = model(rest, cache: cache, state: nil).logits
+        // `prepare` returns the remainder flat; the model takes [1, L] (the iterator adds the batch axis).
+        logits = model(LMInput.Text(tokens: rest.tokens.reshaped(1, -1)), cache: cache, state: nil).logits
     case .logits(let out):
         logits = out.logits
     }
