@@ -2509,7 +2509,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                 parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
         }
         if effectiveParameters.draftStrategy?.usesDSpark == true {
-            setupDSpark(input: input, parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
+            // The PREFILLED input decides: a media request whose every media item is inside the
+            // restored prefix prefills a text-only tail (`inputForPrepare` carries no media) and
+            // dSpark serves it; a request that prefilled media decodes autoregressively. For a
+            // text-only request the two inputs carry the same (absent) media.
+            setupDSpark(
+                input: inputForPrepare, parameters: effectiveParameters, stopTokenIDs: stopTokenIDs)
         }
     }
 

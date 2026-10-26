@@ -1383,6 +1383,10 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// Bailing directive prepend is only for templates that do not read it.
     let templateReadsEnableThinking: Bool
     let k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration?
+    /// DeepSeek-V4.1 with its vision tower built: image content parts render as placeholders in
+    /// their own turn, expand to image spans, and ship their patches in `LMInput.image`. nil for
+    /// every other model (images are ignored there, as before).
+    let deepseekV41Vision: DeepseekV41VisionConfiguration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
@@ -1390,7 +1394,8 @@ struct LLMUserInputProcessor: UserInputProcessor {
         messageGenerator: MessageGenerator,
         defaultAdditionalContext: [String: any Sendable]? = nil,
         templateReadsEnableThinking: Bool = false,
-        k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil
+        k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil,
+        deepseekV41Vision: DeepseekV41VisionConfiguration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1399,6 +1404,7 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.defaultAdditionalContext = defaultAdditionalContext
         self.templateReadsEnableThinking = templateReadsEnableThinking
         self.k2ReasoningDeclaration = k2ReasoningDeclaration
+        self.deepseekV41Vision = deepseekV41Vision
     }
 
     func prepare(input: UserInput) throws -> LMInput {
@@ -1429,6 +1435,19 @@ struct LLMUserInputProcessor: UserInputProcessor {
         try K2HorizonTemplateContract.validateContext(
             additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
         let messages = K2HorizonTemplateContract.prepare(messages: nemotronMessages, modelType: modelType)
+        if let vision = deepseekV41Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = try DeepseekV41VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try deepseekV41ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
@@ -1462,6 +1481,49 @@ struct LLMUserInputProcessor: UserInputProcessor {
                 cacheScopeSalt: cacheScopeSalt(from: additionalContext),
                 toolSchemas: input.tools)
         }
+    }
+
+    /// DeepSeek-V4.1 image request (engine `preprocess_dsv41_vl`): render through the same chat
+    /// template path as text (so an image turn and its text continuation share one prompt format
+    /// and cache boundaries), preprocess each image, expand every placeholder token into its
+    /// image span, and remap the cache boundaries into the expanded token space.
+    private func deepseekV41ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: DeepseekV41VisionConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: input.tools,
+            additionalContext: additionalContext,
+            promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map {
+            DeepseekV41ImagePreprocessor.preprocess(
+                try DeepseekV41ImagePreprocessor.decodeRGB($0), config: vision)
+        }
+        let expansion = try DeepseekV41VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId, grids: processed.map(\.grid))
+        if DeepseekV4Model.visionLogEnabled {
+            NSLog(
+                "VMLX DSV4.1 VL preprocess: \(expansion.tokens.count) tokens, "
+                    + "\(processed.reduce(0) { $0 + $1.grid.tokenCount }) image-span tokens, "
+                    + "\(processed.count) image(s) "
+                    + processed.map { "\($0.grid.bestW)x\($0.grid.bestH)->\($0.grid.llmH)x\($0.grid.llmW)" }
+                    .joined(separator: ","))
+        }
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: DeepseekV41VisionPrompt.processedImage(processed, patchSize: vision.patchSize),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
     }
 
     private func mergedAdditionalContext(
@@ -2166,7 +2228,8 @@ public final class LLMModelFactory: ModelFactory {
             k2ReasoningDeclaration: K2HorizonTemplateContract.fixedReasoningDeclaration(
                 metadata: K2HorizonTemplateContract.matches(baseConfig.modelType)
                     ? (try? Data(contentsOf: jangConfigURL)) : nil,
-                modelType: baseConfig.modelType))
+                modelType: baseConfig.modelType),
+            deepseekV41Vision: (model as? DeepseekV4Model)?.v41Vision?.config)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
