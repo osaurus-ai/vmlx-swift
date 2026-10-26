@@ -642,6 +642,14 @@ struct Bench {
             try await runSpeedProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DSPARK_DRAFTS"] ?? "0") == "1" {
+            try await runDSparkDraftDump(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_ROWPARTS"] ?? "0") == "1" {
+            try await runDSV41RowParts(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_PROD"] ?? "0") == "1" {
             try await runProdMatrix(modelPath: modelPath, maxNew: maxNew)
             return
