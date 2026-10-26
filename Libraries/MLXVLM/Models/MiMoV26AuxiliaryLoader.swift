@@ -3,6 +3,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// Auxiliary weights are selected before loading shared shards. In particular,
@@ -46,8 +47,8 @@ enum MiMoV26AuxiliaryLoader {
                 guard wanted.isSubset(of: all) else {
                     throw VLMError.processing("MiMo auxiliary index references missing tensors")
                 }
-                let (arrays, _) = try loadArraysAndMetadata(
-                    url: file, excludingKeys: all.subtracting(wanted), exactTensorBuffers: true)
+                let (arrays, _) = try ResidentSafetensorsReader.loadWeights(
+                    url: file, excludingKeys: all.subtracting(wanted))
                 guard Set(arrays.keys) == wanted else {
                     throw VLMError.processing("MiMo auxiliary shard does not match its index")
                 }
@@ -59,8 +60,8 @@ enum MiMoV26AuxiliaryLoader {
         let all = try names(in: file)
         let wanted = all.filter(include)
         guard !wanted.isEmpty else { throw VLMError.processing("MiMo auxiliary weights are missing") }
-        return try loadArraysAndMetadata(
-            url: file, excludingKeys: all.subtracting(wanted), exactTensorBuffers: true).0
+        return try ResidentSafetensorsReader.loadWeights(
+            url: file, excludingKeys: all.subtracting(wanted)).0
     }
 
     static func vision(

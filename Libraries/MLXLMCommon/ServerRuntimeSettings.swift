@@ -434,6 +434,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // Default-on covers only the family measured to win cold (Qwen3.8 Flash-Next: `measuredFamilyAutoDepth`
         // is set from model_type, never from a path or name). Every other family keeps the opt-in contract.
         if mtp.mode == .familyDefault, status?.measuredFamilyAutoDepth == nil {
+            // This native-head decision does not disable an independently
+            // selected DFlash/Uno drafter. Known missing evidence must not
+            // suggest that changing the mode can create a head or tensors.
+            if let status, !status.hasCompleteMTPArtifact {
+                let absent = !status.bundleHasMTP
+                    && status.configuredLayers == 0 && status.tensorCount == 0
+                return .init(
+                    launchMode: .off, recommendation: nil,
+                    reason: absent
+                        ? "This bundle has no native MTP head or tensors."
+                        : "This bundle has incomplete native MTP head/tensor evidence.")
+            }
             return .init(
                 launchMode: .off, recommendation: nil,
                 reason:

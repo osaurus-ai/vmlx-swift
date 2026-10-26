@@ -100,6 +100,64 @@ struct VMLXServerRuntimeSettingsTests {
                 .launchMode == .off)
     }
 
+    @Test("known headless bundles do not advertise native-MTP activation")
+    func familyDefaultExplainsAbsentHeadWithoutCreatingOne() {
+        let settings = VMLXServerRuntimeSettings()
+        let config = Data(#"{"model_type":"llama"}"#.utf8)
+        let status = MTPBundleStatus()
+        let launch = settings.resolvedMTPLaunch(configData: config, jangConfig: nil, status: status)
+        #expect(launch.launchMode == .off)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason == "This bundle has no native MTP head or tensors.")
+        #expect(settings.resolvedMTPDraftStrategy(configData: config, jangConfig: nil, status: status) == nil)
+    }
+
+    @Test("partial native-head evidence is distinct from an available opt-in", arguments: [
+        "missing-tensors", "missing-layers", "incomplete-topology",
+    ])
+    func familyDefaultExplainsIncompleteHead(_ kind: String) {
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: kind == "missing-layers" ? 0 : 1,
+            tensorCount: kind == "missing-tensors" ? 0 : 57,
+            mode: .preservedEnabled,
+            incompleteTopologyReason: kind == "incomplete-topology" ? "Missing fusion projection" : nil)
+        let launch = VMLXServerRuntimeSettings().resolvedMTPLaunch(
+            configData: nil, jangConfig: nil, status: status)
+        #expect(launch.launchMode == .off)
+        #expect(launch.recommendation == nil)
+        #expect(launch.reason == "This bundle has incomplete native MTP head/tensor evidence.")
+    }
+
+    @Test("unknown and complete head evidence retain the family-default opt-in policy")
+    func familyDefaultDoesNotInventMissingEvidence() {
+        let complete = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57, mode: .preservedEnabled)
+        for status in [complete, nil] as [MTPBundleStatus?] {
+            let launch = VMLXServerRuntimeSettings().resolvedMTPLaunch(
+                configData: nil, jangConfig: nil, status: status)
+            #expect(launch.launchMode == .off)
+            #expect(launch.reason.contains("choose On (Adaptive)"))
+        }
+    }
+
+    @Test("headless reason does not override explicit Off or unavailable explicit On")
+    func explicitHeadlessModesKeepTheirPolicy() {
+        for mode in [VMLXMTPServerMode.off, .forceOn] {
+            var settings = VMLXServerRuntimeSettings()
+            settings.mtp.mode = mode
+            let launch = settings.resolvedMTPLaunch(
+                configData: nil, jangConfig: nil, status: MTPBundleStatus())
+            if mode == .off {
+                #expect(launch.launchMode == .off)
+                #expect(launch.reason == "MTP disabled by server settings.")
+            } else {
+                #expect(launch.launchMode == .blocked)
+                #expect(launch.recommendation == nil)
+            }
+        }
+    }
+
     @Test("a bundled dflash2 drafter is used unless speculation is switched off")
     func bundledDFlash2DrafterDiscovery() throws {
         let root = FileManager.default.temporaryDirectory
@@ -144,6 +202,9 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(
             defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
                 != nil)
+        #expect(defaults.resolvedMTPDraftStrategy(
+            configData: targetConfig, jangConfig: nil, status: MTPBundleStatus(), bundleDirectory: root
+        )?.usesDFlash2 == true, "The native-head explanation cannot disable a valid independent drafter")
         var off = defaults
         off.mtp.mode = .off
         #expect(

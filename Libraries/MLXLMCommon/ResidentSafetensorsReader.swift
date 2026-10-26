@@ -8,7 +8,7 @@ import Darwin
 
 /// Direct uncached reads into owned packed compute weights for every model family.
 /// Does not modify the source file or manufacture model/dtype defaults.
-enum ResidentSafetensorsReader {
+public enum ResidentSafetensorsReader {
     struct InvalidFile: LocalizedError {
         let detail: String
         var errorDescription: String? { "Resident safetensors reader: \(detail)" }
@@ -86,7 +86,7 @@ enum ResidentSafetensorsReader {
 
     /// Shared by base models and speculative companion models. Linux keeps the
     /// stock allocator-owned loader; Darwin also avoids duplicate filesystem cache.
-    static func loadWeights(url: URL, excludingKeys: Set<String> = []) throws -> ([String: MLXArray], [String: String]) {
+    public static func loadWeights(url: URL, excludingKeys: Set<String> = []) throws -> ([String: MLXArray], [String: String]) {
         #if canImport(Darwin)
         return try load(url: url, excludingKeys: excludingKeys)
         #else
