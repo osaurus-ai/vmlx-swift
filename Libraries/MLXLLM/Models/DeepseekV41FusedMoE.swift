@@ -501,6 +501,7 @@ enum DeepseekV41FusedMoE {
         """
 
     /// Kernel 1: gate + up + SwiGLU for every (row, slot); slot TOPK is the shared expert.
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device the caller keeps the stock gather_qmm MoE graph.
     static let gateUpKernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_fused_moe_gate_up",
         inputNames: [
@@ -552,6 +553,7 @@ enum DeepseekV41FusedMoE {
         header: header)
 
     /// Kernel 2: routed downs summed in fp32 (column-reduce order) plus the shared down, one cast.
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device the caller keeps the stock gather_qmm MoE graph.
     static let downKernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_fused_moe_down",
         inputNames: ["act", "inds", "dw", "ds", "db", "sdw", "sds", "sdb"],

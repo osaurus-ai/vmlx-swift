@@ -90,6 +90,7 @@ enum DeepseekV41HCStage {
         }
         """
 
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device the caller keeps the stock hyper-connection ops.
     static let stageKernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_hc_stage",
         inputNames: ["h", "y", "post", "comb", "cpre", "w", "fn", "reps"],
@@ -222,6 +223,7 @@ enum DeepseekV41HCStage {
             """,
         header: header)
 
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device the caller keeps the stock hyper-connection ops.
     static let splitKernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_hc_split",
         inputNames: ["z", "ss", "invn", "neps", "scale", "base", "eps"],

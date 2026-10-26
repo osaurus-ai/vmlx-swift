@@ -19,7 +19,9 @@
 // `vision_config` (and only when a request carries images). DSV4-0731 and text-only V4.1 never
 // touch it.
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -489,6 +491,7 @@ public enum DeepseekV41ImagePreprocessor {
         return out
     }
 
+    #if canImport(CoreImage)
     private static let unmanagedSoftwareContext = CIContext(options: [
         .workingColorSpace: NSNull(), .outputColorSpace: NSNull(), .useSoftwareRenderer: true,
     ])
@@ -517,6 +520,12 @@ public enum DeepseekV41ImagePreprocessor {
         }
         return DeepseekV41RGBImage(width: w, height: h, pixels: rgb)
     }
+    #else
+        /// Image decoding needs CoreImage (Apple platforms); elsewhere image requests are refused.
+        public static func decodeRGB(_ image: UserInput.Image) throws -> DeepseekV41RGBImage {
+            throw DeepseekV41VisionError.unreadableImage("image decoding needs CoreImage")
+        }
+    #endif
 }
 
 public enum DeepseekV41VisionError: Error, CustomStringConvertible {

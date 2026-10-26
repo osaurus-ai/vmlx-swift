@@ -30,6 +30,7 @@ enum DeepseekV41RouterGEMV {
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
+    // METAL-ONLY: case 2. Metal kernel; without a Metal device the caller keeps the stock f32 router matmul.
     private static let kernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_router_bf16_gemv_f32",
         inputNames: ["x", "weight"],
