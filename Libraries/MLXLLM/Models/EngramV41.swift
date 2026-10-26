@@ -23,7 +23,11 @@
 // The wkv/q_weight/k_weight module weights live in the backbone shards (affine quant) and load through
 // the normal path; only the big embed table is disk-resident here.
 
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -253,6 +257,21 @@ struct EngramNgramHasher {
     }
 }
 
+// POSIX file calls, qualified by platform (a bare `open` would bind to local helpers named `open`).
+#if canImport(Darwin)
+    private func engramOpen(_ path: String, _ flags: Int32) -> Int32 { Darwin.open(path, flags) }
+    @discardableResult private func engramClose(_ fd: Int32) -> Int32 { Darwin.close(fd) }
+    private func engramPread(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ n: Int, _ off: off_t) -> Int {
+        Darwin.pread(fd, buf, n, off)
+    }
+#else
+    private func engramOpen(_ path: String, _ flags: Int32) -> Int32 { Glibc.open(path, flags) }
+    @discardableResult private func engramClose(_ fd: Int32) -> Int32 { Glibc.close(fd) }
+    private func engramPread(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ n: Int, _ off: off_t) -> Int {
+        Glibc.pread(fd, buf, n, off)
+    }
+#endif
+
 // MARK: - SSD-resident FP8 embedding table (concurrent pread)
 
 /// One engram layer's FP8 table, read in place from its safetensors shard.
@@ -283,7 +302,7 @@ final class EngramTable: @unchecked Sendable {
     init(weightFile: URL, weightOffset: Int, weightShape: [Int],
          scaleFile: URL, scaleOffset: Int, scaleShape: [Int]) throws {
         func open(_ url: URL) throws -> Int32 {
-            let fd = Darwin.open(url.path, O_RDONLY)
+            let fd = engramOpen(url.path, O_RDONLY)
             guard fd >= 0 else { throw EngramError.openFailed(url, errno) }
             return fd
         }
@@ -298,7 +317,7 @@ final class EngramTable: @unchecked Sendable {
             do {
                 self.sFd = try open(scaleFile)
             } catch {
-                Darwin.close(self.wFd)
+                engramClose(self.wFd)
                 throw error
             }
             self.ownsScaleFd = true
@@ -312,8 +331,8 @@ final class EngramTable: @unchecked Sendable {
     }
 
     deinit {
-        if ownsScaleFd { Darwin.close(sFd) }
-        Darwin.close(wFd)
+        if ownsScaleFd { engramClose(sFd) }
+        engramClose(wFd)
     }
 
     /// pread exactly `count` bytes (handles short reads). Returns false on EOF/error.
@@ -322,7 +341,7 @@ final class EngramTable: @unchecked Sendable {
     ) -> Bool {
         var done = 0
         while done < count {
-            let n = Darwin.pread(fd, dst.advanced(by: done), count - done, off_t(offset + done))
+            let n = engramPread(fd, dst.advanced(by: done), count - done, off_t(offset + done))
             if n < 0 && errno == EINTR { continue }
             if n <= 0 { return false }
             done += n
