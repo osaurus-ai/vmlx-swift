@@ -78,6 +78,9 @@ struct MathExpressionToolArgumentTests {
             return "<atem:function_calls>\n<atem:invoke name=\"calculate\">\n<atem:parameter name=\"expression\">\(e)</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
         case .dsml:
             return "<\(dsml)tool_calls>\n<\(dsml)invoke name=\"calculate\">\n<\(dsml)parameter name=\"expression\" string=\"true\">\(e)</\(dsml)parameter>\n</\(dsml)invoke>\n</\(dsml)tool_calls>"
+        case .dsmlV41:
+            // DeepSeek-V4.1 names its DSML tags with a leading space.
+            return "<\(dsml) calls>\n<\(dsml) invoke name=\"calculate\">\n<\(dsml) parameter name=\"expression\" string=\"true\">\(e)</\(dsml) parameter>\n</\(dsml) invoke>\n</\(dsml) calls>"
         case .kimiK2:
             return "<|tool_calls_section_begin|><|tool_call_begin|>functions.calculate:0<|tool_call_argument_begin|>\(jsonArgs)<|tool_call_end|><|tool_calls_section_end|>"
         case .k2Horizon:
