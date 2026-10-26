@@ -7692,7 +7692,12 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     coordConfig.maxCacheBlocks = 1024
     coordConfig.modelKey = "\(modelDir.lastPathComponent)|\(rowName.lowercased())"
     let coordinator = CacheCoordinator(config: coordConfig)
-    let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+    // Bisect knobs (DSV4.1 GPU-timeout investigation, 2026-10-26): BENCH_AGENTIC_NO_COORDINATOR=1 runs the engine
+    // without the cache coordinator (the cache assertions at the end are skipped), BENCH_AGENTIC_NO_DRAFT=1 drops
+    // the bundle's draft strategy, BENCH_AGENTIC_TEMPERATURE overrides the sampling temperature.
+    let noCoordinator = env["BENCH_AGENTIC_NO_COORDINATOR"] == "1"
+    let engine = BatchEngine(
+        context: ctx, maxBatchSize: 1, cacheCoordinator: noCoordinator ? nil : coordinator)
     defer { Task { await engine.shutdown() } }
 
     let fallbackParams = GenerateParameters(maxTokens: maxTokens, prefillStepSize: 512)
@@ -7702,6 +7707,9 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     params.maxTokens = maxTokens
     params.prefillStepSize = 512
     params.enableCompiledBatchDecode = false
+    if env["BENCH_AGENTIC_NO_DRAFT"] == "1" { params.draftStrategy = nil }
+    if let t = env["BENCH_AGENTIC_TEMPERATURE"].flatMap(Float.init) { params.temperature = t }
+    print("Bisect: coordinator=\(!noCoordinator) draft=\(params.draftStrategy.map { "\($0)" } ?? "nil")")
     print(String(format:
         "Sampling: maxTokens=%d temp=%.3f topP=%.3f topK=%d minP=%.3f rep=%@ seed=%@",
         params.maxTokens ?? -1,
@@ -7885,6 +7893,11 @@ func runDSV4AgenticToolCheck(modelPath: String, maxNew: Int) async throws {
     print(
         "DSV4_AGENTIC_CACHE_STATS hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}"
     )
+    if noCoordinator {
+        await engine.shutdown()
+        print("=== \(rowName): PASS (no coordinator: cache assertions skipped) ===")
+        return
+    }
     if !genericAgentic, !snapshot.isPagedIncompatible {
         try fail(40, "DSV4 agentic row did not mark cache as paged-incompatible")
     }

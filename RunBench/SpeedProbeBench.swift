@@ -97,6 +97,17 @@ func runSpeedProbe(modelPath: String) async throws {
             format: "[BENCH_SPEED] arm=%@ model=%@ load=%.1fs type=%@", arm,
             modelDir.lastPathComponent,
             CFAbsoluteTimeGetCurrent() - loadStart, String(describing: type(of: context.model))))
+    // BENCH_SPEED_MEMORY_LIMIT_GB / BENCH_SPEED_CACHE_LIMIT_GB: MLX allocator limits set after the load, to reproduce a
+    // host's policy (Osaurus caps the cache at 8 GiB; an explicit memory limit below the resident weights makes every
+    // allocation wait on in-flight work). Printed with the limits the load left in place.
+    print("[BENCH_SPEED_LIMITS] after load: memoryLimit=\(MLX.Memory.memoryLimit) cacheLimit=\(MLX.Memory.cacheLimit)")
+    if let gb = env["BENCH_SPEED_MEMORY_LIMIT_GB"].flatMap(Double.init) {
+        MLX.Memory.memoryLimit = Int(gb * 1_073_741_824)
+    }
+    if let gb = env["BENCH_SPEED_CACHE_LIMIT_GB"].flatMap(Double.init) {
+        MLX.Memory.cacheLimit = Int(gb * 1_073_741_824)
+    }
+    print("[BENCH_SPEED_LIMITS] in use: memoryLimit=\(MLX.Memory.memoryLimit) cacheLimit=\(MLX.Memory.cacheLimit)")
     nonisolated(unsafe) let ctx = context
     // BENCH_SPEED_CACHE_DIR=<dir>: a disk-backed prefix cache (what the app runs), so multi-turn
     // smokes exercise restore.
@@ -126,6 +137,14 @@ func runSpeedProbe(modelPath: String) async throws {
             p.temperature = 1.0
             p.topP = 0.95
             p.topK = 20
+            p.randomSeed = UInt64(env["BENCH_SPEED_SEED"] ?? "1234") ?? 1234
+        }
+        // BENCH_SPEED_TEMP=<t>: plain temperature sampling at t (top_p 1, top_k 0, fixed seed), the shape Osaurus
+        // sends (e.g. 0.4); combine with BENCH_SPEED_THINKING=1 to reproduce an app thinking request.
+        if let t = env["BENCH_SPEED_TEMP"].flatMap(Float.init) {
+            p.temperature = t
+            p.topP = 1
+            p.topK = 0
             p.randomSeed = UInt64(env["BENCH_SPEED_SEED"] ?? "1234") ?? 1234
         }
         switch arm {
@@ -180,11 +199,13 @@ func runSpeedProbe(modelPath: String) async throws {
     }()
     func run(_ prompt: String, _ budget: Int, cat: String) async throws -> Row {
         var input = UserInput(prompt: filler + prompt)
-        input.additionalContext = ["enable_thinking": false]
+        input.additionalContext = ["enable_thinking": env["BENCH_SPEED_THINKING"] == "1"]
         let startUnix = Date().timeIntervalSince1970
         let t0 = CFAbsoluteTimeGetCurrent()
         let prepared = try await ctx.processor.prepare(input: input)
         nonisolated(unsafe) let send = prepared
+        let activeBefore = MLX.Memory.activeMemory
+        MLX.Memory.peakMemory = 0
         let stream = await engine.generate(input: send, parameters: params(budget))
         var first: Double?
         var last = 0.0
@@ -241,6 +262,10 @@ func runSpeedProbe(modelPath: String) async throws {
         let span = (first.map { last - $0 }) ?? 0
         let chunkRate = span > 0.2 && tokens > 1 ? Double(tokens - 1) / span : 0
         if !mtp.isEmpty { print("[BENCH_SPEED_MTP] \(cat) \(mtp)") }
+        // Request transient: MLX peak above the active memory before the request (weights + earlier caches).
+        print(String(format: "[BENCH_SPEED_TRANSIENT] %@ peak_above_active_gib=%.2f cache_gib=%.2f", cat,
+                     Double(MLX.Memory.peakMemory - activeBefore) / 1_073_741_824,
+                     Double(MLX.Memory.cacheMemory) / 1_073_741_824))
         var row = Row(
             cat: cat, tokens: tokens, decode: decode, ttft: (first ?? t0) - t0, text: text,
             chunkRate: chunkRate, reasoning: reasoning, stop: stop,
