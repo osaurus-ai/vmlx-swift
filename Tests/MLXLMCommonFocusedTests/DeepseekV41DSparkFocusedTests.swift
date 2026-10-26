@@ -45,7 +45,7 @@ struct DeepseekV41DSparkFocusedTests {
     // MARK: Pool layouts
 
     /// The two DeepSeek-V4.1 pool layouts `DeepseekV4Model.makeCaches` builds: one contiguous 4-bit
-    /// slab per pool written in place (default), and `VMLX_DSV41_POOL_LAYOUT=segmented`.
+    /// slab per pool written in place (V4.1), and the segmented storage DSV4-0731 uses.
     enum Layout: String, CaseIterable, Sendable, CustomTestStringConvertible {
         case segmented, contiguous
         var testDescription: String { rawValue }

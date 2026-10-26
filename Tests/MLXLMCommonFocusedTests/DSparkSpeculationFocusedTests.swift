@@ -260,8 +260,7 @@ struct DSparkSpeculationFocusedTests {
             // Governor that always speculates (AR re-measures are disabled) so every step verifies.
             var decoder = DSparkDecoder(
                 session: draft, blockSize: 5, stopTokenIDs: [],
-                governor: DSparkGovernor(probeEvery: 1, arProbeEvery: 1 << 30, warmupSpec: 1 << 30),
-                refeed: false)
+                governor: DSparkGovernor(probeEvery: 1, arProbeEvery: 1 << 30, warmupSpec: 1 << 30))
             let spec = dsparkRun(
                 decoder: &decoder, cache: cache, firstToken: first, count: count,
                 forward: { target.forward($0, cache: cache) }, argmaxLast: target.argmaxLast)

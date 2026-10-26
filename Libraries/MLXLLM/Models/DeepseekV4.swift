@@ -1574,10 +1574,6 @@ public class DeepseekV4ModelInner: Module {
     /// layer ran (0 = skipped).
     var suffixPruneObserver: ((_ start: Int, _ rows: [Int]) -> Void)?
 
-    /// Hoisted per-token debug switch (was an environment read per layer per token).
-    private static let layerDebugEnabled =
-        ProcessInfo.processInfo.environment["VMLX_DSV41_DEBUG"] != nil
-
     func configureEngram(modelDirectory: URL) throws {
         guard !config.engramLayerIds.isEmpty else { return }
         let runtime = try EngramRuntime(modelDirectory: modelDirectory, config: config)
@@ -1848,10 +1844,6 @@ public class DeepseekV4ModelInner: Module {
                     attnPieces: attnPieces)
                 h = r.h
                 preMix = r.ffnPre
-                if Self.layerDebugEnabled {
-                    let ma = MLX.abs(h.asType(.float32)).mean(); MLX.eval(ma)
-                    NSLog("VMLX-DBG layer\(i) out.meanAbs=\(ma.item(Float.self))")
-                }
                 if layerwisePrefill { MLX.eval(h) }
                 layerStats.append(contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
             }
@@ -2064,10 +2056,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         let poolBits = config.isDeepseekV41 ? 4 : DeepseekV4Cache.poolQuantizationBits
         // DeepSeek-V4.1 pools follow the reference `QuantGrowBuffer`: 4-bit from the
         // first row (no BF16 hot tier) in one contiguous slab, so the retained KV is
-        // ~1 KB/token at every context length. `VMLX_DSV41_POOL_LAYOUT=segmented`
-        // restores the previous BF16-hot-tier layout for A/B runs.
+        // ~1 KB/token at every context length. The 0731 segmented layout kept every pool
+        // under 64 MiB in BF16 (>3 KB/token), which is what made V4.1 KV ~3x too big before.
         let v41Contiguous = config.isDeepseekV41
-            && env["VMLX_DSV41_POOL_LAYOUT"]?.lowercased() != "segmented"
         let engramHistoryHolder: Int? = config.engramLayerIds.isEmpty
             ? nil
             : (0..<config.numHiddenLayers).first {

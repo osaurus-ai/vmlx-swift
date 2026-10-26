@@ -163,15 +163,6 @@ struct DeepseekV41KVBytesFocusedTests {
                 Double(swiftPools) <= 1.07 * Double(pythonPools),
                 "pools \(swiftPools) B vs reference \(pythonPools) B")
             #expect(Double(g.swiftBytes(1 << 20)) < 0.97e9, "1M tokens: \(g.swiftBytes(1 << 20)) B")
-
-            // Root cause: the segmented layout kept every pool under 64 MiB in BF16.
-            let old = DeepseekV4Model.makeCaches(
-                config: cfg, environment: ["VMLX_DSV41_POOL_LAYOUT": "segmented"])
-            Self.prefill(old, geometry: g, tokens: tokens)
-            let oldBytes = CacheStoreBudget.cacheBytes(old)
-            let oldPerToken = Double(oldBytes - swiftWindows) / Double(tokens)
-            #expect(oldPerToken > 3_000, "segmented layout \(oldPerToken) B/token")
-            #expect(oldBytes - swiftWindows > 3 * swiftPools)
         }
     }
 

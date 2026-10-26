@@ -16,8 +16,9 @@
 //      next p0. Partial accept with k > 0 (Python `commit_prefix`, M1 step 7): the target recorded
 //      the verify's per-token cache inputs, so the cache is restored in place and only the kept
 //      tokens [p0, d1...dk] are re-appended (window rows, compressor pooling), with no second
-//      forward; truth_k becomes the next p0. k == 0 (or `VMLX_DSV41_DSPARK_REFEED=1`, or a target
-//      without capture): restore in place and run one commit forward of [p0, truth_0...].
+//      forward (each extra forward costs about one more decode step); truth_k becomes the next p0.
+//      k == 0 (or a target without capture): restore in place and run one commit forward of
+//      [p0, truth_0...].
 // Every emitted token is a backbone argmax, so the output is greedy AR's (up to the usual caveat
 // that a multi-row forward rounds differently from a one-row decode step, so a near-tie can flip).
 //
@@ -81,15 +82,6 @@ public enum DSparkEnvironment {
     ) -> Bool {
         guard let raw = environment["VMLX_DSV41_DSPARK"]?.lowercased() else { return false }
         return ["0", "off", "false", "no"].contains(raw)
-    }
-
-    /// `VMLX_DSV41_DSPARK_REFEED=1`: partial accepts restore and refeed instead of committing the
-    /// verified prefix in place (A/B against the Python reference's old path).
-    public static func refeed(
-        _ environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Bool {
-        ["1", "true", "yes", "on"].contains(
-            environment["VMLX_DSV41_DSPARK_REFEED"]?.lowercased() ?? "")
     }
 
     /// `VMLX_DSV41_DSPARK_STATS=1`: one NSLog line per request (spec/AR steps, acceptance, ms/token).
@@ -247,18 +239,13 @@ public struct DSparkDecoder {
     /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(blockSize * ema), 1, bs).
     public private(set) var acceptEMA: Double = 1.0
     let clock: () -> Double
-    /// Partial accepts restore + refeed instead of committing in place (`VMLX_DSV41_DSPARK_REFEED`).
-    public let refeed: Bool
-    private static let refeedFromEnvironment = DSparkEnvironment.refeed()
     private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double)?
 
     public init(
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
         governor: DSparkGovernor = DSparkGovernor(),
-        refeed: Bool? = nil,
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
-        self.refeed = refeed ?? Self.refeedFromEnvironment
         precondition(blockSize >= 1, "dSpark block size must be at least 1")
         self.session = session
         self.blockSize = blockSize
@@ -307,7 +294,7 @@ public struct DSparkDecoder {
 
         // Ask the target to keep this forward's per-token cache inputs, so a partial accept can keep
         // the verified prefix without a second forward.
-        let capturing = !refeed && session.beginVerifyCapture(cache: cache)
+        let capturing = session.beginVerifyCapture(cache: cache)
         defer { if capturing { session.endVerifyCapture(cache: cache) } }
         let verifyStart = clock()
         let logits = forward(feed)

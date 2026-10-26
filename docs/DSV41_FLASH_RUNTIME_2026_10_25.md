@@ -6,6 +6,27 @@ Status and contract for DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, text co
 `DECODE_DSPARK_METHODS.md`. The authoritative prompt format is the bundle's
 `encoding/encoding.py`.
 
+## Speed ledger: why V4.1 was slow here, and what each piece does
+
+Measured live in osaurus (M5 Ultra 256 GB, Release, dSpark on). The first V4.1 build (`661e9173`, AR) ran
+26.8 tok/s decode and had no V4.1 prefill path worth measuring; each row below removes one cause.
+
+| was slow / wrong because | fix (where) | measured |
+|---|---|---|
+| every V4.1 request fell back to AR: osaurus admission dropped the non-native `.dspark` strategy | the bundled head counts as an external drafter (osaurus) | 26.8 → 65–70 tok/s on code |
+| each dSpark step ran a second forward to commit a partial accept | the target records the verify's per-token cache inputs and replays only the kept tokens (`commitCapturedPrefix`) | about one decode step saved per partial accept |
+| Engram rows were read one at a time | 64-lane concurrent `pread`, overlapped with the layers before each Engram layer, plus next-chunk lookahead (`EngramRuntime`) | reads overlap compute |
+| the generic 8 GiB allocator window made 2048-token chunks re-create Metal buffers | V4.1 gets the larger generation window (osaurus) | — |
+| index scores materialized `[C, heads, T]` | fused `sum_h w * relu(q . k)` kernel (`DeepseekV41FusedIndexScores`) | 49k 593 → 680, 100k 458 → 593 pp/s |
+| MLX's GPU `argpartition` sorts whole rows | exact block top-k for prefill rows >= 65536 keys | in the row above |
+| the fused scorer ran on simdgroup fp32 | M5 matrix units, bf16 operands (`DeepseekV41MPPIndexScores`) | 4.1–4.5x kernel; 49k 701 → 720, 100k 595 → 625 pp/s |
+| layers 21–39 computed every prompt row although only the trailing rows reach the prompt end | prompt-suffix pruning (`suffixPruneKeep`, `restartLocalWindow`, row-range selection lookup) | 42k 744 → 1346, 49k 710 → 1317, 100k 594 → 1117 pp/s |
+| V4.1 pools used the 0731 segmented BF16 hot tier (>3 KB/token) and windows kept ~2175 rows after a chunk | 4-bit contiguous pools from the first row, windows trimmed to 128 | 903 MiB at 1,039,360 tokens (911 B/token) |
+
+Measured and rejected: attention sub-chunks of 1024 or none instead of 512 (49k / 100k 708 / 586 and
+678 / 605 vs 720 / 625 pp/s). Still open: the fused decode kernels the Python runtime has (AR 29 → 39 tok/s
+there); Swift decode is 63 / 53 / 100 / 30 tok/s on code / code2 / structured / prose.
+
 ## Family isolation (DSV4-0731 must not change)
 
 `DeepseekV4ChatFamily(modelType:)` selects the contract. Anything that isn't explicitly
@@ -59,7 +80,8 @@ Only the kv-source layers (2, 8, 14, 20; ratios 2, 2, 2, 1) hold pools: compress
   `cache.window = raw[:, -win:]`); previously a 2048-token chunk left ~2175 rows per layer.
 - Disk records store each pool as one segment of its live 4-bit rows, about the resident size.
   Older BF16 records are re-encoded on restore, with the same codes appending would produce.
-- `VMLX_DSV41_POOL_LAYOUT=segmented` restores the old BF16-hot-tier layout for A/B runs.
+- The old BF16-hot-tier (segmented) layout kept every pool under 64 MiB in BF16, >3 KB/token; it
+  stays only as DSV4-0731's storage, and its A/B switch for V4.1 is removed.
 - The disk format records the width and refuses to restore into a cache of the other width.
   `VMLX_DSV41_KVBYTES=1` logs total cache bytes, bytes per token and pool bits after each
   prepare.
@@ -271,7 +293,7 @@ The state is the same as ordinary decoding: the cache holds prompt plus committe
      those tokens.
    - The n-gram history and the hidden tail keep their verify records up to start + k + 1.
    - It emits [p0, d1…dk]; truth_k (argmax of row k) becomes the next p0.
-6. k == 0, or `VMLX_DSV41_DSPARK_REFEED=1`: restore in place, run one commit forward of
+6. k == 0 (or a target without capture): restore in place, run one commit forward of
    [p0, truth_0], and take the next p0 from its last row.
 7. A block is cut at the first stop token and at `maxTokens`. The cache never runs ahead of the
    returned tokens, so the post-answer prefix-cache boundary stays valid.
@@ -311,7 +333,6 @@ verify readback is one sync. The windows project only the new rows.
 |---|---|
 | `VMLX_DSV41_DSPARK=0` (`off`/`false`/`no`) | dSpark off everywhere. It can only turn dSpark off, never on over Off. |
 | `VMLX_DSV41_DSPARK_STATS=1` | one `[dSpark]` NSLog line per request: steps, spec/AR steps, drafted/accepted, acceptance, full accepts, commit forwards, mean emit, ms/token spec and AR (measured and governor EMA), draft/verify/commit ms, tok/s. A skipped request logs `[dSpark] off for this request: <reason>`. |
-| `VMLX_DSV41_DSPARK_REFEED=1` | partial accepts restore and refeed instead of committing in place (A/B) |
 | `VMLX_DSV41_DSPARK_PREFILL_STEP=<n>` | prefill outer chunk while the head is resident (default 1024; `DSV4_PREFILL_OUTER_CHUNK` still wins) |
 
 ### CPU tests (`MLXLMCommonFocusedTests`)
@@ -344,8 +365,8 @@ verify readback is one sync. The windows project only the new rows.
    `accept` ≥ 0.6, `mean_emit` ≥ 3, `ar` steps only from probes, and decode about 45–50 tok/s
    (Python reference with the in-place partial commit: code 57.5, code2 48.7, Rust 59.1, prose 28.8;
    with refeed: code 44.9, code2 41.3; AR about 30). `prefixCommit` should account for most
-   non-full steps, and `commitForwards` only for the k == 0 ones. A/B with
-   `VMLX_DSV41_DSPARK_REFEED=1`. Prose should
+   non-full steps, and `commitForwards` only for the k == 0 ones. (The refeed A/B switch is removed.)
+   Prose should
    be at or above AR (27 tok/s): the governor shows mostly `ar` steps with spec probes.
 3. Identity: run the same greedy prompt with `VMLX_DSV41_DSPARK=0`. The tokens match the dSpark run
    up to the first near-tie. Check any divergence against the AR top-2 margin (expect < 0.05).
