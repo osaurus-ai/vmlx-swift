@@ -117,9 +117,10 @@ enum DeepseekV41IndexerMath {
     }
 
     /// Reference `topk_indices`: unique ids of the k largest (unordered); arange when k >= T.
-    /// Rows at least this long take the block top-k: MLX's GPU `argPartition` sorts the whole row,
-    /// which at long context dominates the indexer (python reference, jangq dc09b99: 2048 x 100k
-    /// 32.7 -> 13.5 ms, 256 x 1M 51.9 -> 3.2 ms).
+    /// Prefill rows (more than 8 queries) at least this long take the block top-k: MLX's GPU
+    /// `argPartition` sorts the whole row, which at long context dominates the indexer (python
+    /// reference: 2048 x 100k 32.7 -> 13.5 ms, 256 x 1M 51.9 -> 3.2 ms). Decode and dSpark verify
+    /// keep the direct partition (faster for one row; their scores are the bf16 path's).
     static let blockTopKMinRows = 65536
     static let blockTopKBlock = 64
 
@@ -134,7 +135,7 @@ enum DeepseekV41IndexerMath {
             return broadcast(MLXArray(Int32(0)..<Int32(T)), to: scores.shape)
         }
         let b = blockTopKBlock
-        if scores.ndim == 2, T >= blockTopKMinRows, T / b > k {
+        if scores.ndim == 2, scores.dim(0) > 8, T >= blockTopKMinRows, T / b > k {
             let C = scores.dim(0)
             let pad = (b - T % b) % b
             let s = pad > 0

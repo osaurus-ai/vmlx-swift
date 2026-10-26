@@ -152,7 +152,7 @@ struct DeepseekV41IndexerFocusedTests {
     @Test("block top-k on long rows selects exactly the values the direct partition selects")
     func blockTopKMatchesDirect() {
         Device.withDefaultDevice(.cpu) {
-            for (rows, length) in [(5, 70000), (3, 140001), (2, 65536)] {
+            for (rows, length) in [(9, 70000), (12, 140001), (9, 65536)] {
                 let noise = MLXRandom.normal([rows, length], key: MLXRandom.key(UInt64(length)))
                 let limit = MLXArray(Int32(0)..<Int32(rows)) + Int32(length - 5)
                 let masked = MLX.where(
@@ -166,6 +166,15 @@ struct DeepseekV41IndexerFocusedTests {
                 let vd = sorted(takeAlong(masked, direct, axis: -1), axis: -1)
                 #expect(arrayEqual(vb, vd).item(Bool.self), "rows \(rows) length \(length)")
             }
+        }
+    }
+
+    @Test("decode-sized rows (<= 8) keep the direct partition")
+    func decodeRowsKeepDirectTopK() {
+        Device.withDefaultDevice(.cpu) {
+            let scores = MLXRandom.normal([3, 70000], key: MLXRandom.key(3))
+            let direct = argPartition(-scores, kth: 511, axis: -1)[0..., 0..<512].asType(.int32)
+            #expect(arrayEqual(DeepseekV41IndexerMath.topK(scores, k: 512), direct).item(Bool.self))
         }
     }
 
