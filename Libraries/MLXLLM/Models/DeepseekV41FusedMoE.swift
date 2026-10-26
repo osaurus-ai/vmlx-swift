@@ -665,15 +665,12 @@ enum DeepseekV41FusedMoE {
         return y.reshaped(1, rows, l.hidden)
     }
 
-    /// The fused MoE output for `x` [1, R, D] with R <= 8, or nil for the stock path. `stock` builds the
-    /// stock output for the admission check (called at most once per shape, outside any compile trace).
-    static func apply(
-        _ x: MLXArray, indices: MLXArray, scores: MLXArray, switchMLP: SwitchGLU,
-        shared: DeepseekV4MLP, limit: Float, stock: () -> MLXArray
-    ) -> MLXArray? {
+    /// The admission key, layer and shared-expert variant when the kernels can serve this call.
+    static func plan(_ x: MLXArray, topK: Int, switchMLP: SwitchGLU, shared: DeepseekV4MLP)
+        -> (key: Key, layer: Layer, wide: Bool)?
+    {
         guard enabled, x.ndim == 3, x.dim(0) == 1, (1 ... maxRows).contains(x.dim(1)),
             x.dtype == .bfloat16 || x.dtype == .float16,
-            indices.ndim == 3, scores.shape == indices.shape,
             // METAL-ONLY: case 1. Guards the Metal kernels; other devices keep the stock graph.
             Device.defaultDevice().deviceType == .gpu,
             let l = layer(switchMLP, shared: shared), x.dim(2) == l.hidden,
@@ -688,8 +685,30 @@ enum DeepseekV41FusedMoE {
             !wide || l.sGate.bits == 8
         else { return nil }
         let key = Key(
-            rows: rows, hidden: l.hidden, inter: l.inter, topK: indices.dim(-1),
+            rows: rows, hidden: l.hidden, inter: l.inter, topK: topK,
             gateBits: l.gate.bits, downBits: l.down.bits, sharedBits: l.sGate.bits, wide: wide)
+        return (key, l, wide)
+    }
+
+    /// True when the kernels could serve `x` but this shape has not been admitted yet. The caller then
+    /// runs its eager path (where admission happens) instead of recording a compiled decode trace, which
+    /// would otherwise bake the stock graph in for good.
+    static func awaitingAdmission(_ x: MLXArray, topK: Int, switchMLP: SwitchGLU, shared: DeepseekV4MLP) -> Bool {
+        guard let p = plan(x, topK: topK, switchMLP: switchMLP, shared: shared) else { return false }
+        return verdict(p.key) == nil
+    }
+
+    /// The fused MoE output for `x` [1, R, D] with R <= 8, or nil for the stock path. `stock` builds the
+    /// stock output for the admission check (called at most once per shape, outside any compile trace).
+    static func apply(
+        _ x: MLXArray, indices: MLXArray, scores: MLXArray, switchMLP: SwitchGLU,
+        shared: DeepseekV4MLP, limit: Float, stock: () -> MLXArray
+    ) -> MLXArray? {
+        guard indices.ndim == 3, scores.shape == indices.shape,
+            let p = plan(x, topK: indices.dim(-1), switchMLP: switchMLP, shared: shared)
+        else { return nil }
+        let (key, l, wide) = (p.key, p.layer, p.wide)
+        let rows = x.dim(1)
         switch verdict(key) {
         case .some(true):
             return run(x, indices: indices, scores: scores, layer: l, limit: limit, wide: wide)

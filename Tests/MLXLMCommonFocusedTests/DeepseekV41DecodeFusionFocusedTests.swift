@@ -242,18 +242,27 @@ struct DeepseekV41DecodeFusionFocusedTests {
     func fusedMoEForwardParity() throws {
         guard let c = DSV41Synth.config else { return }
         try Device.withDefaultDevice(.gpu) {
-            let moe = try DSV41Synth.moe(c, layer: 12, seed: 99)
+            // Two identical modules: each compiled decode region bakes in the kernel choice active at
+            // its first trace, so one module only ever runs with the kernels on, the other off.
+            let moeOn = try DSV41Synth.moe(c, layer: 12, seed: 99)
+            let moeOff = try DSV41Synth.moe(c, layer: 12, seed: 99)
             let saved = DeepseekV41FusedMoE.enabled
             defer { DeepseekV41FusedMoE.enabled = saved }
             DeepseekV41FusedMoE.resetVerdicts()
-            for rows in [1, 1, 1, 2, 4, 6, 8, 1] {  // repeated rows: eager admit, then the compiled region
-                let x = DSV41Synth.hidden(rows: rows, c, seed: UInt64(700 + rows))
+            // A prefill chunk first, as in a real request: it warms the decode region, whose first trace
+            // must still wait for the single-row admission (else the stock graph is baked in for good).
+            let prefill = DSV41Synth.hidden(rows: 16, c, seed: 1600)
+            eval(moeOn(prefill, inputIds: nil), moeOff(prefill, inputIds: nil))
+            // Repeated single rows: eager admission first, then the compiled region's trace and replays.
+            for (step, rows) in [1, 1, 1, 2, 4, 6, 8, 1, 1].enumerated() {
+                let x = DSV41Synth.hidden(rows: rows, c, seed: UInt64(700 + step))
                 DeepseekV41FusedMoE.enabled = true
-                let on = moe(x, inputIds: nil)
+                let on = moeOn(x, inputIds: nil)
+                eval(on)
                 DeepseekV41FusedMoE.enabled = false
-                let off = moe(x, inputIds: nil)
-                eval(on, off)
-                #expect(DSV41Synth.bitEqual(on, off), "rows \(rows)")
+                let off = moeOff(x, inputIds: nil)
+                eval(off)
+                #expect(DSV41Synth.bitEqual(on, off), "step \(step) rows \(rows)")
             }
             DeepseekV41FusedMoE.enabled = true
             for rows in [1, 2, 4, 6, 8] {
@@ -265,10 +274,10 @@ struct DeepseekV41DecodeFusionFocusedTests {
             }
             // 9+ rows (prefill) never take the kernels.
             let x9 = DSV41Synth.hidden(rows: 9, c, seed: 9)
-            let (i9, s9) = moe.gate(x9, inputIds: nil)
+            let (i9, s9) = moeOn.gate(x9, inputIds: nil)
             #expect(DeepseekV41FusedMoE.apply(
-                x9, indices: i9, scores: s9, switchMLP: moe.switchMLP, shared: moe.sharedExperts,
-                limit: c.swigluLimit, stock: { Self.stockExperts(moe, x9, i9, s9) }) == nil)
+                x9, indices: i9, scores: s9, switchMLP: moeOn.switchMLP, shared: moeOn.sharedExperts,
+                limit: c.swigluLimit, stock: { Self.stockExperts(moeOn, x9, i9, s9) }) == nil)
         }
     }
 

@@ -1045,7 +1045,10 @@ class DeepseekV4MoE: Module, UnaryLayer {
         // Python guard) so the trace never bakes the wrong gate variant.
         let ids = gate.isHashLayer ? inputIds : nil
         if DeepseekV4Math.compileRegionsEnabled, !profileStages,
-            x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil)
+            x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil),
+            // V4.1: admit the fused kernels eagerly before the region records its trace.
+            !(config.isDeepseekV41 && DeepseekV41FusedMoE.awaitingAdmission(
+                x, topK: topK, switchMLP: switchMLP, shared: sharedExperts))
         {
             let region = deepseekV4CachedRegion(regionLock, &moeDecodeRegion) {
                 vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
