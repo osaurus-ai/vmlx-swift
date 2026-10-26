@@ -14,13 +14,17 @@ public struct JANGHRoutedModelLayout: Sendable {
     public let modulePrefix: String
     /// Checkpoint-local feed-forward child; the default preserves existing families.
     public let feedForwardModule: String
+    /// Checkpoint path of a layer's routed stack, `{L}` replaced by the layer, for families whose checkpoint does not
+    /// use `model.layers.L.mlp.switch_mlp` (DeepSeek-V4.1: `layers.{L}.ffn.experts`). nil keeps the default spelling.
+    public let parentTemplate: String?
 
     public init(modelType: String, hiddenSize: Int, intermediateSize: Int,
                 expertCount: Int, sparseLayers: Set<Int>, routesPerToken: Int = 8,
-                modulePrefix: String = "", feedForwardModule: String = "mlp") {
+                modulePrefix: String = "", feedForwardModule: String = "mlp", parentTemplate: String? = nil) {
         self.routesPerToken = routesPerToken
         self.modulePrefix = modulePrefix
         self.feedForwardModule = feedForwardModule
+        self.parentTemplate = parentTemplate
         self.modelType = modelType
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -115,14 +119,16 @@ public final class JANGHModelPreparation {
               layout.hiddenSize > 0, layout.intermediateSize > 0,
               layout.expertCount > 0, !layout.sparseLayers.isEmpty,
               layout.sparseLayers.allSatisfy({ $0 >= 0 }),
-              layout.feedForwardModule == (layout.modelType == "lfm2_moe" ? "feed_forward" : "mlp") else {
+              layout.parentTemplate != nil
+                || layout.feedForwardModule == (layout.modelType == "lfm2_moe" ? "feed_forward" : "mlp") else {
             throw JANGHFormatContract.ValidationError.invalid(
                 "JANGH architecture layout does not match configuration")
         }
         var dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var modules: [Int: String] = [:]
         for layer in layout.sparseLayers.sorted() {
-            let parent = layout.modulePrefix + "model.layers.\(layer).\(layout.feedForwardModule).switch_mlp"
+            let parent = layout.parentTemplate.map { $0.replacingOccurrences(of: "{L}", with: String(layer)) }
+                ?? (layout.modulePrefix + "model.layers.\(layer).\(layout.feedForwardModule).switch_mlp")
             modules[layer] = parent
             for role in ["gate_proj", "up_proj", "down_proj"] {
                 dimensions[parent + "." + role] = .init(

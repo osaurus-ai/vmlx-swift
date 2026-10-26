@@ -148,11 +148,13 @@ final class DSparkV41Attention: Module {
     @ModuleInfo(key: "wkv") var wkv: Linear
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
     @ModuleInfo(key: "wo_b") var woB: Linear
-    /// `[groups, o_lora_rank, (H / groups) * headDim]`
+    /// `[groups, o_lora_rank, (H / groups) * headDim]` bf16, or (JANGHT bundles) the mxfp8 packed weight
+    /// `[groups, o_lora_rank, (H / groups) * headDim / 4]` uint32 with `woAScales` uint8 E8M0 per 32 inputs.
     @ParameterInfo(key: "wo_a") var woA: MLXArray
+    @ParameterInfo(key: "wo_a_scales") var woAScales: MLXArray?
     @ParameterInfo(key: "attn_sink") var attnSink: MLXArray
 
-    init(_ cfg: DSparkV41Config) {
+    init(_ cfg: DSparkV41Config, mxfp8: Bool = false) {
         nHeads = cfg.nHeads
         headDim = cfg.headDim
         rd = cfg.qkRopeHeadDim
@@ -167,8 +169,13 @@ final class DSparkV41Attention: Module {
         _wkv.wrappedValue = Linear(cfg.hiddenSize, cfg.headDim, bias: false)
         _kvNorm.wrappedValue = RMSNorm(dimensions: cfg.headDim, eps: cfg.rmsNormEps)
         _woB.wrappedValue = Linear(cfg.oGroups * cfg.oLoraRank, cfg.hiddenSize, bias: false)
-        _woA.wrappedValue = MLXArray.zeros(
-            [cfg.oGroups, cfg.oLoraRank, cfg.nHeads * cfg.headDim / cfg.oGroups], dtype: .bfloat16)
+        let groupIn = cfg.nHeads * cfg.headDim / cfg.oGroups
+        if mxfp8 {
+            _woA.wrappedValue = MLXArray.zeros([cfg.oGroups, cfg.oLoraRank, groupIn / 4], dtype: .uint32)
+            _woAScales.wrappedValue = MLXArray.zeros([cfg.oGroups, cfg.oLoraRank, groupIn / 32], dtype: .uint8)
+        } else {
+            _woA.wrappedValue = MLXArray.zeros([cfg.oGroups, cfg.oLoraRank, groupIn], dtype: .bfloat16)
+        }
         _attnSink.wrappedValue = MLXArray.zeros([cfg.nHeads], dtype: .float32)
         super.init()
     }
@@ -180,15 +187,15 @@ final class DSparkV41Attention: Module {
     /// Window rows for committed positions: rope(kv_norm(wkv(main_x))) `[1, S, headDim]` bf16
     /// (Python `DSparkAttention.seed`).
     func windowRows(mainX: MLXArray, positions: MLXArray) -> MLXArray {
-        rope(kvNorm(wkv(mainX)), positions).asType(.bfloat16)
+        rope(kvNorm(DeepseekV41FP8Rows.apply(wkv, mainX)), positions).asType(.bfloat16)
     }
 
     /// Queries x `[1, bs, d]` attend to (window ++ own KV), every query to every key (Python
     /// `attend` + `sparse_attention`, fp32 scores and accumulation with the learned sink).
     func attend(_ x: MLXArray, positions: MLXArray, window: MLXArray?) -> MLXArray {
         let bs = x.dim(1)
-        let q = rope(wqB(qNorm(wqA(x))).reshaped(1, bs, nHeads, headDim), positions)
-        let kv = rope(kvNorm(wkv(x)), positions)  // [1, bs, headDim]
+        let q = rope(DeepseekV41FP8Rows.apply(wqB, qNorm(DeepseekV41FP8Rows.apply(wqA, x))).reshaped(1, bs, nHeads, headDim), positions)
+        let kv = rope(kvNorm(DeepseekV41FP8Rows.apply(wkv, x)), positions)  // [1, bs, headDim]
         let full = window.map { concatenated([$0, kv.asType($0.dtype)], axis: 1) } ?? kv
         let qf = q[0].asType(.float32)  // [bs, H, D]
         let kf = full[0].asType(.float32)  // [L, D]
@@ -201,8 +208,15 @@ final class DSparkV41Attention: Module {
         o = rope(o.expandedDimensions(axis: 0), positions, inverse: true).asType(.bfloat16)
         // [bs, groups, (H/groups)*D] x wo_a [groups, r, (H/groups)*D] -> [bs, groups, r]
         let og = o.reshaped(bs, nGroups, -1).transposed(1, 0, 2)  // [g, bs, gd]
-        let lowRank = matmul(og, woA.transposed(0, 2, 1)).transposed(1, 0, 2)  // [bs, g, r]
-        return woB(lowRank.reshaped(1, bs, -1))
+        let lowRank: MLXArray
+        if let woAScales {  // mxfp8: one quantized matmul per group, weights read once for the bs rows
+            lowRank = (DeepseekV41FP8Rows.rows(og, weight: woA, scales: woAScales)
+                ?? quantizedMM(og, woA, scales: woAScales, biases: nil, transpose: true,
+                               groupSize: 32, bits: 8, mode: .mxfp8)).transposed(1, 0, 2)
+        } else {
+            lowRank = matmul(og, woA.transposed(0, 2, 1)).transposed(1, 0, 2)  // [bs, g, r]
+        }
+        return DeepseekV41FP8Rows.apply(woB, lowRank.reshaped(1, bs, -1))
     }
 }
 
@@ -212,12 +226,13 @@ final class DSparkV41MoE: Module {
     let topk: Int, routeScale: Float, normTopk: Bool, lim: Float
     @ParameterInfo(key: "gate_w") var gateW: MLXArray  // [nExperts, d] f32
     @ParameterInfo(key: "gate_bias") var gateBias: MLXArray  // [nExperts] f32
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    /// SwitchGLU (4-bit affine draft) or a JANGT routed-expert layer (JANGHT bundles).
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "sw1") var sw1: Linear
     @ModuleInfo(key: "sw3") var sw3: Linear
     @ModuleInfo(key: "sw2") var sw2: Linear
 
-    init(_ cfg: DSparkV41Config) {
+    init(_ cfg: DSparkV41Config, routed: (any WeightedRoutedExpertLayer)? = nil) {
         topk = cfg.numExpertsPerTok
         routeScale = cfg.routedScalingFactor
         normTopk = cfg.normTopkProb
@@ -229,6 +244,9 @@ final class DSparkV41MoE: Module {
         _gateBias.wrappedValue = MLXArray.zeros([cfg.nRoutedExperts], dtype: .float32)
         // Python order: gate/up in fp32, clip, silu(gate) * up, times the route weight, then bf16
         // into the down projection.
+        if let routed {
+            _switchMLP.wrappedValue = routed
+        } else {
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: d, hiddenDims: inter, numExperts: cfg.nRoutedExperts,
             scoredGlue: { gate, up, scores in
@@ -242,6 +260,7 @@ final class DSparkV41MoE: Module {
                 return (MLXNN.silu(g) * u * w).asType(.bfloat16)
             },
             allowFusedGateUpCache: false)
+        }
         _sw1.wrappedValue = Linear(d, inter, bias: false)
         _sw3.wrappedValue = Linear(d, inter, bias: false)
         _sw2.wrappedValue = Linear(inter, d, bias: false)
@@ -256,15 +275,19 @@ final class DSparkV41MoE: Module {
         var w = takeAlong(scores, idx, axis: -1)
         if normTopk && topk > 1 { w = w / (w.sum(axis: -1, keepDims: true) + 1e-20) }
         w = w * routeScale
-        let routed = switchMLP(xf, idx, preDownScores: w)  // [N, topk, D]
-        var y = routed.asType(.float32).sum(axis: -2)
-        var sg = sw1(xf).asType(.float32)
-        var su = sw3(xf).asType(.float32)
+        var y: MLXArray
+        if let affine = switchMLP as? SwitchGLU {
+            y = affine(xf, idx, preDownScores: w).asType(.float32).sum(axis: -2)  // [N, topk, D] -> [N, D]
+        } else {  // JANGT: the kernels apply the route weights and reduce (input dtype)
+            y = (switchMLP as! any WeightedRoutedExpertLayer).callRouted(xf, indices: idx, scores: w).asType(.float32)
+        }
+        var sg = DeepseekV41FP8Rows.apply(sw1, xf).asType(.float32)
+        var su = DeepseekV41FP8Rows.apply(sw3, xf).asType(.float32)
         if lim > 0 {
             su = clip(su, min: -lim, max: lim)
             sg = minimum(sg, MLXArray(lim))
         }
-        y = y + sw2((MLXNN.silu(sg) * su).asType(.bfloat16)).asType(.float32)
+        y = y + DeepseekV41FP8Rows.apply(sw2, (MLXNN.silu(sg) * su).asType(.bfloat16)).asType(.float32)
         return y.asType(x.dtype).reshaped(B, S, D)
     }
 }
@@ -289,12 +312,13 @@ final class DSparkV41Stage: Module {
     /// Last stage only.
     @ModuleInfo(key: "norm") var norm: RMSNorm?
 
-    init(_ cfg: DSparkV41Config, isFirst: Bool, isLast: Bool) {
+    init(_ cfg: DSparkV41Config, isFirst: Bool, isLast: Bool, mxfp8: Bool = false,
+         routed: (any WeightedRoutedExpertLayer)? = nil) {
         self.cfg = cfg
         let d = cfg.hiddenSize
         let mix = (2 + cfg.hcMult) * cfg.hcMult
-        _attn.wrappedValue = DSparkV41Attention(cfg)
-        _moe.wrappedValue = DSparkV41MoE(cfg)
+        _attn.wrappedValue = DSparkV41Attention(cfg, mxfp8: mxfp8)
+        _moe.wrappedValue = DSparkV41MoE(cfg, routed: routed)
         _attnNorm.wrappedValue = RMSNorm(dimensions: d, eps: cfg.rmsNormEps)
         _ffnNorm.wrappedValue = RMSNorm(dimensions: d, eps: cfg.rmsNormEps)
         _hcAttnFn.wrappedValue = MLXArray.zeros([mix, cfg.hcMult * d], dtype: .float32)
@@ -341,9 +365,11 @@ final class DSparkV41Stage: Module {
 final class DSparkV41Drafter: Module {
     @ModuleInfo(key: "stages") var stages: [DSparkV41Stage]
 
-    init(_ cfg: DSparkV41Config) {
+    /// `routed` (JANGHT bundles): per-stage JANGT expert layers; the stages' projections are then mxfp8.
+    init(_ cfg: DSparkV41Config, routed: [any WeightedRoutedExpertLayer]? = nil) {
         _stages.wrappedValue = (0 ..< cfg.nStages).map {
-            DSparkV41Stage(cfg, isFirst: $0 == 0, isLast: $0 == cfg.nStages - 1)
+            DSparkV41Stage(cfg, isFirst: $0 == 0, isLast: $0 == cfg.nStages - 1, mxfp8: routed != nil,
+                           routed: routed?[$0])
         }
         super.init()
     }
@@ -387,7 +413,11 @@ final class DSparkV41Head: @unchecked Sendable {
     /// Draft from `seed` (the backbone's token at `startPos + 1`), windows holding committed KV for
     /// positions up to `startPos`. Returns the drafts for `startPos + 2 ... startPos + 1 + bs`
     /// (Python `DSpark.draft` without the seed). One host sync.
-    func draft(seed: Int, startPos: Int, windows: [MLXArray?]) -> [Int] {
+    /// `noise` `[bs, vocab]` + `inverseTemperature`: coupled sampled drafting (``markovChain``).
+    func draft(
+        seed: Int, startPos: Int, windows: [MLXArray?], noise: MLXArray? = nil,
+        inverseTemperature: Float = 1
+    ) -> [Int] {
         let cfg = config
         let bs = cfg.blockSize
         var ids = [Int32](repeating: Int32(cfg.noiseTokenId), count: bs)
@@ -406,7 +436,8 @@ final class DSparkV41Head: @unchecked Sendable {
         let xc = DeepseekV4Math.hcCollapse(x, pre: preMix)  // [1, bs, d]
         let logits = head(last.norm!(xc)).asType(.float32)[0]  // [bs, vocab]
         let drafted = Self.markovChain(
-            logits: logits, markovEmbed: markovEmbed, headT: markovHeadT, seed: seed)
+            logits: logits, markovEmbed: markovEmbed, headT: markovHeadT, seed: seed, noise: noise,
+            inverseTemperature: inverseTemperature)
         eval(drafted)
         return drafted.asArray(Int32.self).map(Int.init)
     }
@@ -414,14 +445,20 @@ final class DSparkV41Head: @unchecked Sendable {
     /// Markov-biased greedy chain over a drafted block, kept on the device (Python
     /// `markov_chain`): step i adds the Markov bias of the previous token (the seed for i = 0).
     /// logits `[bs, vocab]` f32, headT `[rank, vocab]` f32. Returns `[bs]` int32, unevaluated.
+    /// `noise` `[bs, vocab]` (sampled speculation): step i proposes
+    /// argmax(score * inverseTemperature + noise[i]) with the Gumbel noise the target samples that
+    /// position with (coupled drafting).
     static func markovChain(
-        logits: MLXArray, markovEmbed: MLXArray, headT: MLXArray, seed: Int
+        logits: MLXArray, markovEmbed: MLXArray, headT: MLXArray, seed: Int,
+        noise: MLXArray? = nil, inverseTemperature: Float = 1
     ) -> MLXArray {
         var tok = MLXArray([Int32(seed)])
         var toks: [MLXArray] = []
         for i in 0 ..< logits.dim(0) {
             let me = take(markovEmbed, tok, axis: 0).asType(.float32)  // [1, rank]
-            tok = argMax(logits[i] + matmul(me, headT)[0], axis: -1, keepDims: true).asType(.int32)
+            var score = logits[i] + matmul(me, headT)[0]
+            if let noise { score = score * inverseTemperature + noise[i] }
+            tok = argMax(score, axis: -1, keepDims: true).asType(.int32)
             toks.append(tok)
         }
         return concatenated(toks, axis: 0)
@@ -461,24 +498,77 @@ extension DSparkV41Head {
         let url = file(in: directory)
         guard FileManager.default.fileExists(atPath: url.path) else { throw LoadError.missingFile(url) }
         let raw = try loadArrays(url: url)
-        let drafter = DSparkV41Drafter(cfg)
-        quantize(model: drafter, groupSize: 64, bits: 4) { path, module in
-            path.contains(".switch_mlp.") && module is SwitchLinear
-        }
         func tensor(_ key: String) throws -> MLXArray {
             guard let t = raw[key] else { throw LoadError.missingTensor(key) }
             return t
         }
+        // JANGHT bundles: JANGT trellis routed experts + the release FP8 projections as mxfp8 (loaded as stored).
+        let jangt = raw["mtp.0.ffn.experts.gate_proj.jt_packed"] != nil
+        let drafter: DSparkV41Drafter
+        if jangt {
+            let kbits = DSparkV41Config.rawKeys(bundleConfig: directory.deletingLastPathComponent()
+                .appendingPathComponent("config.json"))
+            let quant = kbits["quantization"] as? [String: Any] ?? [:]
+            func proj(_ stage: Int, _ name: String) throws -> JANGTProjection {
+                let pre = "mtp.\(stage).ffn.experts.\(name)"
+                guard let entry = quant[pre] as? [String: Any], let k = (entry["kbits"] as? NSNumber)?.doubleValue
+                else { throw LoadError.unexpected("JANGHT dSpark: no jangt entry for \(pre)") }
+                return try JANGTProjection(
+                    k: k, packed: try tensor("\(pre).jt_packed"), scale: try tensor("\(pre).jt_scale"),
+                    signs: try tensor("\(pre).jt_su"), outlierColumnIndices: try tensor("\(pre).jt_ocol"),
+                    outlierWeights: try tensor("\(pre).jt_wout"),
+                    columnScales: name == "down_proj" ? try tensor("\(pre).jt_cs") : nil)
+            }
+            let routed: [any WeightedRoutedExpertLayer] = try (0 ..< cfg.nStages).map { i in
+                let gate = try proj(i, "gate_proj")
+                // The router picks among nRoutedExperts; the kernels index the banks by those ids.
+                guard gate.experts == cfg.nRoutedExperts else {
+                    throw LoadError.unexpected("JANGHT dSpark: mtp.\(i) has \(gate.experts) experts, "
+                        + "config declares \(cfg.nRoutedExperts)")
+                }
+                return try JANGTRoutedExpertLayer(
+                    gate: gate, up: try proj(i, "up_proj"), down: try proj(i, "down_proj"),
+                    hiddenSize: cfg.hiddenSize, intermediateSize: cfg.moeInterDim,
+                    activationLimit: cfg.swigluLimit > 0 ? cfg.swigluLimit : nil)
+            }
+            drafter = DSparkV41Drafter(cfg, routed: routed)
+            quantize(model: drafter) { path, module in
+                guard module is Linear, !path.contains(".switch_mlp.") else { return nil }
+                return (groupSize: 32, bits: 8, mode: .mxfp8)
+            }
+        } else {
+            drafter = DSparkV41Drafter(cfg)
+            quantize(model: drafter, groupSize: 64, bits: 4) { path, module in
+                path.contains(".switch_mlp.") && module is SwitchLinear
+            }
+        }
         var p: [String: MLXArray] = [:]
+        /// bf16 dequantized weight (affine draft) or the stored mxfp8 weight + scales (JANGHT).
+        func linear(_ dst: String, _ src: String) throws {
+            if jangt {
+                p["\(dst).weight"] = try tensor("\(src).weight")
+                p["\(dst).scales"] = try tensor("\(src).scales")
+            } else {
+                p["\(dst).weight"] = try tensor("\(src).weight").asType(.bfloat16)
+            }
+        }
         for i in 0 ..< cfg.nStages {
             let src = "mtp.\(i)"
             let dst = "stages.\(i)"
-            for name in ["wq_a", "wq_b", "wkv", "wo_b", "q_norm", "kv_norm"] {
+            for name in ["wq_a", "wq_b", "wkv", "wo_b"] {
+                try linear("\(dst).attn.\(name)", "\(src).attn.\(name)")
+            }
+            for name in ["q_norm", "kv_norm"] {
                 p["\(dst).attn.\(name).weight"] = try tensor("\(src).attn.\(name).weight").asType(.bfloat16)
             }
             p["\(dst).attn.attn_sink"] = try tensor("\(src).attn.attn_sink").asType(.float32)
-            p["\(dst).attn.wo_a"] = try tensor("\(src).attn.wo_a.weight").asType(.bfloat16)
-                .reshaped(cfg.oGroups, cfg.oLoraRank, cfg.nHeads * cfg.headDim / cfg.oGroups)
+            if jangt {
+                p["\(dst).attn.wo_a"] = try tensor("\(src).attn.wo_a.weight").reshaped(cfg.oGroups, cfg.oLoraRank, -1)
+                p["\(dst).attn.wo_a_scales"] = try tensor("\(src).attn.wo_a.scales").reshaped(cfg.oGroups, cfg.oLoraRank, -1)
+            } else {
+                p["\(dst).attn.wo_a"] = try tensor("\(src).attn.wo_a.weight").asType(.bfloat16)
+                    .reshaped(cfg.oGroups, cfg.oLoraRank, cfg.nHeads * cfg.headDim / cfg.oGroups)
+            }
             p["\(dst).attn_norm.weight"] = try tensor("\(src).attn_norm.weight").asType(.bfloat16)
             p["\(dst).ffn_norm.weight"] = try tensor("\(src).ffn_norm.weight").asType(.bfloat16)
             for name in [
@@ -489,16 +579,15 @@ extension DSparkV41Head {
             p["\(dst).moe.gate_w"] = try tensor("\(src).ffn.gate.weight").asType(.float32)
             p["\(dst).moe.gate_bias"] = try tensor("\(src).ffn.gate.bias").asType(.float32)
             for (name, w) in [("sw1", "w1"), ("sw2", "w2"), ("sw3", "w3")] {
-                p["\(dst).moe.\(name).weight"] =
-                    try tensor("\(src).ffn.shared_experts.\(w).weight").asType(.bfloat16)
+                try linear("\(dst).moe.\(name)", "\(src).ffn.shared_experts.\(w)")
             }
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
+            for proj in jangt ? [] : ["gate_proj", "up_proj", "down_proj"] {
                 p["\(dst).moe.switch_mlp.\(proj).weight"] = try tensor("\(src).ffn.experts.\(proj).weight")
                 p["\(dst).moe.switch_mlp.\(proj).scales"] = try tensor("\(src).ffn.experts.\(proj).scales")
                 p["\(dst).moe.switch_mlp.\(proj).biases"] = try tensor("\(src).ffn.experts.\(proj).biases")
             }
             if i == 0 {
-                p["\(dst).main_proj.weight"] = try tensor("\(src).main_proj.weight").asType(.bfloat16)
+                try linear("\(dst).main_proj", "\(src).main_proj")
                 p["\(dst).main_norm.weight"] = try tensor("\(src).main_norm.weight").asType(.bfloat16)
             }
             if i == cfg.nStages - 1 {
@@ -640,6 +729,17 @@ final class DSparkV41Session: DSparkDraftSession {
         sync(end: end, tail: holder?.auxiliaryHiddenTail)
         return head.draft(seed: seed, startPos: end - 1, windows: windows)
     }
+
+    func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int] {
+        let holder = Self.tailHolder(cache)
+        let end = holder?.offset ?? (cache.first?.offset ?? 0)
+        sync(end: end, tail: holder?.auxiliaryHiddenTail)
+        return head.draft(
+            seed: seed, startPos: end - 1, windows: windows, noise: noise,
+            inverseTemperature: inverseTemperature)
+    }
+
+    var vocabularySize: Int? { head.config.vocabSize }
 }
 
 // MARK: - DeepseekV4Model conformance

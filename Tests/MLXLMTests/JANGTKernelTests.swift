@@ -109,6 +109,30 @@ final class JANGTKernelTests: XCTestCase {
         return (num / max(den, 1e-30)).squareRoot()
     }
 
+    /// Untrusted tensors (e.g. a dSpark draft file) are checked before any kernel reads them: an outlier column index
+    /// outside [-1, inputs) or an outlier-weight / column-scale shape that disagrees with the bank is refused.
+    func testProjectionRejectsMalformedOutliers() throws {
+        let e = 2, n = 8, kin = 128
+        let words = JANGTCode.wordsPerRow(inputs: kin, k: 2)
+        func make(ocol: [Int32], woutShape: [Int]? = nil, csShape: [Int]? = nil) throws -> JANGTProjection {
+            let outs = ocol.count / e
+            let ws = woutShape ?? [e, n, outs]
+            return try JANGTProjection(
+                k: 2, packed: MLXArray.zeros([e, n, words], dtype: .uint32),
+                scale: MLXArray.ones([e, n], dtype: .float32), signs: MLXArray.ones([kin], dtype: .float32),
+                outlierColumnIndices: MLXArray(ocol, [e, outs]),
+                outlierWeights: MLXArray.zeros(ws, dtype: .float16),
+                columnScales: csShape.map { MLXArray.ones($0, dtype: .float32) })
+        }
+        XCTAssertEqual(try make(ocol: [0, 127, -1, 5]).outlierColumns, 2)
+        XCTAssertEqual(try make(ocol: [-1, -1, -1, -1]).outlierColumns, 0)
+        XCTAssertThrowsError(try make(ocol: [0, 128, 1, 2]))
+        XCTAssertThrowsError(try make(ocol: [0, -2, 1, 2]))
+        XCTAssertThrowsError(try make(ocol: [0, 1, 2, 3], woutShape: [e, n, 1]))
+        XCTAssertThrowsError(try make(ocol: [0, 1, 2, 3], csShape: [e, kin / 2]))
+        XCTAssertNoThrow(try make(ocol: [0, 1, 2, 3], csShape: [e, kin]))
+    }
+
     func testCodeStatisticsMatchTheStateSpace() {
         for k in [2.0, 2.5, 3.0] {
             var sum = [0.0, 0.0], sq = [0.0, 0.0]

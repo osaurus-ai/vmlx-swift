@@ -12,7 +12,11 @@
 //     `dsv41_dspark_governor_test.py`): zero acceptance stays within a few percent of AR, a slow
 //     partially-accepting draft falls back, high acceptance beats AR, acceptance returning
 //     mid-stream recovers, and neither mode is terminal;
-//   - the draft-window hidden tail: record / replace / truncate / prune / read-back by position.
+//   - the draft-window hidden tail: record / replace / truncate / prune / read-back by position;
+//   - sampled speculation: with any drafts (uncoupled or coupled through the noise), the output
+//     is token for token the position-keyed AR sampler's (each position's token is the AR
+//     sampler's draw with that position's Gumbel noise), with filters, and the cache ends where
+//     that AR run's does.
 
 import Foundation
 import MLX
@@ -82,6 +86,28 @@ final class DSparkToyTarget {
         argMax(logits[0, -1], axis: -1).item(Int.self)
     }
 
+    /// The sampled token for the position the cache is about to take (its offset), from logits
+    /// `[1, L, vocab]`: the AR sampler's draw with that position's noise.
+    func sampleLast(_ logits: MLXArray, cache: [KVCache], sampling: DSparkSampling) -> Int {
+        let position = cache.map(\.offset).max() ?? 0
+        return sampling.pick(
+            logits[0, -1].reshaped(1, -1), noise: sampling.noise(first: position, count: 1, vocab: vocab)
+        ).item(Int.self)
+    }
+
+    /// Position-keyed sampled AR: the prompt prefill, then one forward per returned token.
+    func sampled(prompt: [Int], count: Int, sampling: DSparkSampling) -> (tokens: [Int], cache: [KVCache]) {
+        let cache = newCache()
+        var logits = forward(prompt, cache: cache)
+        var out: [Int] = []
+        while out.count < count {
+            let t = sampleLast(logits, cache: cache, sampling: sampling)
+            out.append(t)
+            logits = forward([t], cache: cache)
+        }
+        return (out, cache)
+    }
+
     /// Plain greedy AR: the prompt prefill, then one forward per returned token.
     func greedy(prompt: [Int], count: Int) -> (tokens: [Int], cache: [KVCache]) {
         let cache = newCache()
@@ -104,6 +130,11 @@ final class DSparkScriptedDraft: DSparkDraftSession {
     let good: (Int) -> Int
     let onDraft: () -> Void
     var calls = 0
+    /// Report a vocabulary, so the decoder drafts sampled steps through the coupled entry point
+    /// (and reuses its noise rows for the verify).
+    var coupled = false
+    var coupledCalls = 0
+    var vocabularySize: Int? { coupled ? vocab : nil }
     /// Set to let the decoder commit partial accepts in place through the toy target.
     var target: DSparkToyTarget?
 
@@ -127,6 +158,12 @@ final class DSparkScriptedDraft: DSparkDraftSession {
             let truth = reference[end + 1 + i] ?? 0
             return i < g ? truth : (truth + 1) % vocab
         }
+    }
+
+    func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int] {
+        precondition(noise.shape == [blockSize, vocab])
+        coupledCalls += 1
+        return draft(seed: seed, cache: cache)
     }
 
     func beginVerifyCapture(cache: [KVCache]) -> Bool {
@@ -306,6 +343,86 @@ struct DSparkSpeculationFocusedTests {
         // Only the last, budget-cut block may need a commit forward.
         #expect(r.stats.commitForwards <= 1)
         #expect(Double(r.stats.specEmitted) / Double(r.stats.specSteps) > 5)
+    }
+
+    // MARK: Sampled identity
+
+    static func sampledRun(
+        good: @escaping (Int) -> Int, sampling: DSparkSampling, count: Int = 60,
+        commitInPlace: Bool = false, coupled: Bool = false
+    ) -> (spec: [Int], ar: [Int], cachesMatch: Bool, stats: DSparkGenerationStats, coupledCalls: Int) {
+        Device.withDefaultDevice(.cpu) {
+            let target = DSparkToyTarget()
+            let prompt = [3, 1, 4, 1, 5, 9, 2]
+            let ar = target.sampled(prompt: prompt, count: count + 8, sampling: sampling)
+            var reference: [Int: Int] = [:]
+            for (i, t) in ar.tokens.enumerated() { reference[prompt.count + i] = t }
+            let draft = DSparkScriptedDraft(reference: reference, vocab: target.vocab, good: good)
+            draft.coupled = coupled
+            if commitInPlace { draft.target = target }
+            let cache = target.newCache()
+            let first = target.sampleLast(target.forward(prompt, cache: cache), cache: cache, sampling: sampling)
+            var decoder = DSparkDecoder(
+                session: draft, blockSize: 5, stopTokenIDs: [], sampling: sampling,
+                governor: DSparkGovernor(probeEvery: 1, arProbeEvery: 1 << 30, warmupSpec: 1 << 30))
+            let spec = dsparkRun(
+                decoder: &decoder, cache: cache, firstToken: first, count: count,
+                forward: { target.forward($0, cache: cache) },
+                argmaxLast: { target.sampleLast($0, cache: cache, sampling: sampling) })
+            let arCache = target.sampled(prompt: prompt, count: count, sampling: sampling).cache
+            return (
+                spec, Array(ar.tokens.prefix(count)), dsparkCachesMatch(cache, arCache), decoder.stats,
+                draft.coupledCalls
+            )
+        }
+    }
+
+    @Test("sampled: partially right drafts give the position-keyed AR samples (restore + commit path)")
+    func sampledIdentityPartial() throws {
+        let sampling = try #require(DSparkSampling(temperature: 0.9, seed: 11))
+        let r = Self.sampledRun(good: { [0, 1, 2, 3, 5, 1, 4][$0 % 7] }, sampling: sampling)
+        #expect(r.spec == r.ar)
+        #expect(r.cachesMatch)
+        #expect(r.stats.sampled && r.stats.commitForwards > 0 && r.stats.fullAccepts > 0)
+        #expect(r.stats.accepted > 0 && r.stats.accepted < r.stats.drafted)
+    }
+
+    @Test("sampled with filters and in-place commits, coupled drafting: still the position-keyed AR samples")
+    func sampledIdentityFilteredInPlaceCoupled() throws {
+        let sampling = try #require(DSparkSampling(temperature: 1.3, topP: 0.9, topK: 7, minP: 0.02, seed: 4))
+        let r = Self.sampledRun(
+            good: { [0, 1, 2, 3, 5, 1, 4][$0 % 7] }, sampling: sampling, commitInPlace: true, coupled: true)
+        #expect(r.spec == r.ar)
+        #expect(r.cachesMatch)
+        #expect(r.stats.prefixCommits > 0 && r.coupledCalls == r.stats.specSteps)
+    }
+
+    @Test("sampled: always-wrong and always-right drafts")
+    func sampledIdentityExtremes() throws {
+        let sampling = try #require(DSparkSampling(temperature: 0.7, seed: 99))
+        let wrong = Self.sampledRun(good: { _ in 0 }, sampling: sampling)
+        #expect(wrong.spec == wrong.ar && wrong.cachesMatch && wrong.stats.accepted == 0)
+        let right = Self.sampledRun(good: { _ in 5 }, sampling: sampling, coupled: true)
+        #expect(right.spec == right.ar && right.cachesMatch)
+        #expect(Double(right.stats.specEmitted) / Double(right.stats.specSteps) > 5)
+    }
+
+    @Test("sampling: greedy requests have none; noise is keyed by seed and position; the sampled-off switch")
+    func samplingContract() throws {
+        #expect(DSparkSampling(temperature: 0, seed: 1) == nil)
+        #expect(DSparkSampling(parameters: GenerateParameters(temperature: 0)) == nil)
+        try Device.withDefaultDevice(.cpu) {
+            let a = try #require(DSparkSampling(temperature: 1, seed: 7))
+            let b = try #require(DSparkSampling(temperature: 1, seed: 8))
+            let rows = a.noise(first: 10, count: 3, vocab: 50)
+            #expect(rows.shape == [3, 50])
+            #expect(allClose(rows[1 ..< 3], a.noise(first: 11, count: 2, vocab: 50)).item(Bool.self))
+            #expect(!allClose(rows, b.noise(first: 10, count: 3, vocab: 50)).item(Bool.self))
+        }
+        #expect(DSparkEnvironment.sampledDisabled(["VMLX_DSV41_DSPARK_SAMPLED": "0"]))
+        #expect(DSparkEnvironment.sampledDisabled(["VMLX_DSV41_DSPARK_SAMPLED": "off"]))
+        #expect(!DSparkEnvironment.sampledDisabled([:]))
+        #expect(!DSparkEnvironment.sampledDisabled(["VMLX_DSV41_DSPARK_SAMPLED": "1"]))
     }
 
     // MARK: Checkpoints
@@ -507,13 +624,17 @@ struct DSparkSpeculationFocusedTests {
             #expect(stats.specSteps > 0 && stats.accepted > 0)
             #expect(it.cache.allSatisfy { $0.offset == prompt.count + count })
 
-            // A sampled request never runs dSpark (and never loads a head).
+            // A sampled request runs sampled dSpark (exactness: the decoder-level sampled tests).
             let sampledModel = DSparkToyLanguageModel(good: { _ in 5 })
-            var sampled = GenerateParameters(maxTokens: 8, temperature: 0.7)
+            var sampled = GenerateParameters(maxTokens: count, temperature: 0.7)
+            sampled.randomSeed = 3
             sampled.draftStrategy = params.draftStrategy
             var sIt = try TokenIterator(input: input, model: sampledModel, parameters: sampled)
-            while sIt.next() != nil {}
-            #expect(sIt.dsparkGenerationStats == nil && !sampledModel.attached)
+            var sOut: [Int] = []
+            while let t = sIt.next() { sOut.append(t) }
+            let sStats = try #require(sIt.dsparkGenerationStats)
+            #expect(sampledModel.attached && sStats.sampled && sStats.specSteps > 0)
+            #expect(sOut.count == count && sIt.cache.allSatisfy { $0.offset == prompt.count + count })
         }
     }
 

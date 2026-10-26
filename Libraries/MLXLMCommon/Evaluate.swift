@@ -648,27 +648,32 @@ public struct TopPSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
+        let logprobs = filteredLogprobs(logits)
+        return withRandomState(randomState) {
+            categorical(logprobs)
+        }
+    }
+
+    /// The distribution `sample` draws from: log-probabilities at the temperature with the filters
+    /// applied (rejected tokens -inf). dSpark's sampled speculation picks from the same values.
+    func filteredLogprobs(_ logits: MLXArray) -> MLXArray {
         var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
+        var logprobs = logSoftmax(logits * (1 / temp))
 
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits * (1 / temp))
-
-            // Apply filters in Python mlx-lm order after temperature scaling.
-            if let topP {
-                logprobs = applyTopP(logprobs, topP: topP)
-            }
-            if let minP {
-                logprobs = applyMinP(logprobs, minP: minP)
-            }
-            if let topK {
-                logprobs = applyTopK(logprobs, topK: topK)
-            }
-
-            return categorical(logprobs)
+        // Apply filters in Python mlx-lm order after temperature scaling.
+        if let topP {
+            logprobs = applyTopP(logprobs, topP: topP)
         }
+        if let minP {
+            logprobs = applyMinP(logprobs, minP: minP)
+        }
+        if let topK {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+        return logprobs
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
@@ -2518,11 +2523,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
     }
 
-    /// Load the dSpark head for a greedy `.dspark` request (once per model; a sampled request never
-    /// pays for the 8.3 GB head). Failures are logged and the request decodes AR.
+    /// Load the dSpark head for a `.dspark` request (once per model; with sampled dSpark off, a
+    /// sampled request never pays for the head). Failures are logged and the request decodes AR.
     static func attachDSparkIfRequested(model: any LanguageModel, parameters: GenerateParameters) {
         guard let directory = parameters.draftStrategy?.dsparkDrafterPath,
-            parameters.temperature <= 0,
+            parameters.temperature <= 0 || !DSparkEnvironment.sampledDisabled(),
             !DSparkEnvironment.disabled(),
             let target = model as? any DSparkSpeculativeModel,
             target.dsparkBlockSize == nil
@@ -2550,7 +2555,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             guard let blockSize = target.dsparkBlockSize, let session = target.makeDSparkDraftSession()
             else { return "no dSpark head is attached" }
             if uno != nil { return "Uno is active" }
-            if parameters.temperature > 0 { return "sampled decoding (dSpark verifies greedily)" }
+            if parameters.temperature > 0, DSparkEnvironment.sampledDisabled() {
+                return "sampled decoding with VMLX_DSV41_DSPARK_SAMPLED=0"
+            }
             if processor != nil {
                 return "logit processors (penalties / reasoning budget / JSON schema) need per-token sampling"
             }
@@ -2559,7 +2566,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             if state != nil || input.image != nil || input.video != nil { return "media inputs" }
             if let why = target.dsparkCacheUnsupportedReason(cache) { return why }
             dspark = DSparkDecoder(
-                session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs)
+                session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs,
+                sampling: DSparkSampling(parameters: parameters))
             dsparkStartOffset = cache.map(\.offset).max() ?? 0
             return nil
         }()
@@ -2583,12 +2591,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         guard var decoder = dspark else { return nil }
         defer { dspark = decoder }
-        // Waits for the previous step's last forward; the decoder closes that step's timing here.
-        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
         let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        // The governor chooses before the pending token is read: an AR step returns to the ordinary decode step,
+        // which submits the next forward before it waits for this token.
+        guard decoder.begin(remaining: remaining) else { return nil }
+        // Waits for the previous step's last forward.
+        let seed = y.tokens.reshaped(-1)[0].item(Int.self)
         let model = self.model
         let cache = self.cache
-        let step = decoder.step(seed: seed, cache: cache, remaining: remaining) { ids in
+        let step = decoder.speculate(seed: seed, cache: cache, remaining: remaining) { ids in
             let tokens = MLXArray(ids.map { Int32($0) }).reshaped(1, ids.count)
             return model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits
         }
