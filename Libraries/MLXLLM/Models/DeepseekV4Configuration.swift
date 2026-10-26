@@ -59,6 +59,12 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     public var engramHeadDim: Int = 0
     public var engramMaxNgramSize: Int = 1
 
+    // MARK: - DeepSeek-V4.1 vision tower (top-level `vision_config` + `image_token_id`)
+    /// Decoded only for a DeepSeek-V4.1 bundle whose `vision_config` has layers; nil otherwise
+    /// (always nil for DSV4-0731). The loader clears it for a text-only construction
+    /// (`VMLX_DSV41_VL=0`, or a caller that does not request `.vision`).
+    public var vision: DeepseekV41VisionConfiguration? = nil
+
     // MARK: - MLA — grouped low-rank O
 
     /// `wo_a` splits head output into `oGroups` × `oLoraRank` via an
@@ -182,6 +188,8 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case indexHeadDim = "index_head_dim"
         case indexTopk = "index_topk"
         case useAttnSink = "use_attn_sink"
+        case visionConfig = "vision_config"
+        case imageTokenId = "image_token_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -259,6 +267,14 @@ public struct DeepseekV4Configuration: Codable, Sendable {
             (try? c.decode(Int.self, forKey: .numHashLayers)) == nil {
             self.numHashLayers = 0
         }
+        if self.isDeepseekV41,
+            var v = try? c.decode(DeepseekV41VisionConfiguration.self, forKey: .visionConfig),
+            v.numHiddenLayers > 0
+        {
+            v.imageTokenId = (try? c.decode(Int.self, forKey: .imageTokenId)) ?? v.imageTokenId
+            v.textHiddenSize = self.hiddenSize
+            self.vision = v
+        }
         self.activationQATEnabled = false
     }
 
@@ -327,6 +343,10 @@ public struct DeepseekV4Configuration: Codable, Sendable {
             try c.encode(engramNHeads, forKey: .engramNHeads)
             try c.encode(engramHeadDim, forKey: .engramHeadDim)
             try c.encode(engramMaxNgramSize, forKey: .engramMaxNgramSize)
+        }
+        if isDeepseekV41, let vision {
+            try c.encode(vision, forKey: .visionConfig)
+            try c.encode(vision.imageTokenId, forKey: .imageTokenId)
         }
     }
 
