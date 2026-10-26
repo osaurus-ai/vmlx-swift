@@ -314,6 +314,7 @@ final class DeepseekV4PoolStorage {
     }
 
     func replace(with value: MLXArray?) {
+        noteDrop(toRows: 0)
         hotPool = nil
         segmentStore = []
         emptySpec = nil
@@ -395,6 +396,7 @@ final class DeepseekV4PoolStorage {
             // Dropped rows stay in the slab as slack and are overwritten by the
             // next append.
             slabRows = max(0, slabRows - remaining)
+            noteDrop(toRows: slabRows)
             return
         }
         if let hotPool {
@@ -419,6 +421,7 @@ final class DeepseekV4PoolStorage {
         hotPool = nil
         emptySpec = nil
         if contiguous {
+            noteDrop(toRows: 0)
             slab = nil
             slabRows = 0
             guard let first = segments.first else { return }
@@ -448,22 +451,76 @@ final class DeepseekV4PoolStorage {
         }
     }
 
-    /// Reference snapshot for an in-place speculative restore. Rows are only ever appended as new
-    /// arrays or segments (never written in place), so saved references stay valid.
+    /// Snapshot for an in-place speculative restore (dSpark verify).
+    ///
+    /// Segmented layout: rows are only ever appended as new arrays or segments (never written in
+    /// place), so the saved references stay valid.
+    ///
+    /// Contiguous layout: O(1) and holds no array. (A saved slab reference would stop MLX donating
+    /// the slab, so every verify's first append would copy the whole slab.) Appends write only rows
+    /// at or past the live count, and a growth copies the live rows unchanged, so the rows that were
+    /// live at the checkpoint are still the slab's first rows: a restore only resets the live
+    /// count. Rows a rejected tail wrote past it become slack that no reader sees and the next
+    /// append overwrites. Only a drop below the checkpoint's count (trim, replace, re-encode, a
+    /// restore to fewer rows) lets later appends rewrite its rows; restoring it after that traps.
     struct Snapshot {
         let hotPool: MLXArray?
-        let quantizedSegments: [HybridPoolQuantizedSegment]
+        let segments: [HybridPoolQuantizedSegment]
         let emptySpec: (shape: [Int], dtype: DType)?
+        let slabRows: Int
+        let dropSerial: Int
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(hotPool: hotPool, quantizedSegments: quantizedSegments, emptySpec: emptySpec)
+        Snapshot(
+            hotPool: hotPool, segments: segmentStore, emptySpec: emptySpec,
+            slabRows: slabRows, dropSerial: dropSerial)
     }
 
     func load(_ snapshot: Snapshot) {
-        hotPool = snapshot.hotPool
-        quantizedSegments = snapshot.quantizedSegments
         emptySpec = snapshot.emptySpec
+        if !contiguous {
+            hotPool = snapshot.hotPool
+            segmentStore = snapshot.segments
+            return
+        }
+        precondition(
+            snapshotRowsIntact(snapshot),
+            "DSV4 contiguous pool: speculative checkpoint of \(snapshot.slabRows) rows restored "
+                + "after its rows were dropped (live rows \(slabRows))")
+        if snapshot.slabRows < slabRows { noteDrop(toRows: snapshot.slabRows) }
+        slabRows = snapshot.slabRows
+    }
+
+    /// True when the rows live at `snapshot` are still the slab's first rows.
+    func snapshotRowsIntact(_ snapshot: Snapshot) -> Bool {
+        guard contiguous else { return true }
+        if snapshot.slabRows == 0 { return true }
+        guard snapshot.dropSerial >= forgottenDropSerial,
+              snapshot.slabRows <= slabRows, slab != nil
+        else { return false }
+        // `drops` rows increase with serial: the first drop after the snapshot is the lowest.
+        let firstLater = drops.first { $0.serial > snapshot.dropSerial }
+        return (firstLater?.rows ?? Int.max) >= snapshot.slabRows
+    }
+
+    /// Contiguous layout: drops of live rows as `(serial, rows left)`, rows strictly increasing with
+    /// serial (a drop to `m` subsumes every earlier drop that left `>= m`). A snapshot taken at
+    /// serial `s` with `n` rows is intact iff every later drop left at least `n` rows.
+    private var drops: [(serial: Int, rows: Int)] = []
+    private var dropSerial = 0
+    /// Snapshots older than this serial can no longer be validated (``drops`` is bounded).
+    private var forgottenDropSerial = 0
+    private static let maxTrackedDrops = 64
+
+    private func noteDrop(toRows rows: Int) {
+        guard contiguous else { return }
+        dropSerial += 1
+        while let last = drops.last, last.rows >= rows { drops.removeLast() }
+        drops.append((dropSerial, rows))
+        if drops.count > Self.maxTrackedDrops {
+            forgottenDropSerial = drops.removeFirst().serial
+        }
     }
 
     func copy() -> DeepseekV4PoolStorage {
@@ -504,6 +561,7 @@ final class DeepseekV4PoolStorage {
         guard k > 0 else { return }
         if let current = slab, !Self.compatible(current, rows) {
             // Width/group change (never produced by one cache): re-encode.
+            noteDrop(toRows: 0)
             let live = liveSlab().map(Self.dequantize)
             let merged = Self.dequantize(rows)
             slab = Self.quantize(
@@ -1707,6 +1765,10 @@ extension DeepseekV4Cache: SpeculativeCheckpointCache {
         Self.loadPending(s.idxPending, into: idxPending)
         auxiliaryTokenHistory = s.history
         auxiliaryHiddenTail = s.hiddenTail
+        // A restore moves the sequence back like a trim: the next-chunk Engram lookahead was keyed
+        // to the forward that followed the checkpoint, so it is dropped (speed-only, transient).
+        engramLookaheadTokens = nil
+        engramLookahead = nil
     }
 }
 
