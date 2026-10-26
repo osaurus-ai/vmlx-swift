@@ -89,6 +89,26 @@ M5 Ultra 256 GB, Osaurus Release build, `DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMAT
 `usage.prompt_tokens_details.cached_tokens` reports 0 even on an L2 hit. That's a reporting
 gap, not a cache miss.
 
+## Measured live (combined branch `264f6c4c`, osaurus `fix/dsv41-thinking-toggle`)
+
+M5 Ultra 256 GB, Osaurus Release, DSpark on (default), thinking off, unique cold prompts:
+
+| metric | value |
+|---|---|
+| load + first reply | 39.7 s |
+| phys_footprint after load / peak (42k context) | 205.0 GB (incl. the 8.9 GB dSpark head) / 212.4 GB |
+| decode code / code2 / structured / prose | 65.6 / 58.7 / 105.2 / 34.3 tok/s (AR ≈ 34 tok/s, 28–30 ms/token) |
+| TTFT | 0.30–0.42 s |
+| cold prefill 1.6k (first request) / 6.5k / 42k | 363 / 896 / 654 pp/s |
+| long-context retrieval at 42k | correct |
+| SSD L2 repeat prompt | 1.77 → 0.31 s, `cached_tokens` 3420 reported |
+| tool call + tool turn 2 | populated `tool_calls`; turn 2 370 tokens cached |
+| KV bytes at 42k (`VMLX_DSV41_KVBYTES=1`) | 53.1 MiB = 1.32 KB/token incl. fixed windows (4-bit pools, group 32); ~1.1–1.3 GB at 1M |
+| DSpark stats (code, per request) | accept 0.5–0.7, mean emit 2.8–3.9, prefix commits 5–6 vs commit forwards 0–2, spec 14–20 ms/token vs AR 28–30 |
+
+Before these fixes (PR head `661e9173`, AR): decode 26.8 tok/s, 1.2k prefill 488 pp/s, tool calls broken,
+KV ~3.3 KB/token.
+
 ## GPU verification checklist (for the fixes above)
 
 1. 0731: prompts byte-identical to before (low preface, no `<｜System｜>`); indexer weights
