@@ -271,3 +271,182 @@ verify readback is one sync. The windows project only the new rows.
    about 545.
 9. Long output (2k+ tokens): tok/s does not fall off over the run, and the `ms/tok ar` estimate grows
    only with context.
+
+## Multimodal (image input, branch `feat/dsv41-vision-swift`)
+
+Port of the working vmlx-py path: `jang_tools/dsv41/vision.py` (tower and preprocessing),
+`DSV41.forward(images=, token_types=)` / `Model.merge_image_embeddings` (splice, `bias_vl`,
+Engram masking), and the engine rules in `vmlx_engine/models/deepseek_v4_1/dsv41_vl_preprocess.py`
+and `utils/single_batch_generator.py`. Images stay in the turn they were sent in. A text
+continuation re-sends them and hits the prefix cache. A different image misses.
+
+### Design
+
+- **Tower** (`MLXLLM/Models/DeepseekV41Vision.swift`):
+  - the ViT runs 32 blocks with full bidirectional attention over one image's patch grid, 2D RoPE
+    (row positions in the first half of the rotary dims, column positions in the second) and fp32
+    RMSNorm;
+  - the Aligner zero-pads to a multiple of 3, does a 3x3 merge (column order `c*9 + kh*3 + kw`, as
+    `F.unfold`) and runs `w2(gelu_erf(w1(x)))`;
+  - weights load from the bundle names under `v41_vision.` (`vision.*`, `aligner.*`,
+    `image_{start,end,newline}`) as BF16 passthrough, about 1 GB resident.
+- **Preprocessing** (CPU, per image):
+  - `plan_image_grid`: images smaller than `min_pixels` are scaled up with `int()` truncation, the
+    canvas rounds up to multiples of 14, and over `max_image_tokens` the canvas is re-solved;
+  - `ImageOps.pad(color=127)` with Pillow's exact BICUBIC (22-bit fixed point, an 8-bit
+    intermediate, half-to-even rounding), then `(x/255 - 0.5)/0.5` and patches `[n, 3, 14, 14]`;
+  - request images decode through an unmanaged software `CIContext`, which keeps the stored RGB
+    values, as PIL does.
+- **Prompt** (`LLMUserInputProcessor`, V4.1 with its tower only):
+  - each image renders as `<｜deepseek_image｜>` (token 129264) in its own message, in content-part
+    order. Without an explicit order the images go first. Parts are joined with `\n\n`, which is
+    `encoding.py process_image_messages`;
+  - rendering goes through the same chat template as text, so an image turn and its text
+    continuation share one prompt format;
+  - each placeholder expands to `llmH*(llmW+1)+2` copies of the id (START, (IMAGE x w, NEW_LINE) x h,
+    END) and the cache boundaries are remapped into the expanded space;
+  - `LMInput.image` carries the bf16 patches with one `THW(1, vitH, vitW)` per image, and
+    `mediaTokenIds = [129264]`.
+- **Prefill** (`DeepseekV4Model.prepareImages`):
+  - spans are found from the THW grids. The tokens hold either every image or, after a restore,
+    the last k images;
+  - chunks follow the engine's `_dsv41_vl_chunk_len`: a chunk end that falls inside a span moves
+    back to stop before the image, or forward to take the whole image when the image starts the
+    chunk. Chunks never split a span;
+  - each image is encoded in the chunk that holds it and its rows overwrite the span
+    chunk-relative;
+  - inside that chunk, image tokens choose experts with `gate.bias_vl` (eager selector) and text
+    tokens with `bias`. Image tokens hash DEAD in Engram: they take part in no n-gram, they block
+    the n-grams that span them, and the DEAD ids travel in the cache-carried history. Their Engram
+    gate is zeroed;
+  - the remainder handed to the caller's final forward is text-only, at most one prefill step.
+- **Prefix cache**:
+  - the media salt hashes the patch bytes and grids, combined with scope and KV-policy salts;
+  - `DeepseekV4Model` makes no pre-media promise (`PrefixCacheInvariantModel` is not adopted),
+    so every boundary of an image request is keyed under the whole-request salt, like the
+    engine's `dsv41_vl_media`;
+  - a text follow-up re-sends the same image, gets the same salt and hits the previous turn's
+    boundary. Its suffix holds no placeholder, so it prefills as plain text;
+  - a different image misses every boundary, including the text before the image.
+- **dSpark**: decided on the input that is actually prefilled. After a hit that covers every
+  image the tail is text-only and dSpark serves it. A request that prefills an image decodes AR
+  (`[dSpark] off ... media inputs`).
+
+### Gating
+
+Everything above requires DeepSeek-V4.1 (`isDeepseekV41`), a `vision_config` with layers, and
+images in the request. Without them nothing changes:
+
+- **DSV4-0731**: never decodes `vision_config`, never builds a tower or `bias_vl`, and sanitize
+  drops the vision tensors as before.
+- **Text-only V4.1** (no images, or every image inside a restored prefix): takes the unchanged
+  text prefill (`prefillOuterStep` is an extraction of the old code).
+- **Text-only construction**: `VMLX_DSV41_VL=0`, a caller that requests modalities without
+  `.vision`, and the JANGTQ variant all build no tower. Images are then ignored, as before.
+- **Modalities**: `DeepseekV4Model` reports `[.text, .vision]` through `ModalityBearing` only
+  when the tower exists.
+
+### Osaurus (branch `feat/dsv41-vision`)
+
+- `LocalVisionEvidence` grants vision to a `deepseek_v41` bundle when all of these hold:
+  - the linked vMLX's `DeepseekV4Model` is `ModalityBearing`;
+  - `vision_config.num_hidden_layers` is set and `image_token_id` is present;
+  - every `vision.blocks.N` plus `patch_embed`, `vision.norm`, `aligner.w1/w2` and the three
+    delimiters are backed by tensors.
+- The bundle needs no processor file. `VLMDetection.isVLM(modelType: "deepseek_v41")` follows the
+  same runtime check.
+- `VMLX_DSV41_VL=0` turns the evidence off too, so the text-only construction is admitted.
+- Under the current vMLX pin (`264f6c4c`) the check is false, so V4.1 stays text-only instead of
+  being refused at load ("loaded runtime has no vision tower"). Bump the pin to a vMLX revision
+  containing this branch to turn images on.
+- Image parts already reach the VL path through `mapOpenAIChatToMLX`:
+  - each `Chat.Message` keeps its own images and `contentParts`;
+  - `validateRuntimePolicy` and the composer read the same evidence.
+
+### Environment
+
+| variable | effect |
+|---|---|
+| `VMLX_DSV41_VL=0` (`false`/`off`/`no`) | build V4.1 text-only (no tower, no `bias_vl`) |
+| `VMLX_DSV41_VL_LOG=1` | NSLog `VMLX DSV4.1 VL preprocess: N tokens, S image-span tokens, k image(s) WxH->hxw` and one `VMLX DSV4.1 VL prefill chunk [a, b): image i at r (hxw, n tokens)` line per image chunk |
+| `VMLX_CACHE_FETCH_TRACE=1` | existing salt trace: `[vmlx][cache/salt] ... media=<12 hex> image=[[1521, 3, 14, 14] bfloat16 grids=1x39x39 ...]` |
+| `VMLX_DSV41_DSPARK_STATS=1` | existing: shows `[dSpark] off for this request: media inputs` on an image prefill |
+
+### CPU tests (`DeepseekV41VisionFocusedTests`, 21 tests)
+
+- **Python parity**:
+  - grid plans and token counts for 12 sizes match `plan_image_grid`;
+  - Pillow BICUBIC resize is byte-identical in 4 cases, both up and down;
+  - pad, normalize and patchify are bit-identical to `load_image` (canvas SHA-256 and float32
+    patch SHA-256) in 4 cases;
+  - red and blue 64x64 images give 39x39 patches and 184 tokens;
+  - PNG decodes round-trip exactly through `ciImage` and file URLs.
+- **Tower**: on tiny deterministic weights, ViT + Aligner match the NumPy port of the vision.py
+  math within 2e-5. Span rows are laid out START / rows + NEW_LINE / END.
+- **Prompt**: `encode_messages` goldens for the image turn, the follow-up, a mid-conversation
+  image and two images, in thinking and chat modes. Placeholder text is refused, loose images
+  go to the last user turn, and expansion and boundary remapping are checked.
+- **Splice**:
+  - span location covers full and trailing sets, adjacent images and partial spans;
+  - the never-split rule holds, and 21 chunk plans keep whole spans with a text-only remainder;
+  - chunk-relative splice and the masks are checked;
+  - a tiny V4.1 backbone (synthetic Engram bundle) gives the same image-prefill logits for outer
+    chunks of 4, 5, 6, 9, 13 and 64 (< 1e-4);
+  - other pixels change the logits, and a span-free suffix takes the text path.
+- **Routing and Engram**: `bias_vl` routes image tokens. An all-text mask equals the compiled
+  gate. Engram DEAD hashing is checked, and chunked hashing with the carried history equals
+  one-shot.
+- **Cache keys**: the same image gives the same salt across turns and a different image gives a
+  different salt. The plan keys every boundary under the request salt. The boundary and
+  suffix-media checks pass.
+- **Unchanged paths**:
+  - text-only V4.1 logits are bit-identical with and without the tower;
+  - 0731 builds no tower or `bias_vl`, and sanitize drops the vision tensors;
+  - `VMLX_DSV41_VL` and config decode and round-trip are checked.
+- **Regression**: all V4.1 / dSpark / DSV4 focused suites (82 tests in 11 suites) and the DSV4
+  disk round-trip, partial-restore and media-prefix suites still pass.
+
+### Not verified (needs the GPU and the real weights)
+
+- Image understanding on the real tower (bf16, 1521 patches, Aligner into 5120). The only check
+  is CPU parity of the math on tiny weights.
+- Pixels of images with alpha or an ICC profile. CoreImage premultiplies and PIL does not, so
+  transparent PNGs can differ from the reference. Opaque sRGB images match.
+- ViT time and memory per image, and the image chunk inside the 2048 (1024 with dSpark) outer
+  chunk.
+- Tool-result images: the engine nests them in `tool_result` blocks; Swift does not render them.
+- Batched multi-request slots with images (the solo `TokenIterator` path is the target).
+
+### GPU verification checklist (lead; one model load at a time)
+
+Load V4.1 in Osaurus once the vMLX pin includes this branch, with `VMLX_DSV41_VL_LOG=1`,
+`VMLX_CACHE_FETCH_TRACE=1` and `VMLX_DSV41_DSPARK_STATS=1`. Use temperature 0 and thinking off
+(chat rail) for fast answers.
+
+1. Load: the model loads with no "no vision tower" error, the picker shows image input, and
+   phys_footprint is about 1 GB above the text-only load.
+2. Image turn: send a 64x64 solid red PNG with "What color is this image? Answer in one word."
+   - The log shows `VL preprocess: ... 184 image-span tokens, 1 image(s) 546x546->13x13` and one
+     `VL prefill chunk ... image 0 at <r> (13x13, 184 tokens)`.
+   - The answer is "Red".
+   - `[dSpark] off for this request: media inputs`, and cached tokens are 0 (cold).
+3. Follow-up: in the same chat send "Name a fruit that has this color." (no new image).
+   - The answer is a red fruit (apple, strawberry, cherry).
+   - Usage `cached_tokens` > 0 and covers the image span, so it is at least about 190.
+   - The salt trace shows the same `media=` digest as turn 2.
+   - There is no `VL prefill chunk` line, since the tail is text-only.
+   - With dSpark on, `[dSpark]` stats appear, because dSpark serves the text-only tail.
+4. Different image: in a new chat send a 64x64 solid blue PNG with the same question.
+   - The answer is "Blue".
+   - The `media=` digest differs and `cached_tokens` = 0: a cache miss, even for the shared text
+     prefix.
+5. Mid-conversation image: text turn, then an image turn, then a text turn.
+   - The image turn misses (new media salt) and answers correctly.
+   - The third turn hits with `cached_tokens` > 0 and still refers to the image.
+6. Long prompt: put the image after more than 2048 prompt tokens.
+   - The chunk log shows the image whole inside one chunk, never split.
+   - The answer is correct.
+7. Text-only regression: V4.1 without images gives the same tokens and tok/s as before (dSpark
+   stats in the same range). 0731 is unchanged.
+8. `VMLX_DSV41_VL=0` (set for the Osaurus process): V4.1 loads text-only with no tower error,
+   and the picker shows no image input. Osaurus reads the same switch.
