@@ -1353,6 +1353,27 @@ class DeepseekV4DecoderLayer: Module {
         imageMask: MLXArray? = nil,
         attnPieces: [Int]? = nil
     ) -> (h: MLXArray, ffnPre: MLXArray) {
+        // Decode (one token): the fused hc stage kernels (`DeepseekV41HCStage`, bit-identical and admitted
+        // per shape against the statements below; `VMLX_DSV41_HC_STAGE=0` keeps them).
+        if h.dim(1) == 1, imageMask == nil,
+            let a = DeepseekV41HCStage.apply(h: h, cpre: preMix, hc: attnHC, norm: inputLayerNorm)
+        {
+            let attnOut = selfAttn(a.normed, mask: mask, cache: cache, compressShare: compressShare)
+            if let f = DeepseekV41HCStage.apply(
+                h: h, y: attnOut, post: a.post, comb: a.comb, cpre: a.pre, hc: ffnHC,
+                norm: postAttentionLayerNorm), let hA = f.stream
+            {
+                let ffnOut = mlp(f.normed, inputIds: inputIds, imageMask: nil)
+                let hF = ffnHC.expand(blockOut: ffnOut, residual: hA, post: f.post, comb: f.comb)
+                return (h: hF, ffnPre: f.pre)
+            }
+            let hA = attnHC.expand(blockOut: attnOut, residual: h, post: a.post, comb: a.comb)
+            let (fPre, fPost, fComb) = ffnHC.mixes(hA)
+            let normedF = postAttentionLayerNorm(DeepseekV4Math.hcCollapse(hA, pre: a.pre))
+            let ffnOut = mlp(normedF, inputIds: inputIds, imageMask: nil)
+            let hF = ffnHC.expand(blockOut: ffnOut, residual: hA, post: fPost, comb: fComb)
+            return (h: hF, ffnPre: fPre)
+        }
         // ---- Attention HC (collapse with INCOMING preMix) ----
         let residualA = h
         let (aPre, aPost, aComb) = attnHC.mixes(h)
