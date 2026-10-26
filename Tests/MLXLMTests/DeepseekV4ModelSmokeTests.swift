@@ -338,6 +338,16 @@ struct DeepseekV4ModelSmokeTests {
         }
     }
 
+    @Test("V4.1 keeps checkpoint F32 control parameters for every bundle layout; V4 does not")
+    func v41PreservesCheckpointDTypesWithoutCustomBanks() {
+        var cfg = Self.tinyConfig()
+        #expect(!DeepseekV4Model(cfg).preservesCheckpointParameterDTypes)
+        cfg.modelType = "deepseek_v41"
+        // No custom routed banks: the affine JANG_2K layout (per-expert routed shards) rounded its F32
+        // hc / attn_sink / gate.bias / bias_vl to bf16 before.
+        #expect(DeepseekV4Model(cfg).preservesCheckpointParameterDTypes)
+    }
+
     @Test("sanitize() rewrites attn→self_attn, ffn→mlp, norms, hc_*, top-level")
     func sanitizeRemap() {
         let cfg = Self.tinyConfig()
