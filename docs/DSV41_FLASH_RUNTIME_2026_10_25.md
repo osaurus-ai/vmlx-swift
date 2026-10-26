@@ -136,6 +136,67 @@ rejected by the 0731 contract (low/high/max), identical to `main`.
 Before these fixes (PR head `661e9173`, AR): decode 26.8 tok/s, 1.2k prefill 488 pp/s, tool calls broken,
 KV ~3.3 KB/token.
 
+## Prompt-suffix pruning (prefill)
+
+Port of the Python `Model.__call__(prompt_end=)` (`jang_tools/dsv41/model.py` `prune_rows`,
+`tests/test_suffix_prune.py`). The layers after the last kv-source / Engram / candidate-source layer
+(`prune_from = max(kv_source ∪ engram ∪ {candidate_source}) + 1` = 21) hold nothing but their 128-row
+window: they read layer 20's pool, index keys and candidates. In a prefill that ends at P, layer i ≥ 21
+only needs the rows the last row before P still reaches through the windows above it:
+`keep_i = 1 + (40 - i) * 127` (layer 39: 128, layer 21: 2414). The logits at P-1 and every layer's window
+at P equal a full prefill's, up to batch-shape rounding.
+
+- `DeepseekV4Model.prepare` (text and `prepareImages`) passes `promptEnd` = cache offset + the tokens its
+  own chunk loop forwards. That is the start of the caller's final forward, not the end of the input: the
+  remainder forward is unpruned and needs every window exact at its start. Each prompt-boundary snapshot
+  in `Evaluate` follows a prepare plus its remainder forward, so it is always at a valid point; a cache
+  is never valid mid-prepare.
+- Per pruned layer and forward `[s, e)`, the kept range is `[max(s, P - keep_i), e)`.
+  - Kept rows fewer than the forward's: the window restarts empty at the kept start
+    (`RotatingKVCache.restartWindow(at:)`, the reference's `cache.window = None`). Only the first 127
+    kept rows see a short window, and nothing reads them.
+  - No kept rows: this layer and every later one restart at `e` and are skipped (no attention, no MoE).
+    The reference runs one row there. Skipping is exact because a layer only skips when at least
+    `keep_i` (≥ 128) prompt rows still follow.
+  - h, preMix, the input ids (hash routing) and the image mask are sliced to the trailing rows.
+- The kept rows run in the forward's own attention partition (512-row sub-chunks from the chunk start,
+  or one piece). The first piece can be the tail of a sub-chunk. `DSV41CompressShare` keeps each
+  selection / candidate mask with its row count and returns the trailing rows of the latest entry that
+  ends where the piece ends. Selections are per query row, so this is the slice the unpruned layer would
+  use.
+- dSpark tail: the target layers (37–39) record only the rows they all hold. That is always at least the
+  last 128 before P, since keep ≥ 128.
+- Off for 0731, decode, dSpark verify/capture, forwards that end after P, `DSV4_KV_MODE=full`, and any
+  cache other than a window-only `DeepseekV4Cache` / plain `RotatingKVCache`.
+
+Work saved: chunks that end before P - 2414 skip layers 21–39 entirely. The last one or two chunks run
+`min(keep_i, rows left)` rows per layer, so layers 21–39 run about 24k rows in total (the sum of keep_i)
+instead of 19 per prompt token.
+
+| variable | effect |
+|---|---|
+| `VMLX_DSV41_SUFFIX_PRUNE=0` (`false`/`off`/`no`) | every row through every layer (A/B). Default on. |
+
+CPU tests (`DeepseekV41SuffixPruneFocusedTests`, tiny random V4.1: 8 layers, window 16, kv sources 1/3,
+index sources 1/3/5/7, candidate source 3, Engram 1/4, so layers 5–7 are pruned):
+- the chunk plans of the Python test (n, step) = (40, 64), (47, 64), (100, 64), (161, 64/32/17), (250, 256),
+  plus `prepare` at 1035 tokens (kept rows straddle a 512 sub-chunk) and 2600 tokens (first chunk
+  skipped):
+  - layers 0–4 are bit-identical;
+  - pruned windows at P have cos ≥ 0.9999 (measured 1.0);
+  - last-token and 8 continuation logits have cos ≥ 0.999 (measured ≥ 0.9999999) with no argmax flip;
+  - the dSpark tail is checked;
+  - each pruned layer runs exactly its kept rows;
+- off, with no prompt end, or with a forward past P: bit-identical, no pruned forward;
+- image prefill with pruned sliding-only layers matches for outer chunks 4/5/6/9/13 (< 1e-4).
+
+The shared test `randomize` no longer randomizes RoPE `invFreq`. The process-wide cos/sin memo is keyed
+by the RoPE configuration, so per-layer random tables made positions depend on which layer filled the
+memo last.
+
+Measured (M5 Ultra, DeepSeek-V4.1-Flash): TODO cold prefill 1.6k / 6.5k / 42k / 100k pp/s with
+`VMLX_DSV41_SUFFIX_PRUNE=1` vs `=0`, retrieval answer, TTFT.
+
 ## GPU verification checklist (for the fixes above)
 
 1. 0731: prompts byte-identical to before (low preface, no `<｜System｜>`); indexer weights
