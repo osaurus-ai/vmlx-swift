@@ -149,6 +149,26 @@ struct DeepseekV41IndexerFocusedTests {
         return c
     }
 
+    @Test("block top-k on long rows selects exactly the values the direct partition selects")
+    func blockTopKMatchesDirect() {
+        Device.withDefaultDevice(.cpu) {
+            for (rows, length) in [(5, 70000), (3, 140001), (2, 65536)] {
+                let noise = MLXRandom.normal([rows, length], key: MLXRandom.key(UInt64(length)))
+                let limit = MLXArray(Int32(0)..<Int32(rows)) + Int32(length - 5)
+                let masked = MLX.where(
+                    MLXArray(Int32(0)..<Int32(length)).reshaped(1, length) .>= limit.reshaped(rows, 1),
+                    MLXArray(-Float.infinity), noise)
+                let block = DeepseekV41IndexerMath.topK(masked, k: 512)
+                let direct = argPartition(-masked, kth: 511, axis: -1)[0..., 0..<512]
+                #expect(block.shape == [rows, 512])
+                #expect(block.dtype == .int32)
+                let vb = sorted(takeAlong(masked, block, axis: -1), axis: -1)
+                let vd = sorted(takeAlong(masked, direct, axis: -1), axis: -1)
+                #expect(arrayEqual(vb, vd).item(Bool.self), "rows \(rows) length \(length)")
+            }
+        }
+    }
+
     @Test("end-to-end select(): owner keys + candidate source + candidate user match the reference")
     func selectMatchesReference() throws {
         try Device.withDefaultDevice(.cpu) {

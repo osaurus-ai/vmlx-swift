@@ -117,10 +117,38 @@ enum DeepseekV41IndexerMath {
     }
 
     /// Reference `topk_indices`: unique ids of the k largest (unordered); arange when k >= T.
+    /// Rows at least this long take the block top-k: MLX's GPU `argPartition` sorts the whole row,
+    /// which at long context dominates the indexer (python reference, jangq dc09b99: 2048 x 100k
+    /// 32.7 -> 13.5 ms, 256 x 1M 51.9 -> 3.2 ms).
+    static let blockTopKMinRows = 65536
+    static let blockTopKBlock = 64
+
+    /// Indices of the k largest along the last axis (unordered). Long 2-D rows: the k largest
+    /// values lie in the k blocks with the largest maxima, so select those blocks first and run
+    /// the exact selection over their `k * blockTopKBlock` entries. Same values selected; only the
+    /// pick among exactly tied values can differ. Indices past the row end (block padding) hold
+    /// -inf; callers mask indices past the visible length.
     static func topK(_ scores: MLXArray, k: Int) -> MLXArray {
         let T = scores.dim(-1)
         if k >= T {
             return broadcast(MLXArray(Int32(0)..<Int32(T)), to: scores.shape)
+        }
+        let b = blockTopKBlock
+        if scores.ndim == 2, T >= blockTopKMinRows, T / b > k {
+            let C = scores.dim(0)
+            let pad = (b - T % b) % b
+            let s = pad > 0
+                ? concatenated(
+                    [scores, MLXArray.full([C, pad], values: MLXArray(-Float.infinity)).asType(scores.dtype)],
+                    axis: -1)
+                : scores
+            let nb = s.dim(1) / b
+            let blockMax = s.reshaped(C, nb, b).max(axis: -1)
+            let topBlocks = argPartition(-blockMax, kth: k - 1, axis: -1)[0..., 0..<k]
+            let cand = (topBlocks.expandedDimensions(axis: -1) * Int32(b)
+                + MLXArray(Int32(0)..<Int32(b)).reshaped(1, 1, b)).reshaped(C, k * b)
+            let sel = argPartition(-takeAlong(s, cand, axis: -1), kth: k - 1, axis: -1)[0..., 0..<k]
+            return takeAlong(cand, sel, axis: -1).asType(.int32)
         }
         return argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, 0..<k].asType(.int32)
     }
