@@ -32,7 +32,7 @@ struct DeepseekV4Step37RuntimeContractsTests {
         #expect(model.contains("`cr > 0`  (every other layer) → `DeepseekV4Cache(window=128, cr=cr)`"))
         #expect(model.contains("Caller-level `GenerateParameters.kvMode = .turboQuant` is\n    /// intentionally NOT enough to switch DSV4 into `\"tq\"` mode."))
         #expect(model.contains("case \"full\", \"tq\":\n                return KVCacheSimple()"))
-        #expect(model.contains("return DeepseekV4Cache(\n                        slidingWindow: config.slidingWindow,\n                        compressRatio: cr,\n                        requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder,\n                        poolQuantizationBits: poolBits)"))
+        #expect(model.contains("return DeepseekV4Cache(\n                        slidingWindow: config.slidingWindow,\n                        compressRatio: cr,\n                        poolBF16HotByteLimit: v41Contiguous ? 0 : nil,\n                        requiresAuxiliaryTokenHistory: layerIdx == engramHistoryHolder,\n                        poolQuantizationBits: poolBits,\n                        contiguousPools: v41Contiguous,\n                        compactLocalWindow: config.isDeepseekV41)"))
 
         #expect(quantize.contains("Preserves `RotatingKVCache`, `DeepseekV4Cache`, `MambaCache`,"))
         #expect(quantize.contains("DSV4's `DeepseekV4Cache` is also\n///   skipped"))
