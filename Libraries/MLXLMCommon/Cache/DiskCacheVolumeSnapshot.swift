@@ -8,6 +8,10 @@ public struct DiskCacheVolumeSnapshot: Equatable, Sendable {
     public let freeBytes: Int64?
     public let ownBytes: Int64?
 
+    /// INVARIANT: cap resolution uses the greater of strict and host-supplied
+    /// purgeable-inclusive free space. The host provider must be nonblocking;
+    /// the runtime never performs the potentially slow important-usage query.
+    /// Guarded by DiskCacheCapPolicyTests' resolution and provider cases.
     public static func read(directory: URL?) -> Self {
         guard let directory else {
             return Self(totalBytes: nil, freeBytes: nil, ownBytes: nil)
@@ -21,8 +25,34 @@ public struct DiskCacheVolumeSnapshot: Equatable, Sendable {
         let attributes = try? FileManager.default.attributesOfFileSystem(forPath: ancestor.path)
         return Self(
             totalBytes: (attributes?[.systemSize] as? NSNumber)?.int64Value,
-            freeBytes: (attributes?[.systemFreeSize] as? NSNumber)?.int64Value,
+            freeBytes: resolvedFreeBytes(
+                strict: (attributes?[.systemFreeSize] as? NSNumber)?.int64Value,
+                purgeableInclusive: purgeableInclusiveFreeBytes.provider?(ancestor.path)),
             ownBytes: indexedPayloadBytes(directory: directory))
+    }
+
+    /// Lets the host supply free space that counts purgeable space (APFS
+    /// local snapshots, purgeable caches), the figure Finder and System
+    /// Settings show. `.systemFreeSize` excludes it: one 8 TB Mac read 18 GB
+    /// strict with 1.44 TB available, so Automatic sized the cache to ~5 GB
+    /// and every explicit share above 0.2% was flagged as exceeding free
+    /// space. The purgeable-inclusive query can stall in CacheDelete, so the
+    /// runtime never issues it; the provider must answer without blocking
+    /// (nil until it has a value). Pass nil to remove it.
+    public static func setPurgeableInclusiveFreeBytesProvider(
+        _ provider: (@Sendable (String) -> Int64?)?
+    ) {
+        purgeableInclusiveFreeBytes.provider = provider
+    }
+
+    private static let purgeableInclusiveFreeBytes = FreeBytesProviderBox()
+
+    /// The larger of the two figures; either one alone when the other is
+    /// missing or zero.
+    static func resolvedFreeBytes(strict: Int64?, purgeableInclusive: Int64?) -> Int64? {
+        guard let purgeableInclusive, purgeableInclusive > 0 else { return strict }
+        guard let strict, strict > 0 else { return purgeableInclusive }
+        return max(strict, purgeableInclusive)
     }
 
     /// Missing index means no indexed payloads. Failure to read an existing
@@ -102,5 +132,15 @@ extension DiskCacheCapPolicy {
             totalBytes: volume.totalBytes, freeBytes: volume.freeBytes, ownBytes: volume.ownBytes,
             previousCapBytes: previousCapBytes
                 ?? directory.flatMap { SharedDiskCacheLimit.currentBytes(for: $0).map(Int64.init) })
+    }
+}
+
+private final class FreeBytesProviderBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: (@Sendable (String) -> Int64?)?
+
+    var provider: (@Sendable (String) -> Int64?)? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }

@@ -835,6 +835,12 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             }
             states.append(arr)
         }
+        // Materialize on the CPU stream before returning, as `DiskCache`
+        // does for the KV payload: the companion's lazy `Load`s otherwise
+        // join the engine's restore graph (`restoreSSMStates` seats them
+        // with GPU copies) and put the SSD read inside a Metal command
+        // buffer as a cross-stream wait.
+        MLX.eval(states)
 
         // Accepted/direct reads, not only repeated stores, make an entry hot.
         // Refresh both files to the same timestamp so quota observes the pair
