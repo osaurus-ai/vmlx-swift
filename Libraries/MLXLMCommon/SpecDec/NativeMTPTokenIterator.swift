@@ -1133,7 +1133,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             } catch {
                 generationFailure = GenerationFailure(
                     stage: .decoding,
-                    cause: (error as? LocalizedError)?.errorDescription ?? String(describing: error))
+                    cause: (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                )
                 iterationTerminated = true
                 return nil
             }
@@ -1443,11 +1444,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
 
             if !isReusablePrefixWarmup,
-               includeGeneratedBoundary,
-               generationFailure == nil,
-               !iterationTerminated,
-               !generatedTokenIds.isEmpty,
-               !cache.isEmpty
+                includeGeneratedBoundary,
+                generationFailure == nil,
+                !iterationTerminated,
+                !generatedTokenIds.isEmpty,
+                !cache.isEmpty
             {
                 let postAnswerTokens = promptTokenIds + generatedTokenIds
                 let postAnswerSnapshot = cache.map { $0.copy() }
