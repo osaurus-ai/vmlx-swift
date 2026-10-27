@@ -322,6 +322,34 @@ struct LFM3Tests {
         }
     }
 
+    /// `LFM3_SPEED_BUNDLE`: greedy 256-token decode after a fixed prompt, one warmup and three
+    /// timed runs per arm (compiled decode off / on); prints the median. Opt-in measurement,
+    /// no assertion: compare with the reference script's numbers on the same bundle.
+    @Test func decodeSpeed() async throws {
+        guard let bundle = ProcessInfo.processInfo.environment["LFM3_SPEED_BUNDLE"] else { return }
+        let context = try await LLMModelFactory.shared.load(
+            from: URL(fileURLWithPath: bundle), using: #huggingFaceTokenizerLoader())
+        let ids = try context.tokenizer.applyChatTemplate(
+            messages: [["role": "user", "content": "Write a long story about a dinosaur who learns to code."]],
+            tools: nil, additionalContext: ["enable_thinking": false])
+        for compiled in [false, true] {
+            func run(_ n: Int) throws -> Double {
+                var parameters = GenerateParameters(maxTokens: n + 1, temperature: 0)
+                parameters.enableCompiledDecode = compiled
+                var iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(ids.map(Int32.init))), model: context.model,
+                    parameters: parameters)
+                _ = iterator.next()  // prefill + first token, not timed
+                let start = Date()
+                for _ in 0 ..< n { guard iterator.next() != nil else { break } }
+                return Double(n) / Date().timeIntervalSince(start)
+            }
+            _ = try run(32)
+            let rates = try (0 ..< 3).map { _ in try run(256) }
+            print("[LFM3] swift vmlx \(URL(fileURLWithPath: bundle).lastPathComponent) compiled=\(compiled): decode tok/s runs=\(rates.map { (($0 * 10).rounded() / 10) }) median=\(rates.sorted()[1])")
+        }
+    }
+
     static let shortMessages: [[String: any Sendable]] = [
         ["role": "user", "content": "What is the capital of Australia? Answer in one sentence."]
     ]
