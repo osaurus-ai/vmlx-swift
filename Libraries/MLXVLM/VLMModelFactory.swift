@@ -743,6 +743,9 @@ public final class VLMModelFactory: ModelFactory {
         if !loadNativeMTP {
             mergedConfigData = try NativeMTPActivation.scrubInactiveMTPConfig(mergedConfigData)
         }
+        // A qwen4_exp bundle whose vision tower has no processor file is constructed text-only.
+        mergedConfigData = Qwen4ExpTextOnlyBundle.textOnlyConfiguration(
+            mergedConfigData, modelDirectory: modelDirectory)
 
         let model: LanguageModel
         do {

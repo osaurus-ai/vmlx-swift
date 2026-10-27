@@ -260,6 +260,24 @@ struct Qwen4ExpConfigurationTests {
         }
     }
 
+    @Test("a vision bundle without a processor file is constructed with no vision tower")
+    func visionBundleWithoutProcessorFileBuildsNoTower() throws {
+        try MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("qwen4-textonly-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let declared = configData(dtype: "bfloat16")
+            let scrubbed = Qwen4ExpTextOnlyBundle.textOnlyConfiguration(declared, modelDirectory: directory)
+            let textOnly = Qwen4Exp(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: scrubbed))
+            #expect(!textOnly.plan.builds(.visionTower))
+            #expect(!textOnly.plan.served.contains(.vision))
+            // The control: the same bundle with its vision_config builds the tower.
+            let full = Qwen4Exp(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: declared))
+            #expect(full.plan.builds(.visionTower))
+        }
+    }
+
     /// The control: official Hugging Face names still get the reference's value transforms.
     @Test("official checkpoint names still get the +1 and the conv squeeze")
     func sanitizesOfficialLayout() throws {
