@@ -23,6 +23,11 @@ func runDSV41LongContext(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
         loadConfiguration: .osaurusProduction)
+    // Osaurus caps MLX's buffer cache after every load (ModelRuntime.mlxCacheLimit: min(weights / 4, RAM / 8,
+    // 8 GiB)). Uncapped, a 1M-token run reached a 114 GB peak footprint. BENCH_CACHE_LIMIT_GB overrides.
+    let cacheLimitGiB = Double(env["BENCH_CACHE_LIMIT_GB"] ?? "8") ?? 8
+    MLX.Memory.cacheLimit = Int(cacheLimitGiB * 1_073_741_824)
+    print("[LONG] MLX cache limit \(cacheLimitGiB) GiB")
     let needle = "Remember this: the vault access code is 7341-ALPHA."
     var bodyIds = context.tokenizer.encode(text: corpus)
     while bodyIds.count < target { bodyIds += bodyIds }
