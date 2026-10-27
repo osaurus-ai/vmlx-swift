@@ -55,6 +55,62 @@ struct LFM3OmniTests {
         #expect(out.tokens.count == 3 + 13 + 4)
     }
 
+    // A configuration-only probe through the real factory. No trained weights or decoder run.
+    private final class ConfigurationProbe: Module, LanguageModel {
+        func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+            .tokens(input.text)
+        }
+
+        func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+    }
+
+    private struct ConfigurationTokenizerLoader: TokenizerLoader {
+        func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer { TestTokenizer() }
+    }
+
+    @Test(arguments: ["lfm3_audio", "lfm3_omni"])
+    func factoryPreservesBundleEOSWithoutTreatingSpeechModesAsStops(modelType: String) async throws
+    {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lfm3-eos-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Official Audio/Omni generation_config.json text defaults and EOS, without speech settings.
+        // 125012/125015 switch output modes; they are not EOS in either checkpoint.
+        let generation =
+            #"{"eos_token_id":[124900,125014],"do_sample":false,"temperature":0,"top_k":1,"repetition_penalty":1.0}"#
+        try Data(generation.utf8).write(
+            to: directory.appendingPathComponent("generation_config.json"))
+        let config = "{\"model_type\":\"\(modelType)\",\"eos_token_id\":[124900,125014]}"
+        try Data(config.utf8).write(to: directory.appendingPathComponent("config.json"))
+        try Data(#"{"processor_class":"ConfigurationProbe"}"#.utf8).write(
+            to: directory.appendingPathComponent("preprocessor_config.json"))
+
+        let factory = VLMModelFactory(
+            typeRegistry: ModelTypeRegistry(creators: [
+                modelType: { _, _ in ConfigurationProbe() }
+            ]),
+            processorRegistry: ProcessorTypeRegistry(creators: [
+                "Lfm3AudioProcessor": { _, _ in TestInputProcessor() },
+                "Lfm3OmniProcessor": { _, _ in TestInputProcessor() },
+            ]),
+            modelRegistry: AbstractModelRegistry(modelConfigurations: []))
+        for explicitStops: Set<String> in [[], ["caller-stop"]] {
+            var resolved = ResolvedModelConfiguration(directory: directory)
+            resolved.extraEOSTokens = explicitStops
+            let context = try await factory._load(
+                configuration: resolved, tokenizerLoader: ConfigurationTokenizerLoader())
+            #expect(context.configuration.eosTokenIds == [124900, 125014])
+            #expect(context.configuration.extraEOSTokens == explicitStops)
+            #expect(
+                context.configuration.generationDefaults?.eosTokenIds?.values == [124900, 125014])
+            #expect(context.configuration.generationDefaults?.temperature == 0)
+            #expect(context.configuration.generationDefaults?.topK == 1)
+            #expect(context.configuration.generationDefaults?.repetitionPenalty == 1)
+        }
+    }
+
     // MARK: - Released bundle parity (opt-in)
 
     /// `LFM3_AUDIO_BUNDLE` (an LFM3-Audio or LFM3-Omni bundle), `LFM3_AUDIO_REF` (JSON +
@@ -86,7 +142,7 @@ struct LFM3OmniTests {
             context.configuration.extraEOSTokens.compactMap {
                 context.tokenizer.convertTokenToId($0)
             })
-        #expect(stops.isSuperset(of: [124900, 125012, 125015]), "stops \(stops.sorted())")
+        #expect(stops == [124900, 125014], "bundle EOS \(stops.sorted())")
 
         // Front end and encoder on the same PCM.
         let pcm = try LFM3OmniProcessor.waveform(.url(wav))

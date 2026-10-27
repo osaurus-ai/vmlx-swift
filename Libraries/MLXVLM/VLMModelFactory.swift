@@ -842,12 +842,6 @@ public final class VLMModelFactory: ModelFactory {
 
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
-        if baseConfig.modelType == "lfm3_audio" || baseConfig.modelType == "lfm3_omni" {
-            // Text generation ends where the model would start to speak: the speech
-            // generator is not loaded (LFM3Omni.sanitize), as the reference text path does.
-            mutableConfiguration.extraEOSTokens.formUnion(["<|audio_start|>", "<|mixed_start|>"])
-        }
-
         // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
         // stamp is authoritative for JANG bundles. Standard MLX models skip this and
         // jangConfig stays nil, in which case we fall through to the model_type heuristic.
