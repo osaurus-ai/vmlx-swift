@@ -176,6 +176,7 @@ public enum LLMTypeRegistry {
             "smollm3": create(SmolLM3Configuration.self, SmolLM3Model.init),
             "ernie4_5": create(Ernie45Configuration.self, Ernie45Model.init),
             "lfm2": create(LFM2Configuration.self, LFM2Model.init),
+            "lfm3": create(LFM3Configuration.self, LFM3Model.init),
             // Laguna is config-driven: S-2.1 uses 48 layers, alternating
             // full/SWA attention, 48/72 query heads, dual RoPE, 256 routed
             // experts with top-10 selection, and one shared expert. Older

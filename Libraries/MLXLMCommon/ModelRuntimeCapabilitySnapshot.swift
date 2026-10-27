@@ -674,7 +674,8 @@ extension ModelRuntimeCapabilitySnapshot {
             return explicit
         }
         if let modelType = modelType?.lowercased(),
-            ["nemotron_dense_audex", "nemotron_h_audex"].contains(modelType)
+            ["nemotron_dense_audex", "nemotron_h_audex", "lfm3_audio", "lfm3_omni"]
+                .contains(modelType)
         {
             return .supported
         }
