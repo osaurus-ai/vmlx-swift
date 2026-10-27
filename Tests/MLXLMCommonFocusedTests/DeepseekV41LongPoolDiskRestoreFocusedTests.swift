@@ -29,11 +29,13 @@ struct DeepseekV41LongPoolDiskRestoreFocusedTests {
             poolQuantizationBits: 4, contiguousPools: true)
     }
 
-    @Test("a ratio-1 pool longer than one segment restores exactly", arguments: [
-        HybridPoolQuantizedSchema.maxSegmentRows,
-        HybridPoolQuantizedSchema.maxSegmentRows + 1,
-        2 * HybridPoolQuantizedSchema.maxSegmentRows + 277,
-    ])
+    @Test(
+        "a ratio-1 pool longer than one segment restores exactly",
+        arguments: [
+            HybridPoolQuantizedSchema.maxSegmentRows,
+            HybridPoolQuantizedSchema.maxSegmentRows + 1,
+            2 * HybridPoolQuantizedSchema.maxSegmentRows + 277,
+        ])
     func longPoolRoundTrip(rows: Int) {
         Device.withDefaultDevice(.cpu) {
             let src = Self.contiguousCache()
@@ -57,10 +59,14 @@ struct DeepseekV41LongPoolDiskRestoreFocusedTests {
             #expect(restoreFromDiskArrays(encoded, into: &target, requirePromptBoundary: true) == 4)
             #expect(dst.hybridPoolQuantizedSegments(branch: .compressor)?.count == 1)
             #expect(dst.hybridPoolQuantizedSegments(branch: .compressor)?.first?.rowCount == rows)
-            #expect(dst.getPooled(.compressor).map {
-                MLX.abs($0 - compressor).max().item(Float.self) } == 0)
-            #expect(dst.getPooled(.indexer).map {
-                MLX.abs($0 - indexer).max().item(Float.self) } == 0)
+            #expect(
+                dst.getPooled(.compressor).map {
+                    MLX.abs($0 - compressor).max().item(Float.self)
+                } == 0)
+            #expect(
+                dst.getPooled(.indexer).map {
+                    MLX.abs($0 - indexer).max().item(Float.self)
+                } == 0)
         }
     }
 
