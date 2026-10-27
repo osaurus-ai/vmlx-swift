@@ -3,6 +3,7 @@ import MLX
 import MLXNN
 import MLXRandom
 import XCTest
+
 @testable import MLXLMCommon
 @testable import MLXVLM
 
@@ -35,8 +36,11 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
             XCTAssertEqual(infos.count, 1)
             XCTAssertEqual(model.failedCommits, 1)
             XCTAssertEqual(info.stopReason, .cancelled)
-            XCTAssertEqual(info.generationFailure, GenerationFailure(
-                stage: .decoding, cause: "native MTP verifier could not commit accepted cache prefix"))
+            XCTAssertEqual(
+                info.generationFailure,
+                GenerationFailure(
+                    stage: .decoding,
+                    cause: "native MTP verifier could not commit accepted cache prefix"))
             XCTAssertGreaterThan(info.generationTokenCount, 0)
             XCTAssertLessThan(info.generationTokenCount, Self.parameters().maxTokens ?? 0)
             XCTAssertEqual(text.count, info.generationTokenCount)
@@ -54,15 +58,17 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
             XCTAssertEqual(iterator.generationFailure?.stage, .decoding)
             let count = iterator.tokenCount
             let calls = model.backboneCalls
-            for _ in 0..<3 { XCTAssertNil(iterator.next()) }
+            for _ in 0 ..< 3 { XCTAssertNil(iterator.next()) }
             XCTAssertEqual(model.failedCommits, 1)
             XCTAssertEqual(model.backboneCalls, calls)
             XCTAssertEqual(iterator.tokenCount, count)
             // Cleanup still runs; failure must survive stats finalization and stores.
             iterator.finalizeGenerationStats(generatedTokenIds: emitted)
-            iterator.storeCacheAfterGeneration(generatedTokenIds: emitted, includeGeneratedBoundary: true)
-            XCTAssertEqual(iterator.generationFailure?.cause,
-                           "native MTP verifier could not commit accepted cache prefix")
+            iterator.storeCacheAfterGeneration(
+                generatedTokenIds: emitted, includeGeneratedBoundary: true)
+            XCTAssertEqual(
+                iterator.generationFailure?.cause,
+                "native MTP verifier could not commit accepted cache prefix")
         }
     }
 
@@ -77,7 +83,10 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
                 tokenizer: NativeFailureTokenizer(), promptTokenIds: Self.prompt,
                 makeIterator: {
                     // Always release the test's ready wait even if construction throws.
-                    defer { ready.continuation.yield(()); release.wait() }
+                    defer {
+                        ready.continuation.yield(())
+                        release.wait()
+                    }
                     return try NativeMTPTokenIterator(
                         input: Self.input(), model: model, parameters: Self.parameters(), depth: 2)
                 })
@@ -102,11 +111,13 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
 
     func testLateCommitFailureNeverPublishesGeneratedStateEvenIfCallerRequestsIt() throws {
         try MLXMetalTestLock.withLock {
-            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+                UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }
-            let coordinator = CacheCoordinator(config: .init(
-                usePagedCache: false, enableDiskCache: true, diskCacheDir: root,
-                modelKey: "native-mtp-late-commit-failure"))
+            let coordinator = CacheCoordinator(
+                config: .init(
+                    usePagedCache: false, enableDiskCache: true, diskCacheDir: root,
+                    modelKey: "native-mtp-late-commit-failure"))
             // Fail the acknowledgement AFTER the real commit. This exercises a
             // consistent-looking offset; offset validation alone cannot reject it.
             let model = try CommitFailureModel(failAfterRealCommit: true)
@@ -117,13 +128,17 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
             while let token = iterator.next() { emitted.append(token) }
             XCTAssertTrue(model.realCommitSucceeded)
             let candidate = emitted + model.acceptedDrafts
-            XCTAssertTrue(iterator.cache.allSatisfy { $0.offset == Self.prompt.count + candidate.count })
-            iterator.storeCacheAfterGeneration(generatedTokenIds: candidate, includeGeneratedBoundary: true)
-            XCTAssertFalse(coordinator.hasDurableDiskEntry(
-                tokens: Self.prompt + candidate, mediaSalt: iterator.mediaSalt),
+            XCTAssertTrue(
+                iterator.cache.allSatisfy { $0.offset == Self.prompt.count + candidate.count })
+            iterator.storeCacheAfterGeneration(
+                generatedTokenIds: candidate, includeGeneratedBoundary: true)
+            XCTAssertFalse(
+                coordinator.hasDurableDiskEntry(
+                    tokens: Self.prompt + candidate, mediaSalt: iterator.mediaSalt),
                 "A failed commit cannot certify a successful generated checkpoint")
-            XCTAssertTrue(coordinator.hasDurableDiskEntry(tokens: Self.prompt, mediaSalt: iterator.mediaSalt),
-                          "The owned prefill snapshot remains valid after a decode failure")
+            XCTAssertTrue(
+                coordinator.hasDurableDiskEntry(tokens: Self.prompt, mediaSalt: iterator.mediaSalt),
+                "The owned prefill snapshot remains valid after a decode failure")
         }
     }
 
@@ -140,7 +155,8 @@ final class NativeMTPFailurePropagationTests: XCTestCase {
 }
 
 private final class CommitFailureModel: Module, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, @unchecked Sendable {
+    DFlash2StagedVerifyRollbackModel, @unchecked Sendable
+{
     let real: Qwen4Exp
     private(set) var failedCommits = 0
     private(set) var backboneCalls = 0
@@ -151,32 +167,42 @@ private final class CommitFailureModel: Module, NativeMTPModel,
     init(failAfterRealCommit: Bool = false) throws {
         self.failAfterRealCommit = failAfterRealCommit
         MLXRandom.seed(7103)
-        real = Qwen4Exp(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: Data(Self.config.utf8)))
+        real = Qwen4Exp(
+            try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: Data(Self.config.utf8)))
         super.init()
     }
     var nativeMTPAvailable: Bool { real.nativeMTPAvailable }
-    func newCache(parameters: GenerateParameters?) -> [KVCache] { real.newCache(parameters: parameters) }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        real.newCache(parameters: parameters)
+    }
     func makeNativeMTPCache() -> [KVCache] { real.makeNativeMTPCache() }
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         try real.prepare(input, cache: cache, windowSize: windowSize)
     }
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray { real(inputs, cache: cache) }
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        real(inputs, cache: cache)
+    }
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
         backboneCalls += 1
         return real.nativeBackboneForward(inputs, cache: cache)
     }
-    func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+    func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?)
+        -> NativeMTPForwardResult
+    {
         backboneCalls += 1
         verifierInputs = inputs.reshaped(-1).asArray(Int.self)
         return real.nativeBackboneMTPVerifyForward(inputs, cache: cache)
     }
-    func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+    func nativeMTPForward(hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache]?)
+        -> NativeMTPForwardResult
+    {
         real.nativeMTPForward(hiddenStates: hiddenStates, nextTokenIds: nextTokenIds, cache: cache)
     }
     func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
         real.commitVerifiedBlock(cache: cache, acceptedInputs: acceptedInputs)
     }
-    func commitStagedVerifiedBlock(cache: [KVCache], acceptedInputs: Int, blockLength: Int) -> Bool {
+    func commitStagedVerifiedBlock(cache: [KVCache], acceptedInputs: Int, blockLength: Int) -> Bool
+    {
         failedCommits += 1
         if failAfterRealCommit {
             realCommitSucceeded = real.commitStagedVerifiedBlock(
@@ -186,20 +212,20 @@ private final class CommitFailureModel: Module, NativeMTPModel,
         return false
     }
     private static let config = #"""
-    {"model_type":"qwen4_exp","text_config":{
-      "model_type":"qwen4_exp_text","dtype":"float32","mamba_ssm_dtype":"float32",
-      "mtp_num_hidden_layers":1,"hidden_size":64,"num_hidden_layers":2,
-      "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":1,"head_dim":16,
-      "linear_num_value_heads":4,"linear_num_key_heads":1,"linear_key_head_dim":16,
-      "linear_value_head_dim":16,"linear_conv_kernel_dim":4,"vocab_size":128,
-      "num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,
-      "shared_expert_intermediate_size":16,"layer_types":["linear_attention","full_attention"],
-      "hc_count":4,"hc_lowrank":8,"ple_layer_ids":[],"ple_embed_dim":64,
-      "ple_conv_kernel_size":4,"ngram_size":3,"heads_per_ngram":2,"ngram_vocab_size_base":101,
-      "make_ngram_vocab_size_divisible_by":128,"seed":1234,"split_ngram_parts":4,
-      "indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":8,
-      "indexer_budget":32,"indexer_compress_ratio":4}}
-    """#
+        {"model_type":"qwen4_exp","text_config":{
+          "model_type":"qwen4_exp_text","dtype":"float32","mamba_ssm_dtype":"float32",
+          "mtp_num_hidden_layers":1,"hidden_size":64,"num_hidden_layers":2,
+          "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":1,"head_dim":16,
+          "linear_num_value_heads":4,"linear_num_key_heads":1,"linear_key_head_dim":16,
+          "linear_value_head_dim":16,"linear_conv_kernel_dim":4,"vocab_size":128,
+          "num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,
+          "shared_expert_intermediate_size":16,"layer_types":["linear_attention","full_attention"],
+          "hc_count":4,"hc_lowrank":8,"ple_layer_ids":[],"ple_embed_dim":64,
+          "ple_conv_kernel_size":4,"ngram_size":3,"heads_per_ngram":2,"ngram_vocab_size_base":101,
+          "make_ngram_vocab_size_divisible_by":128,"seed":1234,"split_ngram_parts":4,
+          "indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":8,
+          "indexer_budget":32,"indexer_compress_ratio":4}}
+        """#
 }
 
 private struct NativeFailureTokenizer: MLXLMCommon.Tokenizer {
@@ -207,9 +233,13 @@ private struct NativeFailureTokenizer: MLXLMCommon.Tokenizer {
     var eosToken: String? { nil }
     var unknownToken: String? { nil }
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { String(repeating: "x", count: tokenIds.count) }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        String(repeating: "x", count: tokenIds.count)
+    }
     func convertTokenToId(_ token: String) -> Int? { nil }
     func convertIdToToken(_ id: Int) -> String? { "x" }
-    func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
-                           additionalContext: [String: any Sendable]?) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
 }
