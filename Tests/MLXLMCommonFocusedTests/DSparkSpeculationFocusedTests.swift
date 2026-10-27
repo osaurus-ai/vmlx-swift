@@ -678,6 +678,28 @@ struct DSparkSpeculationFocusedTests {
         #expect(stats.specSteps > 60)
     }
 
+    @Test("governor: per-token cost is total seconds over total tokens, so one missed draft does not flip to AR")
+    func governorRatioOfMeans() {
+        // Speculation alternates a 6-token and a 1-token step of 50 ms (14.3 ms/token); AR costs 21 ms/token.
+        // A mean of per-step ratios reads 29 ms/token and drops into AR stretches.
+        var g = DSparkGovernor(probeEvery: 16, arProbeEvery: 64)
+        var specSteps = 0, arSteps = 0, i = 0
+        for _ in 0 ..< 400 {
+            switch g.choose() {
+            case .spec:
+                g.record(.spec, seconds: 0.050, emitted: i % 2 == 0 ? 6 : 1)
+                specSteps += 1
+                i += 1
+            case .ar:
+                g.record(.ar, seconds: 0.021, emitted: 1)
+                arSteps += 1
+            }
+        }
+        #expect(!g.arMode)
+        #expect(arSteps < 12, "AR steps \(arSteps) of \(specSteps + arSteps)")
+        #expect(abs(g.spec! - 0.050 / 3.5) < 0.004)
+    }
+
     @Test("governor has no terminal state")
     func governorNoTerminalState() {
         var g = DSparkGovernor(probeEvery: 4, arProbeEvery: 8)

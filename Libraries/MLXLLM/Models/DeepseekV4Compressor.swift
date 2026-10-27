@@ -126,6 +126,15 @@ final class DeepseekV4PoolStorage {
         return nil
     }
 
+    /// DeepSeek-V4.1 contiguous 4-bit layout only: the slab's packed codes `[B, capacity, groups, group/2]`
+    /// (element 2k in the low nibble), fp16 scales and minimums `[B, capacity, groups, 1]` at full capacity
+    /// (rows `0 ..< rowCount` are live), so a kernel can decode selected rows in place with the same arithmetic
+    /// as ``gatherDequantizedRows(_:)``. nil for every other layout.
+    var nibbleSlab: (codes: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int, dtype: DType)? {
+        guard contiguous, let slab, slabRows > 0, slab.bits == 4 else { return nil }
+        return (slab.codes, slab.scales, slab.biases, slab.groupSize, slab.originalDType)
+    }
+
     var poolDType: DType? {
         if contiguous, let slab { return slab.originalDType }
         if let hotPool { return hotPool.dtype }
@@ -970,6 +979,12 @@ public struct DeepseekV4PoolView {
         case .storage(let storage):
             storage.forEachDequantizedTile(maxRows: maxRows, body)
         }
+    }
+
+    /// The contiguous 4-bit V4.1 slab behind this view (``DeepseekV4PoolStorage/nibbleSlab``); nil otherwise.
+    var nibbleSlab: (codes: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int, dtype: DType)? {
+        if case .storage(let storage) = backing { return storage.nibbleSlab }
+        return nil
     }
 
     public func gatherDequantizedRows(_ indices: MLXArray) -> MLXArray {
