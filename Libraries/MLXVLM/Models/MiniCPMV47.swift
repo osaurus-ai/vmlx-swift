@@ -15,7 +15,9 @@
 // canvas image with separator lines (`concat_frames_as_image`) before the same slicing — a different input path
 // that is not implemented here.
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -62,6 +64,7 @@ public struct MiniCPMV47ProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct MiniCPMV47Processor: UserInputProcessor {
     private let config: MiniCPMV47ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -171,3 +174,4 @@ public struct MiniCPMV47Processor: UserInputProcessor {
             toolSchemas: input.tools)
     }
 }
+#endif

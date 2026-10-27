@@ -13,11 +13,14 @@
 // MiniCPMV47VisionTests against reference dumps); CoreImage colour management of ICC-tagged inputs is the one
 // thing PIL (which ignores profiles) does differently.
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
 
+#if canImport(CoreImage)
 enum MiniCPMV47ImageProcessing {
 
     // MARK: Python arithmetic
@@ -376,3 +379,4 @@ enum MiniCPMV47ImageProcessing {
         )
     }
 }
+#endif

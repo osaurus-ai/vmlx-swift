@@ -2,7 +2,9 @@
 
 // port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/qwen3_vl
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -14,6 +16,7 @@ private enum Qwen3VLError: Error {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Qwen3VLProcessor: UserInputProcessor {
 
     private let config: Qwen3VLProcessorConfiguration
@@ -319,6 +322,7 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             toolSchemas: input.tools)
     }
 }
+#endif
 
 public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
 

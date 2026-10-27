@@ -1,8 +1,12 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-@preconcurrency import AVFoundation
-import CoreImage
+#if canImport(AVFoundation)
+    @preconcurrency import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -64,6 +68,7 @@ struct MiMoV26MessageGenerator: MessageGenerator {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Native placeholders are expanded before cache lookup. The media payload
 /// retains item boundaries, so lazy tower work never changes the token key.
 struct MiMoV26Processor: UserInputProcessor {
@@ -299,3 +304,4 @@ struct MiMoV26Processor: UserInputProcessor {
             cacheStablePrefixTokenCounts: boundaries.stable.filter { $0 <= firstMedia }, toolSchemas: input.tools)
     }
 }
+#endif

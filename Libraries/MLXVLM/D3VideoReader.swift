@@ -1,8 +1,13 @@
-import AVFoundation
-import CoreImage
+#if canImport(AVFoundation)
+    import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLXLMCommon
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Vendor sampling: 2 fps, 4...32 frames distributed over the complete clip, with an even tail.
 /// The processor consumes these frames without sampling them a second time.
 enum D3VideoReader {
@@ -37,3 +42,4 @@ enum D3VideoReader {
         return .frames(frames)
     }
 }
+#endif

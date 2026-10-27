@@ -20,7 +20,9 @@
 //    * all vision Linear layers are bias-free (attention_bias=false)
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon

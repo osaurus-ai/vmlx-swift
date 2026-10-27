@@ -9,7 +9,9 @@
 //
 // Python reference: mlx_vlm/models/gemma4/
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 // For Gemma4TextModel's shared checkpoint-key helpers: this wrapper reads the same
@@ -1633,6 +1635,7 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
 public struct Gemma4Processor: UserInputProcessor {
     private let config: Gemma4ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1963,6 +1966,7 @@ private struct Gemma4MessageGenerator: MessageGenerator {
         return dict
     }
 }
+#endif
 extension VisionTower: ModelCapabilityProviding {
     /// Gemma4's encoder is image-only; this family has no video lane at all.
     var providedModalities: Set<ModelRuntimeRequestModality> { [.vision] }

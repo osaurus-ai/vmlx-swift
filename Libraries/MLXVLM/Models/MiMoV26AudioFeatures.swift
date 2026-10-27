@@ -1,7 +1,9 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-import Accelerate
+#if canImport(Accelerate)
+    import Accelerate
+#endif
 import Foundation
 import MLX
 
@@ -67,6 +69,7 @@ enum MiMoV26AudioFeatures {
     }
 
     static func logMel(_ samples: [Float], configuration c: Configuration) throws -> MLXArray {
+        #if canImport(Accelerate)
         guard c.fft > 0, c.fft.isMultiple(of: 2), c.hop > 0,
             c.window > 0, c.window <= c.fft, c.bins > 0, c.sampleRate > 0,
             c.minimumFrequency >= 0,
@@ -117,5 +120,9 @@ enum MiMoV26AudioFeatures {
         vDSP_mmulD(magnitudes, 1, filters, 1, &output, 1,
                    vDSP_Length(count), vDSP_Length(c.bins), vDSP_Length(frequencies))
         return MLXArray(output.map { Float(log(max($0, 1e-7))) }).reshaped(count, c.bins)
+        #else
+        throw VLMError.processing(
+            "MiMo V2.6 audio features need Accelerate, which this platform lacks.")
+        #endif
     }
 }

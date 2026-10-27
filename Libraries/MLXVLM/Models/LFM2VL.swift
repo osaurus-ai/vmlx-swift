@@ -1,6 +1,8 @@
 // Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/lfm2_vl
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -663,6 +665,7 @@ private class PixelUnshuffleBlock: Module, UnaryLayer {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// LFM2 VL VLM `UserInputProcessor`.
 ///
 /// This is meant to be used with ``LFM2VL`` and is typically created by ``VLMModelFactory``.
@@ -892,6 +895,7 @@ public struct LFM2VLProcessor: UserInputProcessor {
         )
     }
 }
+#endif
 
 // MARK: - Model
 

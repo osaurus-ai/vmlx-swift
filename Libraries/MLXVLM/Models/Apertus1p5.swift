@@ -16,7 +16,9 @@
 // The alternative (giving the processor a reference to the model) would invert the ownership the
 // factory is built around, for no gain.
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLLM
@@ -244,6 +246,7 @@ public struct Apertus1p5ProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Apertus1p5Processor: UserInputProcessor {
     private let config: Apertus1p5ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -411,3 +414,4 @@ public struct Apertus1p5Processor: UserInputProcessor {
         }
     }
 }
+#endif

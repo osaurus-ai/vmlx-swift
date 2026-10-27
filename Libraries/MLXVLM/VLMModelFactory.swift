@@ -273,6 +273,7 @@ public enum VLMProcessorTypeRegistry {
     }
 
     /// Shared instance with default processor types.
+    #if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
     public static let shared: ProcessorTypeRegistry = .init(creators: [
         "MiMoV26Processor": { data, tokenizer in
             try MiMoV26Processor(JSONDecoder.json5().decode(MiMoV26ProcessorConfiguration.self, from: data), tokenizer: tokenizer)
@@ -346,6 +347,9 @@ public enum VLMProcessorTypeRegistry {
         "Zaya1VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Zaya1VLProcessor.init),
     ])
+    #else
+    public static let shared: ProcessorTypeRegistry = .init(creators: [:])
+    #endif
 }
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.

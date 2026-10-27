@@ -5,8 +5,12 @@
 //  Created by Pedro Cuenca on 20/3/25.
 //
 
-import CoreImage
-import CoreMedia
+#if canImport(CoreImage)
+    import CoreImage
+#endif
+#if canImport(CoreMedia)
+    import CoreMedia
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -76,6 +80,7 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct SmolVLMProcessor: UserInputProcessor {
     private let config: SmolVLMProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -392,3 +397,4 @@ public struct SmolVLMProcessor: UserInputProcessor {
         }
     }
 }
+#endif

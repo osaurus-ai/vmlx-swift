@@ -1,6 +1,8 @@
 // Copyright © 2026 Jinho Jang (eric@jangq.ai)
 
-import Accelerate
+#if canImport(Accelerate)
+    import Accelerate
+#endif
 import Foundation
 import MLX
 import MLXLLM
@@ -735,6 +737,7 @@ public struct AudexProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(AVFoundation)
 public struct AudexProcessor: UserInputProcessor {
     private let tokenizer: any Tokenizer
     private static let sampleRate = 16_000
@@ -864,3 +867,4 @@ public struct AudexProcessor: UserInputProcessor {
         return ""
     }
 }
+#endif

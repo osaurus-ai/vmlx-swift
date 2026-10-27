@@ -1,6 +1,8 @@
 // Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/qwen2_5_vl
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -661,6 +663,7 @@ enum Qwen25Vision {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Qwen2.5VL VLM `UserInputProcessor`.
 ///
 /// This is meant to be used with ``Qwen25VL`` and is typically created by ``VLMModelFactory``.
@@ -802,6 +805,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif
 
 // MARK: - Model
 

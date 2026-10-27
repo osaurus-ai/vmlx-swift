@@ -13,9 +13,12 @@
 //     need higher-quality voice output.
 
 import Foundation
-@preconcurrency import AVFoundation
+#if canImport(AVFoundation)
+    @preconcurrency import AVFoundation
+#endif
 import MLX
 
+#if canImport(AVFoundation)
 // MARK: - Live PCM buffer
 
 /// Thread-safe 16 kHz mono PCM buffer for live voice handoff.
@@ -301,3 +304,4 @@ public final class NemotronHOmniSpeaker: @unchecked Sendable {
 // ElevenLabs API, F5-TTS) at the LLM's text stream. The audio IN pipeline
 // that this file supports is the speech-recognition + multimodal-chat
 // surface the bundle is actually trained for.
+#endif

@@ -1,4 +1,6 @@
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1158,6 +1160,7 @@ public struct Mistral3MessageGenerator: MessageGenerator {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Mistral3VLMProcessor: UserInputProcessor {
     private let config: Mistral3VLMProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1375,3 +1378,4 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         )
     }
 }
+#endif

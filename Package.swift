@@ -1119,11 +1119,16 @@ package.targets.append(
             "CSQLite3Linux",
             .product(name: "Crypto", package: "swift-crypto"),
         ]
+        // MLXVLM's Qwen4Exp imports Crypto where CryptoKit is absent.
+        guard let vlm = package.targets.first(where: { $0.name == "MLXVLM" }) else {
+            fatalError("Linux profile: no target named MLXVLM")
+        }
+        vlm.dependencies += [.product(name: "Crypto", package: "swift-crypto")]
     }
     if Context.environment["VMLX_LINUX_PROFILE"] != "0" {
         let roots = [
-            "MLXEmbedders", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT", "MLXLinalg",
-            "CSQLite3Linux", "VMLXLinuxTests",
+            "MLXEmbedders", "MLXLLM", "MLXVLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT",
+            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests",
         ]
         let targetsByName = Dictionary(
             package.targets.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })

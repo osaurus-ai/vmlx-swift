@@ -26,13 +26,16 @@
 //  per-row `image_newline` slots and the trailing `view_separator` slot.
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
 
 // MARK: - Processor
 
+#if canImport(CoreImage)
 public struct DeepseekOCRProcessor: UserInputProcessor {
 
     private let config: DeepseekOCRConfiguration
@@ -461,3 +464,4 @@ public struct DeepseekOCRProcessor: UserInputProcessor {
         return concatenated([oriFlat, patches.reshaped([-1])], axis: 0)
     }
 }
+#endif

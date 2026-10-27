@@ -5,7 +5,9 @@
 //  Image/video preprocessing and placeholder expansion for Muse Glimmer.
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -94,6 +96,7 @@ public struct MuseGlimmerProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct MuseGlimmerProcessor: UserInputProcessor {
     private let config: MuseGlimmerProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -263,6 +266,7 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif
 
 
 /// Emits structured content parts so the chat template renders the media
