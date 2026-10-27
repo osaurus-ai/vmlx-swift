@@ -422,6 +422,41 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
     }
 }
 
+extension Qwen3VLProcessorConfiguration {
+    /// transformers v5 writes `processor_config.json` with the image settings
+    /// nested under `image_processor` and the video settings under
+    /// `video_processor`. unsloth's Qwen3.6 MLX conversions ship only that
+    /// file, so the flat decode failed on `image_mean`, the VLM load fell back
+    /// to the text-only factory, and the vision tower was dropped.
+    private enum NestedProcessorKeys: String, CodingKey {
+        case imageProcessor = "image_processor"
+        case videoProcessor = "video_processor"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let root = try decoder.container(keyedBy: CodingKeys.self)
+        let nested = try decoder.container(keyedBy: NestedProcessorKeys.self)
+        let image: KeyedDecodingContainer<CodingKeys>
+        if !root.contains(.imageMean), nested.contains(.imageProcessor) {
+            image = try nested.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageProcessor)
+        } else {
+            image = root
+        }
+        imageMean = try image.decode([CGFloat].self, forKey: .imageMean)
+        imageStd = try image.decode([CGFloat].self, forKey: .imageStd)
+        _size = try image.decodeIfPresent(Size.self, forKey: ._size)
+        _minPixels = try image.decodeIfPresent(Int.self, forKey: ._minPixels)
+        _maxPixels = try image.decodeIfPresent(Int.self, forKey: ._maxPixels)
+        mergeSize = try image.decode(Int.self, forKey: .mergeSize)
+        patchSize = try image.decode(Int.self, forKey: .patchSize)
+        temporalPatchSize = try image.decode(Int.self, forKey: .temporalPatchSize)
+        imageProcessorType = try image.decode(String.self, forKey: .imageProcessorType)
+        _videoConfiguration =
+            try root.decodeIfPresent(VideoConfiguration.self, forKey: ._videoConfiguration)
+            ?? nested.decodeIfPresent(VideoConfiguration.self, forKey: .videoProcessor)
+    }
+}
+
 // MARK: - Model Configuration
 
 public struct Qwen3VLConfiguration: Codable, Sendable {
