@@ -20,12 +20,9 @@ import Testing
 @Suite("DeepSeek-V4.1 KV bytes per token (real geometry, CPU)", .serialized)
 struct DeepseekV41KVBytesFocusedTests {
 
-    static let bundleConfig = URL(fileURLWithPath:
-        "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX/config.json")
-
-    /// The bundle's text config, or the same geometry inline when it is absent.
+    /// The bundle's text config (DSV41TestBundle), or the same geometry inline when it is absent.
     static func config() throws -> DeepseekV4Configuration {
-        if let data = try? Data(contentsOf: bundleConfig) {
+        if let url = DSV41TestBundle.config, let data = try? Data(contentsOf: url) {
             return try JSONDecoder().decode(DeepseekV4Configuration.self, from: data)
         }
         let ratios = [0, 0] + Array(repeating: 2, count: 18) + Array(repeating: 1, count: 20) + [0, 0, 0]

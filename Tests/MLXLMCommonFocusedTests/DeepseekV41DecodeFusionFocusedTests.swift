@@ -4,8 +4,8 @@
 // DeepSeek-V4.1 decode / dSpark-verify fusion (1-8 rows). Synthetic tensors with the real V4.1-Flash
 // shapes and bit plan (hidden 5120, 384 routed experts of width 2304, top-6, 2/3-bit group-64 gate/up,
 // 3-bit down, 8-bit shared expert, bf16 router); no model loads and no shared MLX test lock, so run this
-// suite on its own. The configuration is read from the local V4.1 bundle's config.json when present
-// (`VMLX_DSV41_CONFIG` overrides the path); every test is skipped without it.
+// suite on its own. The configuration is a real V4.1 config.json (`VMLX_DSV41_CONFIG`, or the bundle's under
+// `VMLX_DSV41_BUNDLE`; see DSV41TestBundle); the suite is disabled without one.
 //
 // Microbenchmarks run only with VMLX_DSV41_DEC_BENCH=1.
 
@@ -21,12 +21,9 @@ import Testing
 @testable import MLXLMCommon
 
 enum DSV41Synth {
-    static let configPath =
-        ProcessInfo.processInfo.environment["VMLX_DSV41_CONFIG"]
-        ?? "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX/config.json"
-
     static let config: DeepseekV4Configuration? = {
-        guard let data = FileManager.default.contents(atPath: configPath) else { return nil }
+        guard let url = DSV41TestBundle.config, let data = FileManager.default.contents(atPath: url.path)
+        else { return nil }
         return try? JSONDecoder().decode(DeepseekV4Configuration.self, from: data)
     }()
 
@@ -196,7 +193,9 @@ enum DSV41Synth {
     }
 }
 
-@Suite("DeepSeek-V4.1 decode fusion", .serialized)
+@Suite(
+    "DeepSeek-V4.1 decode fusion", .serialized,
+    .enabled(if: DSV41Synth.config != nil, "needs VMLX_DSV41_CONFIG or VMLX_DSV41_BUNDLE"))
 struct DeepseekV41DecodeFusionFocusedTests {
 
     // MARK: - Router GEMV (bf16 rows, fp32 math)

@@ -60,11 +60,11 @@ struct EngramV41FocusedTests {
         #expect(Array(full[(10 * per)...]) != padded)
     }
 
-    @Test("matches the reference NgramHasher on the real bundle aux tables")
+    @Test(
+        "matches the reference NgramHasher on the real bundle aux tables",
+        .enabled(if: DSV41TestBundle.item("engram_aux.safetensors") != nil, "needs VMLX_DSV41_BUNDLE"))
     func matchesReferenceOnBundleAux() throws {
-        let aux = URL(fileURLWithPath:
-            "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX/engram_aux.safetensors")
-        guard FileManager.default.fileExists(atPath: aux.path) else { return }
+        let aux = try #require(DSV41TestBundle.item("engram_aux.safetensors"))
         let hasher = EngramNgramHasher(try EngramAux.load(aux))
         let ids: [Int32] = [0, 3923, 128803, 1, 100, 100, 100, 7, 129000, 55555, 42, 9, 12345]
         // Pure-python replica of engram.py NgramHasher.hash (numpy int64 semantics).
@@ -140,12 +140,11 @@ struct EngramV41FocusedTests {
         }
     }
 
-    @Test("the real V4.1 bundle resolves its engram tables without any env var")
+    @Test(
+        "the real V4.1 bundle resolves its engram tables without any engram env var",
+        .enabled(if: DSV41TestBundle.item("engram") != nil, "needs VMLX_DSV41_BUNDLE"))
     func realBundleResolves() throws {
-        let bundle = URL(fileURLWithPath:
-            "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX")
-        guard FileManager.default.fileExists(atPath: bundle.appendingPathComponent("engram").path)
-        else { return }
+        let bundle = try #require(DSV41TestBundle.directory)
         let config = try JSONDecoder().decode(
             DeepseekV4Configuration.self,
             from: Data(contentsOf: bundle.appendingPathComponent("config.json")))

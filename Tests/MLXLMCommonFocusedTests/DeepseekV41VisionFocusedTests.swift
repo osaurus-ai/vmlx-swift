@@ -289,11 +289,12 @@ struct DeepseekV41VisionFocusedTests {
         }
     }
 
-    @Test("every tower parameter matches a bundle tensor name and shape (safetensors header only)")
+    @Test(
+        "every tower parameter matches a bundle tensor name and shape (safetensors header only)",
+        .enabled(if: DSV41TestBundle.item("model.safetensors.index.json") != nil, "needs VMLX_DSV41_BUNDLE"))
     func bundleTensorContract() throws {
-        let bundle = URL(fileURLWithPath: "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX")
+        let bundle = try #require(DSV41TestBundle.directory)
         let index = bundle.appendingPathComponent("model.safetensors.index.json")
-        guard FileManager.default.fileExists(atPath: index.path) else { return }
         let config = try JSONDecoder().decode(
             DeepseekV4Configuration.self, from: Data(contentsOf: bundle.appendingPathComponent("config.json")))
         let vision = try #require(config.vision)

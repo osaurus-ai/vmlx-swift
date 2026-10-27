@@ -14,18 +14,16 @@ import Testing
 
 @Suite("DeepSeek-V4.1 prefill lookahead and candidate scatter (CPU)")
 struct DeepseekV41PrefillLookaheadFocusedTests {
-    static let bundle = URL(fileURLWithPath:
-        "/Users/eric/models/DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMATRIX")
-
-    @Test("background (lookahead) reads return the same rows as the forward-time reads")
+    @Test(
+        "background (lookahead) reads return the same rows as the forward-time reads",
+        .enabled(if: DSV41TestBundle.item("engram") != nil, "needs VMLX_DSV41_BUNDLE"))
     func lookaheadRowsAreIdentical() throws {
-        guard FileManager.default.fileExists(atPath: Self.bundle.appendingPathComponent("engram").path)
-        else { return }
+        let bundle = try #require(DSV41TestBundle.directory)
         try Device.withDefaultDevice(.cpu) {
             let config = try JSONDecoder().decode(
                 DeepseekV4Configuration.self,
-                from: Data(contentsOf: Self.bundle.appendingPathComponent("config.json")))
-            let runtime = try EngramRuntime(modelDirectory: Self.bundle, config: config)
+                from: Data(contentsOf: bundle.appendingPathComponent("config.json")))
+            let runtime = try EngramRuntime(modelDirectory: bundle, config: config)
             var rng = SplitMix64(seed: 41)
             let first = (0 ..< 300).map { _ in Int32(rng.next() % 120_000) }
             let next = (0 ..< 257).map { _ in Int32(rng.next() % 120_000) }
