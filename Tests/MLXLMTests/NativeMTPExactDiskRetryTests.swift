@@ -30,10 +30,10 @@ final class NativeMTPExactDiskRetryTests: XCTestCase {
         tokens: MLXArray(ids.map(Int32.init)).reshaped(1, n), tokenIds: ids)
       let salt = computeCacheSalt(for: input, parameters: parameters)
 
-      func coordinator() -> CacheCoordinator {
+      func coordinator(_ directory: URL) -> CacheCoordinator {
         let value = CacheCoordinator(
           config: .init(
-            usePagedCache: false, enableDiskCache: true, diskCacheDir: root,
+            usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
             modelKey: "tiny-qwen-native-mtp-exact-retry"))
         value.setHybrid(
           true, requiresRecurrentSSMCompanion: true,
@@ -45,7 +45,7 @@ final class NativeMTPExactDiskRetryTests: XCTestCase {
       // native hybrid serializers. One-token calls match the cold
       // oracle's prepare schedule, avoiding a different numerical path.
       do {
-        let writer = coordinator()
+        let writer = coordinator(root)
         for boundary in [n - 1, n] {
           let prefix = Array(ids.prefix(boundary))
           let cache = real.newCache(parameters: parameters)
@@ -72,7 +72,7 @@ final class NativeMTPExactDiskRetryTests: XCTestCase {
       // A new coordinator owns no paged or recurrent RAM entries. Do not
       // probe fetch before constructing the iterator: that would hide
       // which boundary the production NativeMTP caller actually asked for.
-      let reader = coordinator()
+      let reader = coordinator(root)
       let before = reader.snapshotStats()
       XCTAssertFalse(before.pagedEnabled)
       XCTAssertNil(before.pagedStats)
@@ -110,8 +110,13 @@ final class NativeMTPExactDiskRetryTests: XCTestCase {
       // Real Qwen4Exp.prepare forwards its final tail and returns .logits.
       // The iterator snapshots AFTER prepare, so this prompt snapshot is N,
       // while cacheRestore above must still report the actual N-1 disk seed.
+      // A missing coordinator intentionally retains no prompt snapshot.
+      // Use an empty independent disk root so the cold reference exercises
+      // the same persistence contract without finding either saved row.
+      let coldReader = coordinator(root.appendingPathComponent("cold-reference"))
       var cold = try NativeMTPTokenIterator(
-        input: input, model: real, parameters: parameters, depth: 1)
+        input: input, model: real, parameters: parameters, depth: 1,
+        cacheCoordinator: coldReader)
       let snapshot = try XCTUnwrap(warm.promptCacheSnapshot)
       let coldSnapshot = try XCTUnwrap(cold.promptCacheSnapshot)
       XCTAssertEqual(Set(cacheBoundaryLeafOffsets(snapshot)), Set([n]))
@@ -126,8 +131,13 @@ final class NativeMTPExactDiskRetryTests: XCTestCase {
       assertState(warm.cache, equals: cold.cache)
       var warmTokens: [Int] = []
       var coldTokens: [Int] = []
+      let warmStart = ProcessInfo.processInfo.systemUptime
       while let token = warm.next() { warmTokens.append(token) }
+      let warmSeconds = ProcessInfo.processInfo.systemUptime - warmStart
+      let coldStart = ProcessInfo.processInfo.systemUptime
       while let token = cold.next() { coldTokens.append(token) }
+      let coldSeconds = ProcessInfo.processInfo.systemUptime - coldStart
+      print("[TinyNativeMTPRetry] warm_tokens=\(warmTokens.count) warm_decode_seconds=\(warmSeconds) warm_tokens_per_second=\(Double(warmTokens.count) / warmSeconds) cold_tokens=\(coldTokens.count) cold_decode_seconds=\(coldSeconds) cold_tokens_per_second=\(Double(coldTokens.count) / coldSeconds) scope=untrained_fixture_not_model_speed")
       XCTAssertEqual(warmTokens.count, 4)
       XCTAssertEqual(coldTokens.count, 4)
       XCTAssertEqual(warmTokens, coldTokens)
