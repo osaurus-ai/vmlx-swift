@@ -146,6 +146,27 @@ final class LocalModelStoreTests: XCTestCase {
         XCTAssertNotNil(loaded.componentWeights["unconditional_transformer"]?["input_proj.weight"])
     }
 
+    /// A Hugging Face hub cache stores every file as a symlink into `blobs/`. A link is not a regular
+    /// file and reports its own length, so both must be read through to the target.
+    func testSymlinkedShardsAreCountedAndSizedByTheirTargets() throws {
+        let root = try makeTemporaryImageModelRoot()
+        let model = root.appendingPathComponent("Z-Image-Turbo-mflux-4bit", isDirectory: true)
+        try makeComponentLayout(at: model)
+        let blobs = root.appendingPathComponent("blobs", isDirectory: true)
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        let blob = blobs.appendingPathComponent("0123abcd.safetensors")
+        try MLX.save(arrays: ["w": MLXArray(0 ..< 64).asType(.float32)], url: blob)
+        let shard = model.appendingPathComponent("transformer/0.safetensors")
+        try FileManager.default.removeItem(at: shard)
+        try FileManager.default.createSymbolicLink(
+            atPath: shard.path, withDestinationPath: "../../blobs/0123abcd.safetensors")
+
+        XCTAssertEqual(try MLXStudioModelStore.inspect(directory: model).safetensorCount, 3)
+        XCTAssertEqual(
+            try WeightLoader.storedWeightBytes(inFiles: [shard]),
+            try WeightLoader.storedWeightBytes(inFiles: [blob]))
+    }
+
     private func makeTemporaryImageModelRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("vmlx-flux-tests-\(UUID().uuidString)", isDirectory: true)

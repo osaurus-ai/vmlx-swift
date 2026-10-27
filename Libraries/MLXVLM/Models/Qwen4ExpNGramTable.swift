@@ -257,7 +257,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         if let names = try? fm.contentsOfDirectory(atPath: modelDirectory.path) {
             for name in names where name.hasSuffix(".safetensors") {
                 let attrs = try? fm.attributesOfItem(
-                    atPath: modelDirectory.appendingPathComponent(name).path)
+                    atPath: modelDirectory.appendingPathComponent(name).resolvingSymlinksInPath().path)
                 bundleBytes += (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
             }
         }
