@@ -232,10 +232,13 @@ public struct DSparkGovernor: Sendable, Equatable {
     /// Seconds per emitted token of AR steps (nil until measured).
     public var ar: Double? { arSteps?.perToken }
 
-    private func ema(_ old: Steps?, _ seconds: Double, _ tokens: Double, replace: Bool = false) -> Steps {
+    private func ema(_ old: Steps?, _ seconds: Double, _ tokens: Double, replace: Bool = false)
+        -> Steps
+    {
         guard let old, !replace else { return Steps(seconds: seconds, tokens: tokens) }
-        return Steps(seconds: (1 - alpha) * old.seconds + alpha * seconds,
-                     tokens: (1 - alpha) * old.tokens + alpha * tokens)
+        return Steps(
+            seconds: (1 - alpha) * old.seconds + alpha * seconds,
+            tokens: (1 - alpha) * old.tokens + alpha * tokens)
     }
 
     public mutating func record(_ mode: Mode, seconds: Double, emitted: Int) {
