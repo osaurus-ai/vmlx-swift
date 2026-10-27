@@ -511,17 +511,28 @@ class DeepseekV4Attention: Module {
                         // during prefill: tiled online-softmax attention
                         // replaces SDPA entirely for this layer, so the
                         // pool is never materialized (Python mirror:
-                        // `_dsv4_tiled_pool_attention`).
-                        tiledPoolOut = DeepseekV4Math.tiledPoolAttention(
-                            queries: q,
-                            localKV: fullKV,
-                            pooled: pooledView,
-                            offset: offset,
-                            window: config.slidingWindow,
-                            ratio: compressRatio,
-                            scale: scale,
-                            sinks: config.useAttnSink ? attnSink : nil,
-                            topK: topK)
+                        // `_dsv4_tiled_pool_attention`). DeepSeek-V4.1 decode / dSpark verify rows over
+                        // the contiguous 4-bit pool take the split-by-keys kernels first
+                        // (`VMLX_DSV41_ATTN_SPLIT`, default on); nil keeps the path below.
+                        if isV41, let tk = topK,
+                            let split = DeepseekV41SplitAttention.attend(
+                                queries: q, localKV: fullKV, pooled: pooledView, topK: tk,
+                                offset: offset, window: config.slidingWindow, ratio: compressRatio,
+                                scale: scale, sinks: config.useAttnSink ? attnSink : nil)
+                        {
+                            tiledPoolOut = split
+                        } else {
+                            tiledPoolOut = DeepseekV4Math.tiledPoolAttention(
+                                queries: q,
+                                localKV: fullKV,
+                                pooled: pooledView,
+                                offset: offset,
+                                window: config.slidingWindow,
+                                ratio: compressRatio,
+                                scale: scale,
+                                sinks: config.useAttnSink ? attnSink : nil,
+                                topK: topK)
+                        }
                     } else if W > 0, var pooled = pooledView.denseArray {
 
                         if L == 1 {
