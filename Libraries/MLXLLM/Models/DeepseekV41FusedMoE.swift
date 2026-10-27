@@ -54,7 +54,7 @@ enum DeepseekV41FusedMoE {
     /// `VMLX_DSV41_FUSED_MOE_MAX_ROWS` (1-8) overrides; tests raise it to 8.
     nonisolated(unsafe) static var maxRows: Int = {
         let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_FUSED_MOE_MAX_ROWS"].flatMap(Int.init)
-        return min(8, max(1, raw ?? 6))
+        return min(maxSupportedRows, max(1, raw ?? 6))
     }()
 
     /// The largest block the kernels can serve (`VMLX_DSV41_FUSED_MOE_MAX_ROWS` upper bound).

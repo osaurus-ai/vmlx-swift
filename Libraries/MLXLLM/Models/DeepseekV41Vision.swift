@@ -1008,7 +1008,8 @@ public final class DeepseekV41VisionModel: Module {
     }
 
     /// The bundle tensor names this module loads (`vision.`, `aligner.`, `image_` prefixes).
-    public static func ownsBundleKey(_ key: String) -> Bool {
+    /// Test-facing (the bundle-contract test); the loader does not call it.
+    static func ownsBundleKey(_ key: String) -> Bool {
         key.hasPrefix("vision.") || key.hasPrefix("aligner.") || key == "image_start"
             || key == "image_end" || key == "image_newline"
     }

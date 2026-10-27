@@ -800,7 +800,8 @@ private enum DeepseekV4CompiledSelectorCache {
         // `sqrtsoftplus_select`. Parameters that alter graph structure are
         // captured in the cache key; the scaling factor remains an array input
         // so bundles with the same selector shape can share the safe stateless
-        // trace without sharing model or cache state.
+        // trace without sharing model or cache state. The bias only picks the experts: their
+        // weights are the UNBIASED scores (biased weights broke coherence).
         let body: Selector = { args in
             let logits = args[0]
             let bias = args[1]
