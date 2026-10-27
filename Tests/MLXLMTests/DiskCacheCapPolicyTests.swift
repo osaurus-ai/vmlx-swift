@@ -7,6 +7,43 @@ import Testing
 @Suite struct DiskCacheCapPolicyTests {
     private let gb: Int64 = 1_073_741_824
 
+    /// The reported 8 TB Mac: 18 GB strict free, 1.44 TB with purgeable space.
+    @Test func purgeableInclusiveFreeSpaceDecidesTheAdvisoryAndAutomatic() {
+        let total: Int64 = 8_000_000_000_000
+        let strict = DiskCacheCapPolicy.resolve(
+            percent: 10, legacyGB: nil, totalBytes: total, freeBytes: 18_000_000_000, ownBytes: 0)
+        #expect(strict.exceedsAvailableSpace)
+        let purgeable = DiskCacheCapPolicy.resolve(
+            percent: 10, legacyGB: nil, totalBytes: total, freeBytes: 1_440_000_000_000, ownBytes: 0)
+        #expect(!purgeable.exceedsAvailableSpace)
+        let automatic = DiskCacheCapPolicy.resolve(
+            percent: nil, legacyGB: nil, totalBytes: total, freeBytes: 1_440_000_000_000, ownBytes: 0)
+        #expect(automatic.capBytes == 432_000_000_000)
+    }
+
+    @Test func snapshotTakesTheLargerOfStrictAndPurgeableInclusiveFree() {
+        typealias S = DiskCacheVolumeSnapshot
+        #expect(S.resolvedFreeBytes(strict: 18_000_000_000, purgeableInclusive: 1_440_000_000_000) == 1_440_000_000_000)
+        #expect(S.resolvedFreeBytes(strict: 500, purgeableInclusive: 100) == 500)
+        #expect(S.resolvedFreeBytes(strict: 18_000_000_000, purgeableInclusive: nil) == 18_000_000_000)
+        #expect(S.resolvedFreeBytes(strict: 0, purgeableInclusive: 6 * gb) == 6 * gb)
+        #expect(S.resolvedFreeBytes(strict: nil, purgeableInclusive: 0) == nil)
+    }
+
+    @Test func snapshotReadsTheHostsPurgeableInclusiveProvider() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let answered = root.standardizedFileURL.path
+        // Larger than any real volume, and only for this directory, so other
+        // suites reading snapshots concurrently are unaffected.
+        let huge: Int64 = 9_000_000_000_000_000
+        DiskCacheVolumeSnapshot.setPurgeableInclusiveFreeBytesProvider { $0 == answered ? huge : nil }
+        defer { DiskCacheVolumeSnapshot.setPurgeableInclusiveFreeBytesProvider(nil) }
+        #expect(DiskCacheVolumeSnapshot.read(directory: root).freeBytes == huge)
+        #expect(DiskCacheVolumeSnapshot.read(directory: root.appendingPathComponent("not-yet-created")).freeBytes == huge)
+    }
+
     @Test func unreadableIndexPreservesAnotherModelsLiveRootCap() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
