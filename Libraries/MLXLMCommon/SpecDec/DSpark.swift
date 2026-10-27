@@ -23,7 +23,9 @@
 // that a multi-row forward rounds differently from a one-row decode step, so a near-tie can flip).
 // A sampled request (temperature > 0) replaces each argmax by the AR sampler's draw with Gumbel
 // noise keyed by the absolute position (``DSparkSampling``, Python `SpecSampler`), and the draft
-// sees the same noise, so the output is distributed as AR sampling's.
+// sees the same noise, so the output is distributed as AR sampling's. The governor's AR steps draw
+// with the same position-keyed noise (`TokenIterator.convertToToken`), so with a fixed seed the
+// output does not depend on which steps speculated (a wall-clock decision).
 //
 // The width W tracks acceptance (EMA, 1...blockSize). Whether to speculate at all is decided by the
 // measured wall-clock cost per emitted token of speculative steps against AR steps
@@ -165,6 +167,16 @@ public struct DSparkSampling {
     public func pick(_ logits: MLXArray, noise: MLXArray) -> MLXArray {
         let z = filters?.filteredLogprobs(logits) ?? logits.asType(.float32) * (1 / temperature)
         return argMax(z + noise, axis: -1).asType(.int32)
+    }
+
+    /// The token at absolute `position` from its single logits row (`[vocab]` or `[1, vocab]`): id `[1]`
+    /// int32. ``pick(_:noise:)`` with that position's noise row, so a token decided by an AR step equals the
+    /// one a verify row would give it. While dSpark sampling is active every sampled token after the
+    /// prompt's comes from here or from a verify row, so the stream depends only on (seed, prompt), never
+    /// on which steps the wall-clock governor made speculative.
+    public func sample(_ row: MLXArray, position: Int) -> MLXArray {
+        let row = row.reshaped(1, -1)
+        return pick(row, noise: noise(first: position, count: 1, vocab: row.dim(-1)))
     }
 }
 
@@ -483,9 +495,7 @@ public struct DSparkDecoder {
             commitWidth = emit.count
             if let sampling {
                 // The next pending token is position + emit.count's sample.
-                let row = commit[0, -1].reshaped(1, -1)
-                next = sampling.pick(
-                    row, noise: sampling.noise(first: position + emit.count, count: 1, vocab: row.dim(-1)))
+                next = sampling.sample(commit[0, -1], position: position + emit.count)
             } else {
                 next = argMax(commit[0, -1], axis: -1).asType(.int32).reshaped(1)
             }

@@ -3299,7 +3299,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             return y
         }
 
-        let y = sampler.sample(logits: logits)
+        let y: MLXArray
+        if let sampling = dspark?.sampling, !dsparkFinished {
+            // Sampled dSpark: an AR step draws with the same position-keyed noise a verify row of
+            // this position would, so a fixed seed gives the same tokens however the wall-clock
+            // governor split the run into speculative and AR steps. The token sampled here takes
+            // the position the cache offset now names (the forwarded token sits just before it).
+            y = sampling.sample(logits, position: cache.map(\.offset).max() ?? 0)
+        } else {
+            y = sampler.sample(logits: logits)
+        }
         if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
         return y
     }
