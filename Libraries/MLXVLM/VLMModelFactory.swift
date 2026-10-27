@@ -165,6 +165,9 @@ public enum VLMTypeRegistry {
         "ministral3": dispatchMistral3VLM,
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
+        // LFM3-Audio / LFM3-Omni: speech input (and Omni vision) into the LFM3 decoder.
+        "lfm3_audio": create(LFM3OmniConfiguration.self, LFM3Omni.init),
+        "lfm3_omni": create(LFM3OmniConfiguration.self, LFM3Omni.init),
             "apertus1p5": create(Apertus1p5Configuration.self, Apertus1p5.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
@@ -262,6 +265,9 @@ public enum VLMProcessorTypeRegistry {
             "nemotron_h_omni": "NemotronHOmniProcessor",
             "minicpmv4_7": "MiniCPMV47Processor",
             "lfm3_vl": "Lfm3VlProcessor",
+            // LFM3-Audio's preprocessor_config.json (read first) has no processor_class.
+            "lfm3_audio": "Lfm3AudioProcessor",
+            "lfm3_omni": "Lfm3OmniProcessor",
         ]
         return processorTypeOverrides[modelType] ?? declaredProcessorType
     }
@@ -303,6 +309,15 @@ public enum VLMProcessorTypeRegistry {
         // video_processor), which the Qwen3-VL configuration decodes.
         "Lfm3VlProcessor": create(
             Qwen3VLProcessorConfiguration.self, { LFM3VLProcessor($0, tokenizer: $1) }),
+        // LFM3-Audio ships feature settings only; LFM3-Omni adds LFM3-VL's image / video blocks.
+        "Lfm3AudioProcessor": { _, tokenizer in
+            LFM3OmniProcessor(tokenizer: tokenizer, vision: nil)
+        },
+        "Lfm3OmniProcessor": { data, tokenizer in
+            LFM3OmniProcessor(
+                tokenizer: tokenizer,
+                vision: try JSONDecoder.json5().decode(Qwen3VLProcessorConfiguration.self, from: data))
+        },
         "Apertus1p5Processor": create(
             Apertus1p5ProcessorConfiguration.self, Apertus1p5Processor.init),
         "Glm46VProcessor": create(
@@ -826,6 +841,11 @@ public final class VLMModelFactory: ModelFactory {
 
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
+        if baseConfig.modelType == "lfm3_audio" || baseConfig.modelType == "lfm3_omni" {
+            // Text generation ends where the model would start to speak: the speech
+            // generator is not loaded (LFM3Omni.sanitize), as the reference text path does.
+            mutableConfiguration.extraEOSTokens.formUnion(["<|audio_start|>", "<|mixed_start|>"])
+        }
 
         // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
         // stamp is authoritative for JANG bundles. Standard MLX models skip this and

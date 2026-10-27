@@ -403,14 +403,19 @@ final class LFM3VLProjector: Module {
     @ModuleInfo(key: "linear_1") var linear1: Linear
     @ModuleInfo(key: "linear_2") var linear2: Linear
 
-    init(_ config: LFM3VLConfiguration) {
-        let vision = config.visionConfiguration.hiddenSize
-        inputDim = vision * config.downsampleFactor * config.downsampleFactor
-        _layerNorm.wrappedValue = LayerNorm(dimensions: vision, eps: config.projectorLayerNormEps)
-        _linear1.wrappedValue = Linear(inputDim, config.projectorHiddenSize, bias: config.projectorBias)
-        _linear2.wrappedValue = Linear(
-            config.projectorHiddenSize, config.textConfiguration.hiddenSize,
-            bias: config.projectorBias)
+    convenience init(_ config: LFM3VLConfiguration) {
+        self.init(
+            visionHidden: config.visionConfiguration.hiddenSize,
+            downsampleFactor: config.downsampleFactor, hidden: config.projectorHiddenSize,
+            textHidden: config.textConfiguration.hiddenSize, bias: config.projectorBias,
+            eps: config.projectorLayerNormEps)
+    }
+
+    init(visionHidden: Int, downsampleFactor: Int, hidden: Int, textHidden: Int, bias: Bool, eps: Float) {
+        inputDim = visionHidden * downsampleFactor * downsampleFactor
+        _layerNorm.wrappedValue = LayerNorm(dimensions: visionHidden, eps: eps)
+        _linear1.wrappedValue = Linear(inputDim, hidden, bias: bias)
+        _linear2.wrappedValue = Linear(hidden, textHidden, bias: bias)
     }
 
     /// Normalizes each patch token, then concatenates every merge block (consecutive in the
@@ -619,14 +624,20 @@ public struct LFM3VLProcessor: UserInputProcessor {
         return (result, mapped)
     }
 
-    public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen3VLMessageGenerator().generate(from: input)
-        var tokens = try tokenizer.applyChatTemplate(
-            messages: messages, tools: input.tools, additionalContext: input.additionalContext)
-        var boundaries = canonicalChatCacheBoundaries(
-            tokenizer: tokenizer, messages: messages, tools: input.tools,
-            additionalContext: input.additionalContext, promptTokens: tokens,
-            staticSystemPrefix: input.cacheStableSystemPrefix)
+    /// Expanded prompt tokens, carried boundaries, and the processed images / videos.
+    struct VisualMedia {
+        var tokens: [Int]
+        var boundaries: CanonicalChatCacheBoundaries
+        var image: LMInput.ProcessedImage?
+        var video: LMInput.ProcessedVideo?
+    }
+
+    /// Patchifies `input`'s images and videos and expands their placeholders in `tokens`.
+    func expandVisualMedia(
+        tokens: [Int], boundaries: CanonicalChatCacheBoundaries, input: UserInput
+    ) async throws -> VisualMedia {
+        var tokens = tokens
+        var boundaries = boundaries
         let mergeArea = config.mergeSize * config.mergeSize
 
         var processedImage: LMInput.ProcessedImage?
@@ -711,6 +722,24 @@ public struct LFM3VLProcessor: UserInputProcessor {
             tokens = all.tokens
             boundaries = CanonicalChatCacheBoundaries(all: all.boundaries, stable: stable.boundaries)
         }
+
+        return VisualMedia(
+            tokens: tokens, boundaries: boundaries, image: processedImage, video: processedVideo)
+    }
+
+    public func prepare(input: UserInput) async throws -> LMInput {
+        let messages = Qwen3VLMessageGenerator().generate(from: input)
+        let rendered = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: input.additionalContext)
+        let media = try await expandVisualMedia(
+            tokens: rendered,
+            boundaries: canonicalChatCacheBoundaries(
+                tokenizer: tokenizer, messages: messages, tools: input.tools,
+                additionalContext: input.additionalContext, promptTokens: rendered,
+                staticSystemPrefix: input.cacheStableSystemPrefix),
+            input: input)
+        let (tokens, boundaries) = (media.tokens, media.boundaries)
+        let (processedImage, processedVideo) = (media.image, media.video)
 
         let promptArray = MLXArray(tokens).expandedDimensions(axis: 0)
         return LMInput(
