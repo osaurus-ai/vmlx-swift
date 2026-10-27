@@ -1,9 +1,9 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
-import Cmlx
 import CmlxGraphShim
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// Prefill erf GELU followed by multiplication, with the same BF16 rounding at
@@ -41,15 +41,7 @@ enum Spark25Activation {
     private static let referenceOverride =
         ProcessInfo.processInfo.environment["VMLX_SPARK_GELU_REFERENCE"] == "1"
 
-    static var usesMetalStream: Bool {
-        let stream = StreamOrDevice.default
-        if stream == .gpu { return true }
-        var device = mlx_device_new()
-        defer { mlx_device_free(device) }
-        var type = MLX_CPU
-        return mlx_stream_get_device(&device, stream.ctx) == 0
-            && mlx_device_get_type(&type, device) == 0 && type == MLX_GPU
-    }
+    static var usesMetalStream: Bool { defaultStreamIsGPU() }
 
     // Traced transformations use the original expression. In particular, do
     // not put CustomTransforms/StopGradient nodes on ordinary inference:

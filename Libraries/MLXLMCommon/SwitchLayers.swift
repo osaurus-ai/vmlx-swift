@@ -1,3 +1,4 @@
+import CmlxGraphShim
 import Foundation
 import MLX
 import MLXNN
@@ -25,12 +26,73 @@ public let safeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return { x in CompiledDecodeTrace.isActive ? body(x) : compiled(x) }
 }()
 
+/// This function calculates the `safeGeluApproximate` formula in float32 for bf16 and fp16 inputs
+/// and rounds the result one time to the input dtype. Other dtypes go to `safeGeluApproximate`.
+public let safeGeluApproximateFloat32: @Sendable (MLXArray) -> MLXArray = {
+    // The float32 chain: the casts are inside the body, so a compiled body reads and writes the
+    // input dtype. It runs where the fused Metal kernel cannot: CPU streams, Linux, traces.
+    let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
+        let y = x.asType(.float32)
+        return (0.5 * y * (1 + tanh(sqrt(2 / Float.pi) * (y + 0.044715 * y * y * y))))
+            .asType(x.dtype)
+    }
+    let chain: @Sendable (MLXArray) -> MLXArray = {
+        guard HardwareInfo.isCompiledDecodeSupported else { return body }
+        let compiled = compile(shapeless: true, body)
+        // Inside the outer compiled-decode trace, run the plain body (see safeGeluApproximate).
+        return { x in CompiledDecodeTrace.isActive ? body(x) : compiled(x) }
+    }()
+    return { x in
+        guard x.dtype == .bfloat16 || x.dtype == .float16 else { return safeGeluApproximate(x) }
+        return SafeGELUFloat32Kernel.apply(x) ?? chain(x)
+    }
+}()
+
+/// The fused Metal form of `safeGeluApproximateFloat32` for bf16 and fp16 inputs. The kernel reads
+/// each value one time, calculates the same formula and constants in float, and writes one time.
+enum SafeGELUFloat32Kernel {
+    /// The kernel's output, or nil when the float32 chain must run: no Metal, a stream that is
+    /// not on a Metal device, an empty or too large array, or a traced transformation.
+    static func apply(_ x: MLXArray) -> MLXArray? {
+        #if canImport(Metal)
+            guard defaultStreamIsGPU(), x.size > 0, x.size <= Int(Int32.max),
+                vmlx_graph_array_is_tracer(x.ctx.ctx) == 0
+            else { return nil }
+            return kernel(
+                [x], template: [("T", x.dtype)],
+                grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [x.shape], outputDTypes: [x.dtype]
+            )[0]
+        #else
+            return nil
+        #endif
+    }
+
+    // safeGeluApproximate's constant, from the same Swift expression. Its description is the
+    // shortest decimal that reads back as this Float.
+    private static let sqrtTwoOverPi: Float = sqrt(2 / Float.pi)
+
+    // METAL-ONLY: case 2. Metal kernel, called only under `canImport(Metal)` and when the default
+    // stream is on the GPU (`defaultStreamIsGPU()`); otherwise `safeGeluApproximateFloat32` runs
+    // the float32 chain.
+    private static let kernel = MLXFast.metalKernel(
+        name: "safe_gelu_approximate_float32",
+        inputNames: ["x"], outputNames: ["out"],
+        source: """
+            uint i = thread_position_in_grid.x;
+            float y = static_cast<float>(x[i]);
+            float t = metal::precise::tanh(\(sqrtTwoOverPi)f * (y + 0.044715f * y * y * y));
+            out[i] = static_cast<T>(0.5f * y * (1.0f + t));
+            """
+    )
+}
+
 /// Drop-in replacement for MLXNN.GELU that avoids the Power primitive crash.
 /// Use this anywhere `GELU(approximation: .precise)` or `.tanh` would be used.
 public class SafeGELU: Module, UnaryLayer {
     public override init() { super.init() }
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        safeGeluApproximate(x)
+        safeGeluApproximateFloat32(x)
     }
 }
 
