@@ -5,8 +5,8 @@ import Testing
 
 @Suite("Qwen4Exp native BF16 affine kernels", .serialized)
 struct Qwen4ExpBF16AffineTests {
-    @Test("Qwen4Exp BF16 JANG retains file-backed non-PLE weights")
-    func fileBackedComputePolicyIsBundleDriven() {
+    @Test("Qwen4Exp BF16 JANG weights stay owned, not file-backed, even when mmap is requested")
+    func ownedWeightPolicyDeclinesMmap() {
         let facts = LoadBundleFacts(
             totalSafetensorsBytes: 96 << 30,
             isRouted: true,
@@ -19,7 +19,8 @@ struct Qwen4ExpBF16AffineTests {
 
         #expect(facts.isQwen4ExpBF16JANG)
         #expect(!facts.requiresResidentSafetensors)
-        #expect(facts.resolveMmapSafetensors(requested: true))
+        // File-backed model-weight ownership is retired (1747b2bd): a request for mmap is declined.
+        #expect(!facts.resolveMmapSafetensors(requested: true))
     }
 
     @Test("Qwen4Exp classification does not infer JANG or BF16 from family name")
