@@ -775,9 +775,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             {
                 result = .miss
             } else {
+                // Same fetch as the AR lanes (TokenIterator, BatchEngine):
+                // a disk-backed topology may not consume the EXACT prompt
+                // boundary, so the coordinator serves the N-1 seed the
+                // store persisted one token short and this request prefills
+                // the last token. Without the flag the exact row was
+                // restored in full (a whole-conversation disk read plus
+                // its eval) and then thrown away by `unsafeFullHit` below,
+                // and the whole prompt was prefilled cold — on every
+                // exact-prompt retry of a hybrid chat (Allosaurus after a
+                // tool call), MTP on only.
                 result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
+                    skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
                     chainId: parameters.cacheChainId,
                     mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix
@@ -810,27 +821,40 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 // cache is separate), so an entry that does not fit it fits
                 // neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    let diskRestored = restoreFromDiskArrays(
-                                diskArrays, into: &self.cache, requirePromptBoundary: true)
+                    // Under `MLXCacheIOLock`, as the AR lanes restore: the
+                    // restore's Metal evals (TQ component `.item()` reads,
+                    // asType conversions, the materializing eval) must not
+                    // interleave with other cache-adjacent GPU submitters —
+                    // serving layers tokenize the NEXT request's input under
+                    // this lock while this producer restores.
+                    let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
+                        () -> Int in
+                        let count = restoreFromDiskArrays(
+                                    diskArrays, into: &self.cache, requirePromptBoundary: true)
+                        if count > 0 {
+                            let cacheHasArraysState = self.cache.contains {
+                                String(describing: type(of: $0)).contains("Arrays")
+                            }
+                            if let ssm = ssmStates,
+                               TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                                || cacheHasArraysState
+                            {
+                                restoreSSMStates(
+                                    ssm, into: self.cache, boundary: matchedTokens)
+                            }
+                            MLX.eval(self.cache)
+                        }
+                        return count
+                    }
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
-                        let cacheHasArraysState = self.cache.contains {
-                            String(describing: type(of: $0)).contains("Arrays")
-                        }
-                        if let ssm = ssmStates,
-                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
-                            || cacheHasArraysState
-                        {
-                            restoreSSMStates(
-                                ssm, into: self.cache, boundary: matchedTokens)
-                        }
-                        MLX.eval(self.cache)
                         restored = true
                     } else if detail == .disk {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "payload does not fit the runtime cache")
+                            reason: "payload does not fit the runtime cache",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
 
@@ -846,7 +870,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
-                            reason: "restored offsets do not match the boundary")
+                            reason: "restored offsets do not match the boundary",
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                     restored = false
                     retainedDiskRestore = false
@@ -857,13 +882,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if cacheLookupUsesPostPrepareAlias {
                         self.promptTokenIds = cacheLookupTokenIds
                     }
-                    let requiresDiskBackedRestore =
-                        cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                     let suffixHoldsMedia =
                         input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
                     let unsafePartial = cacheHitSuffixRequiresMediaRollback(
                         input: input, remainingTokens: remainingTokens,
                         matchedTokens: matchedTokens, plan: cacheSaltPlan)
+                    // Fail-closed backstop only: with `skipExactDiskBoundary`
+                    // above, a disk-backed topology is never served its
+                    // exact prompt boundary from disk, so this now covers
+                    // an exact hit from another tier alone.
                     let unsafeFullHit = remainingTokens.isEmpty && requiresDiskBackedRestore
                     if unsafePartial || unsafeFullHit {
                         self.cache = model.newCache(parameters: effectiveParameters)
@@ -906,7 +933,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
                             skipExactDiskBoundary: coordinator.requiresRecurrentSSMCompanion,
-                            mediaSalt: mediaSalt)
+                            mediaSalt: mediaSalt,
+                            mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                     }
                 }
             case .miss:
@@ -963,6 +991,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             detail: promptCacheSnapshot == nil ? "native-mtp none" : "native-mtp retained")
 
         let firstToken: MLXArray
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-seed"))
         switch prepared {
         case .tokens(let tokens):
             processor?.prompt(input.text.tokens)
@@ -1022,6 +1053,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         pendingTokens.append(firstID)
         if let primer {
+            prefillProgressHandler?(PrefillProgress(
+                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-head-prime"))
             let primeStart = NativeMTPClock.now()
             primer.finish(firstToken: firstToken)
             promptPrimedRows = primer.foldedRows
@@ -1032,6 +1066,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let bridgeStart = NativeMTPClock.now()
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-bridge"))
         try Task.checkCancellation()
         let bridge = model.nativeBackboneForward(Self.tokenInput(firstToken), cache: self.cache)
         let secondToken = Self.sampleLast(
@@ -1050,6 +1087,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
         let draftStart = NativeMTPClock.now()
+        prefillProgressHandler?(PrefillProgress(
+            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-initial-drafts"))
         try Task.checkCancellation()
         let draftBatch = Self.makeDrafts(
             model: model,

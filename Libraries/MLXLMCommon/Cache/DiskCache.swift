@@ -95,6 +95,14 @@ public struct DiskCacheStats: Sendable {
     /// boundary payload can be hundreds of megabytes, and a store → restore
     /// round trip that fails once fails every turn.
     public let rejectedRewritesSuppressed: Int
+    /// Tensor bytes of the payload the most recent fetch served (what its
+    /// restore reads from disk); 0 until a fetch has served one.
+    public let lastFetchPayloadBytes: Int64
+    /// Wall time of that fetch's read: from the loader's open to every
+    /// tensor materialized on the CPU stream. 0 until there has been one.
+    /// A host attaches it to a failure report so a slow restore (a cold page
+    /// cache, a contended volume) is told apart from slow prefill compute.
+    public let lastFetchMs: Double
 
     init(
         hits: Int, misses: Int, stores: Int, storeSkips: Int,
@@ -105,7 +113,8 @@ public struct DiskCacheStats: Sendable {
         lastQuotaPassTick: UInt64 = 0, lastPressureEventTick: UInt64 = 0,
         unreadablePayloadFetches: Int = 0, opaqueBytes: Int64 = 0,
         rejectedDiskRestores: Int = 0, rejectedRewritesSuppressed: Int = 0,
-        capacityPressureByChain: [String: DiskCachePressureRecord] = [:]
+        capacityPressureByChain: [String: DiskCachePressureRecord] = [:],
+        lastFetchPayloadBytes: Int64 = 0, lastFetchMs: Double = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -128,6 +137,8 @@ public struct DiskCacheStats: Sendable {
         self.opaqueBytes = opaqueBytes
         self.rejectedDiskRestores = rejectedDiskRestores
         self.rejectedRewritesSuppressed = rejectedRewritesSuppressed
+        self.lastFetchPayloadBytes = lastFetchPayloadBytes
+        self.lastFetchMs = lastFetchMs
     }
 
     /// The same counters over a different usage figure (the coordinator's
@@ -144,7 +155,8 @@ public struct DiskCacheStats: Sendable {
             unreadablePayloadFetches: unreadablePayloadFetches, opaqueBytes: opaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
             rejectedRewritesSuppressed: rejectedRewritesSuppressed,
-            capacityPressureByChain: capacityPressureByChain)
+            capacityPressureByChain: capacityPressureByChain,
+            lastFetchPayloadBytes: lastFetchPayloadBytes, lastFetchMs: lastFetchMs)
     }
 }
 
@@ -465,6 +477,9 @@ public final class DiskCache: @unchecked Sendable {
     public private(set) var refusedOccupiedStores: Int = 0
     /// See ``DiskCacheStats/unreadablePayloadFetches``.
     public private(set) var unreadablePayloadFetches: Int = 0
+    /// See ``DiskCacheStats/lastFetchPayloadBytes`` / ``DiskCacheStats/lastFetchMs``.
+    private var lastFetchPayloadBytes: Int64 = 0
+    private var lastFetchMs: Double = 0
     /// See ``DiskCacheStats/rejectedDiskRestores``.
     public private(set) var rejectedDiskRestores: Int = 0
     /// See ``DiskCacheStats/rejectedRewritesSuppressed``.
@@ -977,7 +992,9 @@ public final class DiskCache: @unchecked Sendable {
             opaqueBytes: lastOpaqueBytes,
             rejectedDiskRestores: rejectedDiskRestores,
             rejectedRewritesSuppressed: rejectedRewritesSuppressed,
-            capacityPressureByChain: capacityPressureByChain)
+            capacityPressureByChain: capacityPressureByChain,
+            lastFetchPayloadBytes: lastFetchPayloadBytes,
+            lastFetchMs: lastFetchMs)
     }
 
     // MARK: - Initialization
@@ -1831,7 +1848,26 @@ public final class DiskCache: @unchecked Sendable {
             }
             try loadFaultForTesting?(url)
             Self.adviseReadAhead(url: url)
+            let readStart = DispatchTime.now().uptimeNanoseconds
             let (arrays, _) = try loadArraysAndMetadata(url: url)
+            // Materialize the payload HERE, on the CPU stream the loader put
+            // every tensor on, before anything on the GPU can depend on it.
+            // The loader returns lazy `Load` nodes (one `pread` each). Left
+            // lazy, the first GPU consumer — the finite screen below, then
+            // the engine's restore graph (`asType`, owned copies, SSM
+            // seating) evaluated as one `MLX.eval(cache)` — is encoded with
+            // a cross-stream wait on the read, so one Metal command buffer
+            // can wait on the disk read on a cold or contended volume.
+            // Materializing here removes that dependency wait; identifying
+            // the cause of a particular GPU watchdog event still requires
+            // a trace. This eval touches no GPU encoder (CPU primitives
+            // run on the CPU scheduler), costs the read the restore was
+            // about to do anyway, and leaves every array signaled, so the
+            // restore's buffers carry only their own kernels. The screen
+            // below already forced the floating-point tensors; this is a
+            // reordering plus the integer tensors, not a second read.
+            MLX.eval(Array(arrays.values))
+            let readMs = Double(DispatchTime.now().uptimeNanoseconds - readStart) / 1_000_000
             // A record written before the store-side check (or by a build that
             // computed NaN) must never be restored: it is removed on first touch
             // so an installed user recovers on the next prefill without clearing
@@ -1852,6 +1888,8 @@ public final class DiskCache: @unchecked Sendable {
             if countHit {
                 hits += 1
             }
+            lastFetchMs = readMs
+            lastFetchPayloadBytes = arrays.values.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
             return arrays
         } catch {
             // Only what has been positively identified as unusable is
@@ -3487,6 +3525,8 @@ public final class DiskCache: @unchecked Sendable {
         storeSkips = 0
         failedIndexWrites = 0
         unreadablePayloadFetches = 0
+        lastFetchPayloadBytes = 0
+        lastFetchMs = 0
         evictions = 0
         quotaEvictedBytes = 0
         quotaPasses = 0
