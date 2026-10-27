@@ -1018,41 +1018,6 @@ public enum DeepseekV4Math {
         sqrt(logAddExp(logits, MLXArray(0.0)))
     }
 
-    // MARK: - Top-k over sqrtsoftplus with bias + norm
-    //
-    // Production gate path (for non-hash layers):
-    //   biased = scores + noauxBias
-    //   topKIdx = argpartition(-biased, k)[:k]
-    //   topKWeights = take_along_axis(scores, topKIdx)   — UNBIASED!
-    //   normalized = topKWeights / sum(topKWeights) * routedScalingFactor
-    //
-    // Critical: `noauxBias` is used ONLY to pick the indices — once
-    // picked, the UNBIASED score is what gets used as the expert
-    // weight. This was bug #6 in the DSV-EXHAUSTIVE-VARIABLES-GUIDE;
-    // using biased weights broke coherence.
-    public static func sqrtSoftplusSelect(
-        scores: MLXArray,
-        noauxBias: MLXArray?,
-        k: Int,
-        normalize: Bool,
-        scalingFactor: Float
-    ) -> (indices: MLXArray, weights: MLXArray) {
-        let biased = noauxBias != nil ? (scores + noauxBias!) : scores
-        // argpartition returns unordered top-k; sort indices for
-        // determinism (matters for cache-hit byte equivalence).
-        let topKIdx = argPartition(-biased, kth: k - 1, axis: -1)[.ellipsis, 0..<k]
-        // Gather the UNBIASED scores at those indices.
-        let gathered = takeAlong(scores, topKIdx, axis: -1)
-        var weights = gathered
-        if normalize {
-            let denom = weights.sum(axis: -1, keepDims: true) + 1e-20
-            weights = weights / denom * scalingFactor
-        } else {
-            weights = weights * scalingFactor
-        }
-        return (indices: topKIdx, weights: weights)
-    }
-
     // MARK: - YaRN RoPE freq table
     //
     // `rope_factor=16`, `original_seq_len=65536`, `beta_fast=32`,

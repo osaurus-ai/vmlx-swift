@@ -800,7 +800,8 @@ private enum DeepseekV4CompiledSelectorCache {
         // `sqrtsoftplus_select`. Parameters that alter graph structure are
         // captured in the cache key; the scaling factor remains an array input
         // so bundles with the same selector shape can share the safe stateless
-        // trace without sharing model or cache state.
+        // trace without sharing model or cache state. The bias only picks the experts: their
+        // weights are the UNBIASED scores (biased weights broke coherence).
         let body: Selector = { args in
             let logits = args[0]
             let bias = args[1]
@@ -2248,8 +2249,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         {
             return result
         }
-        let prefillStepSize = windowSize ?? 512
-        let outerStep = prefillOuterStep(prefillStepSize)
+        let (prefillStepSize, outerStep) = prefillChunking(windowSize)
 
         let tokensShape = input.text.tokens.shape
         if tokensShape.count >= 2 && tokensShape[0] != 1 {
@@ -2316,20 +2316,35 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
     }
 
-    /// Outer prefill chunk width: with in-layer attention sub-chunking the outer chunk widens to
-    /// 2048 (1024 with the dSpark head resident) so MoE sees a wider batch.
-    private func prefillOuterStep(_ prefillStepSize: Int) -> Int {
-        let sub = DeepseekV4Math.attnSubchunkTokens
-        guard sub > 0 else { return prefillStepSize }
-        let env = ProcessInfo.processInfo.environment
-        // With the 8.3 GB dSpark head resident, 2048-token chunks push active memory plus the
-        // allocator cache past Metal's working set and prefill slows ~30% (RUNTIME_SERVING.md);
-        // 1024 measured best with the head resident.
-        let dsparkResident = dsparkHead != nil
-        let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init)
-            ?? (dsparkResident
-                ? env["VMLX_DSV41_DSPARK_PREFILL_STEP"].flatMap(Int.init) ?? 1024 : 2048)
-        return max(prefillStepSize, requested)
+    /// Prefill chunking for a caller step of `windowSize` (the server's or a tuned prefill step):
+    /// `step` bounds the caller's final forward (the loop runs while more than `step` tokens remain),
+    /// `outer` is the width of each chunk the loop forwards.
+    private func prefillChunking(_ windowSize: Int?) -> (step: Int, outer: Int) {
+        Self.prefillChunking(
+            requestedStep: windowSize ?? 512, attnSubchunk: DeepseekV4Math.attnSubchunkTokens,
+            dsparkHeadResident: dsparkHead != nil)
+    }
+
+    /// With in-layer attention sub-chunking the outer chunk widens to 2048 so MoE sees a wider batch,
+    /// and never narrower than the caller's step. With the dSpark head resident (8.3 GB), 2048-token
+    /// chunks push active memory plus the allocator cache past Metal's working set and prefill slows
+    /// ~30% (RUNTIME_SERVING.md); 1024 measured best. That cap is for memory, so it also wins over a
+    /// wider caller step (a server-wide or tuned 2048 / 4096): both the chunks and the final forward
+    /// stay within it. `VMLX_DSV41_DSPARK_PREFILL_STEP` sets the cap; `DSV4_PREFILL_OUTER_CHUNK`
+    /// (diagnostic) still sets the outer chunk directly, as before.
+    static func prefillChunking(
+        requestedStep: Int, attnSubchunk: Int, dsparkHeadResident: Bool,
+        environment env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> (step: Int, outer: Int) {
+        guard attnSubchunk > 0 else { return (requestedStep, requestedStep) }
+        if let explicit = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init) {
+            return (requestedStep, max(requestedStep, explicit))
+        }
+        if dsparkHeadResident {
+            let cap = max(1, env["VMLX_DSV41_DSPARK_PREFILL_STEP"].flatMap(Int.init) ?? 1024)
+            return (min(requestedStep, cap), cap)
+        }
+        return (requestedStep, max(requestedStep, 2048))
     }
 
     /// DeepSeek-V4.1 image prefill (engine `SingleBatchGenerator._prefill` + `_model_call`): the
@@ -2354,10 +2369,11 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             tokens: tokens, imageTokenId: vision.config.imageTokenId,
             grids: DeepseekV41VisionLayout.grids(frames: image.frames ?? [], config: vision.config))
         guard !spans.isEmpty else { return nil }
-        let prefillStepSize = windowSize ?? 512
+        let chunking = prefillChunking(windowSize)
+        let prefillStepSize = chunking.step
         let chunks = try DeepseekV41VisionLayout.prefillChunks(
             tokenCount: tokens.count, stepSize: prefillStepSize,
-            outerStep: outerStepOverride ?? prefillOuterStep(prefillStepSize), spans: spans)
+            outerStep: outerStepOverride ?? chunking.outer, spans: spans)
         let engramHolder = cache.first {
             ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true
         } as? DeepseekV4Cache

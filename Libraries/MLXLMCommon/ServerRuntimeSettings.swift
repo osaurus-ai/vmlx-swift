@@ -561,9 +561,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 drafterPath: URL(fileURLWithPath: selected.path),
                 blockSize: mtp.dflash2BlockSize)
         }
-        // DeepSeek-V4.1 bundles ship their own dSpark head in `dspark/`. It is speed-only and
-        // greedy-exact, and its wall-clock governor keeps it at or above AR, so it is on by default;
-        // Off (and only Off, or VMLX_DSV41_DSPARK=0) turns it off.
+        // DeepSeek-V4.1 bundles ship their own dSpark head in `dspark/`. It is speed-only and exact
+        // (greedy and sampled requests), and its wall-clock governor keeps it at or above AR, so it is
+        // on by default; Off (and only Off, or VMLX_DSV41_DSPARK=0) turns it off.
         if let dspark = bundledDSparkDrafter(configData: configData, bundleDirectory: bundleDirectory) {
             return .dspark(drafterPath: dspark)
         }

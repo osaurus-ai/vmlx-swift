@@ -7,7 +7,8 @@
 //     always wrong, or always right, and leaves the cache exactly where AR leaves it;
 //   - in-place checkpoints: restore puts the same cache objects back, including after the rotating
 //     window wrapped (no longer trimmable) and after in-place single-token writes;
-//   - stop tokens and the token budget cut a block, so the cache never runs ahead of the output;
+//   - stop tokens and the token budget cut a block, so the cache never runs ahead of the output
+//     (also through `TokenIterator`, where the post-answer boundary key then aligns);
 //   - the wall-clock governor under a synthetic clock (port of the Python
 //     `dsv41_dspark_governor_test.py`): zero acceptance stays within a few percent of AR, a slow
 //     partially-accepting draft falls back, high acceptance beats AR, acceptance returning
@@ -16,7 +17,8 @@
 //   - sampled speculation: with any drafts (uncoupled or coupled through the noise), the output
 //     is token for token the position-keyed AR sampler's (each position's token is the AR
 //     sampler's draw with that position's Gumbel noise), with filters, and the cache ends where
-//     that AR run's does.
+//     that AR run's does; the governor's AR steps inside `TokenIterator` draw the same samples, so a
+//     fixed seed does not depend on which steps speculated.
 
 import Foundation
 import MLX
@@ -425,6 +427,70 @@ struct DSparkSpeculationFocusedTests {
         #expect(!DSparkEnvironment.sampledDisabled(["VMLX_DSV41_DSPARK_SAMPLED": "1"]))
     }
 
+    @Test("sampling: an AR step's position-keyed sample equals the verify row's pick for that position")
+    func samplingPositionMatchesVerifyRow() throws {
+        try Device.withDefaultDevice(.cpu) {
+            for sampling in [
+                try #require(DSparkSampling(temperature: 0.8, seed: 21)),
+                try #require(DSparkSampling(temperature: 1.1, topP: 0.85, topK: 9, minP: 0.01, seed: 21)),
+            ] {
+                let vocab = 37
+                let first = 113
+                let rows = MLXRandom.normal([6, vocab], key: MLXRandom.key(5)) * 3
+                // A verify forward decides positions first ..< first + 6 from one pick over all rows.
+                let verify = sampling.pick(rows, noise: sampling.noise(first: first, count: 6, vocab: vocab))
+                    .asArray(Int32.self)
+                // An AR step decides each position alone from its row.
+                let ar = (0 ..< 6).map {
+                    sampling.sample(rows[$0], position: first + $0).item(Int32.self)
+                }
+                #expect(ar == verify)
+                #expect(sampling.sample(rows[0 ..< 1], position: first).shape == [1])
+            }
+        }
+    }
+
+    @Test("TokenIterator, sampled dSpark with a fixed seed: AR and speculative steps give the position-keyed samples")
+    func tokenIteratorSampledSeedIsRepeatable() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let prompt = [3, 1, 4, 1, 5, 9, 2]
+            let count = 60
+            let input = LMInput(tokens: MLXArray(prompt.map { Int32($0) }))
+            let model = DSparkToyLanguageModel(good: { [0, 2, 5, 1, 5, 3][$0 % 6] })
+            var parameters = GenerateParameters(maxTokens: count, temperature: 0.7)
+            parameters.randomSeed = 3
+            let sampling = try #require(DSparkSampling(parameters: parameters))
+
+            // The prompt's token comes from the request sampler (seeded), before dSpark starts.
+            var once = parameters
+            once.maxTokens = 1
+            var firstIt = try TokenIterator(input: input, model: model, parameters: once)
+            let firstToken = firstIt.next()
+            let first = try #require(firstToken)
+
+            // Every later token: the position-keyed draw, one forward at a time.
+            let target = model.target
+            let cache = target.newCache()
+            _ = target.forward(prompt, cache: cache)
+            var expected = [first]
+            while expected.count < count + 8 {
+                let logits = target.forward([expected.last!], cache: cache)
+                expected.append(target.sampleLast(logits, cache: cache, sampling: sampling))
+            }
+            for (i, t) in expected.enumerated() { model.reference[prompt.count + i] = t }
+
+            parameters.draftStrategy = .dspark(drafterPath: URL(fileURLWithPath: "/nonexistent/dspark"))
+            var it = try TokenIterator(input: input, model: model, parameters: parameters)
+            var out: [Int] = []
+            while let t = it.next() { out.append(t) }
+            let stats = try #require(it.dsparkGenerationStats)
+            // The governor always takes an AR step to measure AR after its spec warm-up.
+            #expect(stats.sampled && stats.specSteps > 0 && stats.arSteps > 0)
+            #expect(out == Array(expected.prefix(count)))
+            #expect(it.cache.allSatisfy { $0.offset == prompt.count + count })
+        }
+    }
+
     // MARK: Checkpoints
 
     @Test("in-place restore after the rotating window wrapped puts the exact pre-verify state back")
@@ -495,6 +561,43 @@ struct DSparkSpeculationFocusedTests {
                 forward: { target.forward($0, cache: cache2) }, argmaxLast: target.argmaxLast)
             #expect(out2 == Array(ar.prefix(7)))
             #expect(cache2.allSatisfy { $0.offset == prompt.count + 7 })
+        }
+    }
+
+    @Test("TokenIterator: a stop token ends a dSpark run with the cache at the returned tokens, so the post-answer key aligns")
+    func tokenIteratorStopTokenKeepsPostAnswerBoundary() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let prompt = [3, 1, 4, 1, 5, 9, 2]
+            let model = DSparkToyLanguageModel(good: { _ in 5 })
+            let ar = model.target.greedy(prompt: prompt, count: 48).tokens
+            for (i, t) in ar.enumerated() { model.reference[prompt.count + i] = t }
+            // A stop token that first occurs inside the run (not as its first token): an always-right
+            // draft proposes past it, so the block holding it is cut there.
+            let stopIndex = try #require((3 ..< 40).first { i in !ar[..<i].contains(ar[i]) })
+            let stop = ar[stopIndex]
+            var params = GenerateParameters(maxTokens: 40, temperature: 0)
+            params.draftStrategy = .dspark(drafterPath: URL(fileURLWithPath: "/nonexistent/dspark"))
+            var it = try TokenIterator(
+                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                parameters: params, stopTokenIDs: [stop])
+            // The generate loop: return tokens until the stop token, which it does not keep.
+            var returned: [Int] = []
+            while let t = it.next() {
+                returned.append(t)
+                if t == stop { break }
+            }
+            let generated = Array(returned.dropLast())
+            it.finalizeGenerationStats(generatedTokenIds: generated)
+            #expect(returned == Array(ar.prefix(stopIndex + 1)))
+            #expect(try #require(it.dsparkGenerationStats).specSteps > 0)
+            // The only stop that stores a post-answer boundary: the cache holds exactly the prompt and
+            // every returned token (the stop token included), as after AR, so the key is exact.
+            let offsets = cacheBoundaryLeafOffsets(it.cache)
+            #expect(offsets.allSatisfy { $0 == prompt.count + returned.count })
+            #expect(
+                TokenIterator.generatedBoundaryTokensAligned(
+                    promptTokenIds: prompt, generatedTokenIds: generated, cacheOffsets: offsets,
+                    pendingDrainedTokenId: stop) == prompt + returned)
         }
     }
 

@@ -1018,7 +1018,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// Every width the pool storage can encode. The disk serializer's
     /// quantized-pool schema accepts exactly these widths — pinned by
     /// `DeepseekV4CacheDiskRoundTripTests.serializerBitsMatchPoolStorage`
-    /// so neither side can drift alone.
+    /// so neither side can drift alone. Test-facing: the runtime does not read it.
     public static var supportedPoolQuantizationBits: Set<Int> { DeepseekV4PoolStorage.supportedBits }
     /// This cache's pool code width: 8 for DSV4-0731, 4 for DeepSeek-V4.1
     /// (its reference stores compressed KV in FP4).
@@ -1196,6 +1196,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// DSV4 hybrid cache at a requested context. It includes UInt8 pool codes,
     /// fp16 affine metadata, every layer's bounded rotating K/V, and a full
     /// incomplete-window buffer allowance for both compressor branches.
+    /// Test-facing sizing helper: no runtime path calls it.
     public static func projectedQuantizedCacheUpperBoundBytes(
         contextLength: Int,
         compressRatios: [Int],
@@ -1664,6 +1665,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         }
     }
 
+    /// Test-facing: pending compressor inputs of `branch` (the dSpark restore tests).
     func pendingPoolTokenCount(_ branch: BranchKey) -> Int {
         pendingSlot(branch).inputs.count
     }

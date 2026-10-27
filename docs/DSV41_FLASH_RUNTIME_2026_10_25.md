@@ -21,7 +21,7 @@ Measured live in osaurus (M5 Ultra 256 GB, Release, dSpark on). The first V4.1 b
 | MLX's GPU `argpartition` sorts whole rows | exact block top-k for prefill rows >= 65536 keys | in the row above |
 | the fused scorer ran on simdgroup fp32 | M5 matrix units, bf16 operands (`DeepseekV41MPPIndexScores`) | 4.1–4.5x kernel; 49k 701 → 720, 100k 595 → 625 pp/s |
 | layers 21–39 computed every prompt row although only the trailing rows reach the prompt end | prompt-suffix pruning (`suffixPruneKeep`, `restartLocalWindow`, row-range selection lookup) | 42k 744 → 1346, 49k 710 → 1317, 100k 594 → 1117 pp/s |
-| a decode step was ~105-150 dispatches per layer and the GPU waited for the host to build the whole token | router logits from bf16 rows in MLX's GEMV order, routed + shared MoE in 2 dispatches, the hc stage in 2 per sublayer, per-layer submit (`DeepseekV41RouterGEMV`, `DeepseekV41FusedMoE`, `DeepseekV41HCStage`; each shape admitted after a bitwise check; `VMLX_DSV41_{ROUTER_KERNEL,FUSED_MOE,HC_STAGE,LAYER_SUBMIT}=0`) | AR 32.2–33.7 → 38.5–40.4 tok/s, text identical |
+| a decode step was ~105-150 dispatches per layer and the GPU waited for the host to build the whole token | router logits from bf16 rows in MLX's GEMV order, routed + shared MoE in 2 dispatches, the hc stage in 2 per sublayer, per-layer submit (`DeepseekV41RouterGEMV`, `DeepseekV41FusedMoE`, `DeepseekV41HCStage`; each shape admitted after a bitwise check; `VMLX_DSV41_ROUTER_KERNEL=0`, `VMLX_DSV41_FUSED_MOE=0`, `VMLX_DSV41_HC_STAGE=0`, `VMLX_DSV41_LAYER_SUBMIT=0`) | AR 32.2–33.7 → 38.5–40.4 tok/s, text identical |
 | the first verify at each width paid the fused-kernel admission and trace recording (~210 ms), so the governor judged speculation slower than AR and the first reply ran mostly AR | the governor ignores a step that ran a forward width for the first time in the process (`DSparkForwardWidths`) | first reply code 51.4 → 68.0 tok/s |
 | V4.1 pools used the 0731 segmented BF16 hot tier (>3 KB/token) and windows kept ~2175 rows after a chunk | 4-bit contiguous pools from the first row, windows trimmed to 128 | 903 MiB at 1,039,360 tokens (911 B/token) |
 
@@ -50,6 +50,37 @@ Hosts must render with the bundle's family. Osaurus does this in
 `SwiftTransformersTokenizerLoader.applyDeepseekV4NativeTemplate`
 (`DeepseekV4ChatEncoder(family:)`, plus `reasoningBudget(from:)` for V4.1 thinking turns). An
 absent effort renders as low (50). The bundle reference default is high (75).
+
+## Bundle formats and F32 control parameters
+
+- **Affine JANG** (for example `JANG_2K`, `JANG-Q2Q3-IMATRIX`): affine-quantized backbone, routed
+  experts per-expert or prestacked, `dspark/` head with 4-bit experts.
+- **JANGHT** (#659): `config.json` `"quantization"` declares every module's format, keyed by the
+  checkpoint path:
+  - routed experts `layers.L.ffn.experts.{gate,up,down}_proj` as JANGT trellis (Hadamard-128 plus
+    signs, K in {1, 1.5, 2, 2.5}), built as `JANGTRoutedExpertLayer`;
+  - the release FP8 projections as MLX mxfp8: attention, indexer `wq_b`, shared experts, Engram
+    `wkv`;
+  - embed / head and the vision / aligner Linears as affine 8-bit;
+  - the dSpark draft's `mtp.S.*` modules in `dspark/dspark.safetensors` (mxfp8 attention, shared
+    expert and `main_proj`, grouped mxfp8 `wo_a`, JANGT experts).
+  `DeepseekV41JANGHPreparation` admits the routed banks through the JANGH preparation and rewrites the
+  per-module plan from checkpoint paths to this runtime's module paths. The bundle needs
+  `engram_aux.safetensors` (byte-identical to the affine bundle's).
+- **Multi-row MXFP8 QMV** (`DeepseekV41FP8Rows`, #659): 3–7 rows through an mxfp8 Linear decode each
+  weight once and run MLX's M=1 arithmetic per row, so every verify or draft row equals the 1-row
+  decode call bit for bit. Each shape is admitted after a bit-equality check on the real weights;
+  anything else keeps `quantizedMM`. `VMLX_FP8_ROWS_QMV=0` keeps the stock kernels.
+- **Keep the F32 control parameters for every V4.1 bundle** (#661, #662): the hyper-connection
+  `hc_*_fn` / `base` / `scale`, `attn_sink`, and the router `gate.bias` / `bias_vl` (and the draft's
+  `mtp.*` copies) stay F32 as stored. The reference and the Python runtime compute with them in F32.
+  The loader's generic bf16 materialisation used to round them: on JANGHT that measured KL 0.0195 /
+  top-1 96.9 %, and the fused hc stage, which admits F32 hc parameters only, never engaged.
+  `DeepseekV4Model.preservesCheckpointParameterDTypes` is now `config.isDeepseekV41`, so every V4.1
+  bundle (affine, `JANG_2K`, JANGHT) keeps checkpoint dtypes. The load log shows
+  `[Load] dtype-materialisation ... preserveCheckpointDTypes=true` (checked on a `JANG_2K` load).
+  A new V4.1 bundle format must keep these tensors F32; nothing else in `JANG_2K` is F32, so no
+  other tensor changes dtype.
 
 ## Engram (n-gram embedding tables)
 
@@ -112,8 +143,8 @@ M5 Ultra 256 GB, Osaurus Release build, `DeepSeek-V4.1-Flash-1017-JANG-Q2Q3-IMAT
 | SSD L2 repeat prompt | 23.7 s → 0.47 s; hits survive a restart |
 | tool calls | broken: raw V4.1 DSML in content (fixed by `dsmlV41`) |
 
-`usage.prompt_tokens_details.cached_tokens` reports 0 even on an L2 hit. That's a reporting
-gap, not a cache miss.
+At this baseline `usage.prompt_tokens_details.cached_tokens` reported 0 even on an L2 hit (a
+reporting gap, not a cache miss). It is fixed: the next table shows 3420 cached tokens reported.
 
 ## Measured live (combined branch `264f6c4c`, osaurus `fix/dsv41-thinking-toggle`)
 
@@ -257,6 +288,14 @@ AR margins of 0.004–0.04 over 256 tokens). Both the verify and AR paths take f
 quantized head: `DeepseekV4Math.lmHeadFp32` casts the hidden to fp32 before `quantizedMM`. That has
 been the default for both DSV4 families, so 0731 is unchanged.
 
+Sampled requests (temperature > 0, on by default since #659) are exact in distribution
+(`DSparkSampling`, Python `SpecSampler`). Each position's token is the request sampler's draw
+(`TopPSampler` filtered log-probabilities, or logits / T) with Gumbel noise keyed by the seed and the
+absolute position, and the draft sees the same noise. The governor's AR steps draw with the same
+position-keyed noise, so with a fixed seed the tokens do not depend on which steps speculated (a
+wall-clock decision). The first token, sampled from the prompt's logits before dSpark starts, comes
+from the request's seeded sampler.
+
 ### Where it runs
 
 - `DraftStrategy.dspark(drafterPath:)` runs inside `TokenIterator`, as Uno does. Prefill, prefix-cache
@@ -266,14 +305,20 @@ been the default for both DSV4 families, so 0731 is unchanged.
 - `VMLXServerRuntimeSettings.resolvedMTPDraftStrategy` returns `.dspark` only when the config's
   `model_type` is `deepseek_v41` or `deepseek_v41_text`, `<bundle>/dspark/dspark.safetensors` exists,
   and `mtp.mode != .off`. It is on by default (`familyDefault`). The host must pass `bundleDirectory`.
-- The head (8.9 GB: prestacked 4-bit experts, bf16 attention and Markov head) loads on the first
-  greedy `.dspark` request, before that request's prefill. A sampled request never loads it. Each
-  `dspark_*` key is read from the bundle config. With the head resident, the default prefill outer
-  chunk is 1024 (see RUNTIME_SERVING.md).
-- Per request it runs only when all of these hold: temperature 0, no logit processor (penalties,
-  reasoning budget, JSON schema), no media, no KV quantization, no compiled decode, and every cache
-  layer supports an in-place checkpoint. Otherwise the request logs why (`dSpark requested but not
-  used for this request`) and decodes AR.
+- The head (8.9 GB: prestacked 4-bit experts, bf16 attention and Markov head; mxfp8 / JANGT on a
+  JANGHT bundle) loads on the first `.dspark` request, greedy or sampled, before that request's
+  prefill. With `VMLX_DSV41_DSPARK_SAMPLED=0` only a greedy request loads it, and a sampled request
+  never pays for it. Each `dspark_*` key is read from the bundle config.
+- With the head resident, prefill runs 1024-token chunks (see RUNTIME_SERVING.md:
+  2048 measured ~30% slower once the head is resident). The cap also bounds the caller's step, so a
+  server-wide or tuned prefill step of 2048 / 4096 no longer overrides it: both the chunks and the
+  final prompt forward stay within 1024. `VMLX_DSV41_DSPARK_PREFILL_STEP` sets the cap;
+  `DSV4_PREFILL_OUTER_CHUNK` (diagnostic) still sets the outer chunk directly.
+- Per request it runs when all of these hold: no logit processor (penalties, reasoning budget, JSON
+  schema), no media in the prefilled tokens, no KV quantization, no compiled decode, every cache layer
+  supports an in-place checkpoint, and, for a sampled request, `VMLX_DSV41_DSPARK_SAMPLED` is not
+  `0`. Otherwise the request logs why (`dSpark requested but not used for this request`) and decodes
+  AR.
 
 ### Loop (`MLXLMCommon/SpecDec/DSpark.swift`)
 
@@ -299,8 +344,13 @@ The state is the same as ordinary decoding: the cache holds prompt plus committe
    - It emits [p0, d1…dk]; truth_k (argmax of row k) becomes the next p0.
 6. k == 0 (or a target without capture): restore in place, run one commit forward of
    [p0, truth_0], and take the next p0 from its last row.
-7. A block is cut at the first stop token and at `maxTokens`. The cache never runs ahead of the
-   returned tokens, so the post-answer prefix-cache boundary stays valid.
+7. A block is cut at the first stop token and at `maxTokens`, so a run that ends on a stop token
+   leaves the cache exactly where AR's would and the post-answer prefix-cache boundary is exact.
+   A consumer that stops early (a stop string, a tool dispatch, a cancel) can leave the cache up to
+   W tokens ahead of the returned ones, and a `DeepseekV4Cache` cannot be trimmed exactly. Nothing
+   is lost: those ends skip the post-answer store on every decode path (AR included), and the prompt
+   boundaries are snapshots taken during prefill. Sampled steps take the position-keyed draw
+   (`DSparkSampling`) where a greedy step takes the argmax.
 
 The governor is a port of `_Governor`. It keeps an EMA (α 0.3) of seconds per emitted token for
 spec steps and for AR steps, measured from one step start to the next. It speculates while spec is
@@ -337,14 +387,22 @@ verify readback is one sync. The windows project only the new rows.
 |---|---|
 | `VMLX_DSV41_DSPARK=0` (`off`/`false`/`no`) | dSpark off everywhere. It can only turn dSpark off, never on over Off. |
 | `VMLX_DSV41_DSPARK_STATS=1` | one `[dSpark]` NSLog line per request: steps, spec/AR steps, drafted/accepted, acceptance, full accepts, commit forwards, mean emit, ms/token spec and AR (measured and governor EMA), draft/verify/commit ms, tok/s. A skipped request logs `[dSpark] off for this request: <reason>`. |
-| `VMLX_DSV41_DSPARK_PREFILL_STEP=<n>` | prefill outer chunk while the head is resident (default 1024; `DSV4_PREFILL_OUTER_CHUNK` still wins) |
+| `VMLX_DSV41_DSPARK_PREFILL_STEP=<n>` | prefill chunk cap while the head is resident (default 1024; it also caps a wider server or tuned prefill step; `DSV4_PREFILL_OUTER_CHUNK` still wins) |
+| `VMLX_DSV41_DSPARK_SAMPLED=0` (`off`/`false`/`no`) | sampled requests (temperature > 0) decode AR and do not load the head. Default: sampled dSpark on. |
+
+The full list of V4.1 flags is in [Environment flags](#environment-flags-every-flag-the-v41-path-reads).
 
 ### CPU tests (`MLXLMCommonFocusedTests`)
 
 - `DSparkSpeculationFocusedTests`:
   - greedy identity against AR on a synthetic attention target (partial acceptance refed and committed in place, zero and full acceptance), with caches equal to AR's;
+  - sampled identity against position-keyed AR (partial, zero and full acceptance, filters, in-place
+    commits, coupled drafting); an AR step's sample equals the verify row's pick for the same
+    position; through `TokenIterator` a fixed seed gives the position-keyed samples with AR and
+    speculative steps mixed;
   - restore after the rotating window wrapped;
-  - stop-token and budget cuts;
+  - stop-token and budget cuts, and through `TokenIterator` a stop token leaves the cache at the
+    returned tokens so the post-answer key aligns;
   - the governor under a synthetic clock (port of `dsv41_dspark_governor_test.py`);
   - the hidden tail;
   - `TokenIterator` end to end.
@@ -358,11 +416,12 @@ verify readback is one sync. The windows project only the new rows.
   - incremental window sync equals one-shot sync;
   - the Markov chain;
   - the strategy and model gates for 0731 and V4.1;
-  - native-MTP cold start off.
+  - native-MTP cold start off;
+  - prefill chunking with the head resident: the 1024 cap wins over a wider caller step.
 
 ### GPU verification checklist (lead; one model load at a time)
 
-1. Load V4.1 in Osaurus with defaults and run one greedy (temperature 0) request. The log shows
+1. Load V4.1 in Osaurus with defaults and run one request (greedy or sampled). The log shows
    `VMLX DSV4.1 dSpark head attached ... 3 stages, block 5, targets [37, 38, 39]` once (a few
    seconds). phys_footprint is about 206 GB (backbone plus 8.9 GB).
 2. With `VMLX_DSV41_DSPARK_STATS=1`, a thinking-off code prompt of about 300 tokens should give
@@ -380,11 +439,15 @@ verify readback is one sync. The windows project only the new rows.
    a restart), `[dSpark]` acceptance on turn 2 is in the same range as turn 1 (full window from the
    persisted tail), the output matches a cold run up to near-ties, and the n-gram history-missing
    log never appears.
-7. Sampled request (temperature > 0): `[dSpark] off for this request: sampled decoding`, decode
-   unchanged. With the default sampler, check whether Osaurus sends a reasoning-budget or penalty
-   processor on V4.1 turns. If it does, dSpark stays off for those turns (see the log reason).
+7. Sampled request (temperature > 0): the `[dSpark]` stats line starts with `sampled`, and decode
+   is at or above AR (the governor falls back to AR when speculation does not pay). The same request with a fixed `seed`, sent
+   twice, returns the same text. With `VMLX_DSV41_DSPARK_SAMPLED=0` the log shows `[dSpark] off for
+   this request: sampled decoding with VMLX_DSV41_DSPARK_SAMPLED=0`, and a fresh load whose first
+   request is sampled does not attach the head. With the default sampler, check whether Osaurus
+   sends a reasoning-budget or penalty processor on V4.1 turns. If it does, dSpark stays off for
+   those turns (see the log reason).
 8. Cold prefill of a 12k-token prompt with the head resident is about 700 pp/s (1024 chunks), not
-   about 545.
+   about 545, also with a 2048 or 4096 prefill step set in Osaurus.
 9. Long output (2k+ tokens): tok/s does not fall off over the run, and the `ms/tok ar` estimate grows
    only with context.
 
@@ -456,7 +519,7 @@ images in the request. Without them nothing changes:
 - **DSV4-0731**: never decodes `vision_config`, never builds a tower or `bias_vl`, and sanitize
   drops the vision tensors as before.
 - **Text-only V4.1** (no images, or every image inside a restored prefix): takes the unchanged
-  text prefill (`prefillOuterStep` is an extraction of the old code).
+  text prefill (`prefillChunking` is shared by both prefills).
 - **Text-only construction**: `VMLX_DSV41_VL=0`, a caller that requests modalities without
   `.vision`, and the JANGTQ variant all build no tower. Images are then ignored, as before.
 - **Modalities**: `DeepseekV4Model` reports `[.text, .vision]` through `ModalityBearing` only
@@ -472,9 +535,9 @@ images in the request. Without them nothing changes:
 - The bundle needs no processor file. `VLMDetection.isVLM(modelType: "deepseek_v41")` follows the
   same runtime check.
 - `VMLX_DSV41_VL=0` turns the evidence off too, so the text-only construction is admitted.
-- Under the current vMLX pin (`264f6c4c`) the check is false, so V4.1 stays text-only instead of
-  being refused at load ("loaded runtime has no vision tower"). Bump the pin to a vMLX revision
-  containing this branch to turn images on.
+- Osaurus main pins vMLX `085c1c57`, which contains this branch, so the check passes and a V4.1
+  bundle with its vision tower accepts images. (Under the older pin `264f6c4c` the check was false
+  and V4.1 stayed text-only instead of being refused at load.)
 - Image parts already reach the VL path through `mapOpenAIChatToMLX`:
   - each `Chat.Message` keeps its own images and `contentParts`;
   - `validateRuntimePolicy` and the composer read the same evidence.
@@ -538,7 +601,7 @@ images in the request. Without them nothing changes:
 
 ### GPU verification checklist (lead; one model load at a time)
 
-Load V4.1 in Osaurus once the vMLX pin includes this branch, with `VMLX_DSV41_VL_LOG=1`,
+Load V4.1 in Osaurus (main's vMLX pin `085c1c57` includes this branch), with `VMLX_DSV41_VL_LOG=1`,
 `VMLX_CACHE_FETCH_TRACE=1` and `VMLX_DSV41_DSPARK_STATS=1`. Use temperature 0 and thinking off
 (chat rail) for fast answers.
 
@@ -569,3 +632,34 @@ Load V4.1 in Osaurus once the vMLX pin includes this branch, with `VMLX_DSV41_VL
    stats in the same range). 0731 is unchanged.
 8. `VMLX_DSV41_VL=0` (set for the Osaurus process): V4.1 loads text-only with no tower error,
    and the picker shows no image input. Osaurus reads the same switch.
+
+## Environment flags (every flag the V4.1 path reads)
+
+None is needed in production: every default below is the shipped behavior. Switches marked "A/B"
+exist to compare against the stock path.
+
+| variable | default | effect |
+|---|---|---|
+| `VMLX_DSV41_DSPARK` | unset (dSpark on when the strategy resolves) | `0`/`off`/`false`/`no` turns dSpark off for every request. It can only turn it off, never on over Speculative Decoding Off. |
+| `VMLX_DSV41_DSPARK_STATS` | off | `1`: one `[dSpark]` NSLog line per request (steps, spec/AR, acceptance, ms/token, governor estimates), or `[dSpark] off for this request: <reason>`. |
+| `VMLX_DSV41_DSPARK_PREFILL_STEP` | 1024 | Prefill chunk cap while the dSpark head is resident; it also caps a wider server or tuned prefill step. |
+| `VMLX_DSV41_DSPARK_SAMPLED` | on | `0`/`off`/`false`/`no`: sampled requests decode AR and do not load the head. Greedy requests are unaffected. |
+| `VMLX_DSV41_VL` | on | `0`/`false`/`off`/`no`: build a vision-config bundle text-only (no tower, no `bias_vl`); request images are ignored, and Osaurus stops offering image input. |
+| `VMLX_DSV41_VL_LOG` | off | `1`: NSLog the image preprocess summary and one line per image prefill chunk. |
+| `VMLX_DSV41_KVBYTES` | off | `1`: NSLog total cache bytes, bytes per token and pool bits after each prepare. |
+| `VMLX_DSV41_SUFFIX_PRUNE` | on | `0`/`false`/`off`/`no`: every prompt row through every layer (A/B for prompt-suffix pruning). |
+| `VMLX_DSV41_FUSED_INDEX` | on | `0`/`false`/`off`/`no`: stock bf16 indexer scoring in prefill instead of the fused `sum_h w * relu(q . k)` kernel (A/B). |
+| `VMLX_DSV41_INDEX_MPP` | on | `0`/`false`/`off`/`no`: the fused index scorer stays on the fp32 simdgroup kernel instead of the M5 matrix-unit (bf16 operand) kernel. Without matrix units the fp32 kernel runs anyway. |
+| `VMLX_DSV41_ROUTER_KERNEL` | on | `0`/`false`/`off`/`no`: stock fp32 cast + matmul for the router logits instead of the bf16 GEMV kernel (A/B). |
+| `VMLX_DSV41_FUSED_MOE` | on | `0`/`false`/`off`/`no`: stock MoE graph instead of the 2-dispatch fused routed + shared MoE (A/B). |
+| `VMLX_DSV41_FUSED_MOE_MAX_ROWS` | 6 | Largest row block (1–8) the fused MoE serves; larger verify blocks take the stock graph. |
+| `VMLX_DSV41_HC_STAGE` | on | `0`/`false`/`off`/`no`: stock staggered-mHC graph instead of the 2-dispatch hc stage (A/B). |
+| `VMLX_DSV41_LAYER_SUBMIT` | on | `0`/`false`/`off`/`no`: one eval at the end of each decode / verify token instead of submitting each layer as it is built (forwards of up to 16 rows). |
+| `VMLX_DSV41_ENGRAM_DIR` | unset | Diagnostic override: a directory holding `engram_aux.safetensors` and `engram/`. Unset, the tables come from the bundle (`runtime.engram_dir`, default `engram`). |
+| `VMLX_FP8_ROWS_QMV` | on | `0`/`false`/`off`/`no`: stock `quantizedMM` for 3–7-row mxfp8 projections (JANGHT bundles) instead of the multi-row QMV kernel. |
+
+The `VMLX_DSV4_*` / `DSV4_*` flags are the DSV4-0731 (V4.0) runtime's diagnostics and are V4.0-only
+for tuning purposes (see `docs/DSV4_ENCODER_CACHE_AUDIT_2026_08_02.md` and
+`docs/DSV4_TOOL_TURN_PREFILL_2026_08_02.md`); the shared-path ones this doc mentions
+(`DSV4_PREFILL_OUTER_CHUNK`, `DSV4_ATTN_SUBCHUNK`, `DSV4_LAYERWISE_PREFILL`, `DSV4_KV_MODE`) are A/B
+switches only.

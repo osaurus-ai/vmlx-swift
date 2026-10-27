@@ -2616,9 +2616,15 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     /// A dSpark step commits whole blocks (cut at stop tokens and the budget), so the cache can only
-    /// run ahead of the returned tokens when the consumer stops early (a stop string, a cancel).
-    /// Trim that back where the trim is exact; a DSV4 pool cache cannot trim exactly, and the
-    /// post-answer store then refuses the offset/key mismatch instead of storing it.
+    /// run ahead of the returned tokens when the consumer stops early (a stop string, a tool
+    /// dispatch, a cancel). Trim that back where the trim is exact. A DSV4 pool cache cannot trim
+    /// exactly, and loses nothing by it: the generate loop stores the post-answer boundary only for
+    /// a stop-token `.stop` (stop strings, tool dispatch and cancels skip that store on every decode
+    /// path, AR included), and a block is cut at the stop token, so on that path the cache ends
+    /// exactly where AR's does. Anything else that leaves the cache ahead (the loop's
+    /// unknown-token stop, which is not in `stopTokenIDs`) gives a key the store's offset guard
+    /// refuses: one re-prefill, never a mislabelled entry. The prompt boundaries are snapshots taken
+    /// during prefill and are not affected.
     private mutating func finishDSpark() {
         guard dspark != nil, !dsparkFinished else { return }
         dsparkFinished = true
@@ -3299,7 +3305,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             return y
         }
 
-        let y = sampler.sample(logits: logits)
+        let y: MLXArray
+        if let sampling = dspark?.sampling, !dsparkFinished {
+            // Sampled dSpark: an AR step draws with the same position-keyed noise a verify row of
+            // this position would, so a fixed seed gives the same tokens however the wall-clock
+            // governor split the run into speculative and AR steps. The token sampled here takes
+            // the position the cache offset now names (the forwarded token sits just before it).
+            y = sampling.sample(logits, position: cache.map(\.offset).max() ?? 0)
+        } else {
+            y = sampler.sample(logits: logits)
+        }
         if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
         return y
     }
