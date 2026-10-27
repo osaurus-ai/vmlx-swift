@@ -7,7 +7,8 @@
 //     always wrong, or always right, and leaves the cache exactly where AR leaves it;
 //   - in-place checkpoints: restore puts the same cache objects back, including after the rotating
 //     window wrapped (no longer trimmable) and after in-place single-token writes;
-//   - stop tokens and the token budget cut a block, so the cache never runs ahead of the output;
+//   - stop tokens and the token budget cut a block, so the cache never runs ahead of the output
+//     (also through `TokenIterator`, where the post-answer boundary key then aligns);
 //   - the wall-clock governor under a synthetic clock (port of the Python
 //     `dsv41_dspark_governor_test.py`): zero acceptance stays within a few percent of AR, a slow
 //     partially-accepting draft falls back, high acceptance beats AR, acceptance returning
@@ -559,6 +560,43 @@ struct DSparkSpeculationFocusedTests {
                 forward: { target.forward($0, cache: cache2) }, argmaxLast: target.argmaxLast)
             #expect(out2 == Array(ar.prefix(7)))
             #expect(cache2.allSatisfy { $0.offset == prompt.count + 7 })
+        }
+    }
+
+    @Test("TokenIterator: a stop token ends a dSpark run with the cache at the returned tokens, so the post-answer key aligns")
+    func tokenIteratorStopTokenKeepsPostAnswerBoundary() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let prompt = [3, 1, 4, 1, 5, 9, 2]
+            let model = DSparkToyLanguageModel(good: { _ in 5 })
+            let ar = model.target.greedy(prompt: prompt, count: 48).tokens
+            for (i, t) in ar.enumerated() { model.reference[prompt.count + i] = t }
+            // A stop token that first occurs inside the run (not as its first token): an always-right
+            // draft proposes past it, so the block holding it is cut there.
+            let stopIndex = try #require((3 ..< 40).first { i in !ar[..<i].contains(ar[i]) })
+            let stop = ar[stopIndex]
+            var params = GenerateParameters(maxTokens: 40, temperature: 0)
+            params.draftStrategy = .dspark(drafterPath: URL(fileURLWithPath: "/nonexistent/dspark"))
+            var it = try TokenIterator(
+                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: model,
+                parameters: params, stopTokenIDs: [stop])
+            // The generate loop: return tokens until the stop token, which it does not keep.
+            var returned: [Int] = []
+            while let t = it.next() {
+                returned.append(t)
+                if t == stop { break }
+            }
+            let generated = Array(returned.dropLast())
+            it.finalizeGenerationStats(generatedTokenIds: generated)
+            #expect(returned == Array(ar.prefix(stopIndex + 1)))
+            #expect(try #require(it.dsparkGenerationStats).specSteps > 0)
+            // The only stop that stores a post-answer boundary: the cache holds exactly the prompt and
+            // every returned token (the stop token included), as after AR, so the key is exact.
+            let offsets = cacheBoundaryLeafOffsets(it.cache)
+            #expect(offsets.allSatisfy { $0 == prompt.count + returned.count })
+            #expect(
+                TokenIterator.generatedBoundaryTokensAligned(
+                    promptTokenIds: prompt, generatedTokenIds: generated, cacheOffsets: offsets,
+                    pendingDrainedTokenId: stop) == prompt + returned)
         }
     }
 
