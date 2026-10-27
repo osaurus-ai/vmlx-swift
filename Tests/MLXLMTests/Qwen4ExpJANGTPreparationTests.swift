@@ -197,15 +197,42 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data).processorClass,
                        "Qwen3VLProcessor")
         XCTAssertNoThrow(try JSONDecoder.json5().decode(Qwen3VLProcessorConfiguration.self, from: data))
-        // A vision bundle, another family, or any processor file on disk: never synthesized.
+        // A vision bundle with no processor file is loaded text-only (its vision_config is dropped before
+        // construction, below), so it gets the same processor, whose values reach no tower.
         root["vision_config"] = ["model_type": "qwen3_vl"]
-        XCTAssertNil(Qwen4ExpTextOnlyBundle.processorConfiguration(
-            modelDirectory: directory, configData: try JSONSerialization.data(withJSONObject: root)))
+        let vision = try JSONSerialization.data(withJSONObject: root)
+        XCTAssertNotNil(Qwen4ExpTextOnlyBundle.processorConfiguration(modelDirectory: directory, configData: vision))
+        // Another family, or any processor file on disk: never synthesized.
         XCTAssertNil(Qwen4ExpTextOnlyBundle.processorConfiguration(
             modelDirectory: directory,
             configData: try JSONSerialization.data(withJSONObject: ["model_type": "qwen3_5"])))
         try Data("{}".utf8).write(to: directory.appendingPathComponent("preprocessor_config.json"))
         XCTAssertNil(Qwen4ExpTextOnlyBundle.processorConfiguration(modelDirectory: directory, configData: textOnly))
+        XCTAssertNil(Qwen4ExpTextOnlyBundle.processorConfiguration(modelDirectory: directory, configData: vision))
+    }
+
+    /// ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit ships a vision tower but no processor file. Its image
+    /// geometry is then undeclared, so the bundle is constructed text-only rather than given vendor values.
+    func testVisionBundleWithoutProcessorFileIsConstructedTextOnly() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q38t-vis-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var root = f.configuration()
+        root["vision_config"] = ["model_type": "qwen3_vl", "patch_size": 16]
+        let vision = try JSONSerialization.data(withJSONObject: root)
+
+        let scrubbed = Qwen4ExpTextOnlyBundle.textOnlyConfiguration(vision, modelDirectory: directory)
+        var expected = root
+        expected.removeValue(forKey: "vision_config")
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: scrubbed) as? NSDictionary, expected as NSDictionary)
+
+        // Untouched, byte for byte: another family, a text-only bundle, and a bundle that ships its processor.
+        let other = try JSONSerialization.data(withJSONObject: ["model_type": "qwen3_5", "vision_config": [:]])
+        XCTAssertEqual(Qwen4ExpTextOnlyBundle.textOnlyConfiguration(other, modelDirectory: directory), other)
+        let textOnly = try JSONSerialization.data(withJSONObject: f.configuration())
+        XCTAssertEqual(Qwen4ExpTextOnlyBundle.textOnlyConfiguration(textOnly, modelDirectory: directory), textOnly)
+        try Data("{}".utf8).write(to: directory.appendingPathComponent("preprocessor_config.json"))
+        XCTAssertEqual(Qwen4ExpTextOnlyBundle.textOnlyConfiguration(vision, modelDirectory: directory), vision)
     }
 
     // MARK: - the factory route Osaurus uses (VLMModelFactory, routed loader)
@@ -274,6 +301,29 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
             XCTAssertGreaterThan(values.lazy.filter { $0 != 0 }.count, values.count / 2, "logits must be live")
             // Media is refused by a model that carries no tower (never silently dropped).
             XCTAssertFalse(model.modalities.contains(.vision))
+        }
+    }
+
+    /// The same route for a bundle that declares a vision tower but ships no processor file: constructed text-only.
+    func testVisionBundleWithoutProcessorFileLoadsTextOnlyThroughTheRoutedFactory() async throws {
+        let f = Q38TFixture()
+        try await MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q38t-vis-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try Device.withDefaultDevice(.cpu) { try f.fullBundle(directory) }
+            let configURL = directory.appendingPathComponent("config.json")
+            var root = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any])
+            root["vision_config"] = [
+                "model_type": "qwen3_vl", "depth": 2, "hidden_size": 64, "out_hidden_size": 64,
+                "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2,
+            ]
+            try JSONSerialization.data(withJSONObject: root).write(to: configURL)
+
+            let context = try await loadModel(from: directory, using: FixtureTokenizerLoader())
+            let model = try XCTUnwrap(context.model as? Qwen4Exp, "qwen4_exp must be constructed by the VLM factory")
+            XCTAssertEqual(model.modalities, [.text])
+            XCTAssertNil(model.namedModules().first { $0.0.hasPrefix("visual") })
         }
     }
 }

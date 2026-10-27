@@ -9,17 +9,24 @@ import Foundation
 /// processor class the family uses, with the Qwen3.8 vendor image geometry (patch 16, merge 2, temporal 2, mean/std
 /// 0.5). Those image values are never applied to a model: `Qwen4ExpConfiguration` without `vision_config` constructs
 /// no vision tower, its modalities are `[.text]`, and `Qwen4Exp.prepare` refuses image or video input.
+///
+/// A bundle that declares a vision tower but ships no processor file (ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit)
+/// is made text-only first, by ``textOnlyConfiguration(_:modelDirectory:)``: its image geometry is undeclared, and
+/// filling it in from the vendor would apply values the bundle never stated.
 enum Qwen4ExpTextOnlyBundle {
-    /// The synthesized processor configuration, or nil when the bundle is not a text-only qwen4_exp bundle (any
-    /// processor file present, another model type, or a `vision_config`).
+    /// True when the bundle ships none of the processor files the VLM factory reads.
+    static func shipsNoProcessorFile(_ modelDirectory: URL) -> Bool {
+        ["preprocessor_config.json", "processor_config.json", "audio_preprocessor/preprocessor_config.json"]
+            .allSatisfy { !FileManager.default.fileExists(atPath: modelDirectory.appending(path: $0).path) }
+    }
+
+    /// The synthesized processor configuration, or nil when the bundle ships a processor file or is another model
+    /// type. A bundle with a `vision_config` gets it too, because it is constructed without that config.
     static func processorConfiguration(modelDirectory: URL, configData: Data?) -> Data? {
-        for name in ["preprocessor_config.json", "processor_config.json", "audio_preprocessor/preprocessor_config.json"] {
-            if FileManager.default.fileExists(atPath: modelDirectory.appending(path: name).path) { return nil }
-        }
-        guard let configData,
+        guard shipsNoProcessorFile(modelDirectory),
+              let configData,
               let root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
-              root["model_type"] as? String == "qwen4_exp",
-              root["vision_config"] == nil || root["vision_config"] is NSNull
+              root["model_type"] as? String == "qwen4_exp"
         else { return nil }
         let synthesized: [String: Any] = [
             "processor_class": "Qwen3VLProcessor",
@@ -29,5 +36,22 @@ enum Qwen4ExpTextOnlyBundle {
             "size": ["longest_edge": 16_777_216, "shortest_edge": 65_536],
         ]
         return try? JSONSerialization.data(withJSONObject: synthesized, options: [.sortedKeys])
+    }
+
+    /// The configuration to construct from: without `vision_config` when a qwen4_exp bundle declares a vision tower
+    /// but ships no processor file, so no tower is built, sanitize drops the `visual.*` weights and `prepare` refuses
+    /// media. Any other configuration is returned unchanged, byte for byte.
+    static func textOnlyConfiguration(_ configData: Data, modelDirectory: URL) -> Data {
+        guard shipsNoProcessorFile(modelDirectory),
+              var root = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+              root["model_type"] as? String == "qwen4_exp",
+              let vision = root["vision_config"], !(vision is NSNull)
+        else { return configData }
+        root.removeValue(forKey: "vision_config")
+        guard let scrubbed = try? JSONSerialization.data(withJSONObject: root) else { return configData }
+        FileHandle.standardError.write(Data(
+            ("[Qwen4Exp] \(modelDirectory.lastPathComponent) declares a vision tower but ships no "
+                + "preprocessor_config.json: loaded text-only, image and video input refused\n").utf8))
+        return scrubbed
     }
 }
