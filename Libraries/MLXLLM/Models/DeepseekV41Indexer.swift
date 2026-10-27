@@ -97,6 +97,15 @@ final class DSV41IndexKeyBox {
     var rows: [MLXArray] = []
 }
 
+/// Prefill segments longer than one query chunk evaluate each chunk's top-k (and candidate blocks) before the next
+/// chunk is built (Python `INDEX_CHUNK_EVAL`, jangq #32: 1M prefill at 1024-token chunks, 786k-1M transient median
+/// 8.4 -> 6.2 GiB, max 11.6 -> 8.3 GiB, ~5 % faster). Same arithmetic. `VMLX_DSV41_INDEX_CHUNK_EVAL=0` keeps the
+/// asynchronous hand-off.
+private let dsv41IndexChunkEval: Bool = {
+    let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_INDEX_CHUNK_EVAL"] ?? "1"
+    return !["0", "false", "off", "no"].contains(raw.trimmingCharacters(in: .whitespaces).lowercased())
+}()
+
 /// Pure selection math (CPU-testable; no module state).
 enum DeepseekV41IndexerMath {
     /// Query rows per scoring chunk (reference: `max(16, min(512, 2**26 // (h*T)))`).
@@ -355,7 +364,13 @@ final class DeepseekV41Indexer: Module {
                 sc = MLX.where(candidates[c ..< e], sc, MLXArray(-Float.infinity))
             }
             idxParts.append(DeepseekV41IndexerMath.topK(sc, k: min(topK, rows)))
-            if e < L { asyncEval(idxParts.last!) }
+            if e < L {
+                if dsv41IndexChunkEval {
+                    eval([idxParts.last!] + (isCandidateSource ? [candParts.last!] : []))
+                } else {
+                    asyncEval(idxParts.last!)
+                }
+            }
             c = e
         }
         let idx = (idxParts.count == 1 ? idxParts[0] : concatenated(idxParts, axis: 0))
