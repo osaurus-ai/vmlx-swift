@@ -830,14 +830,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     let diskRestored = MLXCacheIOLock.withSerializedMLXCacheIO {
                         () -> Int in
                         let count = restoreFromDiskArrays(
-                                    diskArrays, into: &self.cache, requirePromptBoundary: true)
+                            diskArrays, into: &self.cache, requirePromptBoundary: true)
                         if count > 0 {
                             let cacheHasArraysState = self.cache.contains {
                                 String(describing: type(of: $0)).contains("Arrays")
                             }
                             if let ssm = ssmStates,
-                               TQDiskSerializer.formatVersion(of: diskArrays) < 2
-                                || cacheHasArraysState
+                                TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                                    || cacheHasArraysState
                             {
                                 restoreSSMStates(
                                     ssm, into: self.cache, boundary: matchedTokens)
@@ -991,9 +991,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             detail: promptCacheSnapshot == nil ? "native-mtp none" : "native-mtp retained")
 
         let firstToken: MLXArray
-        prefillProgressHandler?(PrefillProgress(
-            stage: .prefill, completedUnitCount: Swift.max(restoredCount, self.promptTokenIds.count - 1),
-            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-seed"))
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill,
+                completedUnitCount: Swift.max(restoredCount, self.promptTokenIds.count - 1),
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-seed"))
         switch prepared {
         case .tokens(let tokens):
             processor?.prompt(input.text.tokens)
@@ -1053,9 +1055,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         pendingTokens.append(firstID)
         if let primer {
-            prefillProgressHandler?(PrefillProgress(
-                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
-                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-head-prime"))
+            prefillProgressHandler?(
+                PrefillProgress(
+                    stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                    totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-head-prime"))
             let primeStart = NativeMTPClock.now()
             primer.finish(firstToken: firstToken)
             promptPrimedRows = primer.foldedRows
@@ -1066,9 +1069,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let bridgeStart = NativeMTPClock.now()
-        prefillProgressHandler?(PrefillProgress(
-            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
-            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-bridge"))
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-bridge"))
         try Task.checkCancellation()
         let bridge = model.nativeBackboneForward(Self.tokenInput(firstToken), cache: self.cache)
         let secondToken = Self.sampleLast(
@@ -1087,9 +1091,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
         let draftStart = NativeMTPClock.now()
-        prefillProgressHandler?(PrefillProgress(
-            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
-            totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-initial-drafts"))
+        prefillProgressHandler?(
+            PrefillProgress(
+                stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+                totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-initial-drafts"))
         try Task.checkCancellation()
         let draftBatch = Self.makeDrafts(
             model: model,
