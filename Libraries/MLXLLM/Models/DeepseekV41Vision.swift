@@ -114,7 +114,8 @@ public struct DeepseekV41VisionConfiguration: Codable, Sendable, Equatable {
     }
 
     /// `VMLX_DSV41_VL=0|false|off|no` builds a vision-config V4.1 bundle text-only (no tower, no
-    /// `bias_vl`, images refused by the processor). Any other value, or unset, keeps the tower.
+    /// `bias_vl`; the processor then ignores request images and renders the text alone, and hosts
+    /// read the same switch to stop offering image input). Any other value, or unset, keeps the tower.
     /// Same switch as the Python engine.
     public static func enabled(
         environment env: [String: String] = ProcessInfo.processInfo.environment

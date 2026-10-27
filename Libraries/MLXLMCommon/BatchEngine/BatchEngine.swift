@@ -538,8 +538,8 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
         if parameters.draftStrategy?.usesDSpark == true {
-            // dSpark is a speed-only strategy (greedy-exact) whose cycle owns the target cache; a
-            // shared batched slot decodes the same tokens autoregressively.
+            // dSpark is a speed-only strategy (exact for greedy and sampled requests) whose cycle owns
+            // the target cache; a shared batched slot decodes the request autoregressively instead.
             parameters.draftStrategy = nil
         }
 
