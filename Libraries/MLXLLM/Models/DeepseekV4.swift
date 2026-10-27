@@ -2086,8 +2086,10 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     /// attention sinks and the router biases in F32, which the reference computes with in F32 (the mixes
     /// projection, the routing scores the expert top-k reads). The loader's generic bf16 materialisation
     /// would round them (and the fused hc stage only admits F32 hc parameters), so every V4.1 bundle keeps
-    /// every tensor as stored: JANGHT, and affine bundles with per-expert routed shards (JANG_2K), which
-    /// unlike the prestacked affine layout were not exempt. Their other float tensors are BF16 already.
+    /// every tensor as stored (the prestacked-affine preserve path in Load.swift covers `deepseek_v4` only).
+    /// Checked on every V4.1 bundle so far (JANGHT, JANG-Q2Q3-IMATRIX with per-expert routed shards,
+    /// JANG-Q2Q3-RTN prestacked): scales / biases / dense weights are BF16 and F32 is only these control
+    /// tensors (+ the draft's mtp.* copies), so nothing else changes dtype and no F16 scale reaches decode.
     public var preservesCheckpointParameterDTypes: Bool { config.isDeepseekV41 }
 
     public convenience init(_ config: DeepseekV4Configuration) {
