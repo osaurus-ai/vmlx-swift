@@ -104,4 +104,46 @@ struct LFM3VLTests {
         #expect(text.contains("OSAURUS 42"), "answer must read the text in the image")
         #expect(prefix >= min(refGreedy.count, 12), "greedy diverged at \(prefix)")
     }
+
+    /// `LFM3_VL_BUNDLE` + `LFM3_VL_VIDEO`: a 4 s clip of a red square moving left to right past
+    /// a fixed blue circle. Not reference-exact (frame sampling is the shared vMLX sampler):
+    /// checks the per-group token structure and that the answer reads the motion.
+    @Test func releasedBundleReadsVideo() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let bundle = env["LFM3_VL_BUNDLE"], let videoPath = env["LFM3_VL_VIDEO"] else { return }
+        let context = try await VLMModelFactory.shared.load(
+            from: URL(fileURLWithPath: bundle), using: #huggingFaceTokenizerLoader())
+        let input = UserInput(
+            chat: [
+                .user(
+                    "In which direction does the red square move: left to right, or right to left? Answer in one sentence.",
+                    videos: [.url(URL(fileURLWithPath: videoPath))])
+            ],
+            additionalContext: ["enable_thinking": false])
+        let prepared = try await context.processor.prepare(input: input)
+        let grid = try #require(prepared.video?.frames?.first)
+        let ids = prepared.text.tokens.reshaped(-1).asArray(Int.self)
+        let videoId = try #require(context.tokenizer.convertTokenToId("<|video|>"))
+        let start = try #require(context.tokenizer.convertTokenToId("<|vision_start|>"))
+        // One inner vision_start per frame group, plus the template's outer one.
+        #expect(ids.filter { $0 == videoId }.count == grid.t * grid.h * grid.w / 4)
+        #expect(ids.filter { $0 == start }.count == grid.t + 1)
+        let rendered = context.tokenizer.decode(tokenIds: ids, skipSpecialTokens: false)
+        #expect(rendered.contains("<0.0 seconds>") || rendered.contains("<0.2 seconds>"), "timestamps")
+
+        var iterator = try TokenIterator(
+            input: prepared, model: context.model,
+            parameters: GenerateParameters(maxTokens: 40, temperature: 0))
+        var tokens: [Int] = []
+        while let token = iterator.next() {
+            if context.configuration.eosTokenIds.contains(token) { break }
+            tokens.append(token)
+        }
+        let answer = context.tokenizer.decode(tokenIds: tokens)
+        print("[LFM3-VL] video grid \(grid), \(ids.count) prompt tokens: \(answer)")
+        // The reversed clip (LFM3_VL_VIDEO_EXPECT="right to left") is the control: a model that
+        // ignored the frame order would give the same answer to both.
+        let expected = env["LFM3_VL_VIDEO_EXPECT"] ?? "left to right"
+        #expect(answer.lowercased().contains(expected), "motion answer: \(answer)")
+    }
 }
