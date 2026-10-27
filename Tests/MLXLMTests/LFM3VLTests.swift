@@ -27,6 +27,56 @@ struct LFM3VLTests {
         ])
     }
 
+    /// Expected sizes from the reference `_smart_resize_image` (factor 32, min 65536) at the
+    /// LFM3-VL (16777216) and LFM3-Omni (2097152) pixel budgets. 720 / 32 = 22.5 rounds to 22
+    /// (half to even), so a 1280x720 frame is 44x80 patches, not 46x80.
+    @Test func imageResizeMatchesTheReference() throws {
+        let cases: [((Int, Int), (Int, Int), (Int, Int))] = [
+            ((720, 1280), (704, 1280), (704, 1280)),
+            ((1280, 720), (1280, 704), (1280, 704)),
+            ((480, 640), (480, 640), (480, 640)),
+            ((10, 1000), (32, 2560), (32, 2560)),
+            ((31, 31), (256, 256), (256, 256)),
+            ((3000, 4000), (3008, 4000), (1248, 1664)),
+            ((80, 80), (256, 256), (256, 256)),
+            ((400, 336), (384, 320), (384, 320)),
+            ((1080, 1920), (1088, 1920), (1088, 1920)),
+            ((1, 50), (64, 1824), (64, 1824)),
+            ((5000, 5000), (4096, 4096), (1440, 1440)),
+        ]
+        for (size, vl, omni) in cases {
+            let a = try LFM3VLProcessor.imageTargetSize(
+                height: size.0, width: size.1, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
+            let b = try LFM3VLProcessor.imageTargetSize(
+                height: size.0, width: size.1, factor: 32, minPixels: 65536, maxPixels: 2_097_152)
+            #expect(a.0 == vl.0 && a.1 == vl.1, "VL \(size): \(a)")
+            #expect(b.0 == omni.0 && b.1 == omni.1, "Omni \(size): \(b)")
+        }
+        #expect(throws: (any Error).self) {
+            try LFM3VLProcessor.imageTargetSize(
+                height: 1, width: 300, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
+        }
+        // Control: the shared Qwen-VL helper rounds 22.5 up, which is why LFM3 carries its own.
+        let shared = try QwenVL.targetSize(
+            height: 720, width: 1280, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
+        #expect(shared.0 == 736, "shared helper now \(shared); if it rounds half-even, reuse it")
+    }
+
+    /// Expected sizes from the reference `Lfm3VlVideoProcessor._process_one` rule (min 4096,
+    /// max 25165824, temporal 2).
+    @Test func videoResizeMatchesTheReference() throws {
+        let cases: [((Int, Int, Int), (Int, Int))] = [
+            ((8, 480, 640), (480, 640)), ((11, 720, 1280), (704, 1280)),
+            ((768, 1080, 1920), (128, 224)), ((4, 20, 40), (32, 64)), ((9, 336, 400), (320, 384)),
+        ]
+        for (input, expected) in cases {
+            let out = try LFM3VLProcessor.videoTargetSize(
+                frames: input.0, height: input.1, width: input.2, temporal: 2, factor: 32,
+                minPixels: 4096, maxPixels: 25_165_824)
+            #expect(out.0 == expected.0 && out.1 == expected.1, "video \(input): \(out)")
+        }
+    }
+
     @Test func expansionReplacesOnlyTheInnerPlaceholderAndCarriesBoundaries() throws {
         // [bos, start, IMG, end, text, start, IMG, end, text]
         let tokens = [1, 8, 5, 9, 2, 8, 5, 9, 3]

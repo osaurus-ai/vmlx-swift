@@ -560,20 +560,75 @@ public struct LFM3VLProcessor: UserInputProcessor {
 
     private var factor: Int { config.patchSize * config.mergeSize }
 
-    /// The reference upscales anything thinner than one merge block instead of refusing it.
-    private func minimumExtent(_ h: Int, _ w: Int) -> (Int, Int) {
-        let shortest = min(h, w)
-        guard shortest < factor, shortest > 0 else { return (h, w) }
-        let scale = Double(factor) / Double(shortest)
-        return (Int(Double(h) * scale), Int(Double(w) * scale))
+    /// Python `round()`: half to even. Rounding x.5 up instead turns a 1280x720 image into a
+    /// 46x80 grid (920 tokens) where the reference builds 44x80 (880).
+    private static func pyRound(_ x: Double) -> Int { Int(x.rounded(.toNearestOrEven)) }
+
+    /// The reference image `smart_resize`, exactly: no minimum edge (a tiny image is scaled up
+    /// by the `min_pixels` branch), and the `max_pixels` branch never goes below one block.
+    static func imageTargetSize(
+        height: Int, width: Int, factor: Int, minPixels: Int, maxPixels: Int
+    ) throws -> (Int, Int) {
+        guard height > 0, width > 0,
+            Double(max(height, width)) / Double(min(height, width)) <= 200
+        else {
+            throw VLMError.imageProcessingFailure(
+                "LFM3-VL image aspect ratio must be at most 200: \(width) x \(height)")
+        }
+        let (h, w, f) = (Double(height), Double(width), Double(factor))
+        var hBar = pyRound(h / f) * factor
+        var wBar = pyRound(w / f) * factor
+        if hBar * wBar > maxPixels {
+            let beta = (h * w / Double(maxPixels)).squareRoot()
+            hBar = max(factor, Int((h / beta / f).rounded(.down)) * factor)
+            wBar = max(factor, Int((w / beta / f).rounded(.down)) * factor)
+        } else if hBar * wBar < minPixels {
+            let beta = (Double(minPixels) / (h * w)).squareRoot()
+            hBar = Int((h * beta / f).rounded(.up)) * factor
+            wBar = Int((w * beta / f).rounded(.up)) * factor
+        }
+        return (hBar, wBar)
+    }
+
+    /// The reference `Lfm3VlVideoProcessor` sizing: a short edge below one block is scaled up
+    /// first, the frame count is rounded to the temporal patch, and the pixel budget scales by
+    /// the true frame count.
+    static func videoTargetSize(
+        frames: Int, height: Int, width: Int, temporal: Int, factor: Int,
+        minPixels: Int, maxPixels: Int
+    ) throws -> (Int, Int) {
+        var (height, width) = (height, width)
+        if min(height, width) < factor, min(height, width) > 0 {
+            let scale = Double(factor) / Double(min(height, width))
+            (height, width) = (Int(Double(height) * scale), Int(Double(width) * scale))
+        }
+        guard height > 0, width > 0, frames > 0,
+            Double(max(height, width)) / Double(min(height, width)) <= 200
+        else {
+            throw VLMError.imageProcessingFailure(
+                "LFM3-VL video aspect ratio must be at most 200: \(width) x \(height)")
+        }
+        let (h, w, f, t) = (Double(height), Double(width), Double(factor), Double(frames))
+        var hBar = pyRound(h / f) * factor
+        var wBar = pyRound(w / f) * factor
+        let roundedT = pyRound(t / Double(temporal)) * temporal
+        if roundedT * hBar * wBar > maxPixels {
+            let beta = (t * h * w / Double(maxPixels)).squareRoot()
+            hBar = max(factor, Int((h / beta / f).rounded(.down)) * factor)
+            wBar = max(factor, Int((w / beta / f).rounded(.down)) * factor)
+        } else if roundedT * hBar * wBar < minPixels {
+            let beta = (Double(minPixels) / (t * h * w)).squareRoot()
+            hBar = Int((h * beta / f).rounded(.up)) * factor
+            wBar = Int((w * beta / f).rounded(.up)) * factor
+        }
+        return (hBar, wBar)
     }
 
     func patches(for image: CIImage, processing: UserInput.Processing?) throws -> (MLXArray, THW) {
         let source = MediaProcessing.apply(image, processing: processing)
         let (extentH, extentW) = try QwenVL.intExtent(source.extent.size)
-        let (h, w) = minimumExtent(extentH, extentW)
-        let (resizedH, resizedW) = try QwenVL.targetSize(
-            height: h, width: w, factor: factor,
+        let (resizedH, resizedW) = try Self.imageTargetSize(
+            height: extentH, width: extentW, factor: factor,
             minPixels: config.size.minPixels, maxPixels: config.size.maxPixels)
         let size = CGSize(width: resizedW, height: resizedH)
         let pixels = MediaProcessing.asMLXArrayUnmanaged(
@@ -666,8 +721,15 @@ public struct LFM3VLProcessor: UserInputProcessor {
             var grids: [THW] = []
             var replacements: [[Int]] = []
             for video in input.videos {
+                // The reference samples int(duration * fps) frames; the shared sampler rounds
+                // its estimate, so hand it the rate that rounds to the truncated count.
                 let sequence = try await MediaProcessing.asProcessedVideoFrames(
-                    video, targetFPS: { _ in config.videoFPS },
+                    video,
+                    targetFPS: { duration in
+                        let seconds = duration.seconds
+                        guard seconds > 0 else { return config.videoFPS }
+                        return (config.videoFPS * seconds).rounded(.down) / seconds
+                    },
                     minFrames: config.videoMinFrames, maxFrames: config.videoMaxFrames
                 ) { frame in
                     VideoFrame(
@@ -678,10 +740,9 @@ public struct LFM3VLProcessor: UserInputProcessor {
                     throw VLMError.imageProcessingFailure("No video frames were decoded")
                 }
                 let (extentH, extentW) = try QwenVL.intExtent(first.frame.extent.size)
-                let (h, w) = minimumExtent(extentH, extentW)
-                let (resizedH, resizedW) = try Qwen3VLProcessor.videoTargetSize(
-                    frameCount: sequence.frames.count, height: h, width: w,
-                    temporalFactor: config.temporalPatchSize, factor: factor,
+                let (resizedH, resizedW) = try Self.videoTargetSize(
+                    frames: sequence.frames.count, height: extentH, width: extentW,
+                    temporal: config.temporalPatchSize, factor: factor,
                     minPixels: config.videoMinPixels, maxPixels: config.videoMaxPixels)
                 let size = CGSize(width: resizedW, height: resizedH)
                 let frames = sequence.frames.map {
