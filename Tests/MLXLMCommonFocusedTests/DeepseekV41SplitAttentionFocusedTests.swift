@@ -15,7 +15,9 @@ struct DeepseekV41SplitAttentionFocusedTests {
     struct Case: CustomStringConvertible {
         let rows: Int, window: Int, picks: Int, poolRows: Int, offset: Int, ratio: Int, sink: Bool
         var allRows = false  // no indexer selection: every pool row (topK nil)
-        var description: String { "S\(rows) Lw\(window) K\(allRows ? "all" : "\(picks)") T\(poolRows) off\(offset) r\(ratio) sink\(sink)" }
+        var description: String {
+            "S\(rows) Lw\(window) K\(allRows ? "all" : "\(picks)") T\(poolRows) off\(offset) r\(ratio) sink\(sink)"
+        }
     }
 
     static let cases: [Case] = [
@@ -63,7 +65,7 @@ struct DeepseekV41SplitAttentionFocusedTests {
         #expect(diff > 0 || c.picks == 1)
     }
 
-    @Test("not admitted off-shape: 9 rows, non-bf16, no contiguous 4-bit slab")
+    @Test("not admitted off-shape: 9 rows, non-bf16, no contiguous 4-bit slab; production takes one row")
     func admission() {
         let c = Case(rows: 1, window: 16, picks: 8, poolRows: 32, offset: 64, ratio: 1, sink: true)
         let (q, local, pooled, topK, _) = Self.inputs(c, seed: 31)
@@ -73,6 +75,11 @@ struct DeepseekV41SplitAttentionFocusedTests {
             topK: MLX.concatenated(Array(repeating: topK!, count: 9), axis: 1)))
         #expect(!DeepseekV41SplitAttention.admitted(
             queries: q.asType(.float16), localKV: local, pooled: pooled, topK: topK))
+        // Production takes one decode row; verify-shaped calls keep the dense path.
+        let two = MLX.concatenated([q, q], axis: 2)
+        #expect(DeepseekV41SplitAttention.attend(
+            queries: two, localKV: local, pooled: pooled, topK: MLX.concatenated([topK!, topK!], axis: 1),
+            offset: 64, window: 128, ratio: 1, scale: 0.04, sinks: nil) == nil)
         let dense = DeepseekV4PoolView(dense: MLXRandom.normal([1, 32, 512]).asType(.bfloat16))
         #expect(!DeepseekV41SplitAttention.admitted(queries: q, localKV: local, pooled: dense, topK: topK))
     }

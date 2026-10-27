@@ -511,8 +511,8 @@ class DeepseekV4Attention: Module {
                         // during prefill: tiled online-softmax attention
                         // replaces SDPA entirely for this layer, so the
                         // pool is never materialized (Python mirror:
-                        // `_dsv4_tiled_pool_attention`). DeepSeek-V4.1 decode / dSpark verify rows over
-                        // the contiguous 4-bit pool take the split-by-keys kernels first
+                        // `_dsv4_tiled_pool_attention`). A DeepSeek-V4.1 decode row over the contiguous
+                        // 4-bit pool takes the split-by-keys kernels first
                         // (`VMLX_DSV41_ATTN_SPLIT`, default on; with no indexer selection yet, every
                         // visible pool row); nil keeps the path below.
                         if isV41,

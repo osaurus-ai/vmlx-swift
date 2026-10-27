@@ -1,7 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 //
-// DeepSeek-V4.1 sparse attention for decode and dSpark verify rows (<= 8), split by keys.
+// DeepSeek-V4.1 sparse attention for one decode row, split by keys.
 //
 // The stock path (`DeepseekV4Math.selectedPoolAttention`) gathers and dequantizes the indexer's picks from the
 // 4-bit pool, runs an online softmax over the sliding window, then two fp32 einsums over the picks: about a
@@ -28,8 +28,12 @@ enum DeepseekV41SplitAttention {
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
-    /// Decode and dSpark verify rows (reference `GATHER_MAX_QUERIES`).
-    static let maxRows = 8
+    /// Rows the kernels take in production: one decode row. The kernels handle up to `kernelMaxRows` (the tests
+    /// cover 1-6), but each row reloads its keys, and in the osaurus app on JANG_2K a 6-row dSpark verify ran
+    /// slower than the existing dense path (dSpark code 74.6 -> 69-71 tok/s) while a single row ran 11-12 % faster
+    /// (plain decode 44 -> 49-51 tok/s, dSpark prose 41.9 -> 47). Verify rows keep the dense path.
+    static let maxRows = 1
+    static let kernelMaxRows = 8
     /// Key chunks of 16 per (row, head): the window (<= 128 + verify rows) and the indexer's picks (<= 512).
     static let maxChunks = 48
 
@@ -152,15 +156,18 @@ enum DeepseekV41SplitAttention {
         header: header,
         ensureRowContiguous: true)
 
-    /// Local + pool attention for `S <= 8` rows, as `DeepseekV4Math.tiledPoolAttention`: q (1, H, S, D) bf16 (RoPE
+    /// Local + pool attention for one decode row, as `DeepseekV4Math.tiledPoolAttention`: q (1, H, S, D) bf16 (RoPE
     /// applied), localKV (1, 1, Lw, D) bf16, the pool as a contiguous 4-bit slab, topK (1, S, K) selected pool rows,
     /// or nil for every pool row (no indexer selection while the pool has at most `index_topk` rows). Returns
-    /// (1, H, S, D) in q's dtype, or nil when not admitted (the caller keeps the stock path).
+    /// (1, H, S, D) in q's dtype, or nil when not admitted (the caller keeps the stock path). `launch` itself takes
+    /// up to `kernelMaxRows` rows (tests).
     static func attend(
         queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray?,
         offset: Int, window: Int, ratio: Int, scale: Float, sinks: MLXArray?
     ) -> MLXArray? {
-        guard enabled, admitted(queries: q, localKV: localKV, pooled: pooled, topK: topK) else { return nil }
+        guard enabled, q.ndim == 4, q.dim(2) <= maxRows,
+            admitted(queries: q, localKV: localKV, pooled: pooled, topK: topK)
+        else { return nil }
         guard selfCheckPassed else { return nil }
         return launch(
             queries: q, localKV: localKV, pooled: pooled, topK: topK, offset: offset, window: window,
@@ -175,7 +182,7 @@ enum DeepseekV41SplitAttention {
             return false
         }
         let B = q.dim(0), H = q.dim(1), S = q.dim(2), D = q.dim(3)
-        guard B == 1, S >= 1, S <= maxRows, D == 512, H % 16 == 0, q.dtype == .bfloat16,
+        guard B == 1, S >= 1, S <= kernelMaxRows, D == 512, H % 16 == 0, q.dtype == .bfloat16,
             localKV.dtype == .bfloat16, localKV.dim(0) == 1, localKV.dim(3) == D,
             topK.map({ $0.dim(0) == 1 && $0.dim(1) == S }) ?? true,
             let slab = pooled.nibbleSlab, slab.dtype == .bfloat16, D % slab.groupSize == 0
