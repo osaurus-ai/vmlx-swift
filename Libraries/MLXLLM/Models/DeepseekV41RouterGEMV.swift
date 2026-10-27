@@ -25,7 +25,9 @@ enum DeepseekV41RouterGEMV {
     /// `VMLX_DSV41_ROUTER_KERNEL=0` (or false/off/no) keeps the stock fp32 cast + matmul. Read once;
     /// tests flip it to time and compare both paths in one process.
     nonisolated(unsafe) static var enabled: Bool = {
-        let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_ROUTER_KERNEL"] ?? "1"
+        let env = ProcessInfo.processInfo.environment
+        // VMLX_DSV41_ROUTER_GEMV is the Python runtime's name for the same switch.
+        let raw = env["VMLX_DSV41_ROUTER_KERNEL"] ?? env["VMLX_DSV41_ROUTER_GEMV"] ?? "1"
         return !["0", "false", "off", "no"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
