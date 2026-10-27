@@ -465,7 +465,8 @@ struct DSparkSpeculationFocusedTests {
             var once = parameters
             once.maxTokens = 1
             var firstIt = try TokenIterator(input: input, model: model, parameters: once)
-            let first = try #require(firstIt.next())
+            let firstToken = firstIt.next()
+            let first = try #require(firstToken)
 
             // Every later token: the position-keyed draw, one forward at a time.
             let target = model.target
