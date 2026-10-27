@@ -27,7 +27,8 @@ import MLXFast
 enum DeepseekV41MPPIndexScores {
     /// `VMLX_DSV41_INDEX_MPP=0` (or false/off/no) keeps the fp32 fused kernel for prefill.
     static func requested(_ environment: [String: String]) -> Bool {
-        let raw = environment["VMLX_DSV41_INDEX_MPP"] ?? "1"
+        // VMLX_DSV41_INDEX_BF16 is the Python runtime's name for the same switch (bf16 operands on the matrix units).
+        let raw = environment["VMLX_DSV41_INDEX_MPP"] ?? environment["VMLX_DSV41_INDEX_BF16"] ?? "1"
         return !["0", "false", "off", "no"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }

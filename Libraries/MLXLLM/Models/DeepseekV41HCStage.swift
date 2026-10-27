@@ -35,7 +35,9 @@ import MLXNN
 enum DeepseekV41HCStage {
     /// `VMLX_DSV41_HC_STAGE=0` (or false/off/no) keeps the stock staggered-mHC graph. Tests flip it.
     nonisolated(unsafe) static var enabled: Bool = {
-        let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_HC_STAGE"] ?? "1"
+        let env = ProcessInfo.processInfo.environment
+        // VMLX_DSV41_FUSED_HC is the Python runtime's name for the same switch.
+        let raw = env["VMLX_DSV41_HC_STAGE"] ?? env["VMLX_DSV41_FUSED_HC"] ?? "1"
         return !["0", "false", "off", "no"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
