@@ -992,7 +992,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let firstToken: MLXArray
         prefillProgressHandler?(PrefillProgress(
-            stage: .prefill, completedUnitCount: self.promptTokenIds.count,
+            stage: .prefill, completedUnitCount: Swift.max(restoredCount, self.promptTokenIds.count - 1),
             totalUnitCount: self.promptTokenIds.count, detail: "native-mtp-seed"))
         switch prepared {
         case .tokens(let tokens):

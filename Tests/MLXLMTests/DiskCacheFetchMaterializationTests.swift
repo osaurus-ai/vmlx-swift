@@ -111,4 +111,31 @@ struct DiskCacheFetchMaterializationTests {
             #expect(fetched.states[0].sum().item(Float.self) == 128)
         }
     }
+
+    @Test("a rejected payload does not replace the last served fetch sample")
+    func rejectedPayloadPreservesLastServedSample() async throws {
+        try await MLXMetalTestLock.withLock {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vmlx-disk-fetch-rejected-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let modelKey = "disk-fetch-rejected"
+            let goodTokens = [1, 2, 3]
+            let badTokens = [4, 5, 6]
+            let cache = DiskCache(cacheDir: dir, maxSizeGB: 0.1, modelKey: modelKey)
+            cache.store(tokens: goodTokens, arrays: ["state": MLXArray.ones([8])])
+            cache.store(tokens: badTokens, arrays: ["state": MLXArray.ones([16])])
+            #expect(cache.waitForPendingPayloadRelease())
+            #expect(cache.fetch(tokens: goodTokens) != nil)
+            let accepted = cache.snapshotStats()
+            let hash = DiskCache.hashTokens(badTokens, modelKey: modelKey, mediaSalt: nil)
+            try MLX.save(
+                arrays: ["state": MLXArray([Float.infinity] + Array(repeating: Float(0), count: 15))],
+                url: dir.appendingPathComponent("\(hash).safetensors"))
+            #expect(cache.fetch(tokens: badTokens) == nil)
+            #expect(cache.refusedNonFiniteFetches == 1)
+            let rejected = cache.snapshotStats()
+            #expect(rejected.lastFetchPayloadBytes == accepted.lastFetchPayloadBytes)
+            #expect(rejected.lastFetchMs == accepted.lastFetchMs)
+        }
+    }
 }
