@@ -352,6 +352,25 @@ public enum VLMProcessorTypeRegistry {
     #endif
 }
 
+#if !(canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate))
+    /// The processor `VLMModelFactory` installs on a platform without Apple's media frameworks, for a
+    /// processor type that the registry does not know. It refuses every input, text-only included,
+    /// so that no prompt is ever built differently from what the bundle's own processor builds.
+    struct PreparedInputRequiredProcessor: UserInputProcessor {
+        let processorType: String
+
+        static func message(_ processorType: String) -> String {
+            "\(processorType) needs Apple's media frameworks (CoreImage, AVFoundation, Accelerate), "
+                + "which this platform lacks. Register a processor for \"\(processorType)\", "
+                + "or prepare the LMInput yourself."
+        }
+
+        func prepare(input: UserInput) async throws -> LMInput {
+            throw VLMError.processing(Self.message(processorType))
+        }
+    }
+#endif
+
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.
 /// If asked for an unknown configuration this will use the model/tokenizer as-is.
 ///
@@ -966,9 +985,23 @@ public final class VLMModelFactory: ModelFactory {
             modelType: dispatchModelType,
             declaredProcessorType: baseProcessorConfig.processorClass)
 
+        #if canImport(CoreImage) && canImport(AVFoundation) && canImport(Accelerate)
         let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
+        #else
+        // Every built-in processor needs Apple's media frameworks. A processor that the caller
+        // registered is used; for any other type, the model loads with a stand-in processor that
+        // refuses input, so that the caller can prepare the LMInput itself.
+        let baseProcessor: any UserInputProcessor
+        if processorRegistry.containsProcessorType(processorType) {
+            baseProcessor = try await processorRegistry.createModel(
+                configuration: processorConfigData,
+                processorType: processorType, tokenizer: tokenizer)
+        } else {
+            baseProcessor = PreparedInputRequiredProcessor(processorType: processorType)
+        }
+        #endif
         let defaultAdditionalContext = VLMDefaultContextUserInputProcessor.defaultContext(
             capabilities: jangConfig?.capabilities)
         let needsReasoningTranslation =

@@ -1089,7 +1089,7 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
 package.targets.append(
     .testTarget(
         name: "VMLXLinuxTests",
-        dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXEmbedders"],
+        dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXEmbedders", "MLXVLM"],
         path: "Tests/VMLXLinuxTests"
     )
 )
