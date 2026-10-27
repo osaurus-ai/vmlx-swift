@@ -8,6 +8,10 @@ public struct DiskCacheVolumeSnapshot: Equatable, Sendable {
     public let freeBytes: Int64?
     public let ownBytes: Int64?
 
+    /// INVARIANT: cap resolution uses the greater of strict and host-supplied
+    /// purgeable-inclusive free space. The host provider must be nonblocking;
+    /// the runtime never performs the potentially slow important-usage query.
+    /// Guarded by DiskCacheCapPolicyTests' resolution and provider cases.
     public static func read(directory: URL?) -> Self {
         guard let directory else {
             return Self(totalBytes: nil, freeBytes: nil, ownBytes: nil)
