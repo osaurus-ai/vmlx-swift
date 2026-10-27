@@ -249,6 +249,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     var tokenCount = 0
     var promptPrefillTime: TimeInterval = 0
+    // Returning nil ends the sequence, but must not erase a verifier error
+    // or let a direct caller resume a partially committed speculative cycle.
+    private(set) var generationFailure: GenerationFailure?
+    private var iterationTerminated = false
 
     /// `VMLX_LOGITS_NAN_TRACE=1` diagnostic (see ``NaNLogitsTrace``);
     /// `nil` when the flag is off. Probes the backbone (target) logits at
@@ -1096,6 +1100,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     mutating func next() -> Int? {
+        guard !iterationTerminated else { return nil }
+        if Task.isCancelled {
+            iterationTerminated = true
+            return nil
+        }
         if let returnedAt = lastTokenReturnedAt {
             // Everything between the previous return and this call belonged to the consumer.
             consumerWaitTotal += Swift.max(0, NativeMTPClock.now() - returnedAt)
@@ -1118,7 +1127,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 } else {
                     try verifyCycle()
                 }
+            } catch is CancellationError {
+                iterationTerminated = true
+                return nil
             } catch {
+                generationFailure = GenerationFailure(
+                    stage: .decoding,
+                    cause: (error as? LocalizedError)?.errorDescription ?? String(describing: error))
+                iterationTerminated = true
                 return nil
             }
         }
@@ -1428,6 +1444,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
             if !isReusablePrefixWarmup,
                includeGeneratedBoundary,
+               generationFailure == nil,
+               !iterationTerminated,
                !generatedTokenIds.isEmpty,
                !cache.isEmpty
             {
