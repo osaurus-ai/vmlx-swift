@@ -57,7 +57,9 @@ struct NativeMTPFetchParitySourceTests {
     func fetchSkipsTheExactDiskBoundaryLikeTheARLane() throws {
         let source = try Self.source(Self.iteratorPath)
         guard let call = Self.initFetchCall(in: source) else {
-            Issue.record("`result = coordinator.fetch(` is gone from NativeMTPTokenIterator.init — rewrite this guard")
+            Issue.record(
+                "`result = coordinator.fetch(` is gone from NativeMTPTokenIterator.init — rewrite this guard"
+            )
             return
         }
         #expect(
@@ -88,14 +90,22 @@ struct NativeMTPFetchParitySourceTests {
             return
         }
         let afterFetch = source[initStart.upperBound...]
-        guard let restore = afterFetch.range(of: "diskArrays, into: &self.cache, requirePromptBoundary: true") else {
-            Issue.record("init's `restoreFromDiskArrays(diskArrays, into: &self.cache, requirePromptBoundary: true)` is gone — rewrite this guard")
+        guard
+            let restore = afterFetch.range(
+                of: "diskArrays, into: &self.cache, requirePromptBoundary: true")
+        else {
+            Issue.record(
+                "init's `restoreFromDiskArrays(diskArrays, into: &self.cache, requirePromptBoundary: true)` is gone — rewrite this guard"
+            )
             return
         }
         // The lock call must open between the fetch and the restore, and
         // the restore must be the first disk restore after it.
         let between = String(afterFetch[afterFetch.startIndex ..< restore.lowerBound])
-        guard let lockAt = between.range(of: "MLXCacheIOLock.withSerializedMLXCacheIO", options: .backwards) else {
+        guard
+            let lockAt = between.range(
+                of: "MLXCacheIOLock.withSerializedMLXCacheIO", options: .backwards)
+        else {
             Issue.record(
                 """
                 NativeMTPTokenIterator.init restores disk arrays outside \
@@ -110,18 +120,22 @@ struct NativeMTPFetchParitySourceTests {
         let lockToRestore = between[lockAt.upperBound...]
         #expect(
             lockToRestore.components(separatedBy: "restoreFromDiskArrays(").count - 1 == 1,
-            "another disk restore sits between the lock and init's restore; the lock must wrap this restore")
+            "another disk restore sits between the lock and init's restore; the lock must wrap this restore"
+        )
         // The materializing eval is the submission that matters; it must be
         // inside the same closure (before the closure returns its count).
         let afterRestore = afterFetch[restore.upperBound...]
         guard let evalAt = afterRestore.range(of: "MLX.eval(self.cache)"),
-              let returnAt = afterRestore.range(of: "return count")
+            let returnAt = afterRestore.range(of: "return count")
         else {
-            Issue.record("the restore's `MLX.eval(self.cache)` / `return count` pair is gone — rewrite this guard")
+            Issue.record(
+                "the restore's `MLX.eval(self.cache)` / `return count` pair is gone — rewrite this guard"
+            )
             return
         }
         #expect(
             evalAt.lowerBound < returnAt.lowerBound,
-            "the restore's materializing eval must run inside the MLXCacheIOLock closure, not after it")
+            "the restore's materializing eval must run inside the MLXCacheIOLock closure, not after it"
+        )
     }
 }

@@ -4,8 +4,9 @@
 import Cmlx
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import Testing
+
+@testable import MLXLMCommon
 
 /// A disk-cache fetch must hand back MATERIALIZED arrays.
 ///
@@ -62,7 +63,8 @@ struct DiskCacheFetchMaterializationTests {
             let lazy = fetched.keys.sorted().filter { !Self.isAvailable(fetched[$0]!) }
             #expect(
                 lazy.isEmpty,
-                "fetch returned lazy Load tensors \(lazy); the restore's GPU graph would wait on the disk read")
+                "fetch returned lazy Load tensors \(lazy); the restore's GPU graph would wait on the disk read"
+            )
 
             let stats = reader.snapshotStats()
             #expect(stats.lastFetchPayloadBytes == expectedBytes)
@@ -93,21 +95,27 @@ struct DiskCacheFetchMaterializationTests {
             defer { try? FileManager.default.removeItem(at: dir) }
             let modelKey = "ssm-fetch-materialize-model"
             let tokens = [11, 12, 13, 14, 15]
-            let states = [MLXArray.ones([2, 64], dtype: .float32), MLXArray.zeros([2, 16, 16], dtype: .float32)]
+            let states = [
+                MLXArray.ones([2, 64], dtype: .float32),
+                MLXArray.zeros([2, 16, 16], dtype: .float32),
+            ]
 
             do {
-                let writer = try SSMCompanionDiskStore(cacheDir: dir, modelKey: modelKey, maxBytes: 10_000_000)
+                let writer = try SSMCompanionDiskStore(
+                    cacheDir: dir, modelKey: modelKey, maxBytes: 10_000_000)
                 try writer.store(ssmStates: states, tokens: tokens, boundary: tokens.count)
             }
 
-            let reader = try SSMCompanionDiskStore(cacheDir: dir, modelKey: modelKey, maxBytes: 10_000_000)
+            let reader = try SSMCompanionDiskStore(
+                cacheDir: dir, modelKey: modelKey, maxBytes: 10_000_000)
             let fetched = try #require(reader.fetch(tokens: tokens, boundary: tokens.count))
             #expect(fetched.states.count == states.count)
             #expect(fetched.isComplete)
             let lazy = fetched.states.indices.filter { !Self.isAvailable(fetched.states[$0]) }
             #expect(
                 lazy.isEmpty,
-                "companion fetch returned lazy states at \(lazy); restoreSSMStates would seat them with GPU copies waiting on the read")
+                "companion fetch returned lazy states at \(lazy); restoreSSMStates would seat them with GPU copies waiting on the read"
+            )
             #expect(fetched.states[0].sum().item(Float.self) == 128)
         }
     }
@@ -129,7 +137,9 @@ struct DiskCacheFetchMaterializationTests {
             let accepted = cache.snapshotStats()
             let hash = DiskCache.hashTokens(badTokens, modelKey: modelKey, mediaSalt: nil)
             try MLX.save(
-                arrays: ["state": MLXArray([Float.infinity] + Array(repeating: Float(0), count: 15))],
+                arrays: [
+                    "state": MLXArray([Float.infinity] + Array(repeating: Float(0), count: 15))
+                ],
                 url: dir.appendingPathComponent("\(hash).safetensors"))
             #expect(cache.fetch(tokens: badTokens) == nil)
             #expect(cache.refusedNonFiniteFetches == 1)
