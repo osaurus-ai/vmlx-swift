@@ -379,7 +379,7 @@ public final class LFM3ModelInner: Module {
     let firstFullAttention: Int?
     let firstSlidingAttention: Int?
 
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     @ModuleInfo(key: "embedding_norm") var embeddingNorm: RMSNorm
 
     public init(_ args: LFM3Configuration) {
@@ -442,7 +442,19 @@ public final class LFM3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
+        logits(inputs, cache: cache)
+    }
+
+    /// Logits from token ids, or from precomputed input embeddings (the LFM3-VL / Omni
+    /// paths splice media features into the embeddings before the decoder runs).
+    /// `lastPositionOnly` projects only the final position: a prefill chunk needs one row of
+    /// logits, and the full `[L, vocab]` head would be the largest matmul of the chunk.
+    public func logits(
+        _ inputs: MLXArray?, cache: [KVCache]?, inputEmbeddings: MLXArray? = nil,
+        lastPositionOnly: Bool = false
+    ) -> MLXArray {
+        var out = model(inputs, cache: cache, inputEmbeddings: inputEmbeddings)
+        if lastPositionOnly { out = out[0..., (out.dim(1) - 1)..., 0...] }
         if let lmHead { return lmHead(out) }
         return model.embedTokens.asLinear(out)
     }

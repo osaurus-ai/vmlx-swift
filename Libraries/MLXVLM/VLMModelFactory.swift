@@ -164,6 +164,7 @@ public enum VLMTypeRegistry {
         // both keys to the same dispatch.
         "ministral3": dispatchMistral3VLM,
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
             "apertus1p5": create(Apertus1p5Configuration.self, Apertus1p5.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
@@ -260,6 +261,7 @@ public enum VLMProcessorTypeRegistry {
             "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
             "nemotron_h_omni": "NemotronHOmniProcessor",
             "minicpmv4_7": "MiniCPMV47Processor",
+            "lfm3_vl": "Lfm3VlProcessor",
         ]
         return processorTypeOverrides[modelType] ?? declaredProcessorType
     }
@@ -297,6 +299,10 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        // LFM3-VL ships the transformers-v5 nested processor_config.json (image_processor /
+        // video_processor), which the Qwen3-VL configuration decodes.
+        "Lfm3VlProcessor": create(
+            Qwen3VLProcessorConfiguration.self, { LFM3VLProcessor($0, tokenizer: $1) }),
         "Apertus1p5Processor": create(
             Apertus1p5ProcessorConfiguration.self, Apertus1p5Processor.init),
         "Glm46VProcessor": create(
