@@ -661,4 +661,28 @@ struct DeepseekV41DSparkFocusedTests {
             #expect(cache[1].offset == 4)
         }
     }
+
+    @Test("prefill chunking: the resident-head cap wins over a wider caller step; nothing changes without the head")
+    func prefillChunkingResidentCap() {
+        func chunking(_ step: Int, resident: Bool, sub: Int = 512, _ env: [String: String] = [:]) -> [Int] {
+            let c = DeepseekV4Model.prefillChunking(
+                requestedStep: step, attnSubchunk: sub, dsparkHeadResident: resident, environment: env)
+            return [c.step, c.outer]
+        }
+        // No head: the outer chunk widens to 2048, never narrower than the caller's step.
+        #expect(chunking(512, resident: false) == [512, 2048])
+        #expect(chunking(4096, resident: false) == [4096, 4096])
+        // Head resident: 1024 chunks, and a server-wide or tuned 2048 / 4096 step no longer overrides
+        // the cap (neither the chunks nor the final forward exceed it).
+        #expect(chunking(512, resident: true) == [512, 1024])
+        #expect(chunking(1024, resident: true) == [1024, 1024])
+        #expect(chunking(2048, resident: true) == [1024, 1024])
+        #expect(chunking(4096, resident: true) == [1024, 1024])
+        #expect(chunking(4096, resident: true, ["VMLX_DSV41_DSPARK_PREFILL_STEP": "1536"]) == [1536, 1536])
+        #expect(chunking(512, resident: true, ["VMLX_DSV41_DSPARK_PREFILL_STEP": "2048"]) == [512, 2048])
+        // The diagnostic outer-chunk override and the no-sub-chunking path are unchanged.
+        #expect(chunking(4096, resident: true, ["DSV4_PREFILL_OUTER_CHUNK": "512"]) == [4096, 4096])
+        #expect(chunking(512, resident: true, ["DSV4_PREFILL_OUTER_CHUNK": "768"]) == [512, 768])
+        #expect(chunking(2048, resident: true, sub: 0) == [2048, 2048])
+    }
 }
