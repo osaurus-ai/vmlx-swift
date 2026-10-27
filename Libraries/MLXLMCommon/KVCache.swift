@@ -286,6 +286,11 @@ public extension QuantizedHybridPoolCache {
 public enum HybridPoolQuantizedSchema {
     public static let supportedBits: Set<Int> = [4, 8]
 
+    /// Largest row count of one on-disk pool segment. The reader refuses
+    /// anything longer, so the writer splits longer segments (the V4.1
+    /// contiguous slab is a single segment of every live row) at this size.
+    public static let maxSegmentRows = 16 * 1024
+
     /// Packed code columns per affine group for `bits`.
     public static func packedGroupWidth(groupSize: Int, bits: Int) -> Int {
         bits == 4 ? groupSize / 2 : groupSize

@@ -745,10 +745,42 @@ public enum TQDiskSerializer {
             return pool
         }
 
+        // The reader bounds a segment at `maxSegmentRows`. DeepSeek-V4.1 hands
+        // over its contiguous slab as ONE segment of every live row, and its
+        // compress-ratio-1 layers hold one row per token, so past 16K tokens
+        // that segment was written whole and every such record deserialized
+        // as a required miss: each long follow-up turn re-prefilled the whole
+        // prompt. Rows are encoded independently, so splitting is lossless;
+        // the contiguous restore joins the slabs back into one.
+        func boundedSegments(
+            _ segments: [HybridPoolQuantizedSegment]
+        ) -> [HybridPoolQuantizedSegment] {
+            let maxRows = HybridPoolQuantizedSchema.maxSegmentRows
+            return segments.flatMap { segment -> [HybridPoolQuantizedSegment] in
+                guard segment.originalShape.count == 3, segment.rowCount > maxRows else {
+                    return [segment]
+                }
+                return stride(from: 0, to: segment.rowCount, by: maxRows).map { start in
+                    let end = Swift.min(start + maxRows, segment.rowCount)
+                    var shape = segment.originalShape
+                    shape[1] = end - start
+                    return HybridPoolQuantizedSegment(
+                        codes: segment.codes[0..., start ..< end, 0..., 0...],
+                        scales: segment.scales[0..., start ..< end, 0..., 0...],
+                        biases: segment.biases[0..., start ..< end, 0..., 0...],
+                        originalShape: shape,
+                        groupSize: segment.groupSize,
+                        bits: segment.bits,
+                        originalDType: segment.originalDType)
+                }
+            }
+        }
+
         func putQuantizedPool(
             _ stem: String,
             _ segments: [HybridPoolQuantizedSegment]
         ) -> Bool {
+            let segments = boundedSegments(segments)
             result["__\(stem)_qcount__"] = metaInt32(Int32(segments.count))
             for (segmentIndex, segment) in segments.enumerated() {
                 guard segment.originalShape.count == 3,
@@ -1715,7 +1747,7 @@ public enum TQDiskSerializer {
                       // writers losslessly compact adjacent q8 rows into
                       // bounded 16K slabs so near-1M restore/decode does not
                       // traverse thousands of tiny tensors.
-                      shape[1] <= 16 * 1024,
+                      shape[1] <= HybridPoolQuantizedSchema.maxSegmentRows,
                       shape[2] > 0,
                       groupSize > 0,
                       shape[2] % groupSize == 0,

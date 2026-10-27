@@ -32,7 +32,7 @@ import MLXNN
 /// encoded representation.
 final class DeepseekV4PoolStorage {
     static let segmentRows = 64
-    static let slabMaxRows = 16 * 1024
+    static let slabMaxRows = HybridPoolQuantizedSchema.maxSegmentRows
     static let groupSize = 32
     /// DeepSeek-V4.1 4-bit contiguous pools: one fp16 scale/minimum per 64 elements, as the
     /// reference `QuantGrowBuffer` (`mx.quantize`, GROUP_SIZE 64) - 288 B per 512-wide row,
