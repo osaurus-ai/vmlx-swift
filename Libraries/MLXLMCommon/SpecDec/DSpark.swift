@@ -182,10 +182,14 @@ public struct DSparkSampling {
 
 // MARK: - Wall-clock governor
 
-/// Port of the Python `_Governor`. Keeps an EMA of seconds per EMITTED token for speculative steps
-/// and for AR steps, each measured from one step's start to the next step's start (every sync,
-/// draft, verify and commit forward included, and the consumer's time between tokens, which is the
-/// same per token for both modes).
+/// Port of the Python `_Governor`. Keeps, for speculative steps and for AR steps, an EMA of step
+/// seconds and an EMA of tokens EMITTED per step, each step measured from its start to the next step's
+/// start (every sync, draft, verify and commit forward included, and the consumer's time between
+/// tokens, which is the same per token for both modes). The cost per token is their ratio: a mean of
+/// per-step ratios over-weights the one-token steps of a missed draft (a 6-token and a 1-token step of
+/// 50 ms each average 29 ms/token, not the 14 ms/token they cost), and one such miss flipped DeepSeek-V4.1
+/// code generation into AR stretches once AR got faster (osaurus, JANG_2K: 113 of 150 steps AR with
+/// speculation at 14.5 ms/token against AR at 20.8).
 ///
 /// - speculate while spec s/token < AR s/token; otherwise take AR steps;
 /// - in AR mode, one speculative probe every `probeEvery` AR tokens (a probe after an AR stretch
@@ -202,8 +206,14 @@ public struct DSparkGovernor: Sendable, Equatable {
     public let alpha: Double
     public let warmupSpec: Int
 
-    public private(set) var spec: Double?
-    public private(set) var ar: Double?
+    /// EMAs of one mode's seconds per step and tokens emitted per step.
+    private struct Steps: Sendable, Equatable {
+        var seconds: Double, tokens: Double
+        var perToken: Double { seconds / tokens }
+    }
+
+    private var specSteps: Steps?
+    private var arSteps: Steps?
     public private(set) var arMode = false
     private var sinceProbe = 0
     private var sinceAR = 0
@@ -217,21 +227,27 @@ public struct DSparkGovernor: Sendable, Equatable {
         self.warmupSpec = warmupSpec
     }
 
-    private func ema(_ old: Double?, _ x: Double, replace: Bool = false) -> Double {
-        guard let old, !replace else { return x }
-        return (1 - alpha) * old + alpha * x
+    /// Seconds per emitted token of speculative steps (nil until measured).
+    public var spec: Double? { specSteps?.perToken }
+    /// Seconds per emitted token of AR steps (nil until measured).
+    public var ar: Double? { arSteps?.perToken }
+
+    private func ema(_ old: Steps?, _ seconds: Double, _ tokens: Double, replace: Bool = false) -> Steps {
+        guard let old, !replace else { return Steps(seconds: seconds, tokens: tokens) }
+        return Steps(seconds: (1 - alpha) * old.seconds + alpha * seconds,
+                     tokens: (1 - alpha) * old.tokens + alpha * tokens)
     }
 
     public mutating func record(_ mode: Mode, seconds: Double, emitted: Int) {
-        let per = seconds / Double(Swift.max(1, emitted))
+        let tokens = Double(Swift.max(1, emitted))
         switch mode {
         case .spec:
-            spec = ema(spec, per, replace: specStale)
+            specSteps = ema(specSteps, seconds, tokens, replace: specStale)
             specStale = false
             nSpec += 1
             sinceAR += 1
         case .ar:
-            ar = ema(ar, per)
+            arSteps = ema(arSteps, seconds, tokens)
             sinceAR = 0
             if arMode { sinceProbe += 1 }
         }
