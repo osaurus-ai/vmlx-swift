@@ -6,11 +6,11 @@ import MLX
 import MLXHuggingFace
 import MLXNN
 import Testing
+@preconcurrency import VMLXTokenizers
 
 @testable import MLXLLM
 @testable import MLXLMCommon
 @testable import MLXVLM
-@preconcurrency import VMLXTokenizers
 
 /// LFM3-VL: tower geometry, placeholder expansion, and (opt-in) parity with a released bundle.
 @Suite("LFM3-VL", .serialized)
@@ -22,9 +22,10 @@ struct LFM3VLTests {
     /// projector concatenates each consecutive four, and the conv reshapes to the grid.
     @Test func mergeOrderCoordinates() {
         let (rows, cols) = LFM3VLVision.mergeOrderedCoordinates(height: 4, width: 4, merge: 2)
-        #expect(Array(zip(rows, cols).prefix(8)).map { [Int($0.0), Int($0.1)] } == [
-            [0, 0], [0, 1], [1, 0], [1, 1], [0, 2], [0, 3], [1, 2], [1, 3],
-        ])
+        #expect(
+            Array(zip(rows, cols).prefix(8)).map { [Int($0.0), Int($0.1)] } == [
+                [0, 0], [0, 1], [1, 0], [1, 1], [0, 2], [0, 3], [1, 2], [1, 3],
+            ])
     }
 
     /// Expected sizes from the reference `_smart_resize_image` (factor 32, min 65536) at the
@@ -101,8 +102,9 @@ struct LFM3VLTests {
             let imagePath = env["LFM3_VL_IMAGE"]
         else { return }
         let fp32 = env["LFM3_FP32"] == "1"
-        let ref = try JSONSerialization.jsonObject(
-            with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
+        let ref =
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
         let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: refPath + ".safetensors"))
         let refIds = try #require(ref["ids"] as? [Int])
         let question = try #require(ref["question"] as? String)
@@ -160,7 +162,9 @@ struct LFM3VLTests {
     /// checks the per-group token structure and that the answer reads the motion.
     @Test func releasedBundleReadsVideo() async throws {
         let env = ProcessInfo.processInfo.environment
-        guard let bundle = env["LFM3_VL_BUNDLE"], let videoPath = env["LFM3_VL_VIDEO"] else { return }
+        guard let bundle = env["LFM3_VL_BUNDLE"], let videoPath = env["LFM3_VL_VIDEO"] else {
+            return
+        }
         let context = try await VLMModelFactory.shared.load(
             from: URL(fileURLWithPath: bundle), using: #huggingFaceTokenizerLoader())
         let input = UserInput(
@@ -179,7 +183,8 @@ struct LFM3VLTests {
         #expect(ids.filter { $0 == videoId }.count == grid.t * grid.h * grid.w / 4)
         #expect(ids.filter { $0 == start }.count == grid.t + 1)
         let rendered = context.tokenizer.decode(tokenIds: ids, skipSpecialTokens: false)
-        #expect(rendered.contains("<0.0 seconds>") || rendered.contains("<0.2 seconds>"), "timestamps")
+        #expect(
+            rendered.contains("<0.0 seconds>") || rendered.contains("<0.2 seconds>"), "timestamps")
 
         var iterator = try TokenIterator(
             input: prepared, model: context.model,

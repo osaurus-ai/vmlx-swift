@@ -148,9 +148,14 @@ public struct LFM3OmniConfiguration: Codable, Sendable {
     }
 
     private enum AudioEncoderKeys: String, CodingKey {
-        case dimIn = "dim_in", dimConv = "dim_conv", dimOut = "dim_out", lfm
-        case convChannels = "conv_channels", hiddenSize = "hidden_size"
-        case melBins = "num_mel_bins", textConfig = "text_config"
+        case dimIn = "dim_in"
+        case dimConv = "dim_conv"
+        case dimOut = "dim_out"
+        case lfm
+        case convChannels = "conv_channels"
+        case hiddenSize = "hidden_size"
+        case melBins = "num_mel_bins"
+        case textConfig = "text_config"
         case slidingWindow = "sliding_window"
     }
 
@@ -293,10 +298,12 @@ enum LFM3Speech {
             _convIn.wrappedValue = Conv2d(
                 inputChannels: 1, outputChannels: c, kernelSize: 3, stride: 2, padding: 1)
             _convMid.wrappedValue = Conv2d(
-                inputChannels: c, outputChannels: c, kernelSize: 3, stride: 2, padding: 1, groups: c)
+                inputChannels: c, outputChannels: c, kernelSize: 3, stride: 2, padding: 1, groups: c
+            )
             _linMid.wrappedValue = Conv2d(inputChannels: c, outputChannels: c, kernelSize: 1)
             _convEnd.wrappedValue = Conv2d(
-                inputChannels: c, outputChannels: c, kernelSize: 3, stride: 2, padding: 1, groups: c)
+                inputChannels: c, outputChannels: c, kernelSize: 3, stride: 2, padding: 1, groups: c
+            )
             _linEnd.wrappedValue = Conv2d(inputChannels: c, outputChannels: c, kernelSize: 1)
             _linOut.wrappedValue = Linear(config.melBins * c / 8, config.hiddenSize)
         }
@@ -435,7 +442,8 @@ enum LFM3Speech {
 
         init(_ config: LFM3SpeechTrunkConfiguration) {
             layers = (0 ..< config.layerTypes.count).map { Layer(config, index: $0) }
-            _embeddingNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
+            _embeddingNorm.wrappedValue = RMSNorm(
+                dimensions: config.hiddenSize, eps: config.normEps)
         }
 
         func callAsFunction(_ h: MLXArray, window: Int) -> MLXArray {
@@ -607,7 +615,8 @@ public final class LFM3Omni: Module, VLMModel, KVCacheDimensionProvider, Modalit
             {
                 continue
             }
-            if config.textConfiguration.tieWordEmbeddings, name.hasPrefix("language_model.lm_head.") {
+            if config.textConfiguration.tieWordEmbeddings, name.hasPrefix("language_model.lm_head.")
+            {
                 continue
             }
             var value = value

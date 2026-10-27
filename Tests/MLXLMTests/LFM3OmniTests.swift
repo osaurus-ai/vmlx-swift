@@ -6,11 +6,11 @@ import MLX
 import MLXHuggingFace
 import MLXNN
 import Testing
+@preconcurrency import VMLXTokenizers
 
 @testable import MLXLLM
 @testable import MLXLMCommon
 @testable import MLXVLM
-@preconcurrency import VMLXTokenizers
 
 /// LFM3-Audio / LFM3-Omni speech input: feature geometry, encoder sizing, and (opt-in) parity
 /// with a released bundle.
@@ -65,8 +65,9 @@ struct LFM3OmniTests {
             let wavPath = env["LFM3_AUDIO_WAV"]
         else { return }
         let fp32 = env["LFM3_FP32"] == "1"
-        let ref = try JSONSerialization.jsonObject(
-            with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
+        let ref =
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
         let cases = try #require(ref["cases"] as? [String: [String: Any]])
         let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: refPath + ".safetensors"))
         let wav = URL(fileURLWithPath: wavPath)
@@ -97,21 +98,26 @@ struct LFM3OmniTests {
         let refSpeech = try #require(tensors["speech"])
         let speechDiff = abs(speech - refSpeech).max().item(Float.self)
         let speechScale = abs(refSpeech).max().item(Float.self)
-        print("[LFM3-Omni] log-mel max |diff| \(featureDiff); speech max |diff| \(speechDiff) (scale \(speechScale))")
+        print(
+            "[LFM3-Omni] log-mel max |diff| \(featureDiff); speech max |diff| \(speechDiff) (scale \(speechScale))"
+        )
         // float32 FFT here vs float64 in the reference: measured 0.00126 max on the
         // released test clip (near-silent bins, where log10 is steepest).
         #expect(featureDiff < 5e-3, "log-mel diff \(featureDiff)")
         #expect(speechDiff <= (fp32 ? 1e-3 : 0.08) * max(1, speechScale))
 
         for (name, c) in cases.sorted(by: { $0.key < $1.key }) {
-            let question = name == "asr" ? "" : "What number does the speaker say is their favorite? Answer in text."
+            let question =
+                name == "asr"
+                ? "" : "What number does the speaker say is their favorite? Answer in text."
             var chat: [Chat.Message] = []
             if name == "asr" { chat.append(.system("Perform ASR in English.")) }
             chat.append(.user(question, audios: [.url(wav)]))
             let prepared = try await context.processor.prepare(input: UserInput(chat: chat))
             let ids = prepared.text.tokens.reshaped(-1).asArray(Int.self)
             let refIds = try #require(c["ids"] as? [Int])
-            #expect(ids == refIds, "\(name): processor ids differ (\(ids.count) vs \(refIds.count))")
+            #expect(
+                ids == refIds, "\(name): processor ids differ (\(ids.count) vs \(refIds.count))")
 
             let refGreedy = try #require(c["greedy"] as? [Int])
             var iterator = try TokenIterator(

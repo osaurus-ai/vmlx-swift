@@ -316,7 +316,8 @@ public enum VLMProcessorTypeRegistry {
         "Lfm3OmniProcessor": { data, tokenizer in
             LFM3OmniProcessor(
                 tokenizer: tokenizer,
-                vision: try JSONDecoder.json5().decode(Qwen3VLProcessorConfiguration.self, from: data))
+                vision: try JSONDecoder.json5().decode(
+                    Qwen3VLProcessorConfiguration.self, from: data))
         },
         "Apertus1p5Processor": create(
             Apertus1p5ProcessorConfiguration.self, Apertus1p5Processor.init),

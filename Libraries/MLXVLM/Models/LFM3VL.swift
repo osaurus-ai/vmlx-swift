@@ -71,7 +71,8 @@ public struct LFM3VLVisionConfiguration: Codable, Sendable {
         else {
             throw DecodingError.dataCorruptedError(
                 forKey: .layerTypes, in: c,
-                debugDescription: "vision layer_types must be \(hiddenLayers) conv/full_attention entries")
+                debugDescription:
+                    "vision layer_types must be \(hiddenLayers) conv/full_attention entries")
         }
         let rope = try c.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeParameters)
         if case .string(let type) = rope?["rope_type"], type != "axial" {
@@ -143,9 +144,11 @@ public struct LFM3VLConfiguration: Codable, Sendable {
             throw DecodingError.dataCorruptedError(
                 forKey: .downsampleFactor, in: c,
                 debugDescription:
-                    "downsample_factor \(downsampleFactor) != spatial_merge_size \(visionConfiguration.spatialMergeSize)")
+                    "downsample_factor \(downsampleFactor) != spatial_merge_size \(visionConfiguration.spatialMergeSize)"
+            )
         }
-        if let act = try c.decodeIfPresent(String.self, forKey: .projectorHiddenAct), act != "gelu" {
+        if let act = try c.decodeIfPresent(String.self, forKey: .projectorHiddenAct), act != "gelu"
+        {
             throw DecodingError.dataCorruptedError(
                 forKey: .projectorHiddenAct, in: c,
                 debugDescription: "LFM3-VL projector activation '\(act)' is not supported")
@@ -175,7 +178,8 @@ enum LFM3VLVision {
     static func mergeOrderedCoordinates(height: Int, width: Int, merge: Int) -> (
         rows: [Float], cols: [Float]
     ) {
-        var rows: [Float] = [], cols: [Float] = []
+        var rows: [Float] = []
+        var cols: [Float] = []
         rows.reserveCapacity(height * width)
         cols.reserveCapacity(height * width)
         for bi in 0 ..< height / merge {
@@ -359,7 +363,8 @@ enum LFM3VLVision {
             _patchifier.wrappedValue = Linear(
                 config.inChannels * config.temporalPatchSize * config.patchSize * config.patchSize,
                 config.hiddenSize, bias: false)
-            _embeddingNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
+            _embeddingNorm.wrappedValue = RMSNorm(
+                dimensions: config.hiddenSize, eps: config.normEps)
             layers = (0 ..< config.hiddenLayers).map { Layer(config, index: $0) }
         }
 
@@ -376,10 +381,12 @@ enum LFM3VLVision {
                     let count = grid.h * grid.w
                     guard offset + count <= pixels.dim(0) else {
                         throw VLMError.processing(
-                            "LFM3-VL: \(pixels.dim(0)) patches for grids \(grids.map { [$0.t, $0.h, $0.w] })")
+                            "LFM3-VL: \(pixels.dim(0)) patches for grids \(grids.map { [$0.t, $0.h, $0.w] })"
+                        )
                     }
                     var x = embeddingNorm(
-                        patchifier(pixels[offset ..< offset + count].asType(patchifier.weight.dtype)))
+                        patchifier(
+                            pixels[offset ..< offset + count].asType(patchifier.weight.dtype)))
                     for layer in layers {
                         x = layer(x, height: grid.h, width: grid.w, cos: cosA, sin: sinA)
                     }
@@ -411,7 +418,10 @@ final class LFM3VLProjector: Module {
             eps: config.projectorLayerNormEps)
     }
 
-    init(visionHidden: Int, downsampleFactor: Int, hidden: Int, textHidden: Int, bias: Bool, eps: Float) {
+    init(
+        visionHidden: Int, downsampleFactor: Int, hidden: Int, textHidden: Int, bias: Bool,
+        eps: Float
+    ) {
         inputDim = visionHidden * downsampleFactor * downsampleFactor
         _layerNorm.wrappedValue = LayerNorm(dimensions: visionHidden, eps: eps)
         _linear1.wrappedValue = Linear(inputDim, hidden, bias: bias)
@@ -458,7 +468,8 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider, ModalityB
         let positions = tokenIds.indices.filter { tokenIds[$0] == tokenId }
         guard positions.count == features.dim(0) else {
             throw VLMError.processing(
-                "LFM3-VL: \(positions.count) placeholder tokens for \(features.dim(0)) feature rows")
+                "LFM3-VL: \(positions.count) placeholder tokens for \(features.dim(0)) feature rows"
+            )
         }
         guard !positions.isEmpty else { return embeddings }
         let flat = embeddings.reshaped(-1, embeddings.dim(-1))
@@ -517,7 +528,8 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider, ModalityB
             } else if name.hasPrefix("lm_head.") {
                 name = "language_model." + name
             }
-            if config.textConfiguration.tieWordEmbeddings, name.hasPrefix("language_model.lm_head.") {
+            if config.textConfiguration.tieWordEmbeddings, name.hasPrefix("language_model.lm_head.")
+            {
                 continue
             }
             var value = value
@@ -709,7 +721,8 @@ public struct LFM3VLProcessor: UserInputProcessor {
             let stable = try Self.expand(
                 tokens, placeholder: id, replacements: replacements, boundaries: boundaries.stable)
             tokens = all.tokens
-            boundaries = CanonicalChatCacheBoundaries(all: all.boundaries, stable: stable.boundaries)
+            boundaries = CanonicalChatCacheBoundaries(
+                all: all.boundaries, stable: stable.boundaries)
         }
 
         var processedVideo: LMInput.ProcessedVideo?
@@ -781,7 +794,8 @@ public struct LFM3VLProcessor: UserInputProcessor {
             let stable = try Self.expand(
                 tokens, placeholder: id, replacements: replacements, boundaries: boundaries.stable)
             tokens = all.tokens
-            boundaries = CanonicalChatCacheBoundaries(all: all.boundaries, stable: stable.boundaries)
+            boundaries = CanonicalChatCacheBoundaries(
+                all: all.boundaries, stable: stable.boundaries)
         }
 
         return VisualMedia(
@@ -804,7 +818,8 @@ public struct LFM3VLProcessor: UserInputProcessor {
 
         let promptArray = MLXArray(tokens).expandedDimensions(axis: 0)
         return LMInput(
-            text: .init(tokens: promptArray, mask: ones(like: promptArray).asType(.int8), tokenIds: tokens),
+            text: .init(
+                tokens: promptArray, mask: ones(like: promptArray).asType(.int8), tokenIds: tokens),
             image: processedImage,
             video: processedVideo,
             mediaTokenIds: QwenVL.mediaTokenIds(

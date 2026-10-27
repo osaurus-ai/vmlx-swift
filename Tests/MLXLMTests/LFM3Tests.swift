@@ -6,10 +6,10 @@ import MLX
 import MLXHuggingFace
 import MLXNN
 import Testing
+@preconcurrency import VMLXTokenizers
 
 @testable import MLXLLM
 @testable import MLXLMCommon
-@preconcurrency import VMLXTokenizers
 
 /// LFM3 text runtime: config, rotary layout, weight routing, cache behaviour, parsers, and
 /// (opt-in) logit parity with a released bundle.
@@ -47,8 +47,10 @@ struct LFM3Tests {
         #expect(config.layerTypes.filter { $0 == "conv" }.count == 13)
         #expect(config.layerTypes.filter { $0 == "full_attention" }.count == 6)
         #expect(config.layerTypes.filter { $0 == "sliding_attention" }.count == 5)
-        #expect(config.rope(for: "full_attention") == .init(ropeTheta: 1e6, partialRotaryFactor: 0.5))
-        #expect(config.rope(for: "sliding_attention") == .init(ropeTheta: 1e4, partialRotaryFactor: 1))
+        #expect(
+            config.rope(for: "full_attention") == .init(ropeTheta: 1e6, partialRotaryFactor: 0.5))
+        #expect(
+            config.rope(for: "sliding_attention") == .init(ropeTheta: 1e4, partialRotaryFactor: 1))
     }
 
     @Test func malformedLayerPatternsAreRefused() {
@@ -174,7 +176,9 @@ struct LFM3Tests {
             for n in chunks {
                 let out = model(tokens[0..., start ..< start + n], cache: cache)
                 let diff = abs(out - full[0..., start ..< start + n, 0...]).max().item(Float.self)
-                #expect(diff < bound, "chunks \(chunks): positions \(start)..<\(start + n) diff \(diff)")
+                #expect(
+                    diff < bound, "chunks \(chunks): positions \(start)..<\(start + n) diff \(diff)"
+                )
                 start += n
             }
             // INVARIANT (LFM3ShortConv): conv layers advance the offset like attention layers.
@@ -201,14 +205,16 @@ struct LFM3Tests {
     }
 
     @Test func reasoningComesFromTheTemplateAndThePromptTail() throws {
-        let template = #"{%- if enable_thinking -%}{{- "<think>" -}}{%- else -%}{{- "<think></think>" -}}{%- endif -%}"#
+        let template =
+            #"{%- if enable_thinking -%}{{- "<think>" -}}{%- else -%}{{- "<think></think>" -}}{%- endif -%}"#
         let resolved = ParserResolution.reasoning(
             capabilities: nil, modelType: "lfm3", chatTemplate: template)
         let parser = try #require(resolved.parser)
         #expect(parser.startTag == "<think>" && parser.endTag == "</think>")
         // A `<think>` prefill starts inside reasoning; an empty `<think></think>` starts in content.
         var thinking = try #require(
-            ReasoningParser.forPrompt(stampName: "qwen3", promptTail: "<|im_start|>assistant\n<think>"))
+            ReasoningParser.forPrompt(
+                stampName: "qwen3", promptTail: "<|im_start|>assistant\n<think>"))
         #expect(Self.channels(&thinking, "plan</think>answer") == ["r:plan", "c:answer"])
         var plain = try #require(
             ReasoningParser.forPrompt(
@@ -226,8 +232,11 @@ struct LFM3Tests {
             case .content(let c): (tag, body) = ("c:", c)
             }
             guard !body.isEmpty else { continue }
-            if let last = out.last, last.hasPrefix(tag) { out[out.count - 1] = last + body }
-            else { out.append(tag + body) }
+            if let last = out.last, last.hasPrefix(tag) {
+                out[out.count - 1] = last + body
+            } else {
+                out.append(tag + body)
+            }
         }
         return out
     }
@@ -254,8 +263,9 @@ struct LFM3Tests {
         // 100% of 1096 positions, top-20 diff <= 9e-5). Strict runs: LFM3_FP32=1,
         // MLX_ENABLE_TF32=0, LFM3_MAX_LOGIT_DIFF=0.01, LFM3_MIN_ARGMAX_AGREEMENT=1.
         let minArgmaxAgreement = Double(env["LFM3_MIN_ARGMAX_AGREEMENT"] ?? "") ?? 0.95
-        let ref = try JSONSerialization.jsonObject(
-            with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
+        let ref =
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: refPath))) as! [String: Any]
         let cases = try #require(ref["cases"] as? [String: [String: Any]])
         #expect(!cases.isEmpty, "reference has no cases")
 
@@ -296,7 +306,9 @@ struct LFM3Tests {
                 return (row[flip.element.0] - row[flip.element.1]).item(Float.self)
             }
             if !flips.isEmpty {
-                print("[LFM3] \(name) flips (position: gap): \(zip(flips.map(\.offset), gaps).map { "\($0):\($1)" })")
+                print(
+                    "[LFM3] \(name) flips (position: gap): \(zip(flips.map(\.offset), gaps).map { "\($0):\($1)" })"
+                )
             }
             #expect(
                 agreement >= minArgmaxAgreement,
@@ -317,7 +329,9 @@ struct LFM3Tests {
                 greedy.append(token)
             }
             let prefix = zip(greedy, refGreedy).prefix { $0 == $1 }.count
-            print("[LFM3] \(name): \(ids.count) tok, argmax \(agreement), top20 max diff \(diffs.max()!), greedy prefix \(prefix)/\(refGreedy.count): \(context.tokenizer.decode(tokenIds: greedy))")
+            print(
+                "[LFM3] \(name): \(ids.count) tok, argmax \(agreement), top20 max diff \(diffs.max()!), greedy prefix \(prefix)/\(refGreedy.count): \(context.tokenizer.decode(tokenIds: greedy))"
+            )
             #expect(prefix >= min(refGreedy.count, 12), "\(name): greedy diverged at \(prefix)")
         }
     }
@@ -330,7 +344,12 @@ struct LFM3Tests {
         let context = try await LLMModelFactory.shared.load(
             from: URL(fileURLWithPath: bundle), using: #huggingFaceTokenizerLoader())
         let ids = try context.tokenizer.applyChatTemplate(
-            messages: [["role": "user", "content": "Write a long story about a dinosaur who learns to code."]],
+            messages: [
+                [
+                    "role": "user",
+                    "content": "Write a long story about a dinosaur who learns to code.",
+                ]
+            ],
             tools: nil, additionalContext: ["enable_thinking": false])
         for compiled in [false, true] {
             func run(_ n: Int) throws -> Double {
@@ -346,7 +365,9 @@ struct LFM3Tests {
             }
             _ = try run(32)
             let rates = try (0 ..< 3).map { _ in try run(256) }
-            print("[LFM3] swift vmlx \(URL(fileURLWithPath: bundle).lastPathComponent) compiled=\(compiled): decode tok/s runs=\(rates.map { (($0 * 10).rounded() / 10) }) median=\(rates.sorted()[1])")
+            print(
+                "[LFM3] swift vmlx \(URL(fileURLWithPath: bundle).lastPathComponent) compiled=\(compiled): decode tok/s runs=\(rates.map { (($0 * 10).rounded() / 10) }) median=\(rates.sorted()[1])"
+            )
         }
     }
 
