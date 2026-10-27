@@ -11,6 +11,62 @@ struct VLMProcessorConfigFileSelectionTests {
     // The bundled fixture is semantically identical JSON, compacted for readability.
     static let officialNuExtract3 = #"{"image_processor":{"do_convert_rgb":true,"do_normalize":true,"do_rescale":true,"do_resize":true,"image_mean":[0.5,0.5,0.5],"image_processor_type":"Qwen2VLImageProcessor","image_std":[0.5,0.5,0.5],"merge_size":2,"patch_size":16,"resample":3,"rescale_factor":0.00392156862745098,"size":{"longest_edge":16777216,"shortest_edge":65536},"temporal_patch_size":2},"processor_class":"Qwen3VLProcessor","video_processor":{"do_convert_rgb":true,"do_normalize":true,"do_rescale":true,"do_resize":true,"do_sample_frames":true,"fps":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"max_frames":768,"merge_size":2,"min_frames":4,"patch_size":16,"resample":3,"rescale_factor":0.00392156862745098,"return_metadata":false,"size":{"longest_edge":25165824,"shortest_edge":4096},"temporal_patch_size":2,"video_processor_type":"Qwen3VLVideoProcessor"}}"#
 
+    // Verbatim numind/NuExtract3-mlx-4bits@29c38269f94054282bf9ea97a20dfc6bb8bbefea.
+    // This conversion uses direct nested pixel bounds, unlike the base bundle's size edges.
+    static let officialNuExtract3MLX = """
+        {
+          "image_processor": {
+            "do_convert_rgb": true,
+            "do_normalize": true,
+            "do_rescale": true,
+            "image_mean": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "image_processor_type": "Qwen3VLImageProcessor",
+            "image_std": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "max_pixels": 16777216,
+            "merge_size": 2,
+            "min_pixels": 65536,
+            "patch_size": 16,
+            "rescale_factor": 0.00392156862745098,
+            "temporal_patch_size": 2
+          },
+          "processor_class": "Qwen3VLProcessor",
+          "video_processor": {
+            "do_convert_rgb": true,
+            "do_normalize": true,
+            "do_rescale": true,
+            "fps": 2.0,
+            "image_mean": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "image_std": [
+              0.5,
+              0.5,
+              0.5
+            ],
+            "max_frames": 768,
+            "max_pixels": 786432,
+            "merge_size": 2,
+            "min_frames": 4,
+            "min_pixels": 131072,
+            "patch_size": 16,
+            "rescale_factor": 0.00392156862745098,
+            "temporal_patch_size": 2,
+            "video_processor_type": "Qwen3VLVideoProcessor"
+          }
+        }
+
+        """
+
     private func directory() throws -> URL {
         let result = FileManager.default.temporaryDirectory
             .appendingPathComponent("processor-sidecar-\(UUID().uuidString)", isDirectory: true)
@@ -44,6 +100,33 @@ struct VLMProcessorConfigFileSelectionTests {
         #expect(typed.videoMaxFrames == 768)
         #expect(typed.videoMinPixels == 4_096)
         #expect(typed.videoMaxPixels == 25_165_824)
+        _ = try await VLMProcessorTypeRegistry.shared.createModel(
+            configuration: data, processorType: base.processorClass, tokenizer: TestTokenizer())
+    }
+
+    @Test func processorOnlyNuExtract3MLXLoadsExactDirectPixelBounds() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = Data(Self.officialNuExtract3MLX.utf8)
+        #expect(original.count == 991)
+        try write(Self.officialNuExtract3MLX, named: "processor_config.json", in: root)
+        let (data, base) = try await loadProcessorConfig(from: root)
+        #expect(data == original)
+        #expect(base.processorClass == "Qwen3VLProcessor")
+        let typed = try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self, from: data)
+        #expect(typed.imageProcessorType == "Qwen3VLImageProcessor")
+        #expect(typed.imageMean == [0.5, 0.5, 0.5])
+        #expect(typed.imageStd == [0.5, 0.5, 0.5])
+        #expect(typed.patchSize == 16)
+        #expect(typed.mergeSize == 2)
+        #expect(typed.temporalPatchSize == 2)
+        #expect(typed.minPixels == 65_536)
+        #expect(typed.maxPixels == 16_777_216)
+        #expect(typed.videoFPS == 2)
+        #expect(typed.videoMinFrames == 4)
+        #expect(typed.videoMaxFrames == 768)
+        #expect(typed.videoMinPixels == 131_072)
+        #expect(typed.videoMaxPixels == 786_432)
         _ = try await VLMProcessorTypeRegistry.shared.createModel(
             configuration: data, processorType: base.processorClass, tokenizer: TestTokenizer())
     }
