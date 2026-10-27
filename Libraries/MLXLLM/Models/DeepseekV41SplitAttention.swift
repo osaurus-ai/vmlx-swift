@@ -152,12 +152,12 @@ enum DeepseekV41SplitAttention {
         header: header,
         ensureRowContiguous: true)
 
-    /// Local + selected-pool attention for `S <= 8` rows, as `DeepseekV4Math.tiledPoolAttention(... topK:)`:
-    /// q (1, H, S, D) bf16 (RoPE applied), localKV (1, 1, Lw, D) bf16, the pool as a contiguous 4-bit slab, topK
-    /// (1, S, K) pool rows. Returns (1, H, S, D) in q's dtype, or nil when not admitted (the caller keeps the stock
-    /// path).
+    /// Local + pool attention for `S <= 8` rows, as `DeepseekV4Math.tiledPoolAttention`: q (1, H, S, D) bf16 (RoPE
+    /// applied), localKV (1, 1, Lw, D) bf16, the pool as a contiguous 4-bit slab, topK (1, S, K) selected pool rows,
+    /// or nil for every pool row (no indexer selection while the pool has at most `index_topk` rows). Returns
+    /// (1, H, S, D) in q's dtype, or nil when not admitted (the caller keeps the stock path).
     static func attend(
-        queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray,
+        queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray?,
         offset: Int, window: Int, ratio: Int, scale: Float, sinks: MLXArray?
     ) -> MLXArray? {
         guard enabled, admitted(queries: q, localKV: localKV, pooled: pooled, topK: topK) else { return nil }
@@ -167,30 +167,30 @@ enum DeepseekV41SplitAttention {
             ratio: ratio, scale: scale, sinks: sinks)
     }
 
-    static func admitted(queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray)
+    static func admitted(queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray?)
         -> Bool
     {
         // METAL-ONLY: case 1. Guards the Metal kernels above; other devices keep the MLX-op path.
-        guard Device.defaultDevice().deviceType == .gpu, q.ndim == 4, localKV.ndim == 4, topK.ndim == 3 else {
+        guard Device.defaultDevice().deviceType == .gpu, q.ndim == 4, localKV.ndim == 4, (topK?.ndim ?? 3) == 3 else {
             return false
         }
         let B = q.dim(0), H = q.dim(1), S = q.dim(2), D = q.dim(3)
         guard B == 1, S >= 1, S <= maxRows, D == 512, H % 16 == 0, q.dtype == .bfloat16,
             localKV.dtype == .bfloat16, localKV.dim(0) == 1, localKV.dim(3) == D,
-            topK.dim(0) == 1, topK.dim(1) == S,
+            topK.map({ $0.dim(0) == 1 && $0.dim(1) == S }) ?? true,
             let slab = pooled.nibbleSlab, slab.dtype == .bfloat16, D % slab.groupSize == 0
         else { return false }
-        let keys = localKV.dim(2) + topK.dim(2)
+        let keys = localKV.dim(2) + (topK?.dim(2) ?? pooled.rowCount)
         return keys > 0 && keys <= 16 * maxChunks
     }
 
     static func launch(
-        queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray,
+        queries q: MLXArray, localKV: MLXArray, pooled: DeepseekV4PoolView, topK: MLXArray?,
         offset: Int, window: Int, ratio: Int, scale: Float, sinks: MLXArray?
     ) -> MLXArray? {
         guard let slab = pooled.nibbleSlab else { return nil }
         let H = q.dim(1), S = q.dim(2), D = q.dim(3)
-        let Lw = localKV.dim(2), K = topK.dim(2)
+        let Lw = localKV.dim(2), K = topK?.dim(2) ?? pooled.rowCount
         let widx: MLXArray
         let raw: MLXArray
         if Lw > 0 {
@@ -206,7 +206,8 @@ enum DeepseekV41SplitAttention {
         }
         let cidx: MLXArray
         if K > 0 {
-            let rows = topK.reshaped(S, K).asType(.int32)
+            let rows = topK?.reshaped(S, K).asType(.int32)
+                ?? broadcast(MLXArray(Int32(0) ..< Int32(K)).reshaped(1, K), to: [S, K])
             let position = MLXArray(Int32(offset) ..< Int32(offset + S)).reshaped(S, 1)
             let visible = MLX.logicalAnd(
                 rows .>= MLXArray(Int32(0)),
@@ -268,15 +269,17 @@ enum DeepseekV41SplitAttention {
         let local = (MLXRandom.normal([1, 1, Lw, D], key: MLXRandom.key(2)) * 0.3).asType(.bfloat16)
         let topK = MLXRandom.randInt(Int32(0) ..< Int32(T), [1, S, K], key: MLXRandom.key(4)).asType(.int32)
         let offset = 200, window = 128, ratio = 4
-        for sinks in [MLXRandom.normal([H], key: MLXRandom.key(5)), nil] as [MLXArray?] {
-            guard admitted(queries: q, localKV: local, pooled: pooled, topK: topK),
+        // Selected picks with and without a sink, and every pool row (no indexer selection yet).
+        for (sinks, picks) in [(MLXRandom.normal([H], key: MLXRandom.key(5)), topK), (nil, topK),
+                               (MLXRandom.normal([H], key: MLXRandom.key(6)), nil)] as [(MLXArray?, MLXArray?)] {
+            guard admitted(queries: q, localKV: local, pooled: pooled, topK: picks),
                 let got = launch(
-                    queries: q, localKV: local, pooled: pooled, topK: topK, offset: offset, window: window,
+                    queries: q, localKV: local, pooled: pooled, topK: picks, offset: offset, window: window,
                     ratio: ratio, scale: 1 / Float(D).squareRoot(), sinks: sinks)
             else { return false }
             let ref = DeepseekV4Math.tiledPoolAttention(
                 queries: q, localKV: local, pooled: pooled, offset: offset, window: window, ratio: ratio,
-                scale: 1 / Float(D).squareRoot(), sinks: sinks, topK: topK)
+                scale: 1 / Float(D).squareRoot(), sinks: sinks, topK: picks)
             guard withinRounding(got, ref) else { return false }
         }
         return true

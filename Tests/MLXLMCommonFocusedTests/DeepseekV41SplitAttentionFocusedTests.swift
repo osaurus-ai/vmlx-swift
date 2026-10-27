@@ -14,7 +14,8 @@ import Testing
 struct DeepseekV41SplitAttentionFocusedTests {
     struct Case: CustomStringConvertible {
         let rows: Int, window: Int, picks: Int, poolRows: Int, offset: Int, ratio: Int, sink: Bool
-        var description: String { "S\(rows) Lw\(window) K\(picks) T\(poolRows) off\(offset) r\(ratio) sink\(sink)" }
+        var allRows = false  // no indexer selection: every pool row (topK nil)
+        var description: String { "S\(rows) Lw\(window) K\(allRows ? "all" : "\(picks)") T\(poolRows) off\(offset) r\(ratio) sink\(sink)" }
     }
 
     static let cases: [Case] = [
@@ -23,16 +24,20 @@ struct DeepseekV41SplitAttentionFocusedTests {
         Case(rows: 6, window: 133, picks: 512, poolRows: 1500, offset: 3000, ratio: 2, sink: true),
         Case(rows: 3, window: 40, picks: 24, poolRows: 96, offset: 200, ratio: 4, sink: false),
         Case(rows: 2, window: 17, picks: 1, poolRows: 5, offset: 16, ratio: 2, sink: true),
+        Case(rows: 1, window: 128, picks: 0, poolRows: 300, offset: 600, ratio: 2, sink: true, allRows: true),
+        Case(rows: 6, window: 133, picks: 0, poolRows: 512, offset: 520, ratio: 1, sink: true, allRows: true),
+        Case(rows: 3, window: 20, picks: 0, poolRows: 9, offset: 19, ratio: 2, sink: false, allRows: true),
     ]
 
-    static func inputs(_ c: Case, seed: UInt64) -> (MLXArray, MLXArray, DeepseekV4PoolView, MLXArray, MLXArray?) {
+    static func inputs(_ c: Case, seed: UInt64) -> (MLXArray, MLXArray, DeepseekV4PoolView, MLXArray?, MLXArray?) {
         let H = 64, D = 512
         let storage = DeepseekV4PoolStorage(quantizationEnabled: true, hotByteLimit: 0, bits: 4, contiguous: true)
         storage.append((MLXRandom.normal([1, c.poolRows, D], key: MLXRandom.key(seed)) * 0.3).asType(.bfloat16))
         let q = (MLXRandom.normal([1, H, c.rows, D], key: MLXRandom.key(seed + 1)) * 0.3).asType(.bfloat16)
         let local = (MLXRandom.normal([1, 1, c.window, D], key: MLXRandom.key(seed + 2)) * 0.3).asType(.bfloat16)
-        let topK = MLXRandom.randInt(Int32(0) ..< Int32(c.poolRows), [1, c.rows, c.picks], key: MLXRandom.key(seed + 3))
-            .asType(.int32)
+        let topK: MLXArray? = c.allRows ? nil
+            : MLXRandom.randInt(Int32(0) ..< Int32(c.poolRows), [1, c.rows, c.picks], key: MLXRandom.key(seed + 3))
+                .asType(.int32)
         let sinks = c.sink ? MLXRandom.normal([H], key: MLXRandom.key(seed + 4)) : nil
         return (q, local, DeepseekV4PoolView(storage: storage), topK, sinks)
     }
@@ -65,7 +70,7 @@ struct DeepseekV41SplitAttentionFocusedTests {
         let nine = MLX.concatenated(Array(repeating: q, count: 9), axis: 2)
         #expect(!DeepseekV41SplitAttention.admitted(
             queries: nine, localKV: local, pooled: pooled,
-            topK: MLX.concatenated(Array(repeating: topK, count: 9), axis: 1)))
+            topK: MLX.concatenated(Array(repeating: topK!, count: 9), axis: 1)))
         #expect(!DeepseekV41SplitAttention.admitted(
             queries: q.asType(.float16), localKV: local, pooled: pooled, topK: topK))
         let dense = DeepseekV4PoolView(dense: MLXRandom.normal([1, 32, 512]).asType(.bfloat16))

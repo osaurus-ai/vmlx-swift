@@ -513,10 +513,11 @@ class DeepseekV4Attention: Module {
                         // pool is never materialized (Python mirror:
                         // `_dsv4_tiled_pool_attention`). DeepSeek-V4.1 decode / dSpark verify rows over
                         // the contiguous 4-bit pool take the split-by-keys kernels first
-                        // (`VMLX_DSV41_ATTN_SPLIT`, default on); nil keeps the path below.
-                        if isV41, let tk = topK,
+                        // (`VMLX_DSV41_ATTN_SPLIT`, default on; with no indexer selection yet, every
+                        // visible pool row); nil keeps the path below.
+                        if isV41,
                             let split = DeepseekV41SplitAttention.attend(
-                                queries: q, localKV: fullKV, pooled: pooledView, topK: tk,
+                                queries: q, localKV: fullKV, pooled: pooledView, topK: topK,
                                 offset: offset, window: config.slidingWindow, ratio: compressRatio,
                                 scale: scale, sinks: config.useAttnSink ? attnSink : nil)
                         {

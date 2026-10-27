@@ -1947,10 +1947,15 @@ public final class DeepseekV4Compressor: Module {
         // A multi-token continuation begins after any uncommitted decode
         // tail. Flush both compressor branches first to preserve window order.
         v4Cache?.flushPoolPending()
+        // The pool view follows the attention that reads it. DeepSeek-V4.1 decode and dSpark verify rows (<= 8)
+        // read the contiguous 4-bit pool in place (DeepseekV41SplitAttention), so they keep the decode view
+        // instead of a materialized dense pool; with VMLX_DSV41_ATTN_SPLIT=0 any multi-row forward is prefill.
+        let decodeRows = (v4Cache?.contiguousPools == true && DeepseekV41SplitAttention.enabled)
+            ? DeepseekV41SplitAttention.maxRows : 1
         let result = advance(
             x, rope: rope, v4Cache: v4Cache,
             startPos: startPos, branch: branch,
-            isPrefill: x.dim(1) > 1,
+            isPrefill: x.dim(1) > decodeRows,
             latentSink: latentSink)
         v4Cache?.notePoolResult(result, branch: branch)
         return result
