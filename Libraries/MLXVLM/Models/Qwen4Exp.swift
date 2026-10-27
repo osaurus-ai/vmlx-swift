@@ -2556,24 +2556,34 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         var output: [String: MLXArray] = [:]
         output.reserveCapacity(weights.count)
         for (originalKey, originalValue) in weights {
-            if (originalKey.hasPrefix("mtp.") && mtp == nil)
-                || originalKey.contains("ngram_embedding.shards")
-                || originalKey.contains("ngram_heads_") || originalKey.contains("layer_multipliers")
+            var key = originalKey
+            var value = originalValue
+            // An mlx-vlm-style converter (MLX-Serve) saves the module tree's own names,
+            // `language_model.model.*`, `language_model.lm_head`, `language_model.mtp.*`, with every
+            // value already through the reference sanitize: norms shifted, MTP fusion norms folded
+            // to `1 + weight`, conv weights in MLX layout. Its values are not transformed twice.
+            let converted = key.hasPrefix("language_model.model.")
+                || key.hasPrefix("language_model.mtp.") || key.hasPrefix("language_model.lm_head.")
+            if key.hasPrefix("model.language_model.") || key.hasPrefix("model.mtp.")
+                || key.hasPrefix("model.visual.")
+            {
+                key.removeFirst("model.".count)
+            } else if key.hasPrefix("language_model.model.") {
+                key.removeFirst("language_model.model.".count)
+                key = "language_model." + key
+            } else if converted {
+                key.removeFirst("language_model.".count)
+            }
+            if (key.hasPrefix("mtp.") && mtp == nil)
+                || key.contains("ngram_embedding.shards")
+                || key.contains("ngram_heads_") || key.contains("layer_multipliers")
             { continue }
             // No tower to receive them. A multimodal bundle loaded text-only still SHIPS its
             // vision weights; handing them to a module that was never built leaves keys with no
             // destination. Dropping them is what every other converted family does here, and it
             // mirrors the `mtp.` guard directly above — same idea, different lane.
             // The MODULE: a video-only instance HAS the tower and must keep its weights.
-            if !plan.builds(.visionTower), originalKey.hasPrefix("visual.") { continue }
-            var key = originalKey
-            var value = originalValue
-            if key.hasPrefix("model.language_model.") {
-                key.removeFirst("model.".count)
-            }
-            if key.hasPrefix("model.mtp.") {
-                key.removeFirst("model.".count)
-            }
+            if !plan.builds(.visionTower), key.hasPrefix("visual.") { continue }
             if key.hasPrefix("mtp."),
                 key.contains(".mlp.experts.gate_up_proj.")
             {
@@ -2604,15 +2614,20 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             {
                 value = value.transposed(0, 2, 3, 4, 1)
             }
+            // The PLE conv first, as in the reference: the generic rule below also matches its key.
+            // [C, 1, K] (official) and [C, K, 1] (MLX layout) both become [C, K].
+            if key.hasSuffix(".ple.conv1d.weight"), value.ndim == 3 {
+                key = key.replacingOccurrences(of: ".ple.conv1d.weight", with: ".ple.conv1d_weight")
+                value = value.squeezed(axis: value.dim(1) == 1 ? 1 : 2)
+            }
             if key.hasSuffix(".conv1d.weight"), value.ndim == 3, value.dim(1) == 1 {
                 value = value.squeezed(axis: 1).transposed(1, 0)
             }
-            if key.hasSuffix(".ple.conv1d.weight"), value.ndim == 3 {
-                key = key.replacingOccurrences(of: ".ple.conv1d.weight", with: ".ple.conv1d_weight")
-                value = value.squeezed(axis: 1)
+            if converted, key.hasPrefix("mtp.pre_fc_norm_") {
+                value = (value.asType(.float32) - 1).asType(value.dtype)
             }
-            let normAlreadyShifted =
-                config.jangMetadata?.normConvention?.lowercased() == "runtime_plus1_applied"
+            let normAlreadyShifted = converted
+                || config.jangMetadata?.normConvention?.lowercased() == "runtime_plus1_applied"
             if !normAlreadyShifted,
                 key.contains("hc_norm.weight") || key.contains(".ple.norm_")
                     || key.contains(".q_norm.weight") || key.contains(".k_norm.weight")

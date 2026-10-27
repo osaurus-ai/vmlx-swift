@@ -188,4 +188,105 @@ struct Qwen4ExpConfigurationTests {
         #expect(sanitized["lm_head.biases"]?.dtype == .bfloat16)
         #expect(sanitized["language_model.layers.0.linear_attn.A_log"]?.dtype == .float32)
     }
+
+    private func floats(_ array: MLXArray?) -> [Float] {
+        array?.asType(.float32).asArray(Float.self) ?? []
+    }
+
+    /// The layout an mlx-vlm-style converter writes (ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit):
+    /// the module tree's own names, with every value already through the reference's sanitize. On
+    /// that bundle the shifted norms equal JANG_2L's `runtime_plus1_applied` values bit for bit, and
+    /// the two MTP fusion norms equal JANG_2L's zero-centred values plus one.
+    @Test("an mlx-vlm-converted bundle is renamed and its values are not transformed twice")
+    func sanitizesConvertedLayout() throws {
+        try MLXMetalTestLock.withLock {
+            let config = try JSONDecoder().decode(
+                Qwen4ExpConfiguration.self, from: configData(dtype: "bfloat16"))
+            let model = Qwen4Exp(config)
+            let pleConv = MLXArray(0 ..< 32).reshaped(8, 4, 1).asType(.bfloat16)
+            let sanitized = model.sanitize(weights: [
+                "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight":
+                    MLXArray([1.25, 0.5] as [Float]).asType(.bfloat16),
+                "language_model.model.layers.1.self_attn.q_norm.weight":
+                    MLXArray([1.125, 0.65625] as [Float]).asType(.bfloat16),
+                "language_model.model.layers.1.ple.norm_key.weight":
+                    MLXArray([0.828125] as [Float]).asType(.bfloat16),
+                "language_model.model.layers.1.ple.conv1d.weight": pleConv,
+                "language_model.model.layers.1.ple.ple_embedding.layer_multipliers":
+                    MLXArray([3, 5, 7] as [Int32]),
+                "language_model.model.layers.1.ple.ple_embedding.ngram_heads_offsets":
+                    MLXArray([0, 101] as [Int32]),
+                "language_model.model.layers.0.linear_attn.conv1d.weight":
+                    MLXArray.zeros([8, 4, 1], dtype: .bfloat16),
+                "language_model.model.embed_tokens.weight": MLXArray.zeros([2, 2], dtype: .uint32),
+                "language_model.lm_head.weight": MLXArray.zeros([2, 2], dtype: .uint32),
+                "language_model.mtp.fc_hidden.weight": MLXArray.zeros([2, 2], dtype: .uint32),
+                "language_model.mtp.layers.0.self_attn.k_norm.weight":
+                    MLXArray([3.3125] as [Float]).asType(.bfloat16),
+                "language_model.mtp.pre_fc_norm_hidden.weight":
+                    MLXArray([1.078125, 0.35546875] as [Float]).asType(.bfloat16),
+                "language_model.mtp.pre_fc_norm_embedding.weight":
+                    MLXArray([0.35546875] as [Float]).asType(.bfloat16),
+                "model.visual.blocks.0.norm1.weight": MLXArray.ones([4], dtype: .bfloat16),
+            ])
+            #expect(Set(sanitized.keys) == [
+                "language_model.layers.0.attn_hyper_connection.hc_norm.weight",
+                "language_model.layers.1.self_attn.q_norm.weight",
+                "language_model.layers.1.ple.norm_key.weight",
+                "language_model.layers.1.ple.conv1d_weight",
+                "language_model.layers.0.linear_attn.conv1d.weight",
+                "language_model.embed_tokens.weight",
+                "lm_head.weight",
+                "mtp.fc_hidden.weight",
+                "mtp.layers.0.self_attn.k_norm.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "visual.blocks.0.norm1.weight",
+            ])
+            // Already shifted: no second +1.
+            #expect(floats(sanitized["language_model.layers.0.attn_hyper_connection.hc_norm.weight"])
+                == [1.25, 0.5])
+            #expect(floats(sanitized["language_model.layers.1.self_attn.q_norm.weight"]) == [1.125, 0.65625])
+            #expect(floats(sanitized["language_model.layers.1.ple.norm_key.weight"]) == [0.828125])
+            #expect(floats(sanitized["mtp.layers.0.self_attn.k_norm.weight"]) == [3.3125])
+            // The MTP fusion norms are applied as `1 + weight`, so the folded one comes back out.
+            #expect(floats(sanitized["mtp.pre_fc_norm_hidden.weight"]) == [0.078125, -0.64453125])
+            #expect(floats(sanitized["mtp.pre_fc_norm_embedding.weight"]) == [-0.64453125])
+            // [C, K, 1] (MLX conv layout) loses its trailing axis, values in place.
+            #expect(sanitized["language_model.layers.1.ple.conv1d_weight"]?.shape == [8, 4])
+            #expect(floats(sanitized["language_model.layers.1.ple.conv1d_weight"])
+                == (0 ..< 32).map(Float.init))
+            #expect(sanitized["language_model.layers.0.linear_attn.conv1d.weight"]?.shape == [8, 4, 1])
+        }
+    }
+
+    /// The control: official Hugging Face names still get the reference's value transforms.
+    @Test("official checkpoint names still get the +1 and the conv squeeze")
+    func sanitizesOfficialLayout() throws {
+        try MLXMetalTestLock.withLock {
+            let config = try JSONDecoder().decode(
+                Qwen4ExpConfiguration.self, from: configData(dtype: "bfloat16"))
+            let model = Qwen4Exp(config)
+            let pleConv = MLXArray(0 ..< 32).reshaped(8, 1, 4).asType(.bfloat16)
+            let sanitized = model.sanitize(weights: [
+                "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight":
+                    MLXArray([0.25, -0.5] as [Float]).asType(.bfloat16),
+                "model.language_model.layers.1.ple.conv1d.weight": pleConv,
+                "model.mtp.pre_fc_norm_hidden.weight": MLXArray([0.078125] as [Float]).asType(.bfloat16),
+                "model.visual.blocks.0.norm1.weight": MLXArray.ones([4], dtype: .bfloat16),
+            ])
+            #expect(Set(sanitized.keys) == [
+                "language_model.layers.0.attn_hyper_connection.hc_norm.weight",
+                "language_model.layers.1.ple.conv1d_weight",
+                "mtp.pre_fc_norm_hidden.weight",
+                "visual.blocks.0.norm1.weight",
+            ])
+            #expect(floats(sanitized["language_model.layers.0.attn_hyper_connection.hc_norm.weight"])
+                == [1.25, 0.5])
+            #expect(floats(sanitized["mtp.pre_fc_norm_hidden.weight"]) == [0.078125])
+            #expect(sanitized["language_model.layers.1.ple.conv1d_weight"]?.shape == [8, 4])
+            #expect(floats(sanitized["language_model.layers.1.ple.conv1d_weight"])
+                == (0 ..< 32).map(Float.init))
+        }
+    }
 }

@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLX
 import Testing
 
 @testable import MLXVLM
@@ -252,5 +253,174 @@ struct Qwen4ExpNGramTableTests {
                 stats.noCacheFileCount
                     == (Qwen4ExpNGramTable.uncachedReads ? stats.backingFileCount : 0))
         }
+    }
+
+    /// Writes the layout ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit ships: the whole table as
+    /// one safetensors file named by `config.ngram_table.file`, with no index entry and no layer name.
+    private func writeSingleFileTable(
+        rows: Int, dimensions: Int, metadata: DType, pleLayerIds: [Int]
+    ) throws -> (URL, MLXArray, MLXArray, MLXArray) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen4-ple-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let dense = MLXRandom.normal([rows, dimensions], key: MLXRandom.key(7))
+        let (packed, scales, biases) = quantized(dense, groupSize: 32, bits: 4)
+        let storedScales = scales.asType(metadata)
+        let storedBiases = biases!.asType(metadata)
+        let staged = directory.appendingPathComponent("ngram_table.safetensors")
+        try save(
+            arrays: ["weight": packed, "scales": storedScales, "biases": storedBiases],
+            metadata: ["format": "mlx-serve-ngram", "bits": "4", "group_size": "32"], url: staged)
+        try FileManager.default.moveItem(
+            at: staged, to: directory.appendingPathComponent("ngram_table.bin"))
+        let config: [String: Any] = [
+            "text_config": ["ple_layer_ids": pleLayerIds],
+            "ngram_table": ["file": "ngram_table.bin", "bits": 4, "group_size": 32],
+        ]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: directory.appendingPathComponent("config.json"))
+        return (directory, packed, storedScales, storedBiases)
+    }
+
+    @Test("a config ngram_table file is read as one table, with BF16 or F16 metadata")
+    func singleFileTable() throws {
+        try MLXMetalTestLock.withLock {
+            for metadata in [DType.bfloat16, .float16] {
+                let (directory, packed, scales, biases) = try writeSingleFileTable(
+                    rows: 6, dimensions: 64, metadata: metadata, pleLayerIds: [2])
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                // shardCount is the JANG split; a single file ignores it.
+                let table = try Qwen4ExpNGramTable(modelDirectory: directory, layerIndex: 1, shardCount: 128)
+                #expect(table.rowCount == 6)
+                #expect(table.dimensions == 64)
+
+                // The oracle is MLX's own dequantize of the very arrays that were written. MLX
+                // computes in the metadata dtype; the reader computes in float32 (as it does for
+                // JANG's F16), so the oracle gets the stored values widened exactly to float32.
+                let expected = dequantized(
+                    packed, scales: scales.asType(.float32), biases: biases.asType(.float32),
+                    groupSize: 32, bits: 4, dtype: .float32)
+                let rows: [Int64] = [4, 0, 5]
+                let wanted = concatenated(rows.map { expected[Int($0)].reshaped(1, 64) }, axis: 0)
+                    .asArray(Float.self)
+                for parallel in [false, true] {
+                    let got = try table.gather(rows, parallelRows: parallel)
+                    #expect(got.count == wanted.count)
+                    #expect(zip(got, wanted).allSatisfy { abs($0 - $1) <= 1e-6 * max(1, abs($1)) })
+                }
+                #expect(throws: Qwen4ExpNGramTableError.self) {
+                    _ = try table.gather([6], parallelRows: false)
+                }
+            }
+        }
+    }
+
+    @Test("one ngram_table file cannot serve several PLE layers")
+    func singleFileTableRefusesSeveralLayers() throws {
+        try MLXMetalTestLock.withLock {
+            let (directory, _, _, _) = try writeSingleFileTable(
+                rows: 2, dimensions: 32, metadata: .bfloat16, pleLayerIds: [2, 6])
+            defer { try? FileManager.default.removeItem(at: directory) }
+            // The refusal itself, not any error: without the declared-table reader this throws
+            // `missingIndex` and would pass a bare `throws:` check.
+            #expect {
+                _ = try Qwen4ExpNGramTable(modelDirectory: directory, layerIndex: 1, shardCount: 128)
+            } throws: { error in
+                guard case .invalidTensor("ngram_table", let reason)? = error as? Qwen4ExpNGramTableError
+                else { return false }
+                return reason.contains("2 PLE layers")
+            }
+        }
+    }
+
+    /// The numeric oracle for the MLX-Serve layout (T-246): the same trained table, quantized twice
+    /// by different converters, read through the two reader paths. A shard-order or row-offset error
+    /// pairs every row with an unrelated one, so each sampled row must agree better with its own JANG
+    /// row than any wrong pairing does; that needs no threshold. Also pins the bundle's stored hash
+    /// buffers to the ones vmlx computes, since sanitize drops them.
+    @Test("MLX-Serve and JANG tables hold the same rows in the same order")
+    func mlxServeTableMatchesJANG() throws {
+        try MLXMetalTestLock.withLock {
+            let environment = ProcessInfo.processInfo.environment
+            guard let servePath = environment["QWEN4_MLX_SERVE_BUNDLE"],
+                let jangPath = environment["QWEN4_JANG_BUNDLE"]
+            else { return }
+            let serve = URL(fileURLWithPath: servePath, isDirectory: true)
+            let jang = URL(fileURLWithPath: jangPath, isDirectory: true)
+            let config = try JSONDecoder().decode(
+                Qwen4ExpConfiguration.self,
+                from: Data(contentsOf: serve.appendingPathComponent("config.json")))
+            let layer = config.extras.pleLayerIds[0] - 1
+            let serveTable = try Qwen4ExpNGramTable(
+                modelDirectory: serve, layerIndex: layer, shardCount: config.extras.splitNgramParts)
+            let jangTable = try Qwen4ExpNGramTable(
+                modelDirectory: jang, layerIndex: layer, shardCount: config.extras.splitNgramParts)
+            #expect(serveTable.rowCount == jangTable.rowCount)
+            #expect(serveTable.dimensions == jangTable.dimensions)
+
+            // Both ends, both sides of JANG shard boundaries, and every head's first row.
+            let shardRows = jangTable.rowCount / Int64(config.extras.splitNgramParts)
+            let headCount = (config.extras.ngramSize - 1) * config.extras.headsPerNgram
+            let layout = Qwen4ExpNGramHash.headVocabLayout(
+                ngramHeads: headCount, pleLayerIndex: config.extras.pleLayerIds.firstIndex(of: layer + 1)!,
+                ngramVocabSizeBase: config.extras.ngramVocabSizeBase)
+            // The last ADDRESSABLE row: the table is padded past the last head to a multiple of
+            // `make_ngram_vocab_size_divisible_by`, and padding rows are constant (no correlation).
+            let lastRow = Int64(layout.offsets.last! + layout.sizes.last!) - 1
+            var rows: [Int64] = [0, 1, lastRow]
+            for shard in [1, 2, 63, 64, 127] {
+                rows += [Int64(shard) * shardRows - 1, Int64(shard) * shardRows]
+            }
+            rows += layout.offsets.map(Int64.init)
+            rows = Array(Set(rows)).sorted()
+
+            let dimensions = serveTable.dimensions
+            let a = try serveTable.gather(rows, parallelRows: false)
+            let b = try jangTable.gather(rows, parallelRows: false)
+            func correlation(_ i: Int, _ j: Int) -> Double {
+                let x = a[i * dimensions ..< (i + 1) * dimensions].map(Double.init)
+                let y = b[j * dimensions ..< (j + 1) * dimensions].map(Double.init)
+                let mx = x.reduce(0, +) / Double(dimensions), my = y.reduce(0, +) / Double(dimensions)
+                var sxy = 0.0, sxx = 0.0, syy = 0.0
+                for k in 0 ..< dimensions {
+                    sxy += (x[k] - mx) * (y[k] - my); sxx += (x[k] - mx) * (x[k] - mx); syy += (y[k] - my) * (y[k] - my)
+                }
+                return sxy / (sxx * syy).squareRoot()
+            }
+            var weakestOwn = 1.0, strongestOther = -1.0
+            for i in rows.indices {
+                let own = correlation(i, i)
+                let others = rows.indices.filter { $0 != i }.map { correlation(i, $0) }
+                #expect(own > others.max()!, "row \(rows[i]): own \(own), best other \(others.max()!)")
+                weakestOwn = min(weakestOwn, own)
+                strongestOther = max(strongestOther, others.max()!)
+            }
+            print("[Qwen4ExpPLE] MLX-Serve vs JANG: \(rows.count) rows, weakest own-row correlation "
+                + "\(weakestOwn), strongest wrong pairing \(strongestOther)")
+
+            // The stored hash buffers equal what the runtime computes.
+            let buffers = try loadArrays(url: serve.appendingPathComponent(
+                try indexFile(serve, "language_model.model.layers.\(layer).ple.ple_embedding.ngram_heads_offsets")))
+            let prefix = "language_model.model.layers.\(layer).ple.ple_embedding."
+            #expect(buffers[prefix + "ngram_heads_offsets"]!.asArray(Int64.self) == layout.offsets.map(Int64.init))
+            #expect(buffers[prefix + "ngram_heads_vocab_sizes"]!.asArray(Int64.self) == layout.sizes.map(Int64.init))
+            let multipliers = try loadArrays(url: serve.appendingPathComponent(
+                try indexFile(serve, prefix + "layer_multipliers")))[prefix + "layer_multipliers"]!
+            #expect(
+                multipliers.asArray(Int64.self)
+                    == Qwen4ExpNGramHash.layerMultipliers(
+                        unigramVocabSize: config.base.textConfiguration.vocabularySize,
+                        ngramSize: config.extras.ngramSize,
+                        pleLayerIndex: config.extras.pleLayerIds.firstIndex(of: layer + 1)!,
+                        seed: config.extras.seed
+                    ).map { Int64(bitPattern: $0) })
+        }
+    }
+
+    private func indexFile(_ directory: URL, _ tensor: String) throws -> String {
+        let index = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json")))
+        return try #require(((index as? [String: Any])?["weight_map"] as? [String: String])?[tensor])
     }
 }
