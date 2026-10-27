@@ -392,6 +392,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .lfm2
         }
 
+        // LFM3 family (lfm3, lfm3_vl, lfm3_omni, lfm3_audio) left LFM2's
+        // pythonic `<|tool_call_start|>[f(a=1)]` for the XML-function envelope:
+        // <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>…
+        // Routing it to `.lfm2` would leak every call into visible content.
+        if compact.hasPrefix("lfm3") {
+            return .xmlFunction
+        }
+
         // GLM/GLM-style families (glm4, glm4_moe, glm5, glm47, GPT-OSS).
         if compact == "spark25" {
             return .glm4
@@ -737,6 +745,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // `<|tool_call_start|>` / `<|tool_call_end|>`.
         case "lfm2", "lfm2_5":
             return .lfm2
+        // LFM3 — XML-function envelope (`<tool_call><function=…><parameter=…>`).
+        case "lfm3", "lfm3_vl", "lfm3_omni", "lfm3_audio":
+            return .xmlFunction
         // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
         case "k2_horizon", "k2horizon":
             return .k2Horizon
