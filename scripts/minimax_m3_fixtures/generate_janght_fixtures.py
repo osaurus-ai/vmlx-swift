@@ -100,8 +100,8 @@ VISION = {  # source names, BF16: a text-only load must drop them
     "multi_modal_projector.linear_1.weight": (64, 32),
     "patch_merge_mlp.0.weight": (32, 64),
 }
-SOURCES = ("models/minimax_m3/minimax_m3.py", "jangt/switch.py", "jangt/moe_kernels.py", "jangt/prefill.py",
-           "utils/jang_loader.py")
+SOURCES = ("models/minimax_m3/minimax_m3.py", "models/minimax_m3/msa.py", "jangt/switch.py", "jangt/moe_kernels.py",
+           "jangt/prefill.py", "utils/jang_loader.py")
 
 
 def fail(message):

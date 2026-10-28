@@ -1,9 +1,10 @@
 {
  "generator": "scripts/minimax_m3_fixtures/generate_janght_fixtures.py",
- "generator_sha256": "011d6f798b8a8ca092398ba9b8a8ecda13a003c19ac6f97435e1e3a3675662bf",
- "vmlx_commit": "7680e68a",
+ "generator_sha256": "578aad137457e2073095d2712f06a8d0d00a41c9caaa0f209875829fcb1dbc37",
+ "vmlx_commit": "885355f0",
  "reference_sha256": {
-  "models/minimax_m3/minimax_m3.py": "3cf0e613cfdd9c8fe8f5a3398b8af2d15a6310eb4e1551efdb57059b2479fb1e",
+  "models/minimax_m3/minimax_m3.py": "fd59bcff442e0a9b804876cc6969d87e8ef42fdbcaaed9c89ef5a130926675a1",
+  "models/minimax_m3/msa.py": "f01348e0fe6c084aea382700e497518689948399798f00de80a6d6e8e34b2413",
   "jangt/switch.py": "9ab5c946596e6e04ac27e6c9657c69aec3dea15e8ed47f92f63fedbceeab6a4a",
   "jangt/moe_kernels.py": "44d796106d5b12a9ff4129de45c169a0e55c99774f5cbfdb08515a7134692158",
   "jangt/prefill.py": "21625f420f966d612085289668911a476230fb6e60e93569d1c29702af0e5c4d",
@@ -48,9 +49,9 @@
    "max": 0.4919155240058899
   },
   "runtime_vs_dequant_decode": {
-   "median": 0.013598557561635971,
-   "p90": 0.015205629169940948,
-   "max": 0.015673309564590454
+   "median": 0.009868710301816463,
+   "p90": 0.014487083069980145,
+   "max": 0.017301684245467186
   },
   "control_clamped_silu": {
    "median": 0.334311842918396,

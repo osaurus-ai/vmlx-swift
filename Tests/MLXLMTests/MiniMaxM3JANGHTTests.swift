@@ -20,7 +20,9 @@ import Testing
 ///
 /// Routes: the goldens were generated with Python's sort threshold at Swift's 512 (token, slot) pairs, so each batch
 /// runs the same kernel family in both engines: the 2853-token prefill (11412 pairs) on the sorted NAX tiles, the
-/// 101-token chunks (404 pairs) and the decode steps on the decode kernels.
+/// 101-token chunks (404 pairs) and the decode steps on the decode kernels. MSA attention: vMLX 885355f0 (block-sparse
+/// MSA, `MiniMaxM3MSA.swift`), so the decode steps attend on the MSA decode kernel in both engines; the prefill and the
+/// chunks take the dense mask path (2 query heads per KV group, below the chunk kernel's 8).
 ///
 /// Tolerance (per-position relative L2 error of the logits; measured on M5 Max, 2026-10-28):
 /// - vs the Python runtime, strict float32 (process started with MLX_ENABLE_TF32=0, as the goldens were made): the

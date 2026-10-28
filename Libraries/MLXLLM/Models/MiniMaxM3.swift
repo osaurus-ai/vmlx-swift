@@ -24,8 +24,8 @@ import MLXNN
 // The official M3.1 checkpoint loads as stored (MXFP8 linears, NVFP4 routed experts); see MiniMaxM3SourceFormat.swift.
 // A JANGHT bundle (config.json `jangt` header) keeps its trunk in MXFP8 / affine per module and its routed experts as
 // mapped JANGT trellis (or JANGH codebook) banks; see MiniMaxM3JANGHPreparation.swift.
-// Attention over the selected blocks is a dense additive mask per KV group (the reference) or, behind
-// VMLX_MINIMAX_MSA=gather, a gather of the selected keys; see MiniMaxM3MSA.swift.
+// Attention over the selected blocks runs on a block-sparse Metal kernel for decode-sized calls or, as the reference, a
+// dense additive mask per KV group; see MiniMaxM3MSA.swift.
 
 /// `(1 + weight)` RMS norm. The sum is formed in the weight's dtype, as in the Python runtime.
 final class MiniMaxM3RMSNorm: Module, UnaryLayer {
@@ -192,6 +192,9 @@ final class MiniMaxM3Attention: Module {
                 queries: queries, keys: keys, values: values, scale: scale, mask: mask)
         }
         switch MiniMaxM3MSA.choosePath(selection, queries: queries, keys: keys, mask: mask, kvHeads: kvHeads) {
+        case .decode:
+            return MiniMaxM3MSA.decodeKernelAttention(
+                queries: queries, keys: keys, values: values, selection: selection, scale: scale)
         case .gather:
             return MiniMaxM3MSA.gatheredAttention(
                 queries: queries, keys: keys, values: values, selection: selection, scale: scale)
