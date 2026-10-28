@@ -1,5 +1,6 @@
 @testable import MLX
 import Dispatch
+import Metal
 import Testing
 
 @Suite("MLXArray empty host reads")
@@ -61,6 +62,29 @@ struct MLXArrayEmptyHostReadTests {
         #expect(array.size == 0)
         #expect(array.asArray(type).isEmpty)
         #expect(try array.asArrayChecked(type).isEmpty)
+    }
+
+    // `asMTLBuffer` has no bytes to wrap or copy for an array with no
+    // elements either: its no-copy path unwrapped the null data pointer.
+
+    @Test("asMTLBuffer returns nil for [0], with and without a copy")
+    func emptyVectorMTLBuffer() throws {
+        try expectNoMTLBuffer(MLXArray([Float](), [0]))
+    }
+
+    @Test("asMTLBuffer returns nil for [1, 0, 3, 448], with and without a copy")
+    func emptyRank4MTLBuffer() throws {
+        try expectNoMTLBuffer(MLXArray([Float](), [1, 0, 3, 448]))
+    }
+
+    /// The copy first, so that a trap in the no-copy path comes after the
+    /// copy's result is recorded.
+    private func expectNoMTLBuffer(_ array: MLXArray) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        #expect(array.size == 0)
+        #expect(array.contiguousToDimension() == 0)
+        #expect(array.asMTLBuffer(device: device, noCopy: false) == nil)
+        #expect(array.asMTLBuffer(device: device, noCopy: true) == nil)
     }
 
     @Test("evaluated host access holds the stream lock through the read")

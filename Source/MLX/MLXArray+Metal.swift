@@ -10,6 +10,8 @@ extension MLXArray {
 
     /// Return the contents as a Metal buffer in the native ``dtype``.
     ///
+    /// Returns `nil` for an array with no elements, which has no bytes to wrap or copy.
+    ///
     /// > If you can guarantee the lifetime of the ``MLXArray`` will exceed the MTLBuffer and that
     /// the array will not be mutated (e.g. using indexing or other means) it is possible to pass `noCopy: true`
     /// to reference the backing bytes.
@@ -28,6 +30,7 @@ extension MLXArray {
             reportUnrealizedHostRead("asMTLBuffer")
             return nil
         }
+        guard self.size > 0 else { return nil }
 
         if noCopy && self.contiguousToDimension() == 0 {
             // the backing is contiguous, we can provide a wrapper
