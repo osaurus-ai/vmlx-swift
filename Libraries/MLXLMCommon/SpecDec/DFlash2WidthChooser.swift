@@ -6,7 +6,7 @@
 // (+51-60 % easy text in Python) while prose, where deep draft positions rarely land, wants 8.
 // Fixed widths lose somewhere; the rate-EMA and acceptance-only rules were measured and rejected in Python.
 //
-// MODEL (expected tokens per measured second, TensorFold's depth objective):
+// MODEL (expected tokens per measured second, the reference depth objective):
 //   E[tokens | w] = 1 + sum_{j=1}^{w-1} prod_{k<=j} p_k, p_k = P(draft position k accepted | 1..k-1 were).
 //   p_k is learned from EVERY cycle at ANY width (positions 1..accepted hit, accepted+1 missed if it was
 //   verified), counts decay x0.85 per cycle; a position with little data leans on the previous estimate

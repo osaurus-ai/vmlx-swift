@@ -143,7 +143,7 @@ impact:
    the forward commits. The stash pins the pre-mutation value with a
    `* 1` graph node — still no eval.
 
-2. **One host sync per cycle** (oMLX Lightning MTP's headline lever):
+2. **One host sync per cycle** (reference runtime Lightning MTP's headline lever):
    verify input built on-graph from the drafter output, greedy argmax
    folded into the verify flush, `asyncEval` dispatch.
 
@@ -154,7 +154,7 @@ impact:
 
 Remaining headroom, still real but now secondary: the vendored MLX
 0.31.1 qmm at M=8 costs 1.3–2.9× M=1 at these shapes (lm_head worst);
-mlx 0.32.1 measures ~15–30% better at the same shapes, and oMLX-style
+mlx 0.32.1 measures ~15–30% better at the same shapes, and reference runtime-style
 split-K verify-shape kernels (their lm_head 2.6–3.3×) would close the
 rest. That is the path from ~1.4–1.5× to ~2×+ on quants.
 

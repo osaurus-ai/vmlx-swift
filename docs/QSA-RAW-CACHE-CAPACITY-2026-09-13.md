@@ -45,7 +45,7 @@ No model-name, quant-name or context-length allowlist is used.
 logical length, backing capacity and dtype. These are diagnostic switches, not
 new application settings. No per-token environment lookup is added.
 
-The storage principle was compared with oMLX's `_QSAIndexerCache` at revision
+The storage principle was compared with reference runtime's `_QSAIndexerCache` at revision
 `7cbb407168ae628bbe0d7fe385be70e0954af303`. Its geometric reservation and media
 position schema were not copied. Swift's separate QSA media-position companion
 gap remains outside this patch and must not be declared qualified by text rates.

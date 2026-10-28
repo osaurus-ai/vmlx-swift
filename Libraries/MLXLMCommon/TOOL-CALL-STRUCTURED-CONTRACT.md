@@ -9,7 +9,7 @@ other model whose Jinja chat template reads
 
 ## The bug
 
-1. osaurus's `ModelRuntime.mapOpenAIChatToMLX`
+1. osaurus's `ModelRuntime.makeMLXChatMessages`
    (`Packages/OsaurusCore/Services/ModelRuntime.swift:745-749`)
    serialized assistant tool calls into the `content` string as
    `<tool_call>{...}</tool_call>` XML because ``Chat.Message`` had no
@@ -101,7 +101,7 @@ on top, without having to reimplement the tool-call emission logic.
 
 ## Usage — osaurus side
 
-Replace the current `mapOpenAIChatToMLX` XML-stuffing path with:
+Replace the current `makeMLXChatMessages` XML-stuffing path with:
 
 ```swift
 // Was: content = "<tool_call>{...}</tool_call>"

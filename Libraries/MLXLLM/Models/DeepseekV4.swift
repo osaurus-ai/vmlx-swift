@@ -1668,7 +1668,7 @@ public class DeepseekV4ModelInner: Module {
 
     /// DeepSeek-V4.1 decode / verify (<= `layerSubmitMaxRows` rows): submit each layer to the GPU as soon
     /// as its graph is built (`asyncEval(h, preMix)`), so the GPU runs layer i while the host builds layer
-    /// i + 1 instead of idling through the whole token's graph build (ds4 #1261 / oMLX `language.py`
+    /// i + 1 instead of idling through the whole token's graph build (ds4 #1261 / reference runtime `language.py`
     /// per-layer submit). Scheduling only: the arrays and their arithmetic are unchanged.
     /// `VMLX_DSV41_LAYER_SUBMIT=0` restores the single end-of-token eval. Tests flip it.
     nonisolated(unsafe) static var layerSubmit: Bool = {

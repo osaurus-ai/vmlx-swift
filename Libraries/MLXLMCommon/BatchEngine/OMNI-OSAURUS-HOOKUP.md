@@ -260,7 +260,7 @@ verified destination.
 | Reasoning toggle `{"reasoning":{"enabled":bool}}` (Anthropic) or osaurus' equivalent | `UserInput.additionalContext = ["enable_thinking": Bool]` | row 7, row 8 (mid-conversation toggle) |
 
 `UserInput.init(prompt:images:videos:audios:tools:additionalContext:)`
-takes all four in one call — osaurus's `mapOpenAIChatToMLX` collects
+takes all four in one call — osaurus's `makeMLXChatMessages` collects
 parts and passes them. `UserInput.init(chat:)` reduces the same fields
 out of `Chat.Message`. No special omni-aware code needed; this is the
 generic protocol surface every VLM in this repo uses.

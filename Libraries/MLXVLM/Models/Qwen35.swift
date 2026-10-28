@@ -1159,7 +1159,7 @@ enum Qwen35RouterTail {
     }
 }
 
-// MARK: - DFlash 2 tree GatedDelta (port of TensorFold lane_tree._TREE_SOURCE, Apache-2.0)
+// MARK: - DFlash 2 tree GatedDelta
 //
 // One verify window holding a draft TREE: row r continues from its parent's state, not from row
 // r-1. Each thread keeps the state of every row in registers (`states[MAXW][n_per_t]`, Dk/32

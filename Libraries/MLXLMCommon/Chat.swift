@@ -32,7 +32,7 @@ public enum Chat {
         /// Array of audio data associated with the message. Used by
         /// speech-aware models (Nemotron-3-Nano-Omni Parakeet path).
         /// Stays empty for text/image-only models. The osaurus
-        /// `MessageContentPart.audioInput` → `mapOpenAIChatToMLX`
+        /// `MessageContentPart.audioInput` → `makeMLXChatMessages`
         /// path populates this field; downstream
         /// ``UserInput.init(chat:)`` copies it into ``UserInput/audios``.
         public var audios: [UserInput.Audio]

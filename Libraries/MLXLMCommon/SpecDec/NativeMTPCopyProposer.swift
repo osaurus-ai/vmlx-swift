@@ -1,5 +1,5 @@
 // Copy drafts for the native-MTP verify cycle — Swift port of vMLX Python `native_mtp_copy.py`
-// (SuffixCopyProposer; TensorFold's SuffixLookupProposer). On repetitive, quoted, edited or structured text
+// (SuffixCopyProposer; the reference SuffixLookupProposer). On repetitive, quoted, edited or structured text
 // the next tokens very often repeat a span that already occurs earlier in the prompt or reply; proposing that
 // span as the verify window lands far more often than the MTP head's chained drafts, whose per-depth
 // acceptance compounds.
