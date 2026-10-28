@@ -339,6 +339,7 @@ let package = Package(
         .library(name: "vMLXFlux", targets: ["vMLXFlux"]),
         .executable(name: "vmlxflux-probe", targets: ["vMLXFluxProbe"]),
         .executable(name: "RunBench", targets: ["RunBench"]),
+        .executable(name: "M3RealT5", targets: ["M3RealT5"]),
         .executable(name: "TPRankWorker", targets: ["TPRankWorker"]),
         .executable(name: "DistributedProbe", targets: ["DistributedProbe"]),
         .executable(name: "DistributedPeerSmoke", targets: ["DistributedPeerSmoke"]),
@@ -807,6 +808,12 @@ let package = Package(
             exclude: ["coherency-matrix.sh", "test_slice.swift.bak"]
         ),
 
+        .executableTarget(
+            name: "M3RealT5",
+            dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers"],
+            path: "M3RealT5",
+            exclude: ["scripts"]
+        ),
         .testTarget(
             name: "MLXTests",
             dependencies: [
