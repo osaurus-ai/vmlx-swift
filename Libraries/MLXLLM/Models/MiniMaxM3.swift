@@ -444,7 +444,9 @@ public final class MiniMaxM3ModelInner: Module {
     }
 }
 
-public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding {
+public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding,
+    AlignedPrefillModel
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -505,14 +507,95 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
         // the output head included.
         let verifying = MiniMaxM3DSpark.tapHolder(cache).map { MiniMaxM3DSpark.verifies(inputs, holder: $0) } ?? false
         let out = model(inputs, cache: cache)
+        let logits: MLXArray
         if verifying {
-            return lmHead.map { MiniMaxM3RowExact.linear($0, out) }
+            logits = lmHead.map { MiniMaxM3RowExact.linear($0, out) }
                 ?? MiniMaxM3RowExact.rows(out) { model.embedTokens.asLinear($0) }
+        } else if let lmHead {
+            logits = lmHead(out)
+        } else {
+            logits = model.embedTokens.asLinear(out)
         }
-        if let lmHead {
-            return lmHead(out)
+        AlignedPrefill.hooks.logitsObserver?(logits)
+        return logits
+    }
+
+    // MARK: Prompt prefill
+
+    /// Prompt prefill. With the request's aligned plan (`AlignedPrefillPrefix.swift`, installed on the caches by the
+    /// engine) the prompt is cut at every ABSOLUTE multiple of the prefill step and at the plan's store boundary, so a
+    /// cold prefill and a continuation after a cache hit at a chunk boundary (or at an exact-geometry store boundary)
+    /// run the same matrices for every remaining row: the hit's state and logits equal the cold prefill's bit for bit.
+    /// MSA turns a few ulps of chunk-shape rounding into a different block choice, so for M3 this is what makes a
+    /// cached answer the uncached answer. Without a plan (`VMLX_M3_ALIGNED_PREFIX=0`, or no engine plan): chunks of
+    /// `windowSize` from wherever the cache starts, as `LLMModel`'s default prepare (the previous behaviour).
+    ///
+    /// Non-final pieces evaluate the cache rows only (no output head); the last piece is returned for the engine's
+    /// sampling forward.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        let shape = input.text.tokens.shape
+        if shape.count >= 2 && shape[0] != 1 {
+            fatalError("MiniMaxM3Model.prepare expects single-sequence input (batch=1), got shape \(shape)")
         }
-        return model.embedTokens.asLinear(out)
+        let tokens = input.text.tokens.reshaped([-1])
+        let mask: MLXArray? = input.text.mask.map { $0.ndim >= 2 ? $0.reshaped([-1]) : $0 }
+        let count = tokens.size
+        let aligned = AlignedPrefill.layers(cache)
+        let start = cache.first?.offset ?? 0
+        let step = max(1, windowSize ?? 512)
+        let plan = aligned.first?.alignedPrefillPlan
+        let laneRowsBefore = aligned.flatMap(\.alignedPrefillLaneRows)
+
+        var pieces: [Range<Int>]
+        var followsPlan = false
+        // The invariant a restore must leave: every layer and lane holds exactly the rows before this prefill, and
+        // they plus this input are the whole prompt the plan was made for.
+        if let plan, plan.step == step, start + count == plan.promptTokenCount,
+            cache.allSatisfy({ $0.offset == start }), laneRowsBefore.allSatisfy({ $0 == start }),
+            aligned.allSatisfy({ $0.alignedPrefillPlan == plan })
+        {
+            pieces = AlignedPrefillGeometry.pieces(
+                start: start, end: start + count, step: plan.step,
+                boundary: AlignedPrefill.hooks.controlOmitsBoundaryCut ? nil : plan.boundary)
+            followsPlan = true
+        } else {
+            if let plan {
+                // Not a refusal: the prompt still prefills, in the previous relative chunks, and its rows carry no
+                // aligned geometry (no later request reuses them as aligned).
+                RuntimeDiagnostics.write(Data(
+                    ("[vmlx][minimax-m3] aligned prefill plan {\(plan)} does not fit this prefill (cache at \(start), "
+                        + "\(count) tokens, step \(step), lanes \(Array(Set(laneRowsBefore)).sorted())): relative "
+                        + "chunking\n").utf8))
+            }
+            pieces = []
+            var position = start
+            while start + count - position > step {
+                pieces.append(position ..< (position + step))
+                position += step
+            }
+            if position < start + count || pieces.isEmpty { pieces.append(position ..< (start + count)) }
+        }
+        for layer in aligned {
+            layer.alignedPrefillTag = followsPlan ? plan?.tag : nil
+        }
+        AlignedPrefill.hooks.prefillObserver?(AlignedPrefillPrefillRecord(
+            start: start, end: start + count, pieces: pieces, plan: plan, aligned: followsPlan,
+            laneRowsBefore: laneRowsBefore))
+
+        for piece in pieces.dropLast() {
+            // A disconnected client cancels the producer; stop between chunks instead of encoding the whole prompt.
+            try Task.checkCancellation()
+            let local = (piece.lowerBound - start) ..< (piece.upperBound - start)
+            _ = model(tokens[local][.newAxis, 0...], cache: cache.isEmpty ? nil : cache)
+            MLX.eval(cache)
+            PrefillProgressReporter.reportCompletedUnits(piece.upperBound - start)
+            Memory.clearCache()
+        }
+        guard let last = pieces.last else {
+            return .tokens(LMInput.Text(tokens: tokens, mask: mask))
+        }
+        let local = (last.lowerBound - start) ..< (last.upperBound - start)
+        return .tokens(LMInput.Text(tokens: tokens[local], mask: mask.map { $0[local] }))
     }
 
     /// One cache per layer, following the attention type of each layer: sparse (MSA) layers keep keys, values and
@@ -527,6 +610,12 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// The sparse layers' cache is not a promotable compiled cache, and the block selection depends on the host-side
     /// cache length.
     public var supportsWholeForwardCompilation: Bool { false }
+
+    /// Every M3 prompt prefill is cut at absolute chunk boundaries and the store boundary (`prepare`), so prefix-cache
+    /// hits are bit-identical to a cold prefill. `VMLX_M3_ALIGNED_PREFIX=0` turns it off (previous behaviour).
+    public var alignedPrefillSchema: String? {
+        AlignedPrefillGeometry.isEnabled() ? "minimax-m3:" + AlignedPrefillGeometry.schema : nil
+    }
 
     /// The three-lane sparse cache has no batched (B > 1) form yet.
     public var maximumSupportedDecodeBatchSize: Int? { 1 }

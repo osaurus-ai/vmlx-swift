@@ -36,6 +36,13 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
     var dsparkVerifyArmed = false
     var dsparkVerifyStart: Int?
 
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): the current request's plan, set by the engine before its prompt
+    /// prefill and read by `MiniMaxM3Model.prepare`. Request-scoped: never persisted or copied.
+    public var alignedPrefillPlan: AlignedPrefillPlan?
+    /// The geometry the rows of this cache were produced in (prefill step + producing store boundary); nil when not
+    /// produced by an aligned prefill. Persisted in `metaState` (so a disk entry keeps it), kept by `copy` and `trim`.
+    public var alignedPrefillTag: AlignedPrefillTag?
+
     public init() {}
 
     public var offset: Int { kv.offset }
@@ -90,6 +97,9 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
         }
         set {
             dsparkTail = nil
+            // New rows of unknown provenance: whoever sets a state that has a geometry (`copy`, a disk restore) sets
+            // the tag after it.
+            alignedPrefillTag = nil
             if newValue.isEmpty {
                 kv = KVCacheSimple()
                 indexStorage = nil
@@ -107,9 +117,14 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
         }
     }
 
+    /// The K/V lane's metadata, then the aligned-prefill tag when the rows have one.
     public var metaState: [String] {
-        get { kv.metaState }
-        set { kv.metaState = newValue }
+        get { kv.metaState + (alignedPrefillTag?.metaState ?? []) }
+        set {
+            let own = kv.metaState.count
+            kv.metaState = Array(newValue.prefix(own))
+            alignedPrefillTag = newValue.count > own ? AlignedPrefillTag(metaState: Array(newValue.dropFirst(own))) : nil
+        }
     }
 
     public var isTrimmable: Bool { true }
@@ -136,6 +151,7 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
             // `* 1` materializes owned buffers: a slice would share the live cache's storage and block donation.
             copy.state = current.map { $0 * 1 }
             copy.dsparkTail = dsparkTail
+            copy.alignedPrefillTag = alignedPrefillTag
         }
         return copy
     }
@@ -144,9 +160,18 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
 
     public var diskCacheStateIdentifier: String { "minimax-m3-msa-kv-index-v1" }
 
+    /// Restores all three lanes or nothing. The metadata is the K/V lane's, optionally followed by the aligned-prefill
+    /// tag of the stored rows (entries written before aligned prefill have none, and restore without a tag).
     public func restoreDiskCacheState(_ state: [MLXArray], metadata: [String], offset: Int) -> Bool {
-        guard offset > 0, metadata == kv.metaState, Self.isValid(state, offset: offset) else { return false }
+        let own = kv.metaState
+        guard offset > 0, metadata.count >= own.count, Array(metadata.prefix(own.count)) == own,
+            Self.isValid(state, offset: offset)
+        else { return false }
+        let extra = Array(metadata.dropFirst(own.count))
+        let tag = extra.isEmpty ? nil : AlignedPrefillTag(metaState: extra)
+        guard extra.isEmpty || tag != nil else { return false }
         self.state = state
+        alignedPrefillTag = tag
         return true
     }
 
@@ -160,6 +185,11 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
             && keys.dim(3) > 0 && values.dim(3) > 0 && index.dim(3) > 0
             && keys.dtype.isFloatingPoint && keys.dtype == values.dtype && index.dtype.isFloatingPoint
     }
+}
+
+extension MiniMaxM3SparseCache: AlignedPrefillCache {
+    /// K/V rows and indexer-key rows.
+    public var alignedPrefillLaneRows: [Int] { [offset, indexCount] }
 }
 
 // MARK: - Speculative checkpoint (DSpark verify)
