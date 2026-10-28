@@ -167,6 +167,9 @@ public enum LLMTypeRegistry {
                 let config = try JSONDecoder.json5().decode(MiniMaxConfiguration.self, from: data)
                 return MiniMaxModel(config)
             },
+            // MiniMax-M3 / M3.1: MSA attention, sigmoid-routed MoE, a separate architecture from M2.
+            "minimax_m3": dispatchMiniMaxM3,
+            "minimax_m3_vl": dispatchMiniMaxM3,
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -433,6 +436,15 @@ public enum LLMTypeRegistry {
             context = nil
         }
         return ZayaModel(config, moe: context)
+    }
+
+    /// MiniMax-M3 / M3.1 text model. A `minimax_m3_vl` bundle builds without its vision tower; a request for any
+    /// lane other than text is refused here instead of being served text-only.
+    private static func dispatchMiniMaxM3(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
+        _ = try Set.resolveForConstruction(requested: requesting, constructible: [.text])
+        return MiniMaxM3Model(try JSONDecoder.json5().decode(MiniMaxM3Configuration.self, from: data))
     }
 
     /// `model_type = "bailing_hybrid"` covers two architectures that share the
