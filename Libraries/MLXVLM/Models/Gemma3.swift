@@ -1,4 +1,8 @@
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#else
+    import Foundation
+#endif
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -1111,6 +1115,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Gemma3Processor: UserInputProcessor {
     private let config: Gemma3ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1200,6 +1205,7 @@ public struct Gemma3Processor: UserInputProcessor {
         )
     }
 }
+#endif
 
 public struct Gemma3ProcessorConfiguration: Codable, Sendable {
     // Fields from the preprocessor_config.json

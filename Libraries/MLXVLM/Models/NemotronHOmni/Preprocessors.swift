@@ -5,13 +5,20 @@
 // torchvision dependency.
 
 import Foundation
-import CoreImage
-import CoreImage.CIFilterBuiltins
-import Accelerate
-@preconcurrency import AVFoundation
+#if canImport(CoreImage)
+    import CoreImage
+    import CoreImage.CIFilterBuiltins
+#endif
+#if canImport(Accelerate)
+    import Accelerate
+#endif
+#if canImport(AVFoundation)
+    @preconcurrency import AVFoundation
+#endif
 import MLX
 import MLXLMCommon
 
+#if canImport(AVFoundation)
 private final class AudioConverterInputProvider: @unchecked Sendable {
     private let lock = NSLock()
     private let buffer: AVAudioPCMBuffer
@@ -33,6 +40,7 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
         return buffer
     }
 }
+#endif
 
 // MARK: - Image preprocessing (NVLM 1-D dynamic tile)
 
@@ -41,9 +49,11 @@ public let NEMOTRON_OMNI_CLIP_MEAN: [Float] = [0.48145466, 0.4578275, 0.40821073
 /// OpenAI CLIP normalization std (matches source `norm_std`)
 public let NEMOTRON_OMNI_CLIP_STD: [Float] = [0.26862954, 0.26130258, 0.27577711]
 
+#if canImport(CoreImage)
 private let imagePreprocessContext = CIContext(options: [
     .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any
 ])
+#endif
 
 /// Pick the (cols, rows) tile grid whose aspect ratio best matches the input.
 /// Mirrors `_find_closest_aspect_ratio` in image_processor.py.
@@ -95,6 +105,7 @@ private func buildTargetRatios(minNum: Int, maxNum: Int) -> [(Int, Int)] {
     return ratios
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// NVLM-style dynamic tiling. Returns a list of CIImage tiles (each at
 /// imageSize×imageSize), with optional thumbnail appended.
 public func nemotronOmniDynamicPreprocess(
@@ -151,7 +162,9 @@ public func nemotronOmniDynamicPreprocess(
     }
     return tiles
 }
+#endif
 
+#if canImport(CoreImage)
 /// Render a CIImage into a planar (3, H, W) Float32 array, normalized by
 /// CLIP mean/std.
 private func rasterizeImage(
@@ -182,6 +195,7 @@ private func rasterizeImage(
     // (H, W, 3) → (3, H, W)
     return arr.transposed(2, 0, 1)
 }
+#endif
 
 private func pythonRoundToInt(_ value: Double) -> Int {
     let floorValue = floor(value)
@@ -192,6 +206,7 @@ private func pythonRoundToInt(_ value: Double) -> Int {
     return base.isMultiple(of: 2) ? base : base + 1
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 private func nemotronOmniSourceTargetPatches(
     image: CIImage,
     tokensAvailable: Int,
@@ -315,6 +330,7 @@ public func nemotronOmniPreprocessImages(
     }
     return (MLX.concatenated(allImages.map { $0.reshaped([-1]) }, axis: 0), tokenCounts, dims)
 }
+#endif
 
 // MARK: - Audio preprocessing (parakeet mel STFT)
 
@@ -416,6 +432,7 @@ private func preemphasis(_ waveform: [Float], coef: Float) -> [Float] {
     return out
 }
 
+#if canImport(Accelerate)
 /// Real FFT via vDSP. Returns interleaved complex frames as
 /// (nBins=nFFT/2+1, nFrames). Each frame uses a centered, Hann-windowed
 /// segment of the waveform with constant zero padding.
@@ -583,7 +600,9 @@ public func nemotronOmniExtractMelFeatures(
     arr = arr.reshaped([1, nFrames, nMels])
     return arr
 }
+#endif
 
+#if canImport(AVFoundation)
 /// Load a 16 kHz mono Float32 array from an audio file.
 /// Resamples + downmixes if necessary.
 public func nemotronOmniLoadAudioFile(
@@ -656,6 +675,7 @@ public func nemotronOmniLoadAudioFile(
     let chData = outBuffer.floatChannelData!
     return Array(UnsafeBufferPointer(start: chData[0], count: n))
 }
+#endif
 
 // MARK: - Audio resampling
 
@@ -685,6 +705,7 @@ public func linearResamplePCM(_ pcm: [Float], fromRate: Int, toRate: Int) -> [Fl
 
 // MARK: - Video preprocessing (frame extraction + EVS)
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Extract uniformly-spaced frames from a video file using the same async
 /// `AVAssetImageGenerator.images(for:)` API as Qwen 2/2.5/3/3.5/3.6 VL.
 /// Reuses `MediaProcessing.asCIImageSequence` so the frame-decode pipeline
@@ -774,6 +795,7 @@ public func nemotronOmniPreprocessVideo(
     let pixelValues = MLXArray(stacked, [nFrames, 3, H, W])
     return pixelValues.reshaped([nGroups, videoTemporalPatchDim * 3, H, W])
 }
+#endif
 
 public func nemotronOmniVideoTargetSize(
     width: Int,
@@ -807,6 +829,7 @@ public func nemotronOmniVideoTargetSize(
     return (width: patchW * patchSize, height: patchH * patchSize, tokens: tokens)
 }
 
+#if canImport(CoreImage)
 /// Bicubic resize a CIImage to (target, target) and normalize via CLIP
 /// mean/std → returns a contiguous (3*target*target,) Float32 buffer in
 /// (3, H, W) order.
@@ -879,6 +902,7 @@ private func nemotronOmniResizeAndNormalize(
     }
     return out
 }
+#endif
 
 /// Apply Efficient Video Sampling (EVS) at the *embedding* level.
 /// Drops `pruningRate` of redundant tokens by computing cosine similarity

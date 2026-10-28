@@ -1,10 +1,15 @@
 // Copyright © 2024 Apple Inc.
 
-import AVFoundation
-import CoreImage.CIFilterBuiltins
+#if canImport(AVFoundation)
+    import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage.CIFilterBuiltins
+#endif
 import MLX
 import MLXLMCommon
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public typealias VideoFrame = UserInput.VideoFrame
 
 public struct ProcessedFrames {
@@ -681,3 +686,4 @@ extension CIImage {
         return MediaProcessing.asMLXArray(self, colorSpace: colorSpace)
     }
 }
+#endif

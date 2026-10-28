@@ -1,4 +1,6 @@
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -1028,6 +1030,7 @@ public struct PixtralProcessorConfiguration: Codable, Sendable {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct PixtralProcessor: UserInputProcessor {
     private let config: PixtralProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1163,3 +1166,4 @@ public struct PixtralProcessor: UserInputProcessor {
         }
     }
 }
+#endif

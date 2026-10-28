@@ -34,7 +34,9 @@
 //
 // 16 x 16 = 256 latent positions, hence exactly 256 image tokens per image.
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon

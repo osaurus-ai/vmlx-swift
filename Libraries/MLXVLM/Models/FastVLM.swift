@@ -7,7 +7,9 @@
 
 // Based on https://github.com/Blaizzy/mlx-vlm/pull/502
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -966,6 +968,7 @@ public struct FastVLMProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage)
 public struct FastVLMProcessor: UserInputProcessor {
     private let config: FastVLMProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -1033,6 +1036,7 @@ public struct FastVLMProcessor: UserInputProcessor {
         )
     }
 }
+#endif
 
 // MARK: - Multimodal Projector
 

@@ -2,7 +2,9 @@
 
 // port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/paligemma
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -429,6 +431,7 @@ private enum Vision {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// PaliGemma VLM `UserInputProcessor`.
 ///
 /// This is meant to be used with ``PaliGemma`` and is typically created by ``VLMModelFactory``.
@@ -501,6 +504,7 @@ public struct PaliGemmaProcessor: UserInputProcessor {
     }
 
 }
+#endif
 
 // MARK: - Model
 

@@ -15,7 +15,9 @@
 // other VLM file's scoped symbols.
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon

@@ -1,6 +1,10 @@
 import Foundation
-import CoreGraphics
-import CoreImage
+#if canImport(CoreGraphics)
+    import CoreGraphics
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -1664,6 +1668,7 @@ public final class Zaya1VL: Module, VLMModel {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// ZAYA1-VL user-input processor.
 ///
 /// ZAYA1-VL uses the Qwen2.5-VL image geometry and normalization contract,
@@ -1759,3 +1764,4 @@ public struct Zaya1VLProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif

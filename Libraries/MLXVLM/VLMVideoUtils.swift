@@ -22,14 +22,20 @@
 //   • Frame-rate / sampling policies (model-specific defaults)
 
 import Foundation
-import CoreImage
-import CoreImage.CIFilterBuiltins
-import AVFoundation
+#if canImport(CoreImage)
+    import CoreImage
+    import CoreImage.CIFilterBuiltins
+#endif
+#if canImport(AVFoundation)
+    import AVFoundation
+#endif
 import MLX
 
+#if canImport(CoreImage)
 private let sharedVideoCIContext = CIContext(options: [
     .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any
 ])
+#endif
 
 // MARK: - CLIP / SigLIP mean/std presets (used by Nemotron / Qwen 3.6 / Kimi)
 
@@ -41,6 +47,7 @@ public let CLIP_NORM_STD: [Float] = [0.26862954, 0.26130258, 0.27577711]
 public let SIGLIP_NORM_MEAN: [Float] = [0.5, 0.5, 0.5]
 public let SIGLIP_NORM_STD: [Float] = [0.5, 0.5, 0.5]
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 // MARK: - Generic uniform frame extractor
 
 /// Extract roughly `targetFrames` frames uniformly from a video.
@@ -66,7 +73,9 @@ public func vlmExtractFramesUniform(
         asset, samplesPerSecond: samplesPerSecond,
     )
 }
+#endif
 
+#if canImport(CoreImage)
 // MARK: - Resize + normalize
 
 /// Bicubic-resize a CIImage to (target, target) and normalize via the given
@@ -154,6 +163,7 @@ public func vlmStackFramesIntoChannels(
     let pixelValues = MLXArray(stacked, [n, 3, H, W])
     return pixelValues.reshaped([groups, T * 3, H, W])
 }
+#endif
 
 // MARK: - EVS (Efficient Video Sampling)
 

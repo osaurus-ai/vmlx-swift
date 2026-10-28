@@ -68,7 +68,9 @@
 // mask-zeroed output) with `preEncodedEmbedding == nil`; pre-encoded
 // embeddings keep bypassing the tower.
 
-import Accelerate
+#if canImport(Accelerate)
+    import Accelerate
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -217,6 +219,7 @@ private let gemma4HannWindow: [Float] = (0 ..< Gemma4AudioMel.frameLength).map {
     0.5 - 0.5 * cos(2.0 * Float.pi * Float(n) / Float(Gemma4AudioMel.frameLength))
 }
 
+#if canImport(Accelerate)
 /// Extract Gemma4 log-mel features from 16 kHz mono PCM.
 /// Returns `[T, 128]` Float32; `T = (L − 1)/hop + 1 − frame/hop` over the
 /// semicausally padded waveform (≥ 1 frame requires ≥ 161 input samples;
@@ -303,6 +306,7 @@ func gemma4ExtractMelFeatures(_ pcm: [Float]) -> MLXArray {
 
     return MLXArray(mel).reshaped(nFrames, nMels)
 }
+#endif
 
 // MARK: - Tower building blocks
 

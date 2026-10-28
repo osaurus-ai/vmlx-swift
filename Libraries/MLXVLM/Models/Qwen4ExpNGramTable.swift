@@ -1,6 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 import Foundation
 import MLXLMCommon
 
@@ -64,7 +68,11 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
     private let tensors: [String: Qwen4ExpTensorDescriptor]
 
     init(url: URL) throws {
+        #if canImport(Darwin)
         let opened = Darwin.open(url.path, O_RDONLY)
+        #else
+        let opened = Glibc.open(url.path, O_RDONLY)
+        #endif
         guard opened >= 0 else {
             throw Qwen4ExpNGramTableError.openFailed(url, errno)
         }
@@ -74,11 +82,13 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
                 throw Qwen4ExpNGramTableError.statFailed(url, errno)
             }
             let size = UInt64(status.st_size)
+            #if canImport(Darwin)
             if Qwen4ExpNGramTable.uncachedReads {
                 guard fcntl(opened, F_NOCACHE, 1) == 0 else {
                     throw Qwen4ExpNGramTableError.noCacheFailed(url, errno)
                 }
             }
+            #endif
             guard size >= 8 else {
                 throw Qwen4ExpNGramTableError.truncatedHeader(url)
             }
@@ -118,12 +128,20 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
             self.fd = opened
             self.tensors = parsed
         } catch {
+            #if canImport(Darwin)
             Darwin.close(opened)
+            #else
+            Glibc.close(opened)
+            #endif
             throw error
         }
     }
 
+    #if canImport(Darwin)
     deinit { Darwin.close(fd) }
+    #else
+    deinit { Glibc.close(fd) }
+    #endif
 
     func descriptor(for name: String) -> Qwen4ExpTensorDescriptor? {
         tensors[name]
@@ -148,9 +166,15 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
         while completed < count {
             let amount = data.withUnsafeMutableBytes { bytes -> Int in
                 guard let base = bytes.baseAddress else { return 0 }
+                #if canImport(Darwin)
                 return Darwin.pread(
                     fd, base.advanced(by: completed), count - completed,
                     off_t(range.lowerBound) + off_t(completed))
+                #else
+                return Glibc.pread(
+                    fd, base.advanced(by: completed), count - completed,
+                    off_t(range.lowerBound) + off_t(completed))
+                #endif
             }
             guard amount > 0 else {
                 throw Qwen4ExpNGramTableError.readFailed(
@@ -212,11 +236,16 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     /// The reference runtime read the table through the page cache and warmed it once after load; lookups are then RAM
     /// hits. Page-cache pages are clean and reclaimable: under memory pressure macOS evicts them and
     /// lookups fall back to drive reads — never an error, never a refusal.
+    #if canImport(Darwin)
     static let uncachedReads: Bool = {
         let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_NOCACHE"] ?? "0")
             .lowercased()
         return ["1", "true", "yes", "on"].contains(raw)
     }()
+    #else
+    // F_NOCACHE is Darwin-only: on Linux the n-gram rows are always read through the page cache.
+    static let uncachedReads = false
+    #endif
 
     /// Warm policy. `VMLX_QWEN4_PLE_WARM=1` forces the warm, `=0` disables it; unset = automatic (below).
     static let warmOverride: Bool? = {
@@ -289,16 +318,28 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
             defer { buffer.deallocate() }
             var done: UInt64 = 0
             for url in fresh {
+                #if canImport(Darwin)
                 let fd = Darwin.open(url.path, O_RDONLY)
+                #else
+                let fd = Glibc.open(url.path, O_RDONLY)
+                #endif
                 guard fd >= 0 else { continue }
                 var offset: off_t = 0
                 while true {
+                    #if canImport(Darwin)
                     let got = Darwin.pread(fd, buffer, chunk, offset)
+                    #else
+                    let got = Glibc.pread(fd, buffer, chunk, offset)
+                    #endif
                     if got <= 0 { break }
                     offset += off_t(got)
                     done += UInt64(got)
                 }
+                #if canImport(Darwin)
                 Darwin.close(fd)
+                #else
+                Glibc.close(fd)
+                #endif
             }
             let seconds = Date().timeIntervalSince(started)
             log(

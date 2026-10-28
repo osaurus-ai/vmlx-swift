@@ -646,6 +646,7 @@ public final class LFM3Omni: Module, VLMModel, KVCacheDimensionProvider, Modalit
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Speech (and for Omni, image / video) placeholders for LFM3-Audio and LFM3-Omni.
 ///
 /// INVARIANT: each `<|audio|>` expands to ceil(frames / 8) audio tokens, where frames is the
@@ -736,6 +737,7 @@ public struct LFM3OmniProcessor: UserInputProcessor {
             toolSchemas: input.tools)
     }
 }
+#endif
 
 /// Content items the LFM3 templates expand: media first (`image`, `video`, `audio`), then text.
 public struct LFM3MessageGenerator: MessageGenerator {

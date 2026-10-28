@@ -29,9 +29,15 @@
 
 import Foundation
 import MLX
-import AVFoundation
-import CoreImage
-import CoreMedia
+#if canImport(AVFoundation)
+    import AVFoundation
+#endif
+#if canImport(CoreImage)
+    import CoreImage
+#endif
+#if canImport(CoreMedia)
+    import CoreMedia
+#endif
 import MLXLLM
 import MLXLMCommon
 import MLXNN
@@ -66,10 +72,17 @@ enum Glm5NextPrefillMemoryProbe {
             }
         }
         let g = 1024.0 * 1024.0 * 1024.0
+        #if canImport(Metal)
         RuntimeDiagnostics.write(Data(String(
             format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
             tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
             Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+        #else
+        RuntimeDiagnostics.write(Data(String(
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            tokens, Double(Memory.activeMemory) / g, Double(Memory.cacheMemory) / g,
+            Double(Memory.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+        #endif
     }
 }
 
@@ -2444,6 +2457,7 @@ public struct Glm5NextProcessorConfiguration: Codable, Sendable {
     }
 }
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public final class Glm5NextProcessor: UserInputProcessor {
 
     private let config: Glm5NextImageProcessorConfiguration
@@ -2840,6 +2854,7 @@ public final class Glm5NextProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif
 
 // MARK: - Image splicing
 

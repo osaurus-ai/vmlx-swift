@@ -37,7 +37,9 @@
 //    _apply_rotary_embedding), and glm4v/language.py (for the even_odd contrast).
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon

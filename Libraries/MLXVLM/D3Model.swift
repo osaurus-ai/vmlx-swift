@@ -1,9 +1,12 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// A decision model is deliberately not a LanguageModel/NativeMTPModel. Its owner serializes
 /// requests, holds only weights between calls, and never enters a generation iterator.
 public actor D3Model {
@@ -362,3 +365,4 @@ public actor D3Model {
             seconds: Date.timeIntervalSinceReferenceDate - start)
     }
 }
+#endif

@@ -7,8 +7,12 @@
 //  port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/glm_ocr
 //
 
-import CoreImage
-import CoreMedia
+#if canImport(CoreImage)
+    import CoreImage
+#endif
+#if canImport(CoreMedia)
+    import CoreMedia
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -757,6 +761,7 @@ private enum Vision {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// GlmOcr VLM `UserInputProcessor`.
 public struct GlmOcrProcessor: UserInputProcessor {
     private let config: GlmOcrProcessorConfiguration
@@ -986,6 +991,7 @@ public struct GlmOcrProcessor: UserInputProcessor {
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
+#endif
 
 // MARK: - Model
 

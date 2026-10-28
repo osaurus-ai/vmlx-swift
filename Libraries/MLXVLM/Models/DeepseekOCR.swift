@@ -27,7 +27,9 @@
 //    image_newline (n_embed,)    view_separator (n_embed,)
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon

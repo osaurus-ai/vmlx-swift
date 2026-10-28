@@ -9,7 +9,9 @@
 //  and the MLX port in mlx-vlm `mlx_vlm/models/lfm3_vl/`.
 //
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLLM
@@ -550,6 +552,7 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider, ModalityB
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 /// Images and pre-sampled video frames into Qwen-VL patches, with LFM3's placeholder
 /// expansion.
 ///
@@ -830,3 +833,4 @@ public struct LFM3VLProcessor: UserInputProcessor {
             toolSchemas: input.tools)
     }
 }
+#endif

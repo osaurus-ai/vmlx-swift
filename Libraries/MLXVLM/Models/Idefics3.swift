@@ -7,7 +7,9 @@
 
 // port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/idefics3
 
-import CoreImage
+#if canImport(CoreImage)
+    import CoreImage
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -805,6 +807,7 @@ public struct Idefics3ProcessorConfiguration: Codable, Sendable {
 
 // MARK: - Processor
 
+#if canImport(CoreImage) && canImport(AVFoundation)
 public struct Idefics3Processor: UserInputProcessor {
     private let config: Idefics3ProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -901,3 +904,4 @@ public struct Idefics3Processor: UserInputProcessor {
         }
     }
 }
+#endif

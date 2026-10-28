@@ -1,6 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
