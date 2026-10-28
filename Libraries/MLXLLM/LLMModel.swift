@@ -45,8 +45,8 @@ extension LLMModel {
             if tokensShape.count >= 2 && tokensShape[0] != 1 {
                 fatalError(
                     "LLMModel.prepare expects single-sequence input (batch=1), "
-                    + "got shape \(tokensShape). BatchEngine handles multi-sequence "
-                    + "batching outside this extension."
+                        + "got shape \(tokensShape). BatchEngine handles multi-sequence "
+                        + "batching outside this extension."
                 )
             }
 
@@ -81,7 +81,8 @@ extension LLMModel {
                 try error.check()
                 flatTokens = flatTokens[prefillStepSize...]
                 if let m = flatMask { flatMask = m[prefillStepSize...] }
-                PrefillProgressReporter.reportCompletedUnits(input.text.tokens.size - flatTokens.size)
+                PrefillProgressReporter.reportCompletedUnits(
+                    input.text.tokens.size - flatTokens.size)
                 try error.check()
                 Memory.clearCache()
             }

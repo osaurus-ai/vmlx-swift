@@ -45,7 +45,8 @@ final class LLMPrefillErrorBoundaryTests: XCTestCase {
                             LMInput(tokens: MLXArray(Array(repeating: Int32(3), count: restored))),
                             cache: cache, windowSize: 4)
                         if case .tokens(let tail) = prefix {
-                            _ = model(.init(tokens: tail.tokens[.newAxis]), cache: cache, state: nil)
+                            _ = model(
+                                .init(tokens: tail.tokens[.newAxis]), cache: cache, state: nil)
                         }
                         MLX.eval(cache)
                     }
@@ -53,9 +54,10 @@ final class LLMPrefillErrorBoundaryTests: XCTestCase {
                 let progress = Progress()
                 let ids = MLXArray(Array(Int32(1) ... Int32(9)))
                 let mask = masked ? MLXArray(Array(repeating: true, count: 8) + [false]) : nil
-                let input = LMInput(text: .init(
-                    tokens: rankTwo ? ids.reshaped(1, 9) : ids,
-                    mask: rankTwo ? mask?.reshaped(1, 9) : mask))
+                let input = LMInput(
+                    text: .init(
+                        tokens: rankTwo ? ids.reshaped(1, 9) : ids,
+                        mask: rankTwo ? mask?.reshaped(1, 9) : mask))
                 var remaining: [Int32]?
                 var remainingMask: [Bool]?
                 var caught: String?
