@@ -291,7 +291,8 @@ struct MiniMaxM3Tests {
         #expect((attention.indexer?.queryProjection as? QuantizedLinear)?.mode == .mxfp8)
         let moe = try #require(model.model.layers[1].mlp as? MiniMaxM3SparseMoeBlock)
         #expect((moe.sharedExperts.downProj as? QuantizedLinear)?.mode == .mxfp8)
-        let experts = [moe.switchMLP.gateProj, moe.switchMLP.upProj, moe.switchMLP.downProj]
+        let switchMLP = try #require(moe.switchMLP)
+        let experts = [switchMLP.gateProj, switchMLP.upProj, switchMLP.downProj]
         for projection in experts {
             let nvfp4 = try #require(projection as? MiniMaxM3NVFP4SwitchLinear)
             #expect(nvfp4.inverseGlobalScale.dtype == .float32)

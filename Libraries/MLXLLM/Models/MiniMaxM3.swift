@@ -22,6 +22,8 @@ import MLXNN
 //   weights normalized and scaled by `routed_scaling_factor`, plus one shared expert.
 //
 // The official M3.1 checkpoint loads as stored (MXFP8 linears, NVFP4 routed experts); see MiniMaxM3SourceFormat.swift.
+// A JANGHT bundle (config.json `jangt` header) keeps its trunk in MXFP8 / affine per module and its routed experts as
+// mapped JANGT trellis (or JANGH codebook) banks; see MiniMaxM3JANGHPreparation.swift.
 // Attention over a selected subset is computed here as a dense additive mask per KV group.
 
 /// `(1 + weight)` RMS norm. The sum is formed in the weight's dtype, as in the Python runtime.
@@ -314,16 +316,22 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    @ModuleInfo(key: "switch_mlp") var switchMLP: MiniMaxM3SwitchGLU
+    /// A `MiniMaxM3SwitchGLU` (float, affine-quantized or official NVFP4 stacks) or, in a JANGHT bundle, a mapped
+    /// bank layer (`WeightedRoutedExpertLayer`) that gathers, activates and router-weights the routed experts in one
+    /// call with the model's SwiGLU-OAI.
+    @ModuleInfo(key: "switch_mlp") var experts: Module
     @ModuleInfo(key: "shared_experts") var sharedExperts: MiniMaxM3MLP
 
-    init(_ config: MiniMaxM3Configuration) {
+    /// The stacked routed experts; nil when the layer runs mapped JANGHT banks.
+    var switchMLP: MiniMaxM3SwitchGLU? { experts as? MiniMaxM3SwitchGLU }
+
+    init(_ config: MiniMaxM3Configuration, routed: (any WeightedRoutedExpertLayer)? = nil) {
         topK = config.numExpertsPerTok
         routedScalingFactor = config.routedScalingFactor
         normTopKProb = config.normTopKProb
         _gate.wrappedValue = Linear(config.hiddenSize, config.numLocalExperts, bias: false)
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([config.numLocalExperts])
-        _switchMLP.wrappedValue = MiniMaxM3SwitchGLU(
+        _experts.wrappedValue = routed ?? MiniMaxM3SwitchGLU(
             dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize,
             experts: config.numLocalExperts, alpha: config.swigluAlpha, limit: config.swigluLimit)
         _sharedExperts.wrappedValue = MiniMaxM3MLP(
@@ -342,7 +350,13 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         }
         scores = scores * routedScalingFactor
 
-        let routed = (switchMLP(x, indices) * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let routed: MLXArray
+        if let switchMLP {
+            routed = (switchMLP(x, indices) * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        } else {
+            // Mapped banks: the router-weighted sum in F32, returned in x's dtype (Python `JTMixedSwitchGLU.routed`).
+            routed = (experts as! any WeightedRoutedExpertLayer).callRouted(x, indices: indices, scores: scores)
+        }
         return (routed + sharedExperts(x)).asType(x.dtype)
     }
 }
@@ -353,11 +367,11 @@ final class MiniMaxM3DecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: MiniMaxM3RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: MiniMaxM3RMSNorm
 
-    init(_ config: MiniMaxM3Configuration, layer: Int) {
+    init(_ config: MiniMaxM3Configuration, layer: Int, routed: (any WeightedRoutedExpertLayer)? = nil) {
         _selfAttn.wrappedValue = MiniMaxM3Attention(config, layer: layer)
         _mlp.wrappedValue =
             config.isMoE(layer)
-            ? MiniMaxM3SparseMoeBlock(config)
+            ? MiniMaxM3SparseMoeBlock(config, routed: routed)
             : MiniMaxM3MLP(
                 dimensions: config.hiddenSize, hiddenDimensions: config.denseIntermediateSize,
                 alpha: config.swigluAlpha, limit: config.swigluLimit)
@@ -380,10 +394,12 @@ public final class MiniMaxM3ModelInner: Module {
     let layers: [MiniMaxM3DecoderLayer]
     @ModuleInfo(key: "norm") var norm: MiniMaxM3RMSNorm
 
-    init(_ config: MiniMaxM3Configuration) {
+    init(_ config: MiniMaxM3Configuration, routed: [Int: any WeightedRoutedExpertLayer] = [:]) {
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
-        layers = (0 ..< config.hiddenLayers).map { MiniMaxM3DecoderLayer(config, layer: $0) }
+        layers = (0 ..< config.hiddenLayers).map {
+            MiniMaxM3DecoderLayer(config, layer: $0, routed: routed[$0])
+        }
         _norm.wrappedValue = MiniMaxM3RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
@@ -398,12 +414,15 @@ public final class MiniMaxM3ModelInner: Module {
     }
 }
 
-public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider {
+public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
     public let model: MiniMaxM3ModelInner
     let configuration: MiniMaxM3Configuration
+    /// JANGHT: the routed bank tensors the mapped layers own (`...switch_mlp.<proj>.jt_*` / `tq2_*`), kept out of the
+    /// generic safetensors load. Empty for every other bundle.
+    let customTensorNames: Set<String>
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -411,12 +430,41 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider {
         self.configuration = configuration
         vocabularySize = configuration.vocabularySize
         kvHeads = Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)
+        customTensorNames = []
         model = MiniMaxM3ModelInner(configuration)
         if !configuration.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(
                 configuration.hiddenSize, configuration.vocabularySize, bias: false)
         }
     }
+
+    /// A JANGHT bundle: every MoE layer runs its admitted mapped bank layer (`routedExperts`, keyed by layer), and
+    /// `excludedTensorNames` are exactly those banks' tensors.
+    init(
+        _ configuration: MiniMaxM3Configuration, routedExperts: [Int: any WeightedRoutedExpertLayer],
+        excludedTensorNames: Set<String>
+    ) throws {
+        let moeLayers = Set((0 ..< configuration.hiddenLayers).filter(configuration.isMoE))
+        guard Set(routedExperts.keys) == moeLayers,
+            JANGHModelPreparation.isCanonicalRoutedExclusionSet(excludedTensorNames, routedLayers: moeLayers)
+        else {
+            throw MiniMaxM3JANGHPreparation.PreparationError.invalid(
+                "MiniMax-M3 JANGHT: routed banks \(routedExperts.keys.sorted()) do not cover the MoE layers "
+                    + "\(moeLayers.sorted())")
+        }
+        self.configuration = configuration
+        vocabularySize = configuration.vocabularySize
+        kvHeads = Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)
+        customTensorNames = excludedTensorNames
+        model = MiniMaxM3ModelInner(configuration, routed: routedExperts)
+        if !configuration.tieWordEmbeddings {
+            _lmHead.wrappedValue = Linear(
+                configuration.hiddenSize, configuration.vocabularySize, bias: false)
+        }
+    }
+
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool { customTensorNames.contains(key) }
+    public var requiresExactTensorMmapBuffers: Bool { !customTensorNames.isEmpty }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)

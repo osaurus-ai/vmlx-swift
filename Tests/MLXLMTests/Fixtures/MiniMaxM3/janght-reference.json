@@ -1,0 +1,73 @@
+{
+ "generator": "scripts/minimax_m3_fixtures/generate_janght_fixtures.py",
+ "generator_sha256": "011d6f798b8a8ca092398ba9b8a8ecda13a003c19ac6f97435e1e3a3675662bf",
+ "vmlx_commit": "7680e68a",
+ "reference_sha256": {
+  "models/minimax_m3/minimax_m3.py": "3cf0e613cfdd9c8fe8f5a3398b8af2d15a6310eb4e1551efdb57059b2479fb1e",
+  "jangt/switch.py": "9ab5c946596e6e04ac27e6c9657c69aec3dea15e8ed47f92f63fedbceeab6a4a",
+  "jangt/moe_kernels.py": "44d796106d5b12a9ff4129de45c169a0e55c99774f5cbfdb08515a7134692158",
+  "jangt/prefill.py": "21625f420f966d612085289668911a476230fb6e60e93569d1c29702af0e5c4d",
+  "utils/jang_loader.py": "2e7a531ee1d91c37dce88e1e6c10b34e391298050aa2febbb4efbe1b9c2b5e41"
+ },
+ "mlx": "0.32.3",
+ "mlx_lm": "0.31.3",
+ "numpy": "2.2.6",
+ "python": "3.13.13",
+ "machine": "arm64",
+ "float32_matmul": "MLX_ENABLE_TF32=0 (64x64 probe max abs error 9.5e-06)",
+ "python_entry": "vmlx_engine.utils.jang_loader.load_jang_model",
+ "python_sort_threshold": {
+  "default": 72,
+  "goldens": 512
+ },
+ "shapes": {
+  "prefill": 2853,
+  "decode": 5,
+  "chunk": 101,
+  "rows": 87,
+  "routed_pairs": {
+   "prefill": 11412,
+   "chunk": 404,
+   "decode": 4
+  }
+ },
+ "checks": {
+  "chunked_vs_prefill": {
+   "median": 0.015814006328582764,
+   "p90": 0.02836737409234047,
+   "max": 0.49187445640563965
+  },
+  "chunked_python_default_vs_matched": {
+   "median": 0.009663378819823265,
+   "p90": 0.011279146187007427,
+   "max": 0.07861108332872391
+  },
+  "runtime_vs_dequant_prefill": {
+   "median": 0.008810178376734257,
+   "p90": 0.01211375929415226,
+   "max": 0.4919155240058899
+  },
+  "runtime_vs_dequant_decode": {
+   "median": 0.013598557561635971,
+   "p90": 0.015205629169940948,
+   "max": 0.015673309564590454
+  },
+  "control_clamped_silu": {
+   "median": 0.334311842918396,
+   "p90": 0.46062222123146057,
+   "max": 0.5490365624427795,
+   "min": 0.20929689705371857
+  },
+  "control_plain_silu": {
+   "median": 0.45868444442749023,
+   "p90": 0.6078810691833496,
+   "max": 0.8385541439056396,
+   "min": 0.29033607244491577
+  },
+  "msa": {
+   "key_blocks_at_prefill": 23,
+   "topk_blocks": 16,
+   "sparse_query_positions": 805
+  }
+ }
+}
