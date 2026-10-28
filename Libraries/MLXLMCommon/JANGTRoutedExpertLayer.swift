@@ -51,6 +51,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     static let sortThreshold = 512
     /// `VMLX_JANGT_PREFILL=0` keeps the decode kernels for every batch (A/B and diagnosis).
     static let prefillEnabled = ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL"] != "0"
+
+    /// True when `callRouted` runs every one of `pairs` routed (token, slot) pairs of a `dtype` input on the decode
+    /// kernels, the kernels a one-token call uses (a DSpark verify batches its rows' routed experts only then).
+    public static func usesDecodeKernels(pairs: Int, dtype: DType) -> Bool {
+        !(prefillEnabled && pairs >= sortThreshold && JANGTPrefillKernel.available
+            && [.bfloat16, .float16].contains(dtype))
+    }
     private let intermediateSize: Int
     /// The gate/up outlier columns when they are layer-wide (the same real columns for every expert, gate and up):
     /// the fused prefill epilogue needs one column list per tile. Derived, not a bundle tensor: the leading

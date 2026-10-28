@@ -2567,7 +2567,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let why = target.dsparkCacheUnsupportedReason(cache) { return why }
             dspark = DSparkDecoder(
                 session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs,
-                sampling: DSparkSampling(parameters: parameters))
+                sampling: DSparkSampling(parameters: parameters),
+                ladderTop: target.dsparkLadderTop, pinnedWidth: target.dsparkPinnedWidth)
             dsparkStartOffset = cache.map(\.offset).max() ?? 0
             return nil
         }()

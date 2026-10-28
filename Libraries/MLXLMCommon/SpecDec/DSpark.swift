@@ -27,19 +27,28 @@
 // with the same position-keyed noise (`TokenIterator.convertToToken`), so with a fixed seed the
 // output does not depend on which steps speculated (a wall-clock decision).
 //
-// The width W tracks acceptance (EMA, 1...blockSize). Whether to speculate at all is decided by the
+// The width W tracks acceptance (EMA, 1...ladderTop). Whether to speculate at all is decided by the
 // measured wall-clock cost per emitted token of speculative steps against AR steps
-// (``DSparkGovernor``): never a fixed depth, never a permanent latch.
+// (``DSparkGovernor``): never a fixed depth, never a permanent latch. The ladder top is the widest
+// draft the session can produce: the head's block for DeepSeek-V4.1 (its stages draft exactly that
+// many positions), twice the trained block for a MiniMax-M3 block drafter (Python's `ladder_top`: a
+// round past the trained block runs a longer block of mask rows). The trained block is only where
+// the width starts; an env lever (`VMLX_DSPARK_WIDTH`, MiniMax) may pin it for diagnostics.
 
 import Foundation
 import MLX
 
 // MARK: - Model contract
 
-/// A target that carries a dSpark draft head (DeepSeek-V4.1 `dspark/`).
+/// A target that carries a dSpark draft head (DeepSeek-V4.1 / MiniMax-M3 `dspark/`).
 public protocol DSparkSpeculativeModel: AnyObject {
-    /// Draft block size of the attached head; nil while no head is attached.
+    /// Draft block size of the attached head (the trained block: where the width starts); nil while no
+    /// head is attached.
     var dsparkBlockSize: Int? { get }
+    /// The widest draft the controller may choose (default: the block size).
+    var dsparkLadderTop: Int? { get }
+    /// A width pinned for every step by a diagnostic env lever; nil (the default) lets the controller choose.
+    var dsparkPinnedWidth: Int? { get }
     /// Load the head from `directory` once (later calls are no-ops). Returns false when this model
     /// cannot use a dSpark head (for example DSV4-0731).
     func attachDSparkDraft(directory: URL) throws -> Bool
@@ -47,6 +56,11 @@ public protocol DSparkSpeculativeModel: AnyObject {
     func makeDSparkDraftSession() -> (any DSparkDraftSession)?
     /// Why `cache` cannot be speculated on (nil when it can).
     func dsparkCacheUnsupportedReason(_ cache: [KVCache]) -> String?
+}
+
+extension DSparkSpeculativeModel {
+    public var dsparkLadderTop: Int? { dsparkBlockSize }
+    public var dsparkPinnedWidth: Int? { nil }
 }
 
 /// Per-request drafter state (the per-stage attention windows). Not shared between requests.
@@ -76,6 +90,15 @@ public protocol DSparkDraftSession: AnyObject {
         cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int) -> Bool
     /// Drop whatever the capture still holds.
     func endVerifyCapture(cache: [KVCache])
+
+    /// Draft `count` tokens (positions c+2 ... c+1+count). A block drafter runs a block of
+    /// max(trained block, count) rows; the default drafts the head's block and the caller takes a prefix.
+    func draft(seed: Int, cache: [KVCache], count: Int) -> [Int]
+    /// Coupled sampled drafting of `count` tokens; `noise` holds at least `count` rows.
+    func draft(seed: Int, cache: [KVCache], count: Int, noise: MLXArray, inverseTemperature: Float) -> [Int]
+    /// True when ``commitVerifiedPrefix(cache:checkpoint:keep:)`` is as cheap for a zero-accept step
+    /// (keep = 1) as for any other, so such a step commits in place instead of a second forward.
+    var commitsAnyPrefix: Bool { get }
 }
 
 extension DSparkDraftSession {
@@ -88,6 +111,15 @@ extension DSparkDraftSession {
         cache: [KVCache], checkpoint: SpeculativeCacheListCheckpoint, keep: Int
     ) -> Bool { false }
     public func endVerifyCapture(cache: [KVCache]) {}
+    public func draft(seed: Int, cache: [KVCache], count: Int) -> [Int] {
+        draft(seed: seed, cache: cache)
+    }
+    public func draft(
+        seed: Int, cache: [KVCache], count: Int, noise: MLXArray, inverseTemperature: Float
+    ) -> [Int] {
+        draft(seed: seed, cache: cache, noise: noise, inverseTemperature: inverseTemperature)
+    }
+    public var commitsAnyPrefix: Bool { false }
 }
 
 // MARK: - Environment
@@ -99,6 +131,15 @@ public enum DSparkEnvironment {
         _ environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
         guard let raw = environment["VMLX_DSV41_DSPARK"]?.lowercased() else { return false }
+        return ["0", "off", "false", "no"].contains(raw)
+    }
+
+    /// `VMLX_DSPARK=0|off|false|no` (the vMLX Python runtime's lever) keeps MiniMax-M3 DSpark off. Like
+    /// `VMLX_DSV41_DSPARK`, it can only turn DSpark off.
+    public static func miniMaxDisabled(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let raw = environment["VMLX_DSPARK"]?.lowercased() else { return false }
         return ["0", "off", "false", "no"].contains(raw)
     }
 
@@ -346,12 +387,17 @@ public struct DSparkDecoder {
 
     public let session: any DSparkDraftSession
     public let blockSize: Int
+    /// The widest draft the width may reach (>= 1; the block size unless the target declares more).
+    public let ladderTop: Int
+    /// A diagnostic pin of every step's width (an env lever, at most `ladderTop`); nil lets acceptance choose.
+    public let pinnedWidth: Int?
     public let stopTokenIDs: Set<Int>
     /// Sampled speculation (temperature > 0); nil decodes greedily.
     public let sampling: DSparkSampling?
     public private(set) var governor: DSparkGovernor
     public private(set) var stats = DSparkGenerationStats()
-    /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(blockSize * ema), 1, bs).
+    /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(ladderTop * ema), 1, ladderTop).
+    /// Starts at blockSize / ladderTop, so the first width is the trained block.
     public private(set) var acceptEMA: Double = 1.0
     let clock: () -> Double
     /// The step in flight; `timed` is false when it ran a forward width this process had not run yet.
@@ -363,11 +409,15 @@ public struct DSparkDecoder {
         session: any DSparkDraftSession, blockSize: Int, stopTokenIDs: Set<Int>,
         sampling: DSparkSampling? = nil,
         governor: DSparkGovernor = DSparkGovernor(),
+        ladderTop: Int? = nil, pinnedWidth: Int? = nil,
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
         precondition(blockSize >= 1, "dSpark block size must be at least 1")
         self.session = session
         self.blockSize = blockSize
+        self.ladderTop = Swift.max(1, ladderTop ?? blockSize)
+        self.pinnedWidth = pinnedWidth.map { Swift.max(1, $0) }
+        acceptEMA = Swift.min(1, Double(blockSize) / Double(self.ladderTop))
         self.stopTokenIDs = stopTokenIDs
         self.sampling = sampling
         stats.sampled = sampling != nil
@@ -377,7 +427,8 @@ public struct DSparkDecoder {
 
     /// Current draft width.
     public var width: Int {
-        Swift.max(1, Swift.min(blockSize, Int((Double(blockSize) * acceptEMA).rounded())))
+        if let pinnedWidth { return Swift.min(pinnedWidth, ladderTop) }
+        return Swift.max(1, Swift.min(ladderTop, Int((Double(ladderTop) * acceptEMA).rounded())))
     }
 
     /// One step from the pending token `seed`, which the caller has already read back (so the
@@ -435,14 +486,17 @@ public struct DSparkDecoder {
         var noise: MLXArray?
         let draftStart = clock()
         let drafts: [Int]
+        // Rows the session drafts: at least the head's block (a DSV4.1 head drafts exactly that many),
+        // `w` for a block drafter asked for more.
+        let span = Swift.max(blockSize, w)
         if let sampling, let vocab = session.vocabularySize {
-            let rows = sampling.noise(first: position + 1, count: blockSize + 1, vocab: vocab)
+            let rows = sampling.noise(first: position + 1, count: span + 1, vocab: vocab)
             noise = rows
             drafts = session.draft(
-                seed: seed, cache: cache, noise: rows[..<blockSize],
+                seed: seed, cache: cache, count: w, noise: rows[..<span],
                 inverseTemperature: 1 / sampling.temperature)
         } else {
-            drafts = session.draft(seed: seed, cache: cache)
+            drafts = session.draft(seed: seed, cache: cache, count: w)
         }
         stats.draftSeconds += clock() - draftStart
         let proposed = Array(drafts.prefix(w))
@@ -495,7 +549,7 @@ public struct DSparkDecoder {
             stats.fullAccepts += 1
             emit = feed
             next = MLXArray([Int32(truth[proposed.count])])
-        } else if capturing, k > 0 || fullAccept,
+        } else if capturing, k > 0 || fullAccept || session.commitsAnyPrefix,
             session.commitVerifiedPrefix(cache: cache, checkpoint: checkpoint, keep: keep)
         {
             // Partial accept (or a cut block), committed in place (Python `commit_prefix`): the
