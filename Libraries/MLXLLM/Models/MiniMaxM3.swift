@@ -24,7 +24,8 @@ import MLXNN
 // The official M3.1 checkpoint loads as stored (MXFP8 linears, NVFP4 routed experts); see MiniMaxM3SourceFormat.swift.
 // A JANGHT bundle (config.json `jangt` header) keeps its trunk in MXFP8 / affine per module and its routed experts as
 // mapped JANGT trellis (or JANGH codebook) banks; see MiniMaxM3JANGHPreparation.swift.
-// Attention over a selected subset is computed here as a dense additive mask per KV group.
+// Attention over the selected blocks is a dense additive mask per KV group (the reference) or, behind
+// VMLX_MINIMAX_MSA=gather, a gather of the selected keys; see MiniMaxM3MSA.swift.
 
 /// `(1 + weight)` RMS norm. The sum is formed in the weight's dtype, as in the Python runtime.
 final class MiniMaxM3RMSNorm: Module, UnaryLayer {
@@ -76,57 +77,34 @@ final class MiniMaxM3Indexer: Module {
         rope = RoPE(dimensions: config.rotaryDim, traditional: false, base: config.ropeTheta)
     }
 
-    /// Appends this step's indexer keys to `cache` (which must already hold this step's K/V) and returns the
-    /// additive key bias `[B, G, Sq, Sk]` in float32: 0 where query `i` of group `g` attends key `j`, -inf
-    /// elsewhere, causality included. Returns nil while every block is visible (then only causality applies).
-    func keyBias(_ x: MLXArray, cache: MiniMaxM3SparseCache?, offset: Int) -> MLXArray? {
+    /// Index queries `[B, heads, Sq, d]` and keys `[B, 1, Sq, d]` of `x` at positions `offset...` (norm + RoPE).
+    func project(_ x: MLXArray, offset: Int) -> (queries: MLXArray, keys: MLXArray) {
         let (B, queryLength) = (x.dim(0), x.dim(1))
-        var queries = queryNorm(queryProjection(x).reshaped(B, queryLength, heads, headDim))
+        let queries = queryNorm(queryProjection(x).reshaped(B, queryLength, heads, headDim))
             .transposed(0, 2, 1, 3)
-        var keys = keyNorm(keyProjection(x).reshaped(B, queryLength, 1, headDim)).transposed(0, 2, 1, 3)
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
-        if let cache {
-            keys = cache.updateIndexKeys(keys)
-        }
+        let keys = keyNorm(keyProjection(x).reshaped(B, queryLength, 1, headDim)).transposed(0, 2, 1, 3)
+        return (rope(queries, offset: offset), rope(keys, offset: offset))
+    }
 
-        let keyLength = keys.dim(2)
-        let blockCount = (keyLength + blockSize - 1) / blockSize
-        let keep = min(topKBlocks, blockCount)
-        if keep >= blockCount {
-            return nil
-        }
+    /// The block selection for index queries at `offset...` over the index keys `[B, 1, Sk, d]` (nil while every
+    /// block is visible: then only causality applies). See `MiniMaxM3MSA.select`.
+    func select(queries: MLXArray, keys: MLXArray, offset: Int) -> MiniMaxM3MSASelection? {
+        MiniMaxM3MSA.select(
+            queries: queries, keys: keys, offset: offset, blockSize: blockSize, topK: topKBlocks,
+            localBlocks: localBlocks)
+    }
 
-        let queryPositions = MLXArray(Int32(offset) ..< Int32(offset + queryLength))
-            .reshaped(1, 1, queryLength, 1)
-        let keyPositions = MLXArray(Int32(0) ..< Int32(keyLength)).reshaped(1, 1, 1, keyLength)
-        let future = keyPositions .> queryPositions
+    /// Appends this step's indexer keys to `cache` (which must already hold this step's K/V) and selects the blocks
+    /// every query row of every KV group attends.
+    func callAsFunction(_ x: MLXArray, cache: MiniMaxM3SparseCache?, offset: Int) -> MiniMaxM3MSASelection? {
+        let (queries, keys) = project(x, offset: offset)
+        return select(queries: queries, keys: cache?.updateIndexKeys(keys) ?? keys, offset: offset)
+    }
 
-        // [B, G, Sq, Sk]: each indexer head is one KV group and keeps its own scores.
-        var scores = matmul(queries.asType(.float32), keys.asType(.float32).transposed(0, 1, 3, 2))
-        scores = MLX.where(future, -Float.infinity, scores)
-        let padding = blockCount * blockSize - keyLength
-        if padding > 0 {
-            scores = concatenated(
-                [scores, MLXArray.full([B, heads, queryLength, padding], values: MLXArray(-Float.infinity))],
-                axis: -1)
-        }
-        var blockScores = scores.reshaped(B, heads, queryLength, blockCount, blockSize).max(axis: -1)
-
-        // The query's own block (and the `localBlocks - 1` before it) always wins.
-        let blocks = MLXArray(Int32(0) ..< Int32(blockCount)).reshaped(1, 1, 1, blockCount)
-        let queryBlocks = queryPositions.floorDivide(Int32(blockSize))
-        if localBlocks > 0 {
-            let local = (blocks .<= queryBlocks) .&& (blocks .> queryBlocks - Int32(localBlocks))
-            blockScores = MLX.where(local, Float.infinity, blockScores)
-        }
-
-        let selected = argPartition(-blockScores, kth: keep - 1, axis: -1)[.ellipsis, ..<keep]
-        let kept = (expandedDimensions(selected, axis: -1) .== blocks.reshaped(1, 1, 1, 1, blockCount))
-            .any(axis: -2)
-        let blockBias = MLX.where(kept, Float(0), -Float.infinity).asType(.float32)
-        let bias = repeated(blockBias, count: blockSize, axis: -1)[.ellipsis, ..<keyLength]
-        return MLX.where(future, -Float.infinity, bias)
+    /// The selection as an additive key bias `[B, G, Sq, Sk]` in float32: 0 where query `i` of group `g` attends key
+    /// `j`, -inf elsewhere, causality included. nil while every block is visible.
+    func keyBias(_ x: MLXArray, cache: MiniMaxM3SparseCache?, offset: Int) -> MLXArray? {
+        self(x, cache: cache, offset: offset)?.denseBias()
     }
 }
 
@@ -161,17 +139,21 @@ final class MiniMaxM3Attention: Module {
         rope = RoPE(dimensions: config.rotaryDim, traditional: false, base: config.ropeTheta)
     }
 
+    /// q `[B, H, L, D]`, k / v `[B, KV, L, D]` of `x` at positions `offset...` (q / k norms + partial RoPE).
+    func project(_ x: MLXArray, offset: Int) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let queries = qNorm(wq(x).reshaped(B, L, heads, headDim)).transposed(0, 2, 1, 3)
+        let keys = kNorm(wk(x).reshaped(B, L, kvHeads, headDim)).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+        return (rope(queries, offset: offset), rope(keys, offset: offset), values)
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         let offset = cache?.offset ?? 0
-
-        var queries = qNorm(wq(x).reshaped(B, L, heads, headDim)).transposed(0, 2, 1, 3)
-        var keys = kNorm(wk(x).reshaped(B, L, kvHeads, headDim)).transposed(0, 2, 1, 3)
-        var values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        var (queries, keys, values) = project(x, offset: offset)
 
         guard let indexer else {
             let output = attentionWithCacheUpdate(
@@ -193,21 +175,37 @@ final class MiniMaxM3Attention: Module {
             sparseCache = nil
         }
 
-        let output: MLXArray
-        if let keyBias = indexer.keyBias(x, cache: sparseCache, offset: offset) {
-            var bias = keyBias.asType(queries.dtype)
+        let selection = indexer(x, cache: sparseCache, offset: offset)
+        let output = attend(queries, keys, values, selection: selection, mask: mask)
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
+
+    /// Attention output `[B, H, L, D]` (before o_proj) of the queries over keys / values, restricted to the MSA
+    /// selection when there is one. `MiniMaxM3MSA.choosePath` picks the path (`VMLX_MINIMAX_MSA` forces one); the
+    /// dense mask path is the reference.
+    func attend(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, selection: MiniMaxM3MSASelection?,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        guard let selection else {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        }
+        switch MiniMaxM3MSA.choosePath(selection, queries: queries, keys: keys, mask: mask, kvHeads: kvHeads) {
+        case .gather:
+            return MiniMaxM3MSA.gatheredAttention(
+                queries: queries, keys: keys, values: values, selection: selection, scale: scale)
+        case .dense:
+            // 0 and -inf are exact in every float dtype, so the cast to the activation dtype is lossless.
+            var bias = selection.denseBias().asType(queries.dtype)
             if case .array(let extra) = mask {
                 bias =
                     extra.dtype == .bool
                     ? MLX.where(extra, bias, -Float.infinity)
                     : bias + extra.asType(queries.dtype)
             }
-            output = groupedAttention(queries, keys, values, bias: bias)
-        } else {
-            output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+            return groupedAttention(queries, keys, values, bias: bias)
         }
-        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 
     /// Attention where each KV group has its own key mask. Query heads are contiguous per KV head, so folding the
