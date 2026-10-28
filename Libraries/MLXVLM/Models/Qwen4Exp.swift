@@ -2211,49 +2211,61 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let inputIds = input.text.tokens
 
         guard input.image != nil || input.video != nil else {
-            if cache.allSatisfy({ $0.offset == 0 }) { setRopeDelta(0, for: cache) }
-            // Native MTP calls prepare directly, unlike the batch AR lane's
-            // outer segmentation. Honor the same prefill budget here so a
-            // cold or required-tool request cannot materialize a whole long
-            // prompt's expert activations and vocabulary logits at once.
-            let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
-            let step = windowSize ?? 512
-            let count = tokens.dim(1)
-            let beganWithEmptyCache = CanonicalTextPrefillCheckpointReporter.isActive
-                && !cache.isEmpty
-                && cache.allSatisfy { $0.offset == 0 && $0.state.isEmpty }
-            var offset = 0
-            // Native-MTP prompt priming: the chunk's pre-mixer hidden is the MTP head's input, folded into the
-            // head cache as the prefill produces it (see `NativeMTPPromptPrimer`).
-            let primer = NativeMTPPromptPrimer.current
-            if step > 0 {
-                while count - offset > step {
-                    try Task.checkCancellation()
-                    let chunk = tokens[0..., offset..<(offset + step)]
-                    if let primer {
-                        let forward = textModel.forward(
-                            chunk, cache: cache, positionOffset: ropeDelta(for: cache))
-                        primer.fold(hidden: forward.preMixer, tokens: chunk)
-                    } else {
-                        _ = forwardTokens(chunk, cache: cache)
+            // MLX captures C++ evaluation errors. Check each chunk before advancing
+            // cache/progress; an outer scope only throws after prepare has finished.
+            return try withError { error -> PrepareResult in
+                if cache.allSatisfy({ $0.offset == 0 }) { setRopeDelta(0, for: cache) }
+                // Native MTP calls prepare directly, unlike the batch AR lane's
+                // outer segmentation. Honor the same prefill budget here so a
+                // cold or required-tool request cannot materialize a whole long
+                // prompt's expert activations and vocabulary logits at once.
+                let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+                let step = windowSize ?? 512
+                let count = tokens.dim(1)
+                let beganWithEmptyCache = CanonicalTextPrefillCheckpointReporter.isActive
+                    && !cache.isEmpty
+                    && cache.allSatisfy { $0.offset == 0 && $0.state.isEmpty }
+                var offset = 0
+                // Native-MTP prompt priming: the chunk's pre-mixer hidden is the MTP head's input, folded into the
+                // head cache as the prefill produces it (see `NativeMTPPromptPrimer`).
+                let primer = NativeMTPPromptPrimer.current
+                if step > 0 {
+                    while count - offset > step {
+                        try Task.checkCancellation()
+                        try error.check()
+                        let chunk = tokens[0..., offset..<(offset + step)]
+                        if let primer {
+                            let forward = textModel.forward(
+                                chunk, cache: cache, positionOffset: ropeDelta(for: cache))
+                            try error.check()
+                            primer.fold(hidden: forward.preMixer, tokens: chunk)
+                        } else {
+                            _ = forwardTokens(chunk, cache: cache)
+                        }
+                        try error.check()
+                        MLX.eval(cache)
+                        try error.check()
+                        offset += step
+                        CanonicalTextPrefillCheckpointReporter.reportQwen4ExpColdTextChunk(
+                            input: input, cache: cache, chunkSize: step, completed: offset,
+                            beganWithEmptyCache: beganWithEmptyCache)
+                        try error.check()
+                        PrefillProgressReporter.reportCompletedUnits(offset)
+                        MLX.Memory.clearCache()
                     }
-                    MLX.eval(cache)
-                    offset += step
-                    CanonicalTextPrefillCheckpointReporter.reportQwen4ExpColdTextChunk(
-                        input: input, cache: cache, chunkSize: step, completed: offset,
-                        beganWithEmptyCache: beganWithEmptyCache)
-                    PrefillProgressReporter.reportCompletedUnits(offset)
-                    MLX.Memory.clearCache()
                 }
+                try Task.checkCancellation()
+                try error.check()
+                if let primer {
+                    let tail = tokens[0..., offset...]
+                    let forward = textModel.forward(tail, cache: cache, positionOffset: ropeDelta(for: cache))
+                    try error.check()
+                    primer.fold(hidden: forward.preMixer, tokens: tail)
+                    try error.check()
+                    return .logits(LMOutput(logits: projectToLogits(forward.mixed)))
+                }
+                return .logits(LMOutput(logits: forwardTokens(tokens[0..., offset...], cache: cache)))
             }
-            try Task.checkCancellation()
-            if let primer {
-                let tail = tokens[0..., offset...]
-                let forward = textModel.forward(tail, cache: cache, positionOffset: ropeDelta(for: cache))
-                primer.fold(hidden: forward.preMixer, tokens: tail)
-                return .logits(LMOutput(logits: projectToLogits(forward.mixed)))
-            }
-            return .logits(LMOutput(logits: forwardTokens(tokens[0..., offset...], cache: cache)))
         }
 
         // Media arrived at a model that carries no vision tower. Refuse rather than embed the
