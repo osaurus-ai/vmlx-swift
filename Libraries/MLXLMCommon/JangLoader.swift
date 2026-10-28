@@ -1923,11 +1923,18 @@ public struct JangLoader: Sendable {
                 let enabled = thinking["default"] as? Bool,
                 let effort = chDict["reasoning_effort"] as? [String: Any],
                 let rawLevels = effort["values"] as? [String], !rawLevels.isEmpty,
-                rawLevels.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
-                Set(rawLevels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }).count
+                rawLevels.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                ),
+                Set(
+                    rawLevels.map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    }
+                ).count
                     == rawLevels.count
             {
-                let levels = rawLevels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                let levels = rawLevels.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
                 let declaredDefault = (effort["default"] as? String)?
                     .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 splitReasoning = JangChatReasoning(
@@ -1979,7 +1986,9 @@ public struct JangLoader: Sendable {
                     reasoningEffortLevels: effortsDeclared
                         ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil
                 )
-            } else { reasoning = splitReasoning }
+            } else {
+                reasoning = splitReasoning
+            }
 
             // tool_calling subblock
             let toolCalling: JangChatToolCalling?
