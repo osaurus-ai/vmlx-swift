@@ -1194,9 +1194,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return token
     }
 
-    /// The AR-safety governor's clock: wall time minus the time the consumer held the iterator.
+    /// Shared AR-safety and adaptive-depth clock: wall time minus consumer-held time.
     /// `generateAutoregressiveToken` times AR as forward + sample INSIDE the iterator; the MTP
-    /// ring and resume probes must use the same basis. SPEED-CRITICAL: do not swap this back to
+    /// ring, resume probes and depth costs must use the same basis. SPEED-CRITICAL: do not swap this back to
     /// `NativeMTPClock.now()` in the governor — in the app (reasoning parser, tool parser,
     /// detokenizer, UI stream) that charged MTP alone for per-token host work and paused it.
     private func arSafetyClockNow() -> TimeInterval {
@@ -3120,7 +3120,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         if var chooser = depthChooser, stagedVerifierCommitCount > 0, speculativeSampler.isGreedy,
             !forceAutoregressiveFallback
         {
-            let now = NativeMTPClock.now()
+            let now = arSafetyClockNow()
             let period = depthChooserLastStamp.flatMap { last in
                 last.cycle == verifyCalls - 1 ? now - last.time : nil
             }
@@ -3153,7 +3153,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             return
         }
-        let now = NativeMTPClock.now()
+        let now = arSafetyClockNow()
         let cycleWall = lastAdaptiveCycleTimestamp.map { now - $0 } ?? 0
         lastAdaptiveCycleTimestamp = now
         adaptiveWindow.append(
@@ -4288,6 +4288,27 @@ extension NativeMTPTokenIterator {
               probeCycles: arSafetyProbeCyclesRemaining, trips: arSafetyTrips,
               resumes: arSafetyResumes)
     }
+
+        var testingAdaptiveThroughput: [Int: Double] { measuredThroughputByDepth }
+
+        mutating func testingEnableDepthChooser() {
+            depthChooser = NativeMTPDepthChooser(
+                initialDepth: currentDepth, maximumDepth: adaptiveDepthCeiling,
+                costs: NativeMTPDepthCostTable())
+        }
+
+        var testingDepthChooserSummary: String? { depthChooser?.summary }
+
+        mutating func testingFeedAdaptiveCostCycle(
+            activeNow: TimeInterval, consumerWait: TimeInterval
+        ) {
+            verifyCalls += 1
+            stagedVerifierCommitCount += 1
+            consumerWaitTotal += consumerWait
+            NativeMTPClock.$testingNow.withValue(activeNow + consumerWaitTotal) {
+                recordAdaptiveCycle(accepted: currentDepth, preserveConfirmedHead: true)
+            }
+        }
 
     mutating func testingSeedMeasuredGovernor(depth: Int, now: TimeInterval) {
         verifyCalls = Self.arSafetyWarmupCycles
