@@ -1912,6 +1912,32 @@ public struct JangLoader: Sendable {
         }
         let chat: JangChatConfig?
         if let chDict = chatDict {
+            // Some bundles declare thinking and its effort vocabulary separately.
+            // Normalize that explicit contract once; canonical reasoning blocks
+            // remain authoritative when both forms are present.
+            let splitReasoning: JangChatReasoning?
+            if chDict["reasoning"] == nil, topLevelReasoning == nil,
+                let thinking = chDict["thinking"] as? [String: Any],
+                thinking["supported"] as? Bool != false,
+                thinking["template_flag"] as? String == "enable_thinking",
+                let enabled = thinking["default"] as? Bool,
+                let effort = chDict["reasoning_effort"] as? [String: Any],
+                let rawLevels = effort["values"] as? [String], !rawLevels.isEmpty,
+                rawLevels.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
+                Set(rawLevels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }).count
+                    == rawLevels.count
+            {
+                let levels = rawLevels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                let declaredDefault = (effort["default"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                splitReasoning = JangChatReasoning(
+                    supported: thinking["supported"] as? Bool,
+                    defaultMode: enabled ? "thinking" : "chat",
+                    defaultEffort: declaredDefault.flatMap { levels.contains($0) ? $0 : nil },
+                    reasoningEffortLevels: levels.map(Optional.some))
+            } else {
+                splitReasoning = nil
+            }
             // reasoning subblock
             let reasoning: JangChatReasoning?
             if let rDict = chDict["reasoning"] as? [String: Any] {
@@ -1953,7 +1979,7 @@ public struct JangLoader: Sendable {
                     reasoningEffortLevels: effortsDeclared
                         ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil
                 )
-            } else { reasoning = nil }
+            } else { reasoning = splitReasoning }
 
             // tool_calling subblock
             let toolCalling: JangChatToolCalling?
@@ -2010,6 +2036,9 @@ public struct JangLoader: Sendable {
                 // context), changing Raptor's prompt bytes between releases.
                 templateKwargsDefaults = ChatTemplateKwargsDefaults(
                     enableThinking: false)
+            } else if let splitReasoning {
+                templateKwargsDefaults = ChatTemplateKwargsDefaults(
+                    enableThinking: splitReasoning.defaultMode == "thinking")
             } else {
                 templateKwargsDefaults = nil
             }
