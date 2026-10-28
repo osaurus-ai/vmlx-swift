@@ -27,9 +27,20 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
     private var indexCount = 0
     private static let step = 256
 
+    /// DSpark (`MiniMaxM3DSpark`): the drafter's tap rows (target-layer outputs) of the last committed positions,
+    /// recorded by every forward of this sequence while a drafter is attached, keyed by absolute position. Speed-only:
+    /// a cache without it is exact, the drafter just has less context. Trims, copies and checkpoints carry it; a
+    /// restored state does not.
+    var dsparkTail: HybridPoolHiddenTail?
+    /// DSpark: the next multi-row forward is a verify (every row on decode arithmetic), and the offset it starts at.
+    var dsparkVerifyArmed = false
+    var dsparkVerifyStart: Int?
+
     public init() {}
 
     public var offset: Int { kv.offset }
+    /// Rows of the indexer-key lane (equal to `offset` whenever the lanes are in lockstep).
+    var indexRows: Int { indexCount }
     public var maxSize: Int? { nil }
 
     public func innerState() -> [MLXArray] {
@@ -78,6 +89,7 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
             return kvState + [storage[.ellipsis, ..<offset, 0...]]
         }
         set {
+            dsparkTail = nil
             if newValue.isEmpty {
                 kv = KVCacheSimple()
                 indexStorage = nil
@@ -106,6 +118,8 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
     public func trim(_ n: Int) -> Int {
         let trimmed = kv.trim(n)
         indexCount = min(indexCount, offset)
+        dsparkTail?.truncate(toEnd: offset)
+        if dsparkTail?.isEmpty == true { dsparkTail = nil }
         return trimmed
     }
 
@@ -121,6 +135,7 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
         if !current.isEmpty {
             // `* 1` materializes owned buffers: a slice would share the live cache's storage and block donation.
             copy.state = current.map { $0 * 1 }
+            copy.dsparkTail = dsparkTail
         }
         return copy
     }
@@ -144,5 +159,36 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
             && keys.dim(2) == offset && values.dim(2) == offset && index.dim(2) == offset
             && keys.dim(3) > 0 && values.dim(3) > 0 && index.dim(3) > 0
             && keys.dtype.isFloatingPoint && keys.dtype == values.dtype && index.dtype.isFloatingPoint
+    }
+}
+
+// MARK: - Speculative checkpoint (DSpark verify)
+
+extension MiniMaxM3SparseCache: SpeculativeCheckpointCache {
+    private struct Checkpoint {
+        let kv: Any
+        let indexStorage: MLXArray?
+        let indexCount: Int
+        let dsparkTail: HybridPoolHiddenTail?
+    }
+
+    public var speculativeCheckpointIsExact: Bool { kv.speculativeCheckpointIsExact }
+
+    /// References only (O(1)): the K / V lane's own checkpoint, the index buffer (a separate wrapper, so a later slice
+    /// update into the live buffer cannot change it) and its row count, the DSpark tap tail.
+    public func speculativeCheckpoint() -> Any {
+        Checkpoint(
+            kv: kv.speculativeCheckpoint(), indexStorage: indexStorage.map { $0[.ellipsis] }, indexCount: indexCount,
+            dsparkTail: dsparkTail)
+    }
+
+    public func restoreSpeculativeCheckpoint(_ checkpoint: Any) {
+        guard let c = checkpoint as? Checkpoint else {
+            preconditionFailure("MiniMaxM3SparseCache: foreign speculative checkpoint")
+        }
+        kv.restoreSpeculativeCheckpoint(c.kv)
+        indexStorage = c.indexStorage
+        indexCount = c.indexCount
+        dsparkTail = c.dsparkTail
     }
 }

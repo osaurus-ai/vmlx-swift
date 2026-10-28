@@ -78,11 +78,14 @@ final class MiniMaxM3Indexer: Module {
     }
 
     /// Index queries `[B, heads, Sq, d]` and keys `[B, 1, Sq, d]` of `x` at positions `offset...` (norm + RoPE).
-    func project(_ x: MLXArray, offset: Int) -> (queries: MLXArray, keys: MLXArray) {
+    /// `linear` replaces the projection call (DSpark verify: a decode step's arithmetic per row).
+    func project(
+        _ x: MLXArray, offset: Int, linear: MiniMaxM3LinearCall = MiniMaxM3RowExact.plain
+    ) -> (queries: MLXArray, keys: MLXArray) {
         let (B, queryLength) = (x.dim(0), x.dim(1))
-        let queries = queryNorm(queryProjection(x).reshaped(B, queryLength, heads, headDim))
+        let queries = queryNorm(linear(queryProjection, x).reshaped(B, queryLength, heads, headDim))
             .transposed(0, 2, 1, 3)
-        let keys = keyNorm(keyProjection(x).reshaped(B, queryLength, 1, headDim)).transposed(0, 2, 1, 3)
+        let keys = keyNorm(linear(keyProjection, x).reshaped(B, queryLength, 1, headDim)).transposed(0, 2, 1, 3)
         return (rope(queries, offset: offset), rope(keys, offset: offset))
     }
 
@@ -140,11 +143,14 @@ final class MiniMaxM3Attention: Module {
     }
 
     /// q `[B, H, L, D]`, k / v `[B, KV, L, D]` of `x` at positions `offset...` (q / k norms + partial RoPE).
-    func project(_ x: MLXArray, offset: Int) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
+    /// `linear` replaces the projection call (DSpark verify: a decode step's arithmetic per row).
+    func project(
+        _ x: MLXArray, offset: Int, linear: MiniMaxM3LinearCall = MiniMaxM3RowExact.plain
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
         let (B, L) = (x.dim(0), x.dim(1))
-        let queries = qNorm(wq(x).reshaped(B, L, heads, headDim)).transposed(0, 2, 1, 3)
-        let keys = kNorm(wk(x).reshaped(B, L, kvHeads, headDim)).transposed(0, 2, 1, 3)
-        let values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+        let queries = qNorm(linear(wq, x).reshaped(B, L, heads, headDim)).transposed(0, 2, 1, 3)
+        let keys = kNorm(linear(wk, x).reshaped(B, L, kvHeads, headDim)).transposed(0, 2, 1, 3)
+        let values = linear(wv, x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
         return (rope(queries, offset: offset), rope(keys, offset: offset), values)
     }
 
@@ -398,6 +404,12 @@ public final class MiniMaxM3ModelInner: Module {
     let layers: [MiniMaxM3DecoderLayer]
     @ModuleInfo(key: "norm") var norm: MiniMaxM3RMSNorm
 
+    /// DSpark: the decoder layers whose output rows (residual stream, before the final norm) the attached drafter
+    /// reads, in the drafter's order; empty while no drafter is attached. Every forward of a single sequence then
+    /// records the last `dsparkTailCapacity` rows of them on the cache list's tap holder (`MiniMaxM3DSpark`).
+    var dsparkTapLayers: [Int] = []
+    var dsparkTailCapacity = 0
+
     init(_ config: MiniMaxM3Configuration, routed: [Int: any WeightedRoutedExpertLayer] = [:]) {
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
@@ -408,12 +420,21 @@ public final class MiniMaxM3ModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let holder = MiniMaxM3DSpark.tapHolder(cache)
+        if let holder, let cache, MiniMaxM3DSpark.verifies(inputs, holder: holder) {
+            return verifyForward(inputs, cache: cache, holder: holder)
+        }
+        let start = cache?.first?.offset ?? 0
+        let recording = !dsparkTapLayers.isEmpty && holder != nil && inputs.dim(0) == 1
+        var taps: [Int: MLXArray] = [:]
         var h = embedTokens(inputs)
         // Dense layers use this mask; sparse layers fold it into their own per-group block mask.
         let mask = createAttentionMask(h: h, cache: cache?.first)
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
+            if recording && dsparkTapLayers.contains(i) { taps[i] = h }
         }
+        if recording, let holder { recordTaps(taps, start: start, holder: holder) }
         return norm(h)
     }
 }
@@ -429,6 +450,10 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     let customTensorNames: Set<String>
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    /// The attached DSpark drafter (`dspark/`), shared by every request; nil until `attachDSparkDraft`.
+    var dsparkHead: MiniMaxM3DSparkHead?
+    let dsparkAttachLock = NSLock()
 
     public init(_ configuration: MiniMaxM3Configuration) {
         self.configuration = configuration
@@ -471,7 +496,14 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     public var requiresExactTensorMmapBuffers: Bool { !customTensorNames.isEmpty }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // A DSpark verify forward (armed on the cache, several rows): every row on a decode step's arithmetic,
+        // the output head included.
+        let verifying = MiniMaxM3DSpark.tapHolder(cache).map { MiniMaxM3DSpark.verifies(inputs, holder: $0) } ?? false
         let out = model(inputs, cache: cache)
+        if verifying {
+            return lmHead.map { MiniMaxM3RowExact.linear($0, out) }
+                ?? MiniMaxM3RowExact.rows(out) { model.embedTokens.asLinear($0) }
+        }
         if let lmHead {
             return lmHead(out)
         }
