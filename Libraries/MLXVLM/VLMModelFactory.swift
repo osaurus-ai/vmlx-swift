@@ -1003,7 +1003,7 @@ public final class VLMModelFactory: ModelFactory {
         }
         #endif
         let defaultAdditionalContext = VLMDefaultContextUserInputProcessor.defaultContext(
-            capabilities: jangConfig?.capabilities)
+            capabilities: jangConfig?.capabilities, chatConfig: jangConfig?.chat)
         let needsReasoningTranslation =
             VLMDefaultContextUserInputProcessor.requiresReasoningTranslation(
                 modelType: baseConfig.modelType)
@@ -1159,11 +1159,19 @@ struct VLMDefaultContextUserInputProcessor: UserInputProcessor {
         MuseGlimmerReasoningTemplateContext.applies(to: modelType)
     }
 
-    static func defaultContext(capabilities: JangCapabilities?) -> [String: any Sendable]? {
+    static func defaultContext(
+        capabilities: JangCapabilities?, chatConfig: JangChatConfig? = nil
+    ) -> [String: any Sendable]? {
         var context: [String: any Sendable] = [:]
 
         if capabilities?.supportsThinking == false {
             context["enable_thinking"] = false
+        } else if let enabled = chatConfig?.templateKwargsDefaults?.enableThinking {
+            // Only explicit bundle defaults, never a family/capability guess.
+            context["enable_thinking"] = enabled
+            if enabled, let effort = chatConfig?.reasoning?.defaultEffort {
+                context["reasoning_effort"] = effort
+            }
         }
 
         return context.isEmpty ? nil : context
