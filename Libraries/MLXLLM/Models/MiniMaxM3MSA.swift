@@ -27,6 +27,12 @@ import MLXLMCommon
 //   K / V.
 // - `gather`: MLX ops only (gather the selected keys, SDPA over them). Never routed to; an op-level reference.
 //
+// The selection itself (`blockScores`): the reference ops build a `[B, G, Sq, Sk]` float32 score sheet; the selection
+// kernels (msa.py at 5fc31aca) compute the same block scores bit for bit without it (`selectArithmetic` admits the
+// kernel whose dot-product arithmetic is the one MLX's float32 matmul runs in this process), so the top-k picks the
+// same blocks in the same order. `VMLX_MINIMAX_MSA_SELECT=reference` (or `VMLX_MINIMAX_MSA=dense`) keeps the
+// reference ops.
+//
 // Positions: query row r sits at `offset + r`; key j is allowed when its block is selected and `j <= offset + r`.
 // Keys at or past `keyLength` (the logical extent, i.e. the cache offset) are never read: the kernels stop at the
 // row's position (< keyLength) and the gather clamps to `keyLength - 1` and masks the clamped lanes. A partial last
@@ -96,6 +102,8 @@ enum MiniMaxM3MSA {
         private let lock = NSLock()
         private var forced: Request?
         private var observer: ((Path) -> Void)?
+        private var forcedSelect: SelectRequest?
+        private var selectPathObserver: ((SelectPath) -> Void)?
 
         var request: Request? {
             get { lock.withLock { forced } }
@@ -105,6 +113,18 @@ enum MiniMaxM3MSA {
         var pathObserver: ((Path) -> Void)? {
             get { lock.withLock { observer } }
             set { lock.withLock { observer = newValue } }
+        }
+
+        /// A forced selection request (wins over `VMLX_MINIMAX_MSA_SELECT`).
+        var selectRequest: SelectRequest? {
+            get { lock.withLock { forcedSelect } }
+            set { lock.withLock { forcedSelect = newValue } }
+        }
+
+        /// Observer of every routed selection pick (the Python tests' selection spy).
+        var selectObserver: ((SelectPath) -> Void)? {
+            get { lock.withLock { selectPathObserver } }
+            set { lock.withLock { selectPathObserver = newValue } }
         }
     }
 
@@ -174,20 +194,35 @@ enum MiniMaxM3MSA {
     /// Block selection for queries `[B, G, Sq, d]` at positions `offset...` over index keys `[B, 1, Sk, d]`; nil when
     /// every block is visible (`keep >= blocks`, i.e. at most `topK * blockSize` keys: plain causal attention).
     ///
-    /// Each indexer head is one KV group and keeps its own selection. Scores are float32; each block scores the max
-    /// over its keys (future keys -inf, the last block padded with -inf); the query's own block and the
-    /// `localBlocks - 1` before it are forced in; the top `topK` blocks per (row, group) are kept. One query row over
-    /// its own key prefix is exactly a decode step's selection.
+    /// Each indexer head is one KV group and keeps its own selection. The block scores (`blockScores`: the score-sheet
+    /// ops or a selection kernel that reproduces them bit for bit) are float32; each block scores the max over its keys
+    /// (future keys -inf, the last block padded with -inf); the query's own block and the `localBlocks - 1` before it
+    /// are forced in; the top `topK` blocks per (row, group) are kept. One query row over its own key prefix is exactly
+    /// a decode step's selection.
     static func select(
         queries: MLXArray, keys: MLXArray, offset: Int, blockSize: Int, topK: Int, localBlocks: Int
     ) -> MiniMaxM3MSASelection? {
-        let (B, heads, queryLength) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let keyLength = keys.dim(2)
         let blockCount = (keyLength + blockSize - 1) / blockSize
         let keep = min(topK, blockCount)
         if keep >= blockCount {
             return nil
         }
+        let scores = blockScores(
+            queries: queries, keys: keys, offset: offset, blockSize: blockSize, localBlocks: localBlocks)
+        let top = argPartition(-scores, kth: keep - 1, axis: -1)[.ellipsis, ..<keep]
+        return MiniMaxM3MSASelection(topIndices: top, offset: offset, keyLength: keyLength, blockSize: blockSize)
+    }
+
+    /// The indexer's block scores `[B, G, Sq, blocks]` float32 with the runtime's ops (the reference): queries at
+    /// `offset...` over keys `0 ..< Sk`, through the `[B, G, Sq, Sk]` float32 score sheet (cast q / k to float32, one
+    /// matmul, causal -inf, -inf padding to whole blocks, max per block, local block(s) +inf).
+    static func referenceBlockScores(
+        queries: MLXArray, keys: MLXArray, offset: Int, blockSize: Int, localBlocks: Int
+    ) -> MLXArray {
+        let (B, heads, queryLength) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        let keyLength = keys.dim(2)
+        let blockCount = (keyLength + blockSize - 1) / blockSize
         var scores = matmul(queries.asType(.float32), keys.asType(.float32).transposed(0, 1, 3, 2))
         let queryPositions = arange(offset, offset + queryLength).reshaped(1, 1, queryLength, 1)
         let keyPositions = arange(0, keyLength).reshaped(1, 1, 1, keyLength)
@@ -207,8 +242,7 @@ enum MiniMaxM3MSA {
                 to: [B, heads, queryLength, localBlocks])
             blockScores = putAlong(blockScores, local, values: MLXArray(Float.infinity), axis: -1)
         }
-        let top = argPartition(-blockScores, kth: keep - 1, axis: -1)[.ellipsis, ..<keep]
-        return MiniMaxM3MSASelection(topIndices: top, offset: offset, keyLength: keyLength, blockSize: blockSize)
+        return blockScores
     }
 
     /// `floor(positions / block)` for non-negative int32 positions: a right shift when the block is a power of two.
@@ -1057,4 +1091,737 @@ enum MiniMaxM3MSA {
             outputShapes: [[B, L, H, D]], outputDTypes: [q.dtype])[0]
         return out.transposed(0, 2, 1, 3)
     }
+
+    // MARK: selection kernels (block scores without the score sheet)
+
+    // The indexer's block scores `[B, G, Sq, blocks]` without the `[B, G, Sq, Sk]` float32 score sheet. Port of the
+    // vMLX Python runtime's selection kernels (`msa.py` at 5fc31aca); the Metal sources below are its sources.
+    //
+    // Reference (`referenceBlockScores`, the runtime's ops): score(r, g, j) = q[r, g] . k[j] as one MLX float32 matmul
+    // of the float32-cast operands; keys past the row's position -inf; the key axis padded with -inf to whole blocks;
+    // max over each block (NaN-propagating); the row's local block(s) +inf. The top-k over these scores (`select`:
+    // argPartition) is the selection.
+    //
+    // The kernels compute the same numbers in place: the scores of one block live in registers only until its maximum
+    // is taken, the index keys are read in their stored dtype (no float32 copy), keys past the row's position are never
+    // read and the forced local block is written as +inf. Identical block scores give an identical top-k (same op,
+    // same input), so the selected blocks AND their order are the reference's.
+    //
+    // Bit-identical scores need the reference's dot-product arithmetic, i.e. whatever MLX's float32 matmul runs for
+    // these shapes (measured on an M5 Max by the Python runtime, MLX 0.32.3):
+    // - `nax`: matrix units with TF32 on (MLX's default): 16x32x16 matmul2d ops (relaxed precision) accumulating 16
+    //   head-dim elements per op in ascending order; the stored bf16 / fp16 values give the same bits as their float32
+    //   casts.
+    // - `fma`: TF32 off or no matrix units: one fused multiply-add per head-dim element, ascending.
+    // - A one-row call with batch > 1 is neither (MLX runs a matrix-vector kernel there): such calls, and anything else
+    //   `selectKernelSupported` does not cover, take the reference ops.
+    // Which arithmetic this process's matmul runs is not read from MLX internals: `selectArithmetic` runs both kernels
+    // against the reference ops on probe shapes once per (dtype, head dim) and admits the one that reproduces it bit
+    // for bit; when neither does, every call takes the reference ops.
+
+    /// `VMLX_MINIMAX_MSA_SELECT`: `reference` (the score-sheet ops), `kernel` (the admitted kernel), `nax` / `fma`
+    /// (that kernel arithmetic even when it does not reproduce the reference: comparisons only); unset: `auto`.
+    enum SelectRequest: String, Sendable {
+        case auto, reference, kernel, nax, fma
+    }
+
+    /// The selection path a call takes: the reference ops or one kernel family.
+    enum SelectPath: String, Sendable {
+        case reference, nax, fma
+    }
+
+    static let selectEnvironmentVariable = "VMLX_MINIMAX_MSA_SELECT"
+
+    // Selection kernel sizes (they only shape the work; every admitted kernel reproduces the reference bit for bit).
+    // Measured by the Python runtime on the M5 Max, bf16, 4 groups (2048-row chunk at 32k: fragments per simdgroup
+    // 1 / 2 / 4 = 4.4 / 2.8 / 3.6 ms; fma chunk tile of 32 / 64 pairs = 7.6 / 10.2 ms).
+    static let selectSimdgroups = 4  // nax: simdgroups per threadgroup
+    static let selectTargetSimdgroups = 8192  // nax: simdgroups per launch the key ranges aim for
+    static let selectNaxFragments = 2  // nax: 16-pair fragments per simdgroup
+    static let selectFmaPairs = 16  // fma: (group, row) pairs per threadgroup of the scalar kernel; more: tiled kernel
+    static let selectSimdPairs = 32  // fma: pairs per threadgroup of the tiled simdgroup-matrix kernel
+
+    static func requestedSelectPath() -> SelectRequest {
+        if let forced = hooks.selectRequest { return forced }
+        let raw = RuntimeEnvironment.value(selectEnvironmentVariable)?
+            .trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+        if let request = SelectRequest(rawValue: raw), request != .auto { return request }
+        // `VMLX_MINIMAX_MSA=dense` is the pre-kernel runtime end to end: the reference selection too.
+        return requestedPath() == .dense ? .reference : .auto
+    }
+
+    /// `reference`, `nax` or `fma` for this selection call. Only picks a path: every kernel admitted here reproduces
+    /// the reference's block scores bit for bit (`selectArithmetic`). Auto takes the admitted kernel for every
+    /// supported call: measured by the Python runtime on the M5 Max (bf16, 4 groups, scores + top-k, dependent calls,
+    /// medians of 7) it was faster than the reference ops at every shape tried, 1 ..< 2049 rows x 2049 ... 131072 keys.
+    static func chooseSelectPath(queries: MLXArray, keys: MLXArray, blockSize: Int) -> SelectPath {
+        let path = routeSelect(queries: queries, keys: keys, blockSize: blockSize)
+        hooks.selectObserver?(path)
+        return path
+    }
+
+    private static func routeSelect(queries: MLXArray, keys: MLXArray, blockSize: Int) -> SelectPath {
+        let want = requestedSelectPath()
+        if want == .reference || !selectKernelSupported(queries: queries, keys: keys, blockSize: blockSize) {
+            return .reference
+        }
+        switch want {
+        case .fma: return .fma
+        case .nax: return matrixUnitsAvailable() ? .nax : .reference
+        default: return selectArithmetic(queries.dtype, headDim: queries.dim(3)) ?? .reference
+        }
+    }
+
+    /// The indexer's block scores `[B, G, Sq, blocks]` float32 (`referenceBlockScores`), by the routed path.
+    static func blockScores(
+        queries: MLXArray, keys: MLXArray, offset: Int, blockSize: Int, localBlocks: Int
+    ) -> MLXArray {
+        switch chooseSelectPath(queries: queries, keys: keys, blockSize: blockSize) {
+        case .reference:
+            return referenceBlockScores(
+                queries: queries, keys: keys, offset: offset, blockSize: blockSize, localBlocks: localBlocks)
+        case let arithmetic:
+            return kernelBlockScores(
+                queries: queries, keys: keys, offset: offset, blockSize: blockSize, localBlocks: localBlocks,
+                arithmetic: arithmetic)
+        }
+    }
+
+    /// Calls the selection kernels reproduce: Metal GPU, one index-key head, q and k in one float dtype, head dim a
+    /// multiple of 16, blocks a multiple of 32 keys (<= 1024), and the reference's matmul a matrix product (batch 1
+    /// with more than one (group, row) pair, or more than one row): a one-row call with batch > 1 runs MLX's
+    /// matrix-vector kernel, whose arithmetic neither kernel has.
+    static func selectKernelSupported(queries q: MLXArray, keys k: MLXArray, blockSize: Int) -> Bool {
+        guard onGPU, q.ndim == 4, elementType(q.dtype) != nil, k.dtype == q.dtype, k.ndim == 4 else { return false }
+        let (B, G, L, D) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+        guard k.dim(0) == B, k.dim(1) == 1, k.dim(3) == D, D % 16 == 0, blockSize % 32 == 0, blockSize <= 1024
+        else { return false }
+        return (B == 1 && G * L > 1) || L > 1
+    }
+
+    /// Mutated kernel sources (tests: controls that must fail); nil keeps the runtime's.
+    struct SelectSources {
+        var nax = selectNaxSource
+        var naxSplit = selectNaxSplitSource
+        var fma = selectFmaSource
+        var simd = selectSimdSource
+    }
+
+    private enum SelectKernelKind: String {
+        case nax, naxSplit = "nax_split", fma, simd
+    }
+
+    private static func selectKernel(
+        _ kind: SelectKernelKind, element: String, d: Int, block: Int, pt: Int, sources: SelectSources?
+    ) -> MLXFast.MLXFastKernel {
+        let s = sources ?? SelectSources()
+        let constants: [(String, Int)]
+        let body: String
+        var header = ""
+        switch kind {
+        case .nax:
+            constants = [("D", d), ("BLOCK", block), ("NSG", selectSimdgroups), ("FPS", pt)]
+            body = s.nax
+            header = matrixUnitHeader
+        case .simd:
+            constants = [("D", d), ("BLOCK", block), ("TP", pt)]
+            body = s.simd
+        case .naxSplit:
+            constants = [("D", d), ("BLOCK", block), ("FPS", pt)]
+            body = s.naxSplit
+            header = matrixUnitHeader
+        case .fma:
+            constants = [("D", d), ("BLOCK", block), ("PT", pt), ("NSGB", block / 32)]
+            body = s.fma
+        }
+        let source = constantsHeader(element, constants) + body
+        let tag = "\(kind.rawValue)_\(element)_d\(d)_b\(block)" + (pt != 0 ? "_p\(pt)" : "")
+        return cachedKernel(
+            kernelName("vmlx_minimax_msa_select_\(tag)", header + source),
+            inputs: ["q", "k", "meta"], outputs: ["out"], source: source, header: header,
+            ensureRowContiguous: false)
+    }
+
+    /// `referenceBlockScores` computed by the `arithmetic` (`nax` / `fma`) kernel family: `[B, G, Sq, blocks]` float32,
+    /// no score sheet. q `[B, G, Sq, D]` and k `[B, 1, Sk, D]` in one dtype, any strides.
+    static func kernelBlockScores(
+        queries q: MLXArray, keys k: MLXArray, offset: Int, blockSize block: Int, localBlocks local: Int,
+        arithmetic: SelectPath, sources: SelectSources? = nil
+    ) -> MLXArray {
+        let (B, G, L, D) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+        let sk = k.dim(2)
+        let nb = (sk + block - 1) / block
+        let P = G * L
+        let element = elementType(q.dtype)!
+        func meta(_ bps: Int) -> MLXArray {
+            MLXArray([Int32(offset), Int32(sk), Int32(nb), Int32(bps), Int32(local)])
+        }
+        func launch(
+            _ kernel: MLXFast.MLXFastKernel, grid: (Int, Int, Int), threadGroup: (Int, Int, Int), bps: Int = 0
+        ) -> MLXArray {
+            kernel(
+                [q, k, meta(bps)], grid: grid, threadGroup: threadGroup, outputShapes: [[B, G, L, nb]],
+                outputDTypes: [.float32])[0]
+        }
+        switch arithmetic {
+        case .nax where P <= 32:
+            // Decode-sized: every pair in one or two fragments, the block's tiles spread over a threadgroup.
+            let fps = (P + 15) / 16
+            let kernel = selectKernel(.naxSplit, element: element, d: D, block: block, pt: fps, sources: sources)
+            return launch(kernel, grid: (block * nb, B, 1), threadGroup: (block, 1, 1))
+        case .nax:
+            let fps = max(1, min(selectNaxFragments, (P + 15) / 16))
+            let fragmentGroups = (P + 16 * fps - 1) / (16 * fps)
+            let ranges = max(1, (selectTargetSimdgroups + max(1, fragmentGroups) - 1) / max(1, fragmentGroups))
+            let bps = max(1, (nb + ranges - 1) / ranges)
+            let simdgroups = (nb + bps - 1) / bps * fragmentGroups
+            let nsg = selectSimdgroups
+            let kernel = selectKernel(.nax, element: element, d: D, block: block, pt: fps, sources: sources)
+            return launch(
+                kernel, grid: (32 * nsg * ((simdgroups + nsg - 1) / nsg), B, 1), threadGroup: (32 * nsg, 1, 1),
+                bps: bps)
+        case .fma where P > selectFmaPairs && block == 128:
+            // Chunks: the tiled simdgroup-matrix kernel (same fma chain per element).
+            let tp = selectSimdPairs
+            let kernel = selectKernel(.simd, element: element, d: D, block: block, pt: tp, sources: sources)
+            return launch(kernel, grid: (128 * nb, (P + tp - 1) / tp, B), threadGroup: (128, 1, 1))
+        case .fma:
+            var pt = 1
+            while pt < min(P, selectFmaPairs) { pt *= 2 }
+            let kernel = selectKernel(.fma, element: element, d: D, block: block, pt: pt, sources: sources)
+            return launch(kernel, grid: (nb * block, (P + pt - 1) / pt, B), threadGroup: (block, 1, 1))
+        case .reference:
+            preconditionFailure("kernelBlockScores needs a kernel arithmetic (nax / fma)")
+        }
+    }
+
+    nonisolated(unsafe) private static var selectArithmetics: [String: SelectPath?] = [:]
+
+    /// `nax` or `fma`: the kernel family whose block scores equal `referenceBlockScores` bit for bit in this process
+    /// for index tensors of `dtype` / head dim `headDim` (checked once on probe shapes, matrix units first), or nil
+    /// when neither does (every call then takes the reference ops).
+    static func selectArithmetic(_ dtype: DType, headDim d: Int = 128) -> SelectPath? {
+        let key = "\(dtype)/\(d)"
+        lock.lock()
+        if let known = selectArithmetics[key] {
+            lock.unlock()
+            return known
+        }
+        lock.unlock()
+        let result = selectArithmeticCheck(dtype, headDim: d)
+        lock.lock()
+        selectArithmetics[key] = result
+        lock.unlock()
+        return result
+    }
+
+    /// Probe shapes for the arithmetic check (the Python runtime's case): 4 groups, 2853 keys (not a multiple of the
+    /// 128-key block); one row, five rows and forty rows ending at the last key.
+    static func selectProbe(_ dtype: DType, headDim d: Int) -> [(MLXArray, MLXArray, Int)] {
+        let keys = MLXRandom.split(key: MLXRandom.key(17), into: 4)
+        let sk = 2853
+        let k = (MLXRandom.normal([1, 1, sk, d], key: keys[0]) * Float(3)).asType(dtype)
+        return [1, 5, 40].enumerated().map { i, rows in
+            (MLXRandom.normal([1, 4, rows, d], key: keys[i + 1]).asType(dtype), k, sk - rows)
+        }
+    }
+
+    private static func selectArithmeticCheck(_ dtype: DType, headDim d: Int) -> SelectPath? {
+        guard onGPU, elementType(dtype) != nil, d % 16 == 0 else { return nil }
+        let probes = selectProbe(dtype, headDim: d)
+        guard
+            let references = try? withError({ error -> [MLXArray] in
+                let references = probes.map {
+                    referenceBlockScores(queries: $0.0, keys: $0.1, offset: $0.2, blockSize: 128, localBlocks: 1)
+                }
+                eval(references)
+                try error.check()
+                return references
+            })
+        else { return nil }
+        for arithmetic in matrixUnitsAvailable() ? [SelectPath.nax, .fma] : [.fma] {
+            let equal =
+                (try? withError { error -> Bool in
+                    let got = probes.map {
+                        kernelBlockScores(
+                            queries: $0.0, keys: $0.1, offset: $0.2, blockSize: 128, localBlocks: 1,
+                            arithmetic: arithmetic)
+                    }
+                    eval(got)
+                    try error.check()
+                    return zip(got, references).allSatisfy { arrayEqual($0, $1).item(Bool.self) }
+                }) ?? false
+            if equal { return arithmetic }
+        }
+        return nil
+    }
+
+    static let selectNaxSource = #"""
+          const ushort lane = thread_index_in_simdgroup;
+          const int sgid = int(threadgroup_position_in_grid.x) * NSG + int(simdgroup_index_in_threadgroup);
+          const int b = int(threadgroup_position_in_grid.y);
+          const int G = int(q_shape[1]);
+          const int L = int(q_shape[2]);
+          const int P = G * L;                                     // (group, row) pairs, p = g * L + l
+          const int FG = (P + 16 * FPS - 1) / (16 * FPS);          // groups of FPS 16-pair fragments
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int nb = meta[2];
+          const int bps = meta[3];
+          const int local = meta[4];
+          const int nr = (nb + bps - 1) / bps;
+          if (sgid >= nr * FG) return;                             // per-simdgroup ops only: no threadgroup barrier below
+          const int fg = sgid % FG;                                // simdgroups of a threadgroup share the key range
+          const int n_lo = (sgid / FG) * bps;
+          const int n_hi = min(nb, n_lo + bps);
+
+          // Fragment layout of a 16x16 tile: this lane holds rows fm and fm + 8, columns fn .. fn + 3.
+          const short qid = short(lane >> 2);
+          const short fm = (qid & 4) | short((lane >> 1) & 3);
+          const short fn = short(((qid & 2) | (lane & 1)) * 4);
+
+          int qp[FPS][2];                                          // position of the lane's pairs (-1: no pair)
+          elem_t qf[FPS][D / 16][8];
+          int qmax = -1;
+          for (short u = 0; u < FPS; ++u) {
+            for (short i = 0; i < 2; ++i) {
+              const int p = (fg * FPS + u) * 16 + fm + 8 * i;
+              const bool pv = p < P;
+              const int g = pv ? p / L : 0;
+              const int l = pv ? p - g * L : 0;
+              qp[u][i] = pv ? offset + l : -1;
+              qmax = max(qmax, qp[u][i]);
+              device const elem_t* qrow = q + (size_t)b * q_strides[0] + (size_t)g * q_strides[1] + (size_t)l * q_strides[2];
+              for (int c = 0; c < D / 16; ++c) {
+                for (short j = 0; j < 4; ++j) {
+                  qf[u][c][i * 4 + j] = pv ? qrow[(size_t)(c * 16 + fn + j) * q_strides[3]] : elem_t(0);
+                }
+              }
+            }
+          }
+          qmax = simd_max(qmax);                                   // last key any pair of the simdgroup sees
+          // first position no pair of the simdgroup sees past (lanes without a pair do not count)
+          int qmin = INT_MAX;
+          for (short u = 0; u < FPS; ++u) {
+            for (short i = 0; i < 2; ++i) qmin = qp[u][i] >= 0 ? min(qmin, qp[u][i]) : qmin;
+          }
+          qmin = min(simd_min(qmin), sk - 1);
+          device const elem_t* kbase = k + (size_t)b * k_strides[0];
+          const size_t kss = k_strides[2];
+          const size_t kds = k_strides[3];
+          const bool vec_ok = kds == 1 && (kss % 4) == 0 && ((ulong)kbase % (4 * sizeof(elem_t))) == 0;
+          const bool writer = (lane & 9) == 0;                     // one of the four lanes holding a row
+
+          for (int n = n_lo; n < n_hi; ++n) {
+            const int start = n * BLOCK;
+            float m[FPS][2];
+            bool bad[FPS][2];
+            for (short u = 0; u < FPS; ++u) {
+              m[u][0] = m[u][1] = -INFINITY;
+              bad[u][0] = bad[u][1] = false;
+            }
+            for (int t0 = 0; t0 < BLOCK && start + t0 <= qmax; t0 += 32) {   // uniform across the simdgroup
+              const int ts = start + t0;
+              float s[FPS][16];
+              for (short u = 0; u < FPS; ++u) {
+                for (short e = 0; e < 16; ++e) s[u][e] = 0.0f;
+              }
+              for (int c = 0; c < D / 16; ++c) {
+                elem_t kb0[8], kb1[8];
+                for (short i = 0; i < 2; ++i) {
+                  const int kp0 = ts + fm + 8 * i;
+                  const int kp1 = kp0 + 16;
+                  msa_load4(kb0 + i * 4, kbase + (size_t)kp0 * kss, c * 16 + fn, kds, vec_ok, kp0 < sk);
+                  msa_load4(kb1 + i * 4, kbase + (size_t)kp1 * kss, c * 16 + fn, kds, vec_ok, kp1 < sk);
+                }
+                for (short u = 0; u < FPS; ++u) msa_mma_16x32<elem_t, elem_t, true>(s[u], qf[u][c], kb0, kb1);
+              }
+              // s[u][h * 8 + i * 4 + j] = score(pair row fm + 8i of fragment u, key ts + h * 16 + fn + j)
+              if (ts + 31 <= qmin) {                               // every pair sees the whole tile (qmin < sk)
+                for (short u = 0; u < FPS; ++u) {
+                  for (short i = 0; i < 2; ++i) {
+                    float tm = s[u][i * 4];
+                    bool tb = isnan(tm);
+                    for (short h = 0; h < 2; ++h) {
+                      for (short j = 0; j < 4; ++j) {
+                        const float x = s[u][h * 8 + i * 4 + j];
+                        tb = tb || isnan(x);
+                        tm = max(tm, x);
+                      }
+                    }
+                    bad[u][i] = bad[u][i] || tb;
+                    m[u][i] = max(m[u][i], tm);
+                  }
+                }
+              } else {
+                for (short u = 0; u < FPS; ++u) {
+                  for (short h = 0; h < 2; ++h) {
+                    for (short i = 0; i < 2; ++i) {
+                      for (short j = 0; j < 4; ++j) {
+                        const int kp = ts + h * 16 + fn + j;
+                        if (kp <= qp[u][i] && kp < sk) {
+                          const float x = s[u][h * 8 + i * 4 + j];
+                          bad[u][i] = bad[u][i] || isnan(x);
+                          m[u][i] = max(m[u][i], x);
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            for (short u = 0; u < FPS; ++u) {
+              for (short i = 0; i < 2; ++i) {
+                float mm = max(m[u][i], simd_shuffle_xor(m[u][i], ushort(1)));
+                mm = max(mm, simd_shuffle_xor(mm, ushort(8)));
+                int bi = int(bad[u][i]);
+                bi |= simd_shuffle_xor(bi, ushort(1));
+                bi |= simd_shuffle_xor(bi, ushort(8));
+                if (writer && qp[u][i] >= 0) {
+                  const int qb = qp[u][i] / BLOCK;
+                  const bool forced = n <= qb && n >= max(0, qb - local + 1);
+                  out[((size_t)b * P + (fg * FPS + u) * 16 + fm + 8 * i) * nb + n] = forced ? INFINITY : (bi ? NAN : mm);
+                }
+              }
+            }
+          }
+        """#
+
+    static let selectNaxSplitSource = #"""
+          const ushort lane = thread_index_in_simdgroup;
+          const int t = int(simdgroup_index_in_threadgroup);       // 32-key tile of the block
+          const int tid = int(thread_position_in_threadgroup.x);
+          const int n = int(threadgroup_position_in_grid.x);       // key block
+          const int b = int(threadgroup_position_in_grid.y);
+          const int G = int(q_shape[1]);
+          const int L = int(q_shape[2]);
+          const int P = G * L;
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int nb = meta[2];
+          const int local = meta[4];
+          constexpr int NT = BLOCK / 32;
+          threadgroup float red[NT * 16 * FPS];
+          threadgroup int redn[NT * 16 * FPS];
+
+          const short qid = short(lane >> 2);
+          const short fm = (qid & 4) | short((lane >> 1) & 3);
+          const short fn = short(((qid & 2) | (lane & 1)) * 4);
+          int qp[FPS][2];
+          int qmax = -1;
+          for (short u = 0; u < FPS; ++u) {
+            for (short i = 0; i < 2; ++i) {
+              const int p = u * 16 + fm + 8 * i;
+              qp[u][i] = p < P ? offset + p % L : -1;
+              qmax = max(qmax, qp[u][i]);
+            }
+          }
+          qmax = simd_max(qmax);
+          float m[FPS][2];
+          bool bad[FPS][2];
+          for (short u = 0; u < FPS; ++u) {
+            m[u][0] = m[u][1] = -INFINITY;
+            bad[u][0] = bad[u][1] = false;
+          }
+          const int ts = n * BLOCK + t * 32;
+          if (ts <= qmax) {                                        // uniform across the simdgroup
+            elem_t qf[FPS][D / 16][8];
+            for (short u = 0; u < FPS; ++u) {
+              for (short i = 0; i < 2; ++i) {
+                const int p = u * 16 + fm + 8 * i;
+                const bool pv = p < P;
+                const int g = pv ? p / L : 0;
+                const int l = pv ? p - g * L : 0;
+                device const elem_t* qrow = q + (size_t)b * q_strides[0] + (size_t)g * q_strides[1]
+                    + (size_t)l * q_strides[2];
+                for (int c = 0; c < D / 16; ++c) {
+                  for (short j = 0; j < 4; ++j) {
+                    qf[u][c][i * 4 + j] = pv ? qrow[(size_t)(c * 16 + fn + j) * q_strides[3]] : elem_t(0);
+                  }
+                }
+              }
+            }
+            device const elem_t* kbase = k + (size_t)b * k_strides[0];
+            const size_t kss = k_strides[2];
+            const size_t kds = k_strides[3];
+            const bool vec_ok = kds == 1 && (kss % 4) == 0 && ((ulong)kbase % (4 * sizeof(elem_t))) == 0;
+            float s[FPS][16];
+            for (short u = 0; u < FPS; ++u) {
+              for (short e = 0; e < 16; ++e) s[u][e] = 0.0f;
+            }
+            for (int c = 0; c < D / 16; ++c) {
+              elem_t kb0[8], kb1[8];
+              for (short i = 0; i < 2; ++i) {
+                const int kp0 = ts + fm + 8 * i;
+                const int kp1 = kp0 + 16;
+                msa_load4(kb0 + i * 4, kbase + (size_t)kp0 * kss, c * 16 + fn, kds, vec_ok, kp0 < sk);
+                msa_load4(kb1 + i * 4, kbase + (size_t)kp1 * kss, c * 16 + fn, kds, vec_ok, kp1 < sk);
+              }
+              for (short u = 0; u < FPS; ++u) msa_mma_16x32<elem_t, elem_t, true>(s[u], qf[u][c], kb0, kb1);
+            }
+            for (short u = 0; u < FPS; ++u) {
+              for (short h = 0; h < 2; ++h) {
+                for (short i = 0; i < 2; ++i) {
+                  for (short j = 0; j < 4; ++j) {
+                    const int kp = ts + h * 16 + fn + j;
+                    if (kp <= qp[u][i] && kp < sk) {
+                      const float x = s[u][h * 8 + i * 4 + j];
+                      bad[u][i] = bad[u][i] || isnan(x);
+                      m[u][i] = max(m[u][i], x);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          for (short u = 0; u < FPS; ++u) {
+            for (short i = 0; i < 2; ++i) {
+              float mm = max(m[u][i], simd_shuffle_xor(m[u][i], ushort(1)));
+              mm = max(mm, simd_shuffle_xor(mm, ushort(8)));
+              int bi = int(bad[u][i]);
+              bi |= simd_shuffle_xor(bi, ushort(1));
+              bi |= simd_shuffle_xor(bi, ushort(8));
+              if ((lane & 9) == 0) {
+                red[(t * FPS + u) * 16 + fm + 8 * i] = mm;
+                redn[(t * FPS + u) * 16 + fm + 8 * i] = bi;
+              }
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (tid < 16 * FPS && tid < P) {
+            float mm = -INFINITY;
+            int bi = 0;
+            for (int tt = 0; tt < NT; ++tt) {
+              mm = max(mm, red[(tt * FPS + tid / 16) * 16 + tid % 16]);
+              bi |= redn[(tt * FPS + tid / 16) * 16 + tid % 16];
+            }
+            const int qb = (offset + tid % L) / BLOCK;
+            const bool forced = n <= qb && n >= max(0, qb - local + 1);
+            out[((size_t)b * P + tid) * nb + n] = forced ? INFINITY : (bi ? NAN : mm);
+          }
+        """#
+
+    static let selectFmaSource = #"""
+          const int tid = int(thread_position_in_threadgroup.x);
+          const int n = int(threadgroup_position_in_grid.x);
+          const int p0 = int(threadgroup_position_in_grid.y) * PT;
+          const int b = int(threadgroup_position_in_grid.z);
+          const int G = int(q_shape[1]);
+          const int L = int(q_shape[2]);
+          const int P = G * L;
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int nb = meta[2];
+          const int local = meta[4];
+          threadgroup float qs[PT * D];
+          threadgroup float red[PT * NSGB];
+          threadgroup int redn[PT * NSGB];
+          for (int i = tid; i < PT * D; i += BLOCK) {
+            const int pp = i / D;
+            const int d = i - pp * D;
+            const int p = p0 + pp;
+            float x = 0.0f;
+            if (p < P) {
+              const int g = p / L;
+              const int l = p - g * L;
+              x = float(q[(size_t)b * q_strides[0] + (size_t)g * q_strides[1] + (size_t)l * q_strides[2]
+                          + (size_t)d * q_strides[3]]);
+            }
+            qs[i] = x;
+          }
+          int qmax = -1;
+          for (int pp = 0; pp < PT; ++pp) {
+            if (p0 + pp < P) qmax = max(qmax, offset + (p0 + pp) % L);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          const int kp = n * BLOCK + tid;
+          float s[PT];
+          for (int pp = 0; pp < PT; ++pp) s[pp] = 0.0f;
+          if (kp < sk && kp <= qmax) {
+            device const elem_t* krow = k + (size_t)b * k_strides[0] + (size_t)kp * k_strides[2];
+            const size_t kds = k_strides[3];
+            if (kds == 1 && ((ulong)krow % (4 * sizeof(elem_t))) == 0) {
+              for (int d = 0; d < D; d += 4) {
+                const vec<elem_t, 4> k4 = *((device const vec<elem_t, 4>*)(krow + d));
+                for (int e = 0; e < 4; ++e) {
+                  const float kd = float(k4[e]);
+                  for (int pp = 0; pp < PT; ++pp) s[pp] = fma(qs[pp * D + d + e], kd, s[pp]);
+                }
+              }
+            } else {
+              for (int d = 0; d < D; ++d) {
+                const float kd = float(krow[(size_t)d * kds]);
+                for (int pp = 0; pp < PT; ++pp) s[pp] = fma(qs[pp * D + d], kd, s[pp]);
+              }
+            }
+          }
+          const int sg = tid / 32;
+          const bool lead = (tid % 32) == 0;
+          for (int pp = 0; pp < PT; ++pp) {
+            const int p = p0 + pp;
+            const int qpos = p < P ? offset + p % L : -1;
+            const bool valid = kp < sk && kp <= qpos;
+            const bool isn = valid && isnan(s[pp]);
+            const float x = valid && !isn ? s[pp] : -INFINITY;
+            const float bm = simd_max(x);
+            const bool bn = simd_any(isn);
+            if (lead) {
+              red[pp * NSGB + sg] = bm;
+              redn[pp * NSGB + sg] = int(bn);
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (tid < PT && p0 + tid < P) {
+            float m = -INFINITY;
+            int bad = 0;
+            for (int i = 0; i < NSGB; ++i) {
+              m = max(m, red[tid * NSGB + i]);
+              bad |= redn[tid * NSGB + i];
+            }
+            const int p = p0 + tid;
+            const int qb = (offset + p % L) / BLOCK;
+            const bool forced = n <= qb && n >= max(0, qb - local + 1);
+            out[((size_t)b * P + p) * nb + n] = forced ? INFINITY : (bad ? NAN : m);
+          }
+        """#
+
+    static let selectSimdSource = #"""
+          const uint lane = thread_index_in_simdgroup;
+          const int sg = int(simdgroup_index_in_threadgroup);
+          const int tid = int(thread_position_in_threadgroup.x);
+          const int n = int(threadgroup_position_in_grid.x);
+          const int p0 = int(threadgroup_position_in_grid.y) * TP;
+          const int b = int(threadgroup_position_in_grid.z);
+          const int G = int(q_shape[1]);
+          const int L = int(q_shape[2]);
+          const int P = G * L;
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int nb = meta[2];
+          const int local = meta[4];
+          constexpr int BK = 16;
+          constexpr int LDS = BK + 4;
+          constexpr int RF = TP / 16;                              // 8-row fragments per simdgroup (TP / 2 rows)
+          threadgroup float qs[TP * LDS];
+          threadgroup float ks[BLOCK * LDS];
+          threadgroup float red[2 * TP];
+          threadgroup int redn[2 * TP];
+
+          int qmax = -1;
+          for (int pp = 0; pp < TP; ++pp) {
+            if (p0 + pp < P) qmax = max(qmax, offset + (p0 + pp) % L);
+          }
+          const int start = n * BLOCK;
+          const short qid = short(lane / 4);
+          const short fm = (qid & 4) + short((lane / 2) % 4);      // 8x8 layout: row fm, columns fn, fn + 1
+          const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+          const int rbase = (sg / 2) * (TP / 2);
+          const int cbase = (sg % 2) * 64;
+          // Fragments as float2 registers (row fm, columns fn, fn + 1), wrapped in simdgroup matrices per op only: arrays of
+          // simdgroup_matrix were 6x slower here.
+          float2 Cf[RF][8];
+          #pragma unroll
+          for (int r = 0; r < RF; ++r) {
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) Cf[r][c] = float2(0.0f);
+          }
+          if (start <= qmax) {                                     // uniform across the threadgroup
+            device const elem_t* kb = k + (size_t)b * k_strides[0];
+            const bool vec_ok = k_strides[3] == 1 && (k_strides[2] % 4) == 0 && ((ulong)kb % (4 * sizeof(elem_t))) == 0;
+            for (int d0 = 0; d0 < D; d0 += BK) {
+              for (int i = tid; i < TP * BK; i += 128) {
+                const int pp = i / BK;
+                const int d = d0 + i - pp * BK;
+                const int p = p0 + pp;
+                float x = 0.0f;
+                if (p < P) {
+                  const int g = p / L;
+                  const int l = p - g * L;
+                  x = float(q[(size_t)b * q_strides[0] + (size_t)g * q_strides[1] + (size_t)l * q_strides[2]
+                              + (size_t)d * q_strides[3]]);
+                }
+                qs[pp * LDS + i - pp * BK] = x;
+              }
+              for (int i = tid; i < BLOCK * (BK / 4); i += 128) {
+                const int kk = i / (BK / 4);
+                const int dc = (i - kk * (BK / 4)) * 4;
+                const int kp = start + kk;
+                float4 x = float4(0.0f);
+                if (kp < sk && kp <= qmax) {
+                  device const elem_t* krow = kb + (size_t)kp * k_strides[2];
+                  if (vec_ok) {
+                    x = float4(*((device const vec<elem_t, 4>*)(krow + d0 + dc)));
+                  } else {
+                    for (int e = 0; e < 4; ++e) x[e] = float(krow[(size_t)(d0 + dc + e) * k_strides[3]]);
+                  }
+                }
+                for (int e = 0; e < 4; ++e) ks[kk * LDS + dc + e] = x[e];
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              #pragma unroll
+              for (int kk = 0; kk < BK; kk += 8) {
+                float2 Af[RF];
+                #pragma unroll
+                for (int r = 0; r < RF; ++r) {
+                  const int row = rbase + r * 8 + fm;            // A[m][k] = qs[row m][kk + k]
+                  Af[r] = float2(qs[row * LDS + kk + fn], qs[row * LDS + kk + fn + 1]);
+                }
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                  const int col = cbase + c * 8 + fn;            // B[k][n] = ks[key n][kk + k]
+                  const float2 Bf = float2(ks[col * LDS + kk + fm], ks[(col + 1) * LDS + kk + fm]);
+                  #pragma unroll
+                  for (int r = 0; r < RF; ++r) {
+                    simdgroup_matrix<float, 8, 8> Am, Bm, Cm, Dm;
+                    reinterpret_cast<thread float2&>(Am.thread_elements()) = Af[r];
+                    reinterpret_cast<thread float2&>(Bm.thread_elements()) = Bf;
+                    reinterpret_cast<thread float2&>(Cm.thread_elements()) = Cf[r][c];
+                    simdgroup_multiply_accumulate(Dm, Am, Bm, Cm);
+                    Cf[r][c] = reinterpret_cast<thread float2&>(Dm.thread_elements());
+                  }
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+          }
+          // this lane: pair rows rbase + r * 8 + fm, keys start + cbase + c * 8 + fn + e
+          #pragma unroll
+          for (int r = 0; r < RF; ++r) {
+            const int p = p0 + rbase + r * 8 + fm;
+            const int qpos = p < P ? offset + p % L : -1;
+            float m = -INFINITY;
+            bool bad = false;
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+              #pragma unroll
+              for (int e = 0; e < 2; ++e) {
+                const int kp = start + cbase + c * 8 + fn + e;
+                if (kp <= qpos && kp < sk) {
+                  const float x = Cf[r][c][e];
+                  bad = bad || isnan(x);
+                  m = max(m, x);
+                }
+              }
+            }
+            m = max(m, simd_shuffle_xor(m, ushort(1)));
+            m = max(m, simd_shuffle_xor(m, ushort(8)));
+            int bi = int(bad);
+            bi |= simd_shuffle_xor(bi, ushort(1));
+            bi |= simd_shuffle_xor(bi, ushort(8));
+            if ((lane & 9) == 0) {
+              red[(sg % 2) * TP + rbase + r * 8 + fm] = m;
+              redn[(sg % 2) * TP + rbase + r * 8 + fm] = bi;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (tid < TP && p0 + tid < P) {
+            const float m = max(red[tid], red[TP + tid]);
+            const int bi = redn[tid] | redn[TP + tid];
+            const int p = p0 + tid;
+            const int qb = (offset + p % L) / BLOCK;
+            const bool forced = n <= qb && n >= max(0, qb - local + 1);
+            out[((size_t)b * P + p) * nb + n] = forced ? INFINITY : (bi ? NAN : m);
+          }
+        """#
 }
