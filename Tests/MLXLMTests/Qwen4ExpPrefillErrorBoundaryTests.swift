@@ -43,24 +43,27 @@ final class Qwen4ExpPrefillErrorBoundaryTests: XCTestCase {
                 do {
                     try withError {
                         try NativeMTPPromptPrimer.$current.withValue(primer) {
-                            try PrefillProgressReporter.withHandler({ count in
-                                progress.append(count)
-                                if count == errorAfter {
-                                    // A real mlx-c error exercises the same capture/check boundary
-                                    // without poisoning Metal or requiring a GPU watchdog failure.
-                                    _ = MLXArray.zeros([2, 3]) + MLXArray.zeros([4, 5])
-                                }
-                            }, operation: {
-                                _ = try model.prepare(
-                                    LMInput(tokens: MLXArray(Array(Int32(1)...Int32(9)))),
-                                    cache: cache, windowSize: 2)
-                                MLX.eval(cache)
-                            })
+                            try PrefillProgressReporter.withHandler(
+                                { count in
+                                    progress.append(count)
+                                    if count == errorAfter {
+                                        // A real mlx-c error exercises the same capture/check boundary
+                                        // without poisoning Metal or requiring a GPU watchdog failure.
+                                        _ = MLXArray.zeros([2, 3]) + MLXArray.zeros([4, 5])
+                                    }
+                                },
+                                operation: {
+                                    _ = try model.prepare(
+                                        LMInput(tokens: MLXArray(Array(Int32(1) ... Int32(9)))),
+                                        cache: cache, windowSize: 2)
+                                    MLX.eval(cache)
+                                })
                         }
                     }
                 } catch { caught = String(describing: error) }
-                return Receipt(completed: progress.completed, offsets: cache.map(\.offset),
-                               headOffsets: head.map(\.offset), error: caught)
+                return Receipt(
+                    completed: progress.completed, offsets: cache.map(\.offset),
+                    headOffsets: head.map(\.offset), error: caught)
             }
         }
     }
@@ -110,16 +113,16 @@ final class Qwen4ExpPrefillErrorBoundaryTests: XCTestCase {
     }
 
     private static let configuration = #"""
-    {"model_type":"qwen4_exp","text_config":{
-      "model_type":"qwen4_exp_text","dtype":"float32","mtp_num_hidden_layers":1,
-      "hidden_size":64,"num_hidden_layers":2,"intermediate_size":64,
-      "num_attention_heads":4,"num_key_value_heads":1,"head_dim":16,
-      "linear_num_value_heads":4,"linear_num_key_heads":1,"linear_key_head_dim":16,
-      "linear_value_head_dim":16,"linear_conv_kernel_dim":4,"vocab_size":128,
-      "num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":32,
-      "shared_expert_intermediate_size":32,"layer_types":["full_attention","full_attention"],
-      "full_attention_interval":2,"hc_count":4,"hc_lowrank":8,"ple_layer_ids":[],
-      "indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":8,
-      "indexer_budget":32,"indexer_compress_ratio":4,"mrope_section":[1,1,0]}}
-    """#
+        {"model_type":"qwen4_exp","text_config":{
+          "model_type":"qwen4_exp_text","dtype":"float32","mtp_num_hidden_layers":1,
+          "hidden_size":64,"num_hidden_layers":2,"intermediate_size":64,
+          "num_attention_heads":4,"num_key_value_heads":1,"head_dim":16,
+          "linear_num_value_heads":4,"linear_num_key_heads":1,"linear_key_head_dim":16,
+          "linear_value_head_dim":16,"linear_conv_kernel_dim":4,"vocab_size":128,
+          "num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":32,
+          "shared_expert_intermediate_size":32,"layer_types":["full_attention","full_attention"],
+          "full_attention_interval":2,"hc_count":4,"hc_lowrank":8,"ple_layer_ids":[],
+          "indexer_n_heads":2,"indexer_kv_heads":1,"indexer_head_dim":8,
+          "indexer_budget":32,"indexer_compress_ratio":4,"mrope_section":[1,1,0]}}
+        """#
 }
