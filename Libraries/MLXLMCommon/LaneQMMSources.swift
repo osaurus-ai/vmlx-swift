@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Portions adapted from TensorFold 0.6.6 (https://github.com/ashhart/TensorFold, Apache-2.0;
-// Copyright 2026 TensorFold contributors), src/tensorfold/kernels/qwen/dense/v1/lane_qmm.py and
-// lane_widen.py at commit cb2ebf0, via vMLX Python vmlx_engine/metal/lane_qmm.py (commit 4554485c1).
+// Metal sources shared with vMLX Python vmlx_engine/metal/lane_qmm.py (commit 4554485c1).
 // The Metal kernel sources below are byte-identical to the Python port; the `directScales` variants
 // (default since 2026-10-11) differ only in reading scales/biases in place instead of a packed SBt copy.
 //

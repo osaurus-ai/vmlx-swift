@@ -4,7 +4,7 @@
 // DeepSeek-V4.1 MoE at decode and dSpark-verify sizes (1-8 rows) in two Metal dispatches.
 //
 // Port of the mlx-serve fused MoE decode (`MOE_GU_SOURCE` / `MOE_DN_SOURCE`, src/deepseek_v41.zig
-// L1612-1693 at 191da71de32a; oMLX `decode_moe.py` is the same idea): kernel 1 runs the six routed
+// L1612-1693 at 191da71de32a; reference runtime `decode_moe.py` is the same idea): kernel 1 runs the six routed
 // experts' gate and up projections plus the shared expert's w1/w3 as slot 6 in one grid and applies the
 // clamped SwiGLU (times the route weight on the routed slots); kernel 2 runs the six routed down
 // projections, sums them in fp32 in slot order and adds the shared expert's down projection.

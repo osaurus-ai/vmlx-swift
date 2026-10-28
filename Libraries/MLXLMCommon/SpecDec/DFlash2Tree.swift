@@ -5,9 +5,6 @@
 // recurrence → the longest accepted root path is committed (KV rows compacted, recurrent state
 // replayed along the kept path only).
 //
-// Mechanism ported from TensorFold 0.6.6 (Apache-2.0): `drafters/dflash_tree.py` (best_first_tree),
-// `drafters/dflash_proposer.py` (lattice, constants), `kernels/qwen/dense/v1/lane_tree.py` (tree
-// GatedDelta kernel, kept-path replay, accept_path) and `lane_multi.py` (tree forward / commit).
 // Why: a chain verifies ONE candidate per position, so a single early miss wastes the whole
 // window. With the lane matmul a 16-row verify costs about what 8 rows do, so spending the
 // rows on the most likely BRANCHES instead of one deep chain raises tokens per cycle on prose.
@@ -177,7 +174,7 @@ public struct DFlash2Lattice {
 }
 
 public enum DFlash2TreeSearch {
-    /// TensorFold's fitted constants (`DFlashProposer.tree_*`).
+    /// The reference fitted constants (`DFlashProposer.tree_*`).
     public static let tau = 1.5
     public static let edgeWeight = 0.6
     public static let children = 4

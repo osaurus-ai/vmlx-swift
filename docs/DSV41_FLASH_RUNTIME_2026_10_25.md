@@ -538,7 +538,7 @@ images in the request. Without them nothing changes:
 - Osaurus main pins vMLX `085c1c57`, which contains this branch, so the check passes and a V4.1
   bundle with its vision tower accepts images. (Under the older pin `264f6c4c` the check was false
   and V4.1 stayed text-only instead of being refused at load.)
-- Image parts already reach the VL path through `mapOpenAIChatToMLX`:
+- Image parts already reach the VL path through `makeMLXChatMessages`:
   - each `Chat.Message` keeps its own images and `contentParts`;
   - `validateRuntimePolicy` and the composer read the same evidence.
 

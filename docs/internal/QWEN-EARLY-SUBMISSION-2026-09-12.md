@@ -291,7 +291,7 @@ The measured host trace motivating this change has 23 complete token intervals,
 27.557 ms average wall time and 8.562 ms mean largest gap between completed GPU
 buffer spans, predominantly before the next host commit. Buffer-span union is
 not useful GPU occupancy and does not attribute all remaining cost to the CPU.
-Python/oMLX per-layer submission is a source comparison, not Swift proof. The
+Python/reference runtime per-layer submission is a source comparison, not Swift proof. The
 separate Python 6S 37.2713→45.8489 result holds its HC/QSA/PLE composition fixed;
 its different bundle, sampling and runtime cannot supply Swift's missing rows.
 

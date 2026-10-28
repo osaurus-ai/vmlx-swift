@@ -89,25 +89,24 @@ then1L/4M/6S, fresh long-prefill memory, media and sustained MTP. No release.
 Reviewed engine baseline `93baa9f2bd5299f0d9a36eacea9da0b5c3028a52`;
 Python reference `1e022d8e6570bd487ae761a6e016f36e217502a4` in the active
 terminal worktree, not the older wrapper checkout;
-oMLX reference `7cbb407168ae628bbe0d7fe385be70e0954af303`;
+reference runtime reference `7cbb407168ae628bbe0d7fe385be70e0954af303`;
 antirez main `bd66c402070042bf0a79ad6ece8242de4c93680c` and Qwen PR991
 reference refreshed to `ccea7688276a9da8fc1453b13dad3e5c1c044ce2` (still OPEN
 in the live GitHub readback). The reviewed `metal/qwen4.metal` has no changes
 from previous `30305544f96cc35357e0dd376eeff2b1ab3e365e`. New root-C changes
 include checkpoint logits and steering; steering is not part of this port.
 
-| Mechanism | Python / oMLX / C | Swift baseline and action |
+| Mechanism | Python / reference runtime / C | Swift baseline and action |
 | --- | --- | --- |
-| Layer submission | Python `language.py:2256–2308`, oMLX `language.py:2905` submit each eligible layer. | `Qwen4ExpTextModel.forward` already submits AR each layer. Preserve it; fewer kernels can change the best submission grouping, so one old stride experiment is not a universal rejection. |
+| Layer submission | Python `language.py:2256–2308`, reference runtime `language.py:2905` submit each eligible layer. | `Qwen4ExpTextModel.forward` already submits AR each layer. Preserve it; fewer kernels can change the best submission grouping, so one old stride experiment is not a universal rejection. |
 | HC producers | C Qwen `kernel_qwen4_hc_combine_norm` produces next residual and normalized input together; ds4 HC producer clusters preserve their original reduction trees. | The separate `combine` then `mix` constructs/reloads intermediates. New `Qwen4ExpHCCombineNorm` produces both outputs once and passes the norm directly to the next mixer. |
-| HC arithmetic | oMLX fused HC takes precedence over its exact-hybrid path, with explicit quant/shape guards; its epilogues use different FP32 rounding. | Actual retained 2L HC weights were dense BF16, so oMLX's quantized-HC gate is not the missing switch here. Keep native projections and explicit BF16/F16 product, sum, norm, and scale rounding. |
+| HC arithmetic | reference runtime fused HC takes precedence over its exact-hybrid path, with explicit quant/shape guards; its epilogues use different FP32 rounding. | Actual retained 2L HC weights were dense BF16, so reference runtime's quantized-HC gate is not the missing switch here. Keep native projections and explicit BF16/F16 product, sum, norm, and scale rounding. |
 | GDN front | C Qwen combines convolution, Q/K normalization and gate work; Python has grouped inputs and qualified front helpers. | Existing grouped projections and recurrent kernel remain. Restore the separately qualified Q/K norm component, then test with HC fusion; no claim that this is the entire C GDN front. |
 | Projection grouping | Python prepares compatible QSA and shared gate/up projections. C concatenates disjoint output grids without replacing their reductions. | Previous private adapters actually executed, but whole-model results drifted over time. Keep grouping open for composed, repeated qualification; do not infer universal benefit from launch count or universal failure from those medians. |
 | PLE reads and ownership | Python groups selected rows and owns prefetch tickets; C separates model shards, scratch and live state. | Swift uses persistent row readers and bounded prefetch, not whole-table reads per token. Prepared HC normalization must not cross a PLE residual update. No model-shard deletion or new row-cache policy. |
 | QSA/cache | Derived pooling, raw-capacity append and sparse selection are distinct from attention dispatch and SSD prefix durability. | Keep existing capacity/shared-mask candidates separate in attribution, fixed in all new HC/GDN arms. Preserve native KV/GDN/PLE boundaries and media-position limitations. |
 
-Primary sources: [oMLX host and HC work](https://github.com/jundot/omlx/pull/3469),
-[C exact HC producer grouping](https://github.com/antirez/ds4/commit/92d83e6ecd4d2bbd07bfb947db9bd4afe044edc1),
+Primary sources: [C exact HC producer grouping](https://github.com/antirez/ds4/commit/92d83e6ecd4d2bbd07bfb947db9bd4afe044edc1),
 [Qwen C/Metal work](https://github.com/antirez/ds4/pull/991).
 Their measured speeds do not transfer to this build or these bundles.
 

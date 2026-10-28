@@ -1140,7 +1140,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Dispatch, don't sync: the verify graph below consumes the draft
         // tokens ON-GRAPH, so the GPU runs the drafter while the CPU is
         // still building the verify forward. The reference does the same
-        // with `mx.async_eval(draft_tokens)`, and oMLX's Lightning MTP PR
+        // with `mx.async_eval(draft_tokens)`, and reference runtime's Lightning MTP PR
         // credits collapsing to one host sync per cycle for a large share
         // of its speedup — this loop previously paid three.
         asyncEval(proposal.tokens)

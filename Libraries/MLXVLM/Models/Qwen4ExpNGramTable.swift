@@ -209,7 +209,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     /// the model volume during plain AR); decode became SSD-latency-bound, the GPU idled between layers and
     /// its clock governor dropped (9 W, 735-1,100 MHz at "99 % active"): plain AR fell from 53.4 to 31.8
     /// tok/s on identical code as the drive's latency drifted. vMLX Python (table_reader.py) and
-    /// TensorFold read the table through the page cache and warm it once after load; lookups are then RAM
+    /// The reference runtime read the table through the page cache and warmed it once after load; lookups are then RAM
     /// hits. Page-cache pages are clean and reclaimable: under memory pressure macOS evicts them and
     /// lookups fall back to drive reads — never an error, never a refusal.
     static let uncachedReads: Bool = {

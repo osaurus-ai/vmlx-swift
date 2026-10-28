@@ -81,7 +81,7 @@ public enum DFlash2Loader {
         }
 
         // The bf16 release runs quantized in the reference runtime: the
-        // oMLX recipe's "Draft quantization enabled" is `nn.quantize(draft,
+        // reference runtime recipe's "Draft quantization enabled" is `nn.quantize(draft,
         // group_size=64, bits=4)`, and the 60+ t/s contract was measured
         // with it (acceptance held ~88%). Quantize AFTER the weights land
         // so the bf16 tensors load into the still-bf16 modules first.

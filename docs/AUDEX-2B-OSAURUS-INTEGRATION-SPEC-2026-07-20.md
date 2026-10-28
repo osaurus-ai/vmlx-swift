@@ -559,7 +559,7 @@ No Audex-only chat transport is needed. The existing path is:
 flowchart LR
     A[Dinoki/Chat attachment] --> B[ModelMediaCapabilities.audioOnly]
     B --> C[ChatMessage input_audio part]
-    C --> D[ModelRuntime.mapOpenAIChatToMLX]
+    C --> D[ModelRuntime.makeMLXChatMessages]
     D --> E[UserInput.Audio samples or URL]
     E --> F[AudexProcessor]
     F --> G[Audex.prepare]
@@ -828,7 +828,7 @@ distribution:
 | Does the tokenizer remain fast and lossless? | vendored `Tokenizer.swift`, tokenizer focused test |
 | Does vMLX advertise audio? | `ModelRuntimeCapabilitySnapshot.swift` |
 | Does Osaurus expose only audio? | `ModelMediaCapabilities.swift`, `ChatView.swift` |
-| Does API audio reach `UserInput.Audio`? | `OpenAIAPI.swift`, `ModelRuntime.mapOpenAIChatToMLX` |
+| Does API audio reach `UserInput.Audio`? | `OpenAIAPI.swift`, `ModelRuntime.makeMLXChatMessages` |
 | Does Dinoki accept the right attachment types? | `FloatingInputCard.swift`, `ChatView.swift` |
 | Are cache claims safe? | `MediaSalt.swift`, `LanguageModel.swift`, BatchEngine/TokenIterator rollback paths |
 | Is the correct engine consumed? | all four Osaurus pin files |

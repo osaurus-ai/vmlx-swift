@@ -564,7 +564,7 @@ struct NemotronHOmniPreEncodedAudioTests {
     }
 
     @Test("Parakeet source weights transpose to MLX layouts")
-    func parakeetWeightRemapsTransposeToMLXLayouts() {
+    func parakeetWeightRemapsUseMLXLayouts() {
         FocusedMLXTestSupport.withLock {
             let conv2d: [String: MLXArray] = [
                 "sound_encoder.encoder.subsampling.layers.0.weight":

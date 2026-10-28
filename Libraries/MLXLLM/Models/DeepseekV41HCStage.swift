@@ -4,7 +4,7 @@
 // DeepSeek-V4.1 staggered hyper-connection stage at decode (one token) in two Metal dispatches.
 //
 // Port of the mlx-serve hc stage (`HC_STAGE_HEAD/TAIL` + `HC_STAGE_LOAD_EXPAND` + `HC_SPLIT_SOURCE`,
-// src/deepseek_v41.zig L1429-1553 at 191da71de32a; oMLX `decode_layer.py` K1/K2 is the same split). One
+// src/deepseek_v41.zig L1429-1553 at 191da71de32a; reference runtime `decode_layer.py` K1/K2 is the same split). One
 // sublayer of the V4.1 staggered mHC is
 //   mixes(h)   : x = f32(h); r = rsqrt(mean(x * x) + eps); z = (x @ fn.T) * r; split-Sinkhorn(z)
 //   collapse   : y = bf16(sum_j pre_prev[j] * f32(h[j])), then RMSNorm(y)
