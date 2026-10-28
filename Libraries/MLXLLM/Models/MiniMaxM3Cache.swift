@@ -21,8 +21,9 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
     /// The K/V lane. Readable in-module (tests poison its unused capacity to prove nothing reads past `offset`).
     private(set) var kv = KVCacheSimple()
 
-    /// Capacity buffer for the indexer keys; rows past `indexCount` are unused capacity, never visible.
-    private var indexStorage: MLXArray?
+    /// Capacity buffer for the indexer keys; rows past `indexCount` are unused capacity, never visible. Readable
+    /// in-module (tests poison its unused capacity to prove nothing reads past `offset`).
+    private(set) var indexStorage: MLXArray?
     private var indexCount = 0
     private static let step = 256
 
