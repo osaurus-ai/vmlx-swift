@@ -10,18 +10,31 @@ import MLXNN
 /// `JTMixedSwitchGLU.routed` decode route (4 launches when both groups are trellis):
 ///
 ///  1. xr = H128(x * su_gu)                         per-layer input signs, 0 on the layer's outlier columns
-///  2. h  = gate/up trellis decode + (clamped) SwiGLU, F32, outlier columns from the raw x
+///  2. h  = gate/up trellis decode + the model's (clamped) SwiGLU variant, F32, outlier columns from the raw x
 ///  3. hr = H128(h * sv_dn[expert])                 sv_dn = cs * su * mask, per expert
 ///  4. y  = weighted down over the token's k slots, F32 accumulation, cast to the input dtype
 ///
-/// A JANGH group runs the existing JANGH decode kernels (H32 basis). Every batch size uses these kernels — the
-/// sorted NAX prefill tiles of the Python runtime are not ported yet, so long prefills are correct but slower.
-/// Banks are mapped views of the bundle files (no copies); the only derived arrays are the folded sign vectors.
+/// A JANGH group runs the existing JANGH decode kernels (H32 basis). Banks are mapped views of the bundle files (no
+/// copies); the only derived arrays are the folded sign vectors.
+///
+/// The activation is the model's (`JANGTActivation`): SiLU by default, SwiGLU-OAI for MiniMax-M3 / M3.1. Every trellis
+/// gate/up path applies it in its own epilogue. The JANGH fused gate/up epilogues are SiLU only, so a JANGH gate/up
+/// group of a non-SiLU model runs gate and up as two single-weight passes and applies the variant in F32 (Python
+/// `JTMixedSwitchGLU._decode_h` / `_prefill`).
 public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, SupplementalModelWeights {
     private enum GateUp {
         case trellis(gate: JANGTProjection, up: JANGTProjection, signs: MLXArray)
         case codebook(kernel: JANGHFusedGateUpKernel, prefill: JANGHPrefillKernel,
-                      gate: JANGHMappedBanks.Projection, up: JANGHMappedBanks.Projection)
+                      gate: JANGHMappedBanks.Projection, up: JANGHMappedBanks.Projection,
+                      separate: SeparateCodebookPasses?)
+    }
+
+    /// Single-weight JANGH passes for a non-SiLU activation: decode QMVs rotating the raw input to H32 in F32 (the
+    /// basis the fused decode kernel reads) and the up projection's own prefill tile (the gate's is `prefill`).
+    private struct SeparateCodebookPasses {
+        let gateDecode: JANGHProjectionKernel
+        let upDecode: JANGHProjectionKernel
+        let upPrefill: JANGHPrefillKernel
     }
 
     private enum Down {
@@ -48,12 +61,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     private let down: Down
     private let hiddenSize: Int
     private let limit: Float
+    private let activation: JANGTActivation
     private let rowRotation = JANGHRowRotation()
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
     init(banks: JANGHMappedBanks, parentModule: String, hiddenSize: Int, intermediateSize: Int,
-         activationLimit: Float?) throws {
+         activationLimit: Float?, activation: JANGTActivation = .silu) throws {
         if let activationLimit, !activationLimit.isFinite || activationLimit <= 0 {
             throw JANGHFormatContract.ValidationError.invalid("invalid JANGT activation limit")
         }
@@ -98,7 +112,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 kernel: try JANGHFusedGateUpKernel(contract: contract, gateModule: gateName, upModule: upName,
                                                    outputRotation: .none),
                 prefill: try JANGHPrefillKernel(contract: contract, module: gateName, upModule: upName),
-                gate: gate, up: up)
+                gate: gate, up: up,
+                separate: activation == .silu ? nil : SeparateCodebookPasses(
+                    gateDecode: try JANGHProjectionKernel(contract: contract, module: gateName,
+                                                          fuseFloatRotation: true),
+                    upDecode: try JANGHProjectionKernel(contract: contract, module: upName, fuseFloatRotation: true),
+                    upPrefill: try JANGHPrefillKernel(contract: contract, module: upName)))
             count(gate, inputs: hiddenSize)
             count(up, inputs: hiddenSize)
         }
@@ -122,6 +141,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
         self.limit = activationLimit ?? 0
+        self.activation = activation
         supplementalWeightBytes = bytes
         supplementalParameterCount = params
         super.init()
@@ -130,7 +150,8 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     /// A pure-trellis layer from in-memory projections (tensors not served by the mapped banks, e.g. the DeepSeek-V4.1
     /// dSpark draft's `dspark/dspark.safetensors`): the same folded signs and kernels as the banked trellis branches.
     public init(gate: JANGTProjection, up: JANGTProjection, down d: JANGTProjection,
-                hiddenSize: Int, intermediateSize: Int, activationLimit: Float?) throws {
+                hiddenSize: Int, intermediateSize: Int, activationLimit: Float?,
+                activation: JANGTActivation = .silu) throws {
         if let activationLimit, !activationLimit.isFinite || activationLimit <= 0 {
             throw JANGHFormatContract.ValidationError.invalid("invalid JANGT activation limit")
         }
@@ -162,6 +183,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
         self.limit = activationLimit ?? 0
+        self.activation = activation
         supplementalWeightBytes = bytes
         supplementalParameterCount = params
         super.init()
@@ -199,8 +221,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             case .trellis(let gate, let up, let signs):
                 hidden = JANGTKernels.gateUp(
                     xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids, gate: gate, up: up,
-                    limit: limit, outputDType: .float32)
-            case .codebook(let kernel, _, let gate, let up):
+                    limit: limit, activation: activation, outputDType: .float32)
+            case .codebook(_, _, let gate, let up, let separate?):
+                let g = try separate.gateDecode.project(x, packed: gate.packed, scales: gate.scales, indices: ids)
+                let u = try separate.upDecode.project(x, packed: up.packed, scales: up.scales, indices: ids)
+                hidden = activation(gate: g, up: u, limit: limit)
+            case .codebook(let kernel, _, let gate, let up, nil):
                 hidden = try kernel.activatePreparedInput(
                     kernel.prepareInputForFusedDecode(x), gatePacked: gate.packed, gateScales: gate.scales,
                     upPacked: up.packed, upScales: up.scales, indices: ids, limit: limit > 0 ? limit : nil)
@@ -247,26 +273,33 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 // input already Hadamard-32 rotated (the H32 store epilogue).
                 let rotate = downIsCodebook && intermediateSize % 32 == 0
                 hidden = JANGTPrefillKernel.project(xr, gate, up: up, indices: sortedIDs, limit: limit,
-                                                    rotateOutput: rotate)
+                                                    activation: activation, rotateOutput: rotate)
                 hiddenRotated = rotate
             } else if let columns = _sharedOutlierColumns {
                 hidden = JANGTPrefillKernel.projectGateUpWithOutliers(
                     xr, rawRows: take(x, tok, axis: 0), gate: gate, up: up, columns: columns,
-                    indices: sortedIDs, limit: limit)
+                    indices: sortedIDs, limit: limit, activation: activation)
             } else {
                 let raw = take(x, tok, axis: 0)
                 var g = JANGTPrefillKernel.project(xr, gate, indices: sortedIDs).asType(.float32)
                 var u = JANGTPrefillKernel.project(xr, up, indices: sortedIDs).asType(.float32)
                 if let o = JANGTPrefillKernel.outliers(raw, gate, indices: sortedIDs) { g = g + o }
                 if let o = JANGTPrefillKernel.outliers(raw, up, indices: sortedIDs) { u = u + o }
-                if limit > 0 { g = minimum(g, limit); u = clip(u, min: -limit, max: limit) }
-                hidden = (g * sigmoid(g) * u).asType(dtype)
+                hidden = activation(gate: g, up: u, limit: limit).asType(dtype)
             }
-        case .codebook(_, let prefillKernel, let gate, let up):
+        case .codebook(_, let prefillKernel, let gate, let up, let separate):
             let xs = take(try rowRotation(x, outputDType: dtype), tok, axis: 0)
-            hidden = try prefillKernel.projectSorted(
-                xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs,
-                upPacked: up.packed, upScales: up.scales, limit: limit > 0 ? limit : nil)
+            if let separate {
+                let g = try prefillKernel.projectSorted(
+                    xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs).asType(.float32)
+                let u = try separate.upPrefill.projectSorted(
+                    xs, packed: up.packed, scales: up.scales, indices: sortedIDs).asType(.float32)
+                hidden = activation(gate: g, up: u, limit: limit)
+            } else {
+                hidden = try prefillKernel.projectSorted(
+                    xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs,
+                    upPacked: up.packed, upScales: up.scales, limit: limit > 0 ? limit : nil)
+            }
         }
 
         let sortedOutput: MLXArray

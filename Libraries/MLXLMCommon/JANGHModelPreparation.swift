@@ -245,16 +245,19 @@ public final class JANGHModelPreparation {
 
     /// Call only after strict ordinary quantization decoding succeeds. All banks
     /// own their packed storage; no dense expert placeholders are constructed.
-    public func makeRoutedExperts(activationLimit: Float?) throws
+    /// `activation` is the model's SwiGLU variant. A non-SiLU model's codebook-only layers also run through
+    /// `JANGTRoutedExpertLayer`, whose JANGH branches apply any variant; `JANGHRoutedExpertLayer` is SiLU only.
+    public func makeRoutedExperts(activationLimit: Float?, activation: JANGTActivation = .silu) throws
         -> [Int: any WeightedRoutedExpertLayer]
     {
         let banks = try mapBanks()
         let trellis = source.contract.trellis
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
             let anyTrellis = ["gate_proj", "up_proj", "down_proj"].contains { trellis[parent + "." + $0] != nil }
-            if anyTrellis {
+            if anyTrellis || activation != .silu {
                 return try JANGTRoutedExpertLayer(banks: banks, parentModule: parent, hiddenSize: hiddenSize,
-                                                  intermediateSize: intermediateSize, activationLimit: activationLimit)
+                                                  intermediateSize: intermediateSize, activationLimit: activationLimit,
+                                                  activation: activation)
             }
             return try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
                                               inputDimensions: hiddenSize, activationLimit: activationLimit)
