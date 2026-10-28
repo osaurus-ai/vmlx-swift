@@ -150,10 +150,23 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     let inverseOrder = argSort(order)
 
     return (
-        x.flattened(start: 0, end: -3)[order.floorDivide(m)],
+        x.flattened(start: 0, end: -3)[routeTokenIndex(order, routes: m)],
         indices[order],
         inverseOrder
     )
+}
+
+/// The token of each sorted (token, route) pair: `order / routes` for the non-negative pair positions `argSort`
+/// returns. A right shift when `routes` is a power of two, else a gather from the token ids repeated `routes` times;
+/// exact either way. MLX's integer `floorDivide` is a composed op that costs ~0.3 ms per call when it is built on a
+/// stream other than the C++ thread-local default, which every Swift-built op is (measured 2026-10-28, M5 Max).
+func routeTokenIndex(_ order: MLXArray, routes: Int) -> MLXArray {
+    precondition(routes > 0)
+    if routes & (routes - 1) == 0 {
+        return rightShift(order, MLXArray(routes.trailingZeroBitCount).asType(order.dtype))
+    }
+    let tokens = order.size / routes
+    return take(repeated(MLXArray.arange(tokens).asType(order.dtype), count: routes), order)
 }
 
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
