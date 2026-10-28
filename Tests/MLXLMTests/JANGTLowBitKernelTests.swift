@@ -446,16 +446,18 @@ final class JANGTLowBitKernelTests: XCTestCase {
     // MARK: - NAX prefill tiles
 
     /// Expert-sorted prefill tiles with one-hot bf16 rows: every weight of two experts, bit-exact in bf16.
-    private func runPrefillEveryWeight(k: Double, kin: Int, outputs: Int) throws {
-        try XCTSkipUnless(JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
+    private func runPrefillEveryWeight(
+        k: Double, kin: Int, outputs: Int, backend: JANGHPrefillKernel.Backend? = nil, dtype: DType = .bfloat16
+    ) throws {
+        try XCTSkipUnless(backend == .steel || JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
         var rng = Rng(state: UInt64(k * 10) + UInt64(kin) + 31)
         let experts = 2
         let p = Projection(&rng, k: k, experts: experts, outputs: outputs, inputs: kin, columns: [[-1], [-1]],
                            columnScales: false)
         let eye = MLXArray.eye(kin, dtype: .float32)
-        let x = concatenated([eye, eye], axis: 0).asType(.bfloat16)
+        let x = concatenated([eye, eye], axis: 0).asType(dtype)
         let ids = MLXArray([UInt32](repeating: 0, count: kin) + [UInt32](repeating: 1, count: kin))
-        let y = JANGTPrefillKernel.project(x, try p.mlx(), indices: ids).asType(.float32).asArray(Float.self)
+        let y = JANGTPrefillKernel.project(x, try p.mlx(), indices: ids, backend: backend).asType(.float32).asArray(Float.self)
         var exact = [Float](repeating: 0, count: experts * kin * outputs)
         for e in 0 ..< experts {
             for t in 0 ..< kin {
@@ -464,11 +466,11 @@ final class JANGTLowBitKernelTests: XCTestCase {
                 }
             }
         }
-        let want = MLXArray(exact).asType(.bfloat16).asType(.float32).asArray(Float.self)
+        let want = MLXArray(exact).asType(dtype).asType(.float32).asArray(Float.self)
         Self.assertLive(want, "prefill one-hot K=\(k) kin=\(kin)")
         var bad = 0
         for i in want.indices where y[i].bitPattern != want[i].bitPattern { bad += 1 }
-        print("JANGT_LOWBIT prefill every-weight K=\(k) kin=\(kin): \(bad)/\(want.count) not bf16-exact")
+        print("JANGT_LOWBIT prefill every-weight backend=\(backend?.rawValue ?? "native") dtype=\(dtype) K=\(k) kin=\(kin): \(bad)/\(want.count) not dtype-exact")
         XCTAssertEqual(bad, 0, "prefill K=\(k) kin=\(kin)")
     }
 
@@ -489,9 +491,19 @@ final class JANGTLowBitKernelTests: XCTestCase {
         try runPrefillEveryWeight(k: 2.5, kin: 640, outputs: 2560)
     }
 
+    func testSteelPrefillEveryWeightAllWidthsAndDTypes() throws {
+        for dtype in [DType.float16, .bfloat16] {
+            for k in Self.widths + [3] {
+                // Both Allosaurus projection widths, plus a ragged output tile.
+                try runPrefillEveryWeight(k: k, kin: 2560, outputs: 40, backend: .steel, dtype: dtype)
+                try runPrefillEveryWeight(k: k, kin: 640, outputs: 64, backend: .steel, dtype: dtype)
+            }
+        }
+    }
+
     /// Fused gate/up prefill with the layer-wide outlier epilogue and the outlier term, sorted rows over a ragged
     /// expert split, at kin = 2560 (gate/up) and the 640-wide down.
-    private func runPrefillComposed(k: Double) throws -> (Double, Double) {
+    private func runPrefillComposed(k: Double, backend: JANGHPrefillKernel.Backend? = nil) throws -> (Double, Double) {
         var rng = Rng(state: UInt64(k * 100) + 77)
         let experts = 4, d = 2560, i = 640, rows = 72
         let cols = (0 ..< experts).map { _ in [Int32(3), Int32(1900)] }
@@ -536,8 +548,8 @@ final class JANGTLowBitKernelTests: XCTestCase {
         let idx = MLXArray(ids)
         let fused = JANGTPrefillKernel.projectGateUpWithOutliers(
             MLXArray(x, [rows, d]).asType(.bfloat16), rawRows: MLXArray(raw, [rows, d]), gate: g, up: u,
-            columns: MLXArray([Int32(3), Int32(1900)]), indices: idx).asType(.float32).asArray(Float.self)
-        var y = JANGTPrefillKernel.project(MLXArray(hIn, [rows, i]).asType(.bfloat16), down, indices: idx)
+            columns: MLXArray([Int32(3), Int32(1900)]), indices: idx, backend: backend).asType(.float32).asArray(Float.self)
+        var y = JANGTPrefillKernel.project(MLXArray(hIn, [rows, i]).asType(.bfloat16), down, indices: idx, backend: backend)
             .asType(.float32)
         if let o = JANGTPrefillKernel.outliers(MLXArray(hRaw, [rows, i]), down, indices: idx) { y = y + o }
         let e1 = Self.relL2(fused, fusedRef), e2 = Self.relL2(y.asArray(Float.self), downRef)
@@ -552,6 +564,84 @@ final class JANGTLowBitKernelTests: XCTestCase {
             // bf16 activations and tiles.
             XCTAssertLessThan(a, 2e-2, "fused gate/up K=\(k)")
             XCTAssertLessThan(b, 2e-2, "down K=\(k)")
+        }
+    }
+
+    func testSteelPrefillComposedAllWidths() throws {
+        for k in Self.widths + [3] {
+            let (a, b) = try runPrefillComposed(k: k, backend: .steel)
+            XCTAssertLessThan(a, 2e-2, "Steel gate/up K=\(k)")
+            XCTAssertLessThan(b, 2e-2, "Steel down K=\(k)")
+        }
+    }
+
+    func testSteelPrefillTinyAndRaggedSegmentsRejectInvalidRoutesWithoutBankRead() throws {
+        var rng = Rng(state: 19)
+        let p = Projection(&rng, k: 1.5, experts: 2, outputs: 40, inputs: 640,
+                           columns: [[-1], [-1]], columnScales: false)
+        let bank = try p.mlx()
+        for rows in [1, 7, 8, 15, 16, 17, 31, 32, 33, 72] {
+            // Three expert segments cross tile boundaries. The final invalid
+            // segment must publish NaNs without indexing its unmapped bank.
+            let ids = (0..<rows).map { UInt32($0 == rows - 1 ? 2 : $0 / max(1, rows / 2)) }
+            let x = MLXArray.ones([rows, 640], dtype: .float16)
+            let y = JANGTPrefillKernel.project(x, bank, indices: MLXArray(ids), backend: .steel)
+                .asType(.float32).asArray(Float.self)
+            for row in 0..<rows {
+                let values = y[(row * 40)..<((row + 1) * 40)]
+                if ids[row] >= 2 { XCTAssertTrue(values.allSatisfy(\.isNaN)) }
+                else { XCTAssertTrue(values.allSatisfy(\.isFinite)) }
+            }
+        }
+    }
+
+    func testSteelPrefillClampedActivationAndH32AgainstDenseCPU() throws {
+        var rng = Rng(state: 918)
+        let experts = 3, n = 64, kin = 128
+        let gate = Projection(&rng, k: 1.5, experts: experts, outputs: n, inputs: kin,
+                              columns: [[-1], [-1], [-1]], columnScales: false)
+        let up = Projection(&rng, k: 1.5, experts: experts, outputs: n, inputs: kin,
+                            columns: [[-1], [-1], [-1]], columnScales: false)
+        let g = try gate.mlx(), u = try up.mlx()
+        let limit: Float = 0.3
+        for dtype in [DType.float16, .bfloat16] {
+            for rows in [1, 7, 17, 33] {
+                let ids = (0..<rows).map { UInt32(min(2, $0 * 3 / rows)) }
+                let x = MLXArray((0..<(rows * kin)).map { _ in rng.normal() }, [rows, kin]).asType(dtype)
+                let inputs = x.asType(.float32).asArray(Float.self)
+                var expected = [Float]()
+                for row in 0..<rows {
+                    let e = Int(ids[row])
+                    var values = [Float](repeating: 0, count: n)
+                    for col in 0..<n {
+                        var gv: Double = 0, uv: Double = 0
+                        for k in 0..<kin {
+                            let offset = (e * n + col) * kin + k
+                            gv += Double(inputs[row * kin + k]) * Double(gate.values[offset]) * Double(gate.scale[e * n + col])
+                            uv += Double(inputs[row * kin + k]) * Double(up.values[offset]) * Double(up.scale[e * n + col])
+                        }
+                        gv = min(gv, Double(limit)); uv = min(max(uv, -Double(limit)), Double(limit))
+                        values[col] = Float(gv / (1 + Foundation.exp(-gv)) * uv)
+                    }
+                    for block in stride(from: 0, to: n, by: 32) {
+                        var step = 1
+                        while step < 32 {
+                            for i in stride(from: block, to: block + 32, by: 2 * step) {
+                                for j in i..<(i + step) {
+                                    let a = values[j], b = values[j + step]
+                                    values[j] = a + b; values[j + step] = a - b
+                                }
+                            }
+                            step *= 2
+                        }
+                        for col in block..<(block + 32) { values[col] /= sqrt(Float(32)) }
+                    }
+                    expected += values
+                }
+                let actual = JANGTPrefillKernel.project(x, g, up: u, indices: MLXArray(ids),
+                    limit: limit, rotateOutput: true, backend: .steel).asType(.float32).asArray(Float.self)
+                XCTAssertLessThan(Self.relL2(actual, expected), 2e-2, "Steel clamped/H32 rows=\(rows) dtype=\(dtype)")
+            }
         }
     }
 

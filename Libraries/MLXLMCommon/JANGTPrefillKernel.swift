@@ -14,15 +14,65 @@ import MLXFast
 /// Loader: 128 threads fill a 64-row x 64-column tile, thread = (row, half): 32 columns = two 16-column runs, each
 /// decoded with the decode kernels' window logic and normalized as (raw - mu) * isd * row_scale in the tile dtype.
 /// Input rows are the ROTATED basis (H128 with the projection's signs), sorted by expert. Outlier columns are not
-/// included (the caller adds them). NAX (M5-class GPUs, macOS 26.2+) only: elsewhere the caller keeps the decode
-/// kernels, which are correct on every GPU (the vMLX Python NAX path computed garbage on an M4).
+/// included (the caller adds them). NAX (M5-class GPUs, macOS 26.2+) is the default matrix backend. Elsewhere the
+/// caller keeps the decode kernels unless the experimental Steel backend is explicitly requested.
 enum JANGTPrefillKernel {
+    // Diagnostic opt-in until the older-GPU matrix path has runtime qualification.
+    private static let steelRequested =
+        ProcessInfo.processInfo.environment["VMLX_JANGT_PREFILL_BACKEND"] == "steel"
+
+    static var selectedBackend: JANGHPrefillKernel.Backend {
+        steelRequested ? .steel : JANGHPrefillKernel.nativeBackend
+    }
+
     static var available: Bool {
-        JANGHPrefillKernel.nativeBackend == .nax
+        JANGHPrefillKernel.nativeBackend == .nax || steelRequested
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// Same packed trellis rows as NAX, using Steel SIMD-group MMA. BK stays 64
+    /// so the trellis loader consumes complete 16-value windows without a
+    /// separate decoded weight bank. Gate/up activation remains a separate op.
+    private static func steelKernel(k: Double, words: Int, dtype: DType) -> MLXFast.MLXFastKernel {
+        let type = dtype == .bfloat16 ? "bfloat16_t" : "half"
+        let name = "jangt_prefill_steel_K\(JANGTKernels.kname(k))_w\(words)_\(type)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = kernels[name] { return cached }
+        var gather = JANGHPrefillSource.steel
+        let replacements: [(String, String)] = [
+            ("template <typename T, int bits>", "template <typename T>"),
+            ("tq_gather_qmm_steel(", "jt_gather_qmm_steel("),
+            ("const device half* sg", "const device float* sg"),
+            ("constexpr int BM = 16, BN = 32, BK = 32, WM = 1, WN = 2;",
+             "constexpr int BM = 16, BN = 32, BK = 64, WM = 2, WN = 2;"),
+            ("constexpr int pack_factor = get_pack_factor<bits, 8>();", ""),
+            ("constexpr int bytes_per_pack = get_bytes_per_pack<bits>();", ""),
+            ("TQBlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, bits>",
+             "JTBlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE>"),
+            ("const int K_w = K * bytes_per_pack / pack_factor;", "const int K_w = \(words);"),
+            ("auto wl = (const device uint8_t*)wg;", "auto wl = wg;"),
+        ]
+        for (from, to) in replacements {
+            precondition(gather.contains(from), "JANGT Steel prefill anchor missing: \(from)")
+            gather = gather.replacingOccurrences(of: from, with: to)
+        }
+        let source = """
+            constexpr int PAD = 64 + 16 / sizeof(\(type));
+            threadgroup \(type) Xs[16 * PAD];
+            threadgroup \(type) Ws[32 * PAD];
+            jt_gather_qmm_steel<\(type)>(x,wg,sg,indices,y,meta[0],meta[1],meta[2],meta[3],Xs,Ws,
+                threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+            """
+        let built = MLXFast.metalKernel(
+            name: name, inputNames: ["x", "wg", "sg", "indices", "meta"], outputNames: ["y"],
+            source: source, header: JANGHPrefillHeaders.steel + loaderSource(k: k, words: words) + gather,
+            ensureRowContiguous: false)
+        kernels[name] = built
+        return built
+    }
 
     /// The tile loader for one code width and row stride (W words).
     static func loaderSource(k: Double, words: Int) -> String {
@@ -171,10 +221,10 @@ enum JANGTPrefillKernel {
     /// `rotateOutput`, the result is Hadamard-32 rotated — the input basis of a JANGH down unit). No outlier columns.
     static func project(
         _ x: MLXArray, _ projection: JANGTProjection, up: JANGTProjection? = nil, indices: MLXArray,
-        limit: Float = 0, rotateOutput: Bool = false
+        limit: Float = 0, rotateOutput: Bool = false, backend: JANGHPrefillKernel.Backend? = nil
     ) -> MLXArray {
         let m = x.dim(0), kin = x.dim(1), n = projection.outputs
-        precondition(available && [.bfloat16, .float16].contains(x.dtype) && kin == projection.inputs
+        precondition((available || backend == .steel) && [.bfloat16, .float16].contains(x.dtype) && kin == projection.inputs
                      && kin % 64 == 0 && indices.size == m && (up == nil || up!.k == projection.k)
                      && (!rotateOutput || n % 32 == 0), "JANGT prefill: unsupported geometry")
         // MLX passes inputs of < 8 elements through constant pointers; the tile reads device pointers.
@@ -183,6 +233,23 @@ enum JANGTPrefillKernel {
             : indices
         let meta = MLXArray([Int32(m), Int32(n), Int32(kin), Int32(projection.experts)])
         let u = up ?? projection
+        if (backend ?? selectedBackend) == .steel {
+            func single(_ p: JANGTProjection) -> MLXArray {
+                steelKernel(k: p.k, words: p.words, dtype: x.dtype)(
+                    [contiguous(x), p.packed, p.scale, contiguous(idx.asType(.uint32)), meta],
+                    grid: (((n + 31) / 32) * 128, (m + 15) / 16, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[m, n]], outputDTypes: [x.dtype])[0]
+            }
+            var gate = single(projection)
+            if up != nil {
+                var upValue = single(u).asType(.float32)
+                gate = gate.asType(.float32)
+                if limit > 0 { gate = minimum(gate, limit); upValue = clip(upValue, min: -limit, max: limit) }
+                gate = (gate * sigmoid(gate) * upValue).asType(x.dtype)
+            }
+            if rotateOutput { gate = try! JANGHRowRotation()(gate, outputDType: x.dtype) }
+            return gate
+        }
         return kernel(k: projection.k, words: projection.words, dtype: x.dtype, fused: up != nil, rotate: rotateOutput)(
             [contiguous(x), projection.packed, projection.scale, u.packed, u.scale, contiguous(idx.asType(.uint32)),
              meta, MLXArray([limit])],
@@ -195,12 +262,20 @@ enum JANGTPrefillKernel {
     /// plus `outliers` on each, in one tile pass.
     static func projectGateUpWithOutliers(
         _ xr: MLXArray, rawRows: MLXArray, gate: JANGTProjection, up: JANGTProjection, columns: MLXArray,
-        indices: MLXArray, limit: Float = 0
+        indices: MLXArray, limit: Float = 0, backend: JANGHPrefillKernel.Backend? = nil
     ) -> MLXArray {
         let m = xr.dim(0), kin = xr.dim(1), n = gate.outputs, count = columns.size
-        precondition(available && [.bfloat16, .float16].contains(xr.dtype) && kin == gate.inputs && kin % 64 == 0
+        precondition((available || backend == .steel) && [.bfloat16, .float16].contains(xr.dtype) && kin == gate.inputs && kin % 64 == 0
                      && indices.size == m && up.k == gate.k && count == gate.outlierColumns
                      && count == up.outlierColumns, "JANGT prefill: unsupported outlier geometry")
+        if (backend ?? selectedBackend) == .steel {
+            var g = project(xr, gate, indices: indices, backend: .steel).asType(.float32)
+            var u = project(xr, up, indices: indices, backend: .steel).asType(.float32)
+            if let o = outliers(rawRows, gate, indices: indices) { g = g + o }
+            if let o = outliers(rawRows, up, indices: indices) { u = u + o }
+            if limit > 0 { g = minimum(g, limit); u = clip(u, min: -limit, max: limit) }
+            return (g * sigmoid(g) * u).asType(xr.dtype)
+        }
         let idx = indices.size < 8
             ? concatenated([indices, broadcast(indices[(indices.size - 1)...], to: [8 - indices.size])])
             : indices
