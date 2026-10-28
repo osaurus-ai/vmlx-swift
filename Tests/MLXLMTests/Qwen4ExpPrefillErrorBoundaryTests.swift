@@ -50,12 +50,12 @@ final class Qwen4ExpPrefillErrorBoundaryTests: XCTestCase {
                                     // without poisoning Metal or requiring a GPU watchdog failure.
                                     _ = MLXArray.zeros([2, 3]) + MLXArray.zeros([4, 5])
                                 }
-                            }) {
+                            }, operation: {
                                 _ = try model.prepare(
                                     LMInput(tokens: MLXArray(Array(Int32(1)...Int32(9)))),
                                     cache: cache, windowSize: 2)
                                 MLX.eval(cache)
-                            }
+                            })
                         }
                     }
                 } catch { caught = String(describing: error) }
