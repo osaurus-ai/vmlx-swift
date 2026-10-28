@@ -1,6 +1,7 @@
 import Foundation
-import Testing
 import MLXLMCommon
+import Testing
+
 @testable import MLXLLM
 @testable import MLXVLM
 
@@ -11,7 +12,9 @@ struct SplitThinkingDefaultsTests {
             "format": "jang",
             "capabilities": ["supports_thinking": true],
             "chat": [
-                "thinking": ["supported": true, "template_flag": "enable_thinking", "default": enabled],
+                "thinking": [
+                    "supported": true, "template_flag": "enable_thinking", "default": enabled,
+                ],
                 "reasoning_effort": ["values": ["low", "high", "max"], "default": "high"],
             ],
         ]
@@ -24,11 +27,13 @@ struct SplitThinkingDefaultsTests {
         #expect(chat.reasoning?.reasoningEffortLevels == ["low", "high", "max"])
         #expect(chat.reasoning?.defaultEffort == "high")
         #expect(chat.reasoning?.defaultMode == (enabled ? "thinking" : "chat"))
-        let llm = try #require(llmDefaultAdditionalContext(
-            modelType: "deepseek_v41", capabilities: config.capabilities,
-            generationConfig: nil, chatConfig: chat))
-        let vlm = try #require(VLMDefaultContextUserInputProcessor.defaultContext(
-            capabilities: config.capabilities, chatConfig: chat))
+        let llm = try #require(
+            llmDefaultAdditionalContext(
+                modelType: "deepseek_v41", capabilities: config.capabilities,
+                generationConfig: nil, chatConfig: chat))
+        let vlm = try #require(
+            VLMDefaultContextUserInputProcessor.defaultContext(
+                capabilities: config.capabilities, chatConfig: chat))
         for context in [llm, vlm] {
             #expect(context["enable_thinking"] as? Bool == enabled)
             #expect(context["reasoning_effort"] as? String == (enabled ? "high" : nil))
@@ -39,21 +44,25 @@ struct SplitThinkingDefaultsTests {
     @Test
     func explicitRequestAndGenerationConfigWin() throws {
         let config = try JangLoader.parseConfig(from: fixture())
-        let defaults = try #require(llmDefaultAdditionalContext(
-            modelType: "deepseek_v41", capabilities: config.capabilities,
-            generationConfig: nil, chatConfig: config.chat))
-        let low = try #require(llmMergedAdditionalContext(
-            defaultAdditionalContext: defaults,
-            requestAdditionalContext: ["reasoning_effort": "low"], modelType: "deepseek_v41"))
+        let defaults = try #require(
+            llmDefaultAdditionalContext(
+                modelType: "deepseek_v41", capabilities: config.capabilities,
+                generationConfig: nil, chatConfig: config.chat))
+        let low = try #require(
+            llmMergedAdditionalContext(
+                defaultAdditionalContext: defaults,
+                requestAdditionalContext: ["reasoning_effort": "low"], modelType: "deepseek_v41"))
         #expect(DeepseekV4ChatEncoder.reasoningBudget(from: low) == 50)
-        let off = try #require(llmMergedAdditionalContext(
-            defaultAdditionalContext: defaults,
-            requestAdditionalContext: ["enable_thinking": false], modelType: "deepseek_v41"))
+        let off = try #require(
+            llmMergedAdditionalContext(
+                defaultAdditionalContext: defaults,
+                requestAdditionalContext: ["enable_thinking": false], modelType: "deepseek_v41"))
         #expect(off["enable_thinking"] as? Bool == false)
-        let generationOff = try #require(llmDefaultAdditionalContext(
-            modelType: "deepseek_v41", capabilities: config.capabilities,
-            generationConfig: .init(defaultChatTemplateKwargs: .init(enableThinking: false)),
-            chatConfig: config.chat))
+        let generationOff = try #require(
+            llmDefaultAdditionalContext(
+                modelType: "deepseek_v41", capabilities: config.capabilities,
+                generationConfig: .init(defaultChatTemplateKwargs: .init(enableThinking: false)),
+                chatConfig: config.chat))
         #expect(generationOff["enable_thinking"] as? Bool == false)
         #expect(generationOff["reasoning_effort"] == nil)
     }
@@ -73,8 +82,9 @@ struct SplitThinkingDefaultsTests {
         chat["template_kwargs_defaults"] = ["enable_thinking": false]
         root["chat"] = chat
         let explicit = try JangLoader.parseConfig(from: root)
-        let context = try #require(VLMDefaultContextUserInputProcessor.defaultContext(
-            capabilities: explicit.capabilities, chatConfig: explicit.chat))
+        let context = try #require(
+            VLMDefaultContextUserInputProcessor.defaultContext(
+                capabilities: explicit.capabilities, chatConfig: explicit.chat))
         #expect(context["enable_thinking"] as? Bool == false)
         #expect(context["reasoning_effort"] == nil)
     }
@@ -101,10 +111,12 @@ struct SplitThinkingDefaultsTests {
 
     @Test(arguments: ["qwen3_5", "nemotron_h", "k2_horizon", "deepseek_v41"])
     func noNewDefaultsWithoutADeclaration(_ model: String) {
-        #expect(llmDefaultAdditionalContext(
-            modelType: model, capabilities: .init(supportsThinking: true),
-            generationConfig: nil, chatConfig: nil) == nil)
-        #expect(VLMDefaultContextUserInputProcessor.defaultContext(
-            capabilities: .init(supportsThinking: true)) == nil)
+        #expect(
+            llmDefaultAdditionalContext(
+                modelType: model, capabilities: .init(supportsThinking: true),
+                generationConfig: nil, chatConfig: nil) == nil)
+        #expect(
+            VLMDefaultContextUserInputProcessor.defaultContext(
+                capabilities: .init(supportsThinking: true)) == nil)
     }
 }
