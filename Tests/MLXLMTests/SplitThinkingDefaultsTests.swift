@@ -49,12 +49,12 @@ struct SplitThinkingDefaultsTests {
                 modelType: "deepseek_v41", capabilities: config.capabilities,
                 generationConfig: nil, chatConfig: config.chat))
         let low = try #require(
-            llmMergedAdditionalContext(
+            try llmMergedAdditionalContext(
                 defaultAdditionalContext: defaults,
                 requestAdditionalContext: ["reasoning_effort": "low"], modelType: "deepseek_v41"))
         #expect(DeepseekV4ChatEncoder.reasoningBudget(from: low) == 50)
         let off = try #require(
-            llmMergedAdditionalContext(
+            try llmMergedAdditionalContext(
                 defaultAdditionalContext: defaults,
                 requestAdditionalContext: ["enable_thinking": false], modelType: "deepseek_v41"))
         #expect(off["enable_thinking"] as? Bool == false)
