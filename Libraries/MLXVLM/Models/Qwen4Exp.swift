@@ -2620,8 +2620,10 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                 key = key.replacingOccurrences(of: ".ple.conv1d.weight", with: ".ple.conv1d_weight")
                 value = value.squeezed(axis: value.dim(1) == 1 ? 1 : 2)
             }
-            if key.hasSuffix(".conv1d.weight"), value.ndim == 3, value.dim(1) == 1 {
-                value = value.squeezed(axis: 1).transposed(1, 0)
+            // PyTorch's depthwise Conv1d stores [C, 1, K]; the GDN binds MLX's Conv1d, [C, K, 1].
+            // Same rule as Qwen35's sanitize, which owns that module, and as the reference.
+            if key.hasSuffix(".conv1d.weight"), value.ndim == 3, value.dim(-1) != 1 {
+                value = value.movedAxis(source: 2, destination: 1)
             }
             if converted, key.hasPrefix("mtp.pre_fc_norm_") {
                 value = (value.asType(.float32) - 1).asType(value.dtype)

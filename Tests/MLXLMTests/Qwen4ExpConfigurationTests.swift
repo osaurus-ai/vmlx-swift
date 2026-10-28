@@ -292,13 +292,25 @@ struct Qwen4ExpConfigurationTests {
                 "model.language_model.layers.1.ple.conv1d.weight": pleConv,
                 "model.mtp.pre_fc_norm_hidden.weight": MLXArray([0.078125] as [Float]).asType(.bfloat16),
                 "model.visual.blocks.0.norm1.weight": MLXArray.ones([4], dtype: .bfloat16),
+                // PyTorch's depthwise Conv1d stores [C, 1, K]; MLX's Conv1d binds [C, K, 1].
+                "model.language_model.layers.0.linear_attn.conv1d.weight":
+                    MLXArray(0 ..< 32).reshaped(8, 1, 4).asType(.bfloat16),
             ])
             #expect(Set(sanitized.keys) == [
                 "language_model.layers.0.attn_hyper_connection.hc_norm.weight",
                 "language_model.layers.1.ple.conv1d_weight",
+                "language_model.layers.0.linear_attn.conv1d.weight",
                 "mtp.pre_fc_norm_hidden.weight",
                 "visual.blocks.0.norm1.weight",
             ])
+            // The GDN conv the model binds is MLX's [C, K, 1]; the sanitized official weight must match it.
+            let bound = Dictionary(uniqueKeysWithValues: model.parameters().flattened())[
+                "language_model.layers.0.linear_attn.conv1d.weight"]
+            #expect(bound?.ndim == 3 && bound?.dim(2) == 1)
+            // Moving a size-1 axis keeps the memory order, so the values stay 0..<32.
+            #expect(sanitized["language_model.layers.0.linear_attn.conv1d.weight"]?.shape == [8, 4, 1])
+            #expect(floats(sanitized["language_model.layers.0.linear_attn.conv1d.weight"])
+                == (0 ..< 32).map(Float.init))
             #expect(floats(sanitized["language_model.layers.0.attn_hyper_connection.hc_norm.weight"])
                 == [1.25, 0.5])
             #expect(floats(sanitized["mtp.pre_fc_norm_hidden.weight"]) == [0.078125])
