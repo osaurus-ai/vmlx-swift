@@ -32,13 +32,13 @@ func foundationCompatibleTokenizerRegex(_ pattern: String) -> String {
 }
 
 enum StringSplitPattern {
-    case regexp(regexp: String)
+    case regexp(regexp: NSRegularExpression)
     case string(pattern: String)
 
     func split(_ text: String, invert: Bool = true) -> [String] {
         switch self {
         case let .regexp(regexp):
-            text.split(by: regexp, includeSeparators: true)
+            text.splitPreservingMatches(using: regexp)
         case let .string(substring):
             text.split(by: substring, options: [], includeSeparators: !invert)
         }
@@ -49,7 +49,11 @@ enum StringSplitPattern {
             return .string(pattern: pattern)
         }
         if let pattern = config.pattern.Regex.string() {
-            return .regexp(regexp: foundationCompatibleTokenizerRegex(pattern))
+            // ICU rejects an empty pattern; an empty noncapturing group has
+            // the same zero-width split semantics as the serialized regex.
+            let pattern = pattern.isEmpty ? "(?:)" : foundationCompatibleTokenizerRegex(pattern)
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+            return .regexp(regexp: regex)
         }
         return nil
     }
@@ -63,6 +67,25 @@ enum SplitDelimiterBehavior {
 }
 
 extension String {
+    /// Keep whole regex matches, including their original scalar boundaries.
+    /// `String.range(..., .regularExpression)` can use grapheme-cluster matching
+    /// on newer platforms, changing CR/LF, tab and combining-mark boundaries
+    /// compared with the tokenizer's serialized regex. Compile once per
+    /// pre-tokenizer and enumerate matches instead of recompiling for every piece.
+    /// Capture groups must not replace the whole match here.
+    func splitPreservingMatches(using regex: NSRegularExpression) -> [String] {
+        var result: [String] = []
+        var start = startIndex
+        for match in regex.matches(in: self, range: NSRange(startIndex..<endIndex, in: self)) {
+            guard let range = Range(match.range, in: self) else { continue }
+            if start < range.lowerBound { result.append(String(self[start..<range.lowerBound])) }
+            if !range.isEmpty { result.append(String(self[range])) }
+            start = range.upperBound
+        }
+        if start < endIndex { result.append(String(self[start...])) }
+        return result
+    }
+
     func ranges(of string: String, options: CompareOptions = .regularExpression) -> [Range<Index>] {
         var result: [Range<Index>] = []
         var start = startIndex

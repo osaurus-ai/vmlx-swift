@@ -85,6 +85,9 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
 
     /// Whether consecutive unknown tokens should be fused together.
     let fuseUnknownTokens: Bool
+    /// A serialized BPE contract: an existing whole-piece vocabulary token wins
+    /// without consulting merge ranks when `ignore_merges` is enabled.
+    let ignoreMerges: Bool
 
     static func mergesFromConfig(_ config: Config?) -> [[String]]? {
         guard let config else { return nil }
@@ -121,6 +124,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
             bpeRanks[bp] = i
         }
         self.bpeRanks = bpeRanks
+        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
 
         let addedTokens = addedTokens.reduce(into: [BinaryDistinctString: Config]()) { result, element in
             result[BinaryDistinctString(element.key)] = .init(element.value)
@@ -221,6 +225,7 @@ class BPETokenizer: PreTrainedTokenizerModel, @unchecked Sendable {
     /// space before it, and a piece containing U+0020 is split at it, or lost
     /// if it holds nothing else.
     func bpe(token: String) -> [String] {
+        if ignoreMerges, tokensToIds[token as NSString] != nil { return [token] }
         // Seed from Unicode scalars, as Hugging Face tokenizers does. `Array(token)` yields grapheme
         // clusters, and no merge can then produce a token that starts or ends inside one. Upstream
         // swift-transformers #355 made the same fix; AddedTokenTrie.split(_:) notes the same trap.
