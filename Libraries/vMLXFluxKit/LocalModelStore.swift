@@ -323,7 +323,8 @@ public struct MLXStudioModelStore: Sendable {
         var count = 0
         var bytes: UInt64 = 0
         for case let url as URL in enumerator where url.pathExtension == "safetensors" {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            // Through the link: a Hugging Face cache shard is a symlink, which is not a regular file.
+            let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true else { continue }
             count += 1
             bytes += UInt64(values.fileSize ?? 0)

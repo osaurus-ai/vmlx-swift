@@ -305,7 +305,9 @@ public struct LoadBundleFacts: Sendable, Equatable {
             options: [.skipsHiddenFiles])
         {
             for entry in entries where entry.pathExtension == "safetensors" {
-                if let values = try? entry.resourceValues(forKeys: [.fileSizeKey]),
+                // Through the link: a Hugging Face cache stores every shard as a symlink into
+                // `blobs/`, and a link reports its own few dozen bytes, not the weights'.
+                if let values = try? entry.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]),
                     let size = values.fileSize
                 {
                     totalBytes &+= UInt64(size)

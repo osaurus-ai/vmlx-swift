@@ -25,6 +25,25 @@ final class JANGHLoadPolicyTests: XCTestCase {
         return LoadBundleFacts.inspect(bundleURL: directory)
     }
 
+    /// A Hugging Face hub cache stores every file as a symlink into `blobs/`. The weights must be sized by
+    /// their targets: sized by the links (a few dozen bytes each), a 70 GB model was wired as ~10 KB.
+    func testInspectSizesSymlinkedShardsByTheirTargets() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let blobs = root.appendingPathComponent("blobs")
+        let snapshot = root.appendingPathComponent("snapshots/0123abcd")
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(count: 4096).write(to: blobs.appendingPathComponent("aaaa"))
+        try FileManager.default.createSymbolicLink(
+            atPath: snapshot.appendingPathComponent("model-00001-of-00002.safetensors").path,
+            withDestinationPath: "../../blobs/aaaa")
+        try Data(count: 1000).write(to: snapshot.appendingPathComponent("model-00002-of-00002.safetensors"))
+        try JSONSerialization.data(withJSONObject: config()).write(to: snapshot.appendingPathComponent("config.json"))
+
+        XCTAssertEqual(LoadBundleFacts.inspect(bundleURL: snapshot).totalSafetensorsBytes, 4096 + 1000)
+    }
+
     func testValidatedCustomMetadataDoesNotSelectAffineResidentPolicy() throws {
         for type in ["glm5_next", "naive_n05_flash"] {
             let root = config(modelType: type)

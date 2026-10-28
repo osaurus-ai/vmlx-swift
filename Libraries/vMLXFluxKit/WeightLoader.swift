@@ -120,7 +120,8 @@ public enum WeightLoader {
                 throw FluxError.invalidRequest("invalid safetensors header at \(url.path)")
             }
             let length = prefix.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << ($1.offset * 8) }
-            let fileBytes = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            // Through the link: a Hugging Face cache shard is a symlink, whose own size is its path.
+            let fileBytes = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             guard length <= UInt64(max(0, fileBytes - 8)) else {
                 throw FluxError.invalidRequest("safetensors header exceeds file size at \(url.path)")
             }
