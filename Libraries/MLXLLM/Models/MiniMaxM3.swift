@@ -428,8 +428,13 @@ public final class MiniMaxM3ModelInner: Module {
         let recording = !dsparkTapLayers.isEmpty && holder != nil && inputs.dim(0) == 1
         var taps: [Int: MLXArray] = [:]
         var h = embedTokens(inputs)
-        // Dense layers use this mask; sparse layers fold it into their own per-group block mask.
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        // The Python runtime's mask (mlx_lm create_attention_mask): symbolic causal for every multi-token call, at any
+        // cache offset (MLX SDPA aligns a causal mask bottom-right, so the key length carries the offset); none for
+        // one token. Dense layers use it as is; sparse layers fold causality into their block selection. The cache's
+        // own mask is an explicit array once its offset is nonzero, and MSA routes any array mask (batch padding) to
+        // the dense mask path: every prefill chunk after the first, and every multi-row verify call, would skip the
+        // block-sparse kernels.
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode = h.dim(1) > 1 ? .causal : .none
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
             if recording && dsparkTapLayers.contains(i) { taps[i] = h }
