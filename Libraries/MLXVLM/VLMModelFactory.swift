@@ -888,7 +888,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -901,7 +901,7 @@ public final class VLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
