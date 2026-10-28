@@ -9,7 +9,7 @@ import MLXLMCommon
 //
 // Port of the vMLX Python runtime's `vmlx_engine/models/minimax_m3/msa.py` (perf/minimax-m3-block-sparse-msa,
 // 885355f0). The Metal sources below are that file's kernel sources; the routing thresholds and the env lever are
-// the same. (Chunks of more than 16 rows take the dense path here; the chunk kernel is separate.)
+// the same.
 //
 // The Lightning indexer picks, for every query row and KV group, `keep` (16) key blocks of `block` (128) keys: the top
 // block scores, the query's own (local) block forced in. Attention then sees only those blocks, causally.
@@ -22,6 +22,9 @@ import MLXLMCommon
 // - `decode`: decode-sized calls (decode steps, verify rows). A Metal kernel splits each (row, group)'s keep * block
 //   selected keys into 32-key chunks across threadgroups and merges the partial softmaxes; keys are read in place
 //   from the cache. Rows are independent: a row's output is the same alone or with other rows.
+// - `kernel`: prefill chunks. One simdgroup per (row, group) walks the row's selected blocks with an online softmax,
+//   on the matrix units (Metal 4 tensor ops) for bf16 / fp16, else on 8x8 simdgroup matrices. No mask, no copy of
+//   K / V.
 // - `gather`: MLX ops only (gather the selected keys, SDPA over them). Never routed to; an op-level reference.
 //
 // Positions: query row r sits at `offset + r`; key j is allowed when its block is selected and `j <= offset + r`.
@@ -63,7 +66,7 @@ enum MiniMaxM3MSA {
     // MARK: routing
 
     enum Path: String, Sendable, CaseIterable {
-        case dense, gather, decode
+        case dense, gather, decode, kernel
     }
 
     /// `VMLX_MINIMAX_MSA`: `auto` (unset) routes by the measured crossovers; `dense` forces the mask path, `sparse` the
@@ -80,10 +83,12 @@ enum MiniMaxM3MSA {
     // - one row (decode step / verify row): the decode kernel beat the dense mask path at every sparse length.
     // - 2 ..< 16 rows: up to 8 rows the decode kernel won everywhere; at 16 rows dense was 6 % faster at 2.5k keys and
     //   the decode kernel 2.9x faster at 8k.
-    // Longer chunks take the dense path until the chunk kernel lands.
+    // - longer chunks: the chunk kernel's cost is flat in context, dense grows with it; dense won below ~5k keys.
+    //   fp32 chunks (simdgroup kernel) lost to dense, so fp32 chunks stay dense; the fp32 decode kernel still won.
     static let decodeMaxRows = 16
     static let decodeAlwaysRows = 8
     static let decodeMinKeys = 4096
+    static let kernelMinKeys = 5120
 
     /// Test / diagnostics hooks: a forced request that wins over the environment, and an observer of every routed
     /// pick (the Python tests' router spy).
@@ -116,7 +121,7 @@ enum MiniMaxM3MSA {
     /// The custom kernels run on the Metal GPU only (on a CPU default device every call takes the dense path).
     static var onGPU: Bool { Device.defaultDevice().deviceType == .gpu }
 
-    /// `dense`, `gather` or `decode` for this call. Only picks a path; every path computes the same
+    /// `dense`, `gather`, `decode` or `kernel` for this call. Only picks a path; every path computes the same
     /// attention (the sparse ones over the selected blocks only). The pick depends on (rows, keys, dtype, shapes)
     /// only, so a one-row verify call takes exactly the path a one-row decode step takes.
     static func choosePath(
@@ -145,7 +150,8 @@ enum MiniMaxM3MSA {
         case .gather: return .gather
         case .decode:
             return decodeKernelSupported(queries: queries, keys: keys, selection: selection) ? .decode : .dense
-        case .kernel: return .dense
+        case .kernel:
+            return kernelSupported(queries: queries, keys: keys, selection: selection) ? .kernel : .dense
         case .auto, .sparse: break
         }
         let rows = queries.dim(2)
@@ -156,7 +162,11 @@ enum MiniMaxM3MSA {
             }
             return .dense
         }
-        return .dense
+        guard kernelSupported(queries: queries, keys: keys, selection: selection) else { return .dense }
+        if want == .sparse { return .kernel }
+        // Auto: the chunk kernel only on the matrix units (fp32 / no Metal 4: the simdgroup version measured slower).
+        return selection.keyLength >= kernelMinKeys && matrixUnitsSupported(queries: queries, selection: selection)
+            ? .kernel : .dense
     }
 
     // MARK: selection
@@ -542,6 +552,508 @@ enum MiniMaxM3MSA {
         let out = kernels.combine(
             [partials[0], partials[1], partials[2], blocks],
             grid: (32, hg, rows), threadGroup: (32, 1, 1),
+            outputShapes: [[B, L, H, D]], outputDTypes: [q.dtype])[0]
+        return out.transposed(0, 2, 1, 3)
+    }
+
+    // MARK: chunk kernel (simdgroup matrices)
+
+    // One threadgroup per (batch, KV group, query row): the HG query heads of the group (simdgroups of 8 heads) attend
+    // that row's selected blocks, read in place from K / V (any sequence / group / batch stride; the head dim must be
+    // contiguous for the vector loads). Online softmax in fp32 over 32-key tiles (16 for fp32) staged in threadgroup
+    // memory; S = Q K^T and O += P V on 8x8 simdgroup matrices with fp32 accumulators. Blocks are visited in
+    // ascending order; tiles that start past the row's position are skipped (never read), keys past the row's position
+    // are masked. Ints that vary per call (offset, keyLength) ride an input buffer, so one compiled kernel serves every
+    // chunk.
+    static let prefillSource = #"""
+          const uint lane = thread_index_in_simdgroup;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint tid = thread_position_in_threadgroup.x;
+          const int l = int(threadgroup_position_in_grid.y);
+          const int bg = int(threadgroup_position_in_grid.z);
+          const int G = int(blocks_shape[1]);
+          const int L = int(blocks_shape[2]);
+          const int H = int(q_shape[2]);
+          const int b = bg / G;
+          const int g = bg - b * G;
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int q_pos = offset + l;
+          const float qscale = scale[0] * 1.4426950408889634f;   // softmax in base 2
+          const float NEG = -1.0e30f;
+
+          threadgroup elem_t ks[TK * KPAD];
+          threadgroup elem_t vs[TK * KPAD];
+
+          // Lane layout of an 8x8 simdgroup matrix: this lane holds (row fm, cols fn and fn + 1).
+          const short qid = short(lane / 4);
+          const short fm = (qid & 4) + short((lane / 2) % 4);
+          const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+
+          const int head = g * HG + int(sg) * 8 + fm;
+          device const elem_t* qrow = q + ((size_t)(b * L + l) * H + head) * D;
+          simdgroup_matrix<float, 8, 8> Qf[D / 8];
+          simdgroup_matrix<float, 8, 8> Of[D / 8];
+          for (int d = 0; d < D / 8; ++d) {
+            Qf[d].thread_elements()[0] = float(qrow[d * 8 + fn]) * qscale;
+            Qf[d].thread_elements()[1] = float(qrow[d * 8 + fn + 1]) * qscale;
+            Of[d] = simdgroup_matrix<float, 8, 8>(0.0f);
+          }
+          float m_run = NEG;
+          float l_run = 0.0f;
+
+          device const int* blk = blocks + ((size_t)(b * G + g) * L + l) * KEEP;
+          device const elem_t* kbase = k + (size_t)b * k_strides[0] + (size_t)g * k_strides[1];
+          device const elem_t* vbase = v + (size_t)b * v_strides[0] + (size_t)g * v_strides[1];
+          const size_t kss = k_strides[2];
+          const size_t vss = v_strides[2];
+          constexpr int CE = 16 / sizeof(elem_t);                 // elements per 16-byte chunk
+          const bool vec_ok = k_strides[3] == 1 && v_strides[3] == 1 && (kss % CE) == 0 && (vss % CE) == 0
+              && ((ulong)kbase % 16) == 0 && ((ulong)vbase % 16) == 0;
+
+          for (int i = 0; i < KEEP; ++i) {
+            const int start = blk[i] * BLOCK;
+            if (start > q_pos) break;                               // ascending: every later block is in the future too
+            for (int t0 = 0; t0 < BLOCK; t0 += TK) {
+              const int ts = start + t0;
+              if (ts > q_pos) break;
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (vec_ok) {
+                for (int c = int(tid); c < TK * (D / CE); c += NT) {
+                  const int r = c / (D / CE);
+                  const int cc = c - r * (D / CE);
+                  const int kp = ts + r;
+                  uint4 kv = uint4(0), vv = uint4(0);
+                  if (kp < sk) {
+                    kv = *((device const uint4*)(kbase + (size_t)kp * kss) + cc);
+                    vv = *((device const uint4*)(vbase + (size_t)kp * vss) + cc);
+                  }
+                  *((threadgroup uint4*)(ks + r * KPAD) + cc) = kv;
+                  *((threadgroup uint4*)(vs + r * KPAD) + cc) = vv;
+                }
+              } else {
+                for (int c = int(tid); c < TK * D; c += NT) {
+                  const int r = c / D;
+                  const int dd = c - r * D;
+                  const int kp = ts + r;
+                  ks[r * KPAD + dd] = kp < sk ? kbase[(size_t)kp * kss + (size_t)dd * k_strides[3]] : elem_t(0);
+                  vs[r * KPAD + dd] = kp < sk ? vbase[(size_t)kp * vss + (size_t)dd * v_strides[3]] : elem_t(0);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+
+              simdgroup_matrix<float, 8, 8> Sf[TK / 8];
+              for (int f = 0; f < TK / 8; ++f) {
+                Sf[f] = simdgroup_matrix<float, 8, 8>(0.0f);
+                for (int d = 0; d < D / 8; ++d) {
+                  simdgroup_matrix<float, 8, 8> Kt;
+                  Kt.thread_elements()[0] = float(ks[(f * 8 + fn) * KPAD + d * 8 + fm]);
+                  Kt.thread_elements()[1] = float(ks[(f * 8 + fn + 1) * KPAD + d * 8 + fm]);
+                  simdgroup_multiply_accumulate(Sf[f], Qf[d], Kt, Sf[f]);
+                }
+              }
+              float tmax = NEG;
+              for (int f = 0; f < TK / 8; ++f) {
+                for (int e = 0; e < 2; ++e) {
+                  const int kp = ts + f * 8 + fn + e;
+                  float s = Sf[f].thread_elements()[e];
+                  s = kp <= q_pos ? s : NEG;
+                  Sf[f].thread_elements()[e] = s;
+                  tmax = max(tmax, s);
+                }
+              }
+              tmax = max(tmax, simd_shuffle_xor(tmax, 1));
+              tmax = max(tmax, simd_shuffle_xor(tmax, 8));
+              const float m_new = max(m_run, tmax);
+              const float factor = fast::exp2(m_run - m_new);
+              float psum = 0.0f;
+              for (int f = 0; f < TK / 8; ++f) {
+                for (int e = 0; e < 2; ++e) {
+                  const float p = fast::exp2(Sf[f].thread_elements()[e] - m_new);
+                  Sf[f].thread_elements()[e] = p;
+                  psum += p;
+                }
+              }
+              psum += simd_shuffle_xor(psum, 1);
+              psum += simd_shuffle_xor(psum, 8);
+              l_run = l_run * factor + psum;
+              m_run = m_new;
+              for (int d = 0; d < D / 8; ++d) {
+                Of[d].thread_elements()[0] *= factor;
+                Of[d].thread_elements()[1] *= factor;
+              }
+              for (int f = 0; f < TK / 8; ++f) {
+                for (int d = 0; d < D / 8; ++d) {
+                  simdgroup_matrix<float, 8, 8> Vf;
+                  Vf.thread_elements()[0] = float(vs[(f * 8 + fm) * KPAD + d * 8 + fn]);
+                  Vf.thread_elements()[1] = float(vs[(f * 8 + fm) * KPAD + d * 8 + fn + 1]);
+                  simdgroup_multiply_accumulate(Of[d], Sf[f], Vf, Of[d]);
+                }
+              }
+            }
+          }
+          const float inv = 1.0f / l_run;
+          device elem_t* orow = out + ((size_t)(b * L + l) * H + head) * D;
+          for (int d = 0; d < D / 8; ++d) {
+            orow[d * 8 + fn] = elem_t(Of[d].thread_elements()[0] * inv);
+            orow[d * 8 + fn + 1] = elem_t(Of[d].thread_elements()[1] * inv);
+          }
+        """#
+
+    /// Keys per staged K / V tile: two [TK][D + 8] tiles fit the 32 KB of threadgroup memory.
+    static func prefillTile(_ element: String) -> Int { element == "float" ? 16 : 32 }
+
+    static func prefillKernel(
+        element: String, hg: Int, d: Int, keep: Int, block: Int, source body: String = prefillSource
+    ) -> MLXFast.MLXFastKernel {
+        let source =
+            constantsHeader(
+                element,
+                [
+                    ("HG", hg), ("D", d), ("KEEP", keep), ("BLOCK", block), ("TK", prefillTile(element)),
+                    ("KPAD", d + 8), ("NT", 32 * (hg / 8)),
+                ]) + body
+        return cachedKernel(
+            kernelName("vmlx_minimax_msa_prefill_\(element)_h\(hg)_d\(d)_k\(keep)_b\(block)", source),
+            inputs: ["q", "k", "v", "blocks", "meta", "scale"], outputs: ["out"], source: source,
+            ensureRowContiguous: false)
+    }
+
+    // MARK: chunk kernel (matrix units)
+
+    // Same contract as the kernel above, on the M5 matrix units (Metal 4 tensor ops, per-simdgroup 16x32x16 matmul2d
+    // on register fragments). One simdgroup owns one (batch, KV group, query row): the group's query heads are the 16
+    // rows of every fragment (fewer heads leave the remaining rows zero), so S = Q K^T is [16 heads x 32 keys] per step
+    // and O is [16 x D] in registers. Fragment layout of a 16x16 tile: this lane holds rows fm and fm + 8, columns
+    // fn .. fn + 3. K / V are read straight from device memory (no staging); NSG consecutive query rows share a
+    // threadgroup so blocks the rows have in common are read while still in cache. Q K^T multiplies the stored
+    // (bf16 / fp16) values exactly with fp32 accumulation; P (fp32) times V runs at the op's relaxed precision.
+    static let matrixUnitHeader = #"""
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        template <typename AT, typename BT, bool TB>
+        METAL_FUNC void msa_mma_16x32(thread float* c, thread const AT* a, thread const BT* b0, thread const BT* b1) {
+          constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+              16, 32, 16, false, TB, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+          mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+          auto ca = op.template get_left_input_cooperative_tensor<AT, BT, float>();
+          auto cb = op.template get_right_input_cooperative_tensor<AT, BT, float>();
+          auto cc = op.template get_destination_cooperative_tensor<
+              metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
+          #pragma unroll
+          for (short i = 0; i < 8; ++i) { ca[i] = a[i]; cb[i] = b0[i]; cb[8 + i] = b1[i]; }
+          #pragma unroll
+          for (short i = 0; i < 16; ++i) cc[i] = c[i];
+          op.run(ca, cb, cc);
+          #pragma unroll
+          for (short i = 0; i < 16; ++i) c[i] = cc[i];
+        }
+
+        // dst[0..3] = row[col .. col + 3] (head-dim stride ds); zeros when the row is past the logical extent.
+        template <typename T>
+        METAL_FUNC void msa_load4(thread T* dst, device const T* row, int col, size_t ds, bool vec, bool valid) {
+          if (!valid) {
+            dst[0] = T(0); dst[1] = T(0); dst[2] = T(0); dst[3] = T(0);
+          } else if (vec) {
+            const metal::vec<T, 4> x = *((device const metal::vec<T, 4>*)(row + col));
+            dst[0] = x[0]; dst[1] = x[1]; dst[2] = x[2]; dst[3] = x[3];
+          } else {
+            for (short j = 0; j < 4; ++j) dst[j] = row[(size_t)(col + j) * ds];
+          }
+        }
+        """#
+
+    static let matrixUnitSource = #"""
+          const ushort lane = thread_index_in_simdgroup;
+          const int sg = int(simdgroup_index_in_threadgroup);
+          const int L = int(blocks_shape[2]);
+          const int l = int(threadgroup_position_in_grid.y) * NSG + sg;
+          if (l >= L) return;                                      // per-simdgroup ops only: no threadgroup barrier below
+          const int G = int(blocks_shape[1]);
+          const int H = int(q_shape[2]);
+          const int bg = int(threadgroup_position_in_grid.z);
+          const int b = bg / G;
+          const int g = bg - b * G;
+          const int offset = meta[0];
+          const int sk = meta[1];
+          const int q_pos = offset + l;
+          const float qscale = scale[0] * 1.4426950408889634f;
+          const float NEG = -1.0e30f;
+
+          const short qid = short(lane >> 2);
+          const short fm = (qid & 4) | short((lane >> 1) & 3);
+          const short fn = short(((qid & 2) | (lane & 1)) * 4);
+
+          // Q fragments: rows = heads of the group, columns = 16-wide head-dim chunks.
+          elem_t qf[D / 16][8];
+          device const elem_t* qrow = q + ((size_t)(b * L + l) * H + g * HG) * D;
+          for (int c = 0; c < D / 16; ++c) {
+            for (short i = 0; i < 2; ++i) {
+              const short r = fm + 8 * i;
+              for (short j = 0; j < 4; ++j) {
+                qf[c][i * 4 + j] = r < HG ? qrow[(size_t)r * D + c * 16 + fn + j] : elem_t(0);
+              }
+            }
+          }
+          float o[D / 32][16];
+          for (int dp = 0; dp < D / 32; ++dp) {
+            for (short e = 0; e < 16; ++e) o[dp][e] = 0.0f;
+          }
+          float m_run[2] = {NEG, NEG};
+          float l_run[2] = {0.0f, 0.0f};
+
+          device const int* blk = blocks + ((size_t)(b * G + g) * L + l) * KEEP;
+          device const elem_t* kbase = k + (size_t)b * k_strides[0] + (size_t)g * k_strides[1];
+          device const elem_t* vbase = v + (size_t)b * v_strides[0] + (size_t)g * v_strides[1];
+          const size_t kss = k_strides[2];
+          const size_t vss = v_strides[2];
+          const size_t kds = k_strides[3];
+          const size_t vds = v_strides[3];
+          // 8-byte vector loads when the head dim is contiguous and every 4-element chunk is 8-byte aligned.
+          const bool vec_ok = kds == 1 && vds == 1 && (kss % 4) == 0 && (vss % 4) == 0
+              && ((ulong)kbase % 8) == 0 && ((ulong)vbase % 8) == 0;
+
+          for (int bi = 0; bi < KEEP; ++bi) {
+            const int start = blk[bi] * BLOCK;
+            if (start > q_pos) break;                              // ascending: every later block is in the future too
+            for (int t0 = 0; t0 < BLOCK; t0 += 32) {
+              const int ts = start + t0;
+              if (ts > q_pos) break;
+              float s[16];
+              for (short e = 0; e < 16; ++e) s[e] = 0.0f;
+              for (int c = 0; c < D / 16; ++c) {
+                elem_t kb0[8], kb1[8];
+                for (short i = 0; i < 2; ++i) {
+                  const int kp0 = ts + fm + 8 * i;
+                  const int kp1 = kp0 + 16;
+                  msa_load4(kb0 + i * 4, kbase + (size_t)kp0 * kss, c * 16 + fn, kds, vec_ok, kp0 < sk);
+                  msa_load4(kb1 + i * 4, kbase + (size_t)kp1 * kss, c * 16 + fn, kds, vec_ok, kp1 < sk);
+                }
+                msa_mma_16x32<elem_t, elem_t, true>(s, qf[c], kb0, kb1);
+              }
+              // s[n * 8 + i * 4 + j] = S[head fm + 8i][key ts + n * 16 + fn + j]
+              float rmax[2] = {NEG, NEG};
+              for (short n = 0; n < 2; ++n) {
+                for (short i = 0; i < 2; ++i) {
+                  for (short j = 0; j < 4; ++j) {
+                    const int kp = ts + n * 16 + fn + j;
+                    const short e = n * 8 + i * 4 + j;
+                    const float x = kp <= q_pos ? s[e] * qscale : NEG;
+                    s[e] = x;
+                    rmax[i] = max(rmax[i], x);
+                  }
+                }
+              }
+              float factor[2];
+              for (short i = 0; i < 2; ++i) {
+                rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(1)));
+                rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(8)));
+                const float m_new = max(m_run[i], rmax[i]);
+                factor[i] = fast::exp2(m_run[i] - m_new);
+                m_run[i] = m_new;
+              }
+              float rsum[2] = {0.0f, 0.0f};
+              for (short n = 0; n < 2; ++n) {
+                for (short i = 0; i < 2; ++i) {
+                  for (short j = 0; j < 4; ++j) {
+                    const short e = n * 8 + i * 4 + j;
+                    const float p = fast::exp2(s[e] - m_run[i]);
+                    s[e] = p;
+                    rsum[i] += p;
+                  }
+                }
+              }
+              for (short i = 0; i < 2; ++i) {
+                rsum[i] += simd_shuffle_xor(rsum[i], ushort(1));
+                rsum[i] += simd_shuffle_xor(rsum[i], ushort(8));
+                l_run[i] = l_run[i] * factor[i] + rsum[i];
+              }
+              for (int dp = 0; dp < D / 32; ++dp) {
+                for (short h = 0; h < 2; ++h) {
+                  for (short i = 0; i < 2; ++i) {
+                    for (short j = 0; j < 4; ++j) o[dp][h * 8 + i * 4 + j] *= factor[i];
+                  }
+                }
+              }
+              for (short n = 0; n < 2; ++n) {
+                for (int dp = 0; dp < D / 32; ++dp) {
+                  elem_t vb0[8], vb1[8];
+                  for (short i = 0; i < 2; ++i) {
+                    const int kp = ts + n * 16 + fm + 8 * i;
+                    msa_load4(vb0 + i * 4, vbase + (size_t)kp * vss, dp * 32 + fn, vds, vec_ok, kp < sk);
+                    msa_load4(vb1 + i * 4, vbase + (size_t)kp * vss, dp * 32 + 16 + fn, vds, vec_ok, kp < sk);
+                  }
+                  msa_mma_16x32<float, elem_t, false>(o[dp], s + n * 8, vb0, vb1);
+                }
+              }
+            }
+          }
+          device elem_t* orow = out + ((size_t)(b * L + l) * H + g * HG) * D;
+          for (short i = 0; i < 2; ++i) {
+            const short r = fm + 8 * i;
+            if (r >= HG) continue;
+            const float inv = 1.0f / l_run[i];
+            for (int dp = 0; dp < D / 32; ++dp) {
+              for (short h = 0; h < 2; ++h) {
+                for (short j = 0; j < 4; ++j) {
+                  orow[(size_t)r * D + dp * 32 + h * 16 + fn + j] = elem_t(o[dp][h * 8 + i * 4 + j] * inv);
+                }
+              }
+            }
+          }
+        """#
+
+    /// Query rows per threadgroup of the matrix-unit kernel (one simdgroup per row).
+    static let matrixUnitSimdgroups = 4
+
+    static func matrixUnitKernel(
+        element: String, hg: Int, d: Int, keep: Int, block: Int, source body: String = matrixUnitSource
+    ) -> MLXFast.MLXFastKernel {
+        let source =
+            constantsHeader(
+                element, [("HG", hg), ("D", d), ("KEEP", keep), ("BLOCK", block), ("NSG", matrixUnitSimdgroups)])
+            + body
+        return cachedKernel(
+            kernelName(
+                "vmlx_minimax_msa_prefill_nax_\(element)_h\(hg)_d\(d)_k\(keep)_b\(block)",
+                matrixUnitHeader + source),
+            inputs: ["q", "k", "v", "blocks", "meta", "scale"], outputs: ["out"], source: source,
+            header: matrixUnitHeader, ensureRowContiguous: false)
+    }
+
+    static func matrixUnitLaunch(
+        queries q: MLXArray, keys k: MLXArray, values v: MLXArray, selection: MiniMaxM3MSASelection, scale: Float,
+        kernel override: MLXFast.MLXFastKernel? = nil
+    ) -> MLXArray {
+        let (B, H, L, D) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+        let G = selection.groups
+        let blocks = sorted(selection.topIndices.asType(.int32), axis: -1)
+        let qc = contiguous(q.transposed(0, 2, 1, 3))  // [B, L, H, D]
+        let meta = MLXArray([Int32(selection.offset), Int32(selection.keyLength)])
+        let kernel =
+            override
+            ?? matrixUnitKernel(
+                element: elementType(q.dtype)!, hg: H / G, d: D, keep: selection.keep, block: selection.blockSize)
+        let nsg = matrixUnitSimdgroups
+        let out = kernel(
+            [qc, k, v, blocks, meta, MLXArray([scale])],
+            grid: (32 * nsg, (L + nsg - 1) / nsg, B * G), threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[B, L, H, D]], outputDTypes: [q.dtype])[0]
+        return out.transposed(0, 2, 1, 3)
+    }
+
+    nonisolated(unsafe) private static var matrixUnitsChecked: Bool?
+
+    /// Metal 4 tensor ops compile here and the matrix-unit kernel matches the fp32 simdgroup kernel on a small case
+    /// with a partial last block and causal rows inside it (checked once per process, on the GPU). The case is the
+    /// Python runtime's, from the same MLX random keys.
+    static func matrixUnitsAvailable() -> Bool {
+        lock.lock()
+        if let checked = matrixUnitsChecked {
+            lock.unlock()
+            return checked
+        }
+        lock.unlock()
+        let ok = matrixUnitSelfCheck() < 2e-2
+        lock.lock()
+        matrixUnitsChecked = ok
+        lock.unlock()
+        return ok
+    }
+
+    /// The self-check's relative error (max |matrix units - fp32 kernel| / max |fp32 kernel|); infinity when the
+    /// kernel does not compile or run here.
+    static func matrixUnitSelfCheck(kernel override: MLXFast.MLXFastKernel? = nil) -> Float {
+        do {
+            return try withError { error in
+                try Device.withDefaultDevice(.gpu) {
+                    let keys = MLXRandom.split(key: MLXRandom.key(11), into: 4)
+                    let (G, HG, D, sk, L, block, keep) = (2, 16, 64, 300, 40, 32, 4)
+                    let q = MLXRandom.normal([1, G * HG, L, D], key: keys[0]).asType(.bfloat16)
+                    let kk = MLXRandom.normal([1, G, sk, D], key: keys[1]).asType(.bfloat16)
+                    let vv = MLXRandom.normal([1, G, sk, D], key: keys[2]).asType(.bfloat16)
+                    let blockCount = (sk + block - 1) / block
+                    var pick = argSort(
+                        MLXRandom.uniform(0 ..< 1, [1, G, L, blockCount], key: keys[3]), axis: -1
+                    )[.ellipsis, ..<(keep - 1)]
+                    let local = broadcast(
+                        floorDivide(
+                            arange(sk - L, sk).reshaped(1, 1, L, 1), MLXArray(Int32(block))),
+                        to: [1, G, L, 1])
+                    pick = MLX.where(
+                        pick .== local, remainder(local + MLXArray(Int32(1)), MLXArray(Int32(blockCount))), pick)
+                    let selection = MiniMaxM3MSASelection(
+                        topIndices: concatenated([local, pick], axis: -1).asType(.uint32), offset: sk - L,
+                        keyLength: sk, blockSize: block)
+                    let scale = pow(Float(D), -0.5)
+                    let got = matrixUnitLaunch(
+                        queries: q, keys: kk, values: vv, selection: selection, scale: scale, kernel: override
+                    ).asType(.float32)
+                    let reference = kernelAttention(
+                        queries: q.asType(.float32), keys: kk.asType(.float32), values: vv.asType(.float32),
+                        selection: selection, scale: scale, matrixUnits: false)
+                    let err = (abs(got - reference).max() / abs(reference).max()).item(Float.self)
+                    try error.check()
+                    return err.isFinite ? err : .infinity
+                }
+            }
+        } catch {
+            return .infinity
+        }
+    }
+
+    /// Shapes the simdgroup chunk kernel is written for: head dim a multiple of 8, whole simdgroups of 8 query heads
+    /// per KV group (at most 32), blocks a multiple of the staged tile, two tiles in threadgroup memory.
+    static func kernelSupported(queries q: MLXArray, keys k: MLXArray, selection: MiniMaxM3MSASelection) -> Bool {
+        let (H, D) = (q.dim(1), q.dim(3))
+        let G = selection.groups
+        guard onGPU, let element = elementType(q.dtype), k.dtype == q.dtype, H % G == 0 else { return false }
+        let hg = H / G
+        let tile = prefillTile(element)
+        return D % 8 == 0 && 2 * tile * (D + 8) * q.dtype.size <= 32768 && hg % 8 == 0 && hg <= 32
+            && selection.blockSize % tile == 0
+    }
+
+    /// The matrix-unit kernel's shapes: bf16 / fp16, at most 16 query heads per KV group (one fragment of rows), head
+    /// dim a multiple of 32 (at most 256), blocks a multiple of 32 keys, Metal 4 tensor ops present and self-checked.
+    static func matrixUnitsSupported(queries q: MLXArray, selection: MiniMaxM3MSASelection) -> Bool {
+        let (H, D) = (q.dim(1), q.dim(3))
+        let G = selection.groups
+        return (q.dtype == .bfloat16 || q.dtype == .float16) && H % G == 0 && H / G <= 16 && D % 32 == 0
+            && D <= 256 && selection.blockSize % 32 == 0 && matrixUnitsAvailable()
+    }
+
+    /// Block-sparse attention `[B, H, L, D]` for an L-row chunk, reading only the selected blocks (no key mask).
+    /// bf16 / fp16 run on the matrix units when admitted (`matrixUnitsSupported`), everything else (fp32 included) on
+    /// the simdgroup kernel. `matrixUnits` forces one or the other.
+    static func kernelAttention(
+        queries q: MLXArray, keys k: MLXArray, values v: MLXArray, selection: MiniMaxM3MSASelection, scale: Float,
+        matrixUnits: Bool? = nil
+    ) -> MLXArray {
+        checkExtent(k, v, selection)
+        if matrixUnits ?? matrixUnitsSupported(queries: q, selection: selection) {
+            return matrixUnitLaunch(queries: q, keys: k, values: v, selection: selection, scale: scale)
+        }
+        return simdgroupLaunch(queries: q, keys: k, values: v, selection: selection, scale: scale)
+    }
+
+    static func simdgroupLaunch(
+        queries q: MLXArray, keys k: MLXArray, values v: MLXArray, selection: MiniMaxM3MSASelection, scale: Float,
+        kernel override: MLXFast.MLXFastKernel? = nil
+    ) -> MLXArray {
+        let (B, H, L, D) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+        let G = selection.groups
+        let hg = H / G
+        let blocks = sorted(selection.topIndices.asType(.int32), axis: -1)
+        let qc = contiguous(q.transposed(0, 2, 1, 3))  // [B, L, H, D]
+        let meta = MLXArray([Int32(selection.offset), Int32(selection.keyLength)])
+        let kernel =
+            override
+            ?? prefillKernel(
+                element: elementType(q.dtype)!, hg: hg, d: D, keep: selection.keep, block: selection.blockSize)
+        let out = kernel(
+            [qc, k, v, blocks, meta, MLXArray([scale])],
+            grid: (32 * (hg / 8), L, B * G), threadGroup: (32 * (hg / 8), 1, 1),
             outputShapes: [[B, L, H, D]], outputDTypes: [q.dtype])[0]
         return out.transposed(0, 2, 1, 3)
     }
