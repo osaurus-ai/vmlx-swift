@@ -459,8 +459,11 @@ struct MiniMaxM3DSparkTests {
             MiniMaxM3RowExact.counters.reset()
             let cache = model.newCache(parameters: nil)
             Self.prefill(model, prompt, cache: cache)
-            let logits = try Self.verify(model, rows, cache: cache)
+            let (logits, picks) = try Base.spying { spy in (try Self.verify(model, rows, cache: cache), spy.picks) }
             let counters = MiniMaxM3RowExact.counters.snapshot
+            // Every sparse layer's attention for every verify row ran the block-sparse decode kernel (each row is one
+            // decode-step call), never the dense mask path, on this non-empty cache.
+            #expect(picks.count == 3 * width && Set(picks) == [.decode], "MSA paths during the verify: \(Set(picks))")
             let reference = model.newCache(parameters: nil)
             Self.prefill(model, prompt, cache: reference)
             if promptLength > 64 { #expect(Self.sparseActive(model, cache: reference)) }
@@ -479,7 +482,7 @@ struct MiniMaxM3DSparkTests {
                 #expect((counters["routed_batched"] ?? 0) > 0 && counters["routed_rows"] == nil, "\(counters)")
             }
             print("[DSpark verify] prompt \(promptLength) width \(width): \(width - bad.count)/\(width) rows bit-equal, "
-                + "cache problems \(problems.count), \(counters)")
+                + "cache problems \(problems.count), \(counters), MSA paths \(Dictionary(grouping: picks, by: { $0 }).mapValues(\.count))")
         }
     }
 
@@ -491,7 +494,10 @@ struct MiniMaxM3DSparkTests {
             let rows = Self.ids(8, seed: 56)
             let cache = model.newCache(parameters: nil)
             Self.prefill(model, prompt, cache: cache)
-            let stock = model(Self.tokens(rows), cache: cache)[0]
+            let (stock, picks) = Base.spying { spy in (model(Self.tokens(rows), cache: cache)[0], spy.picks) }
+            // The 8-row call reaches the block-sparse decode kernel (the model's causal mask, not the cache's array
+            // mask): its attention rows are independent; the projections are what differ.
+            #expect(Set(picks) == [.decode], "MSA paths of the stock 8-row forward: \(Set(picks))")
             let reference = model.newCache(parameters: nil)
             Self.prefill(model, prompt, cache: reference)
             let steps = rows.map { Self.decode(model, $0, cache: reference) }
@@ -755,10 +761,17 @@ struct MiniMaxM3DSparkTests {
     /// Mimics TokenIterator: queue committed tokens, take an ordinary decode step on `.autoregressive`.
     static func dsparkRun(
         _ model: MiniMaxM3Model, decoder: inout DSparkDecoder, prompt: [Int], count: Int,
-        rows: inout [Int]
+        rows: inout [Int], msaPaths: inout [MiniMaxM3MSA.Path]
     ) -> ([Int], [KVCache]) {
         let cache = model.newCache(parameters: nil)
         var y = argmax(prefill(model, prompt, cache: cache))
+        let spy = Base.PathSpy()
+        let previous = MiniMaxM3MSA.hooks.pathObserver
+        MiniMaxM3MSA.hooks.pathObserver = { spy.picks.append($0) }
+        defer {
+            MiniMaxM3MSA.hooks.pathObserver = previous
+            msaPaths = spy.picks
+        }
         var queue: [Int] = []
         var out: [Int] = []
         var widths: [Int] = []
@@ -825,7 +838,11 @@ struct MiniMaxM3DSparkTests {
                     ladderTop: model.dsparkLadderTop,
                     pinnedWidth: mode == .pinned2 ? 2 : mode == .pinned7 ? 7 : nil)
                 var rows: [Int] = []
-                let (out, cache) = Self.dsparkRun(model, decoder: &decoder, prompt: prompt, count: 45, rows: &rows)
+                var msaPaths: [MiniMaxM3MSA.Path] = []
+                let (out, cache) = Self.dsparkRun(
+                    model, decoder: &decoder, prompt: prompt, count: 45, rows: &rows, msaPaths: &msaPaths)
+                // After the prefill (decode steps, verify rows) every sparse-layer call ran the decode kernel.
+                #expect(!msaPaths.isEmpty && Set(msaPaths) == [.decode], "\(mode): MSA paths \(Set(msaPaths))")
                 let stats = decoder.stats
                 #expect(out == reference, "prompt \(promptLength) \(mode): DSpark output differs from AR")
                 let problems = Self.cacheProblems(cache, arCache)
@@ -868,7 +885,9 @@ struct MiniMaxM3DSparkTests {
                     session: Unarmed(scripted), blockSize: Self.draftBlock, stopTokenIDs: [],
                     governor: Self.alwaysSpeculate, ladderTop: 8, pinnedWidth: 7)
                 var rows: [Int] = []
-                let (out, _) = Self.dsparkRun(model, decoder: &decoder, prompt: prompt, count: 45, rows: &rows)
+                var msaPaths: [MiniMaxM3MSA.Path] = []
+                let (out, _) = Self.dsparkRun(
+                    model, decoder: &decoder, prompt: prompt, count: 45, rows: &rows, msaPaths: &msaPaths)
                 diverged += out != reference ? 1 : 0
             }
             print("[DSpark greedy] control: stock multi-row verify diverged from AR on \(diverged)/3 prompts")
@@ -963,7 +982,10 @@ struct MiniMaxM3DSparkTests {
                 session: scripted, blockSize: Self.draftBlock, stopTokenIDs: [], governor: Self.alwaysSpeculate,
                 ladderTop: model.dsparkLadderTop)
             var widths: [Int] = []
-            let (out, _) = Self.dsparkRun(model, decoder: &decoder, prompt: prompt, count: 24, rows: &widths)
+            var msaPaths: [MiniMaxM3MSA.Path] = []
+            let (out, _) = Self.dsparkRun(
+                model, decoder: &decoder, prompt: prompt, count: 24, rows: &widths, msaPaths: &msaPaths)
+            #expect(!msaPaths.isEmpty && Set(msaPaths) == [.decode], "released geometry: MSA paths \(Set(msaPaths))")
             #expect(out == ar)
             #expect(decoder.stats.accepted > 0 && decoder.stats.accepted < decoder.stats.drafted)
         }
@@ -1128,7 +1150,8 @@ struct MiniMaxM3DSparkTests {
                 MiniMaxM3RowExact.counters.reset()
                 let cache = model.newCache(parameters: nil)
                 Self.prefill(model, prompt, cache: cache, step: 512)
-                let logits = try Self.verify(model, rows, cache: cache)
+                let (logits, picks) = try Base.spying { spy in (try Self.verify(model, rows, cache: cache), spy.picks) }
+                #expect(!picks.isEmpty && Set(picks) == [.decode], "width \(width): MSA paths \(Set(picks))")
                 let reference = model.newCache(parameters: nil)
                 Self.prefill(model, prompt, cache: reference, step: 512)
                 let steps = rows.map { Self.decode(model, $0, cache: reference) }
