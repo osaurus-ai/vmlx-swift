@@ -33,7 +33,8 @@ import Testing
 /// `scripts/minimax_m3_fixtures/generate_aligned_prefix_fixtures.py` from a clean export of the Python branch commit
 /// (ef84c03f): the same prompts give the same per-turn cached / prefilled counts. Counts depend only on lengths and the
 /// rule; `VMLX_M3_ALIGNED_PY_WEIGHTS=<dir>` (the generator's `--weights` output) also loads Python's exact weights and
-/// compares tokens and first-step logits with Python's.
+/// compares tokens and first-step logits with Python's (bit for bit under `MLX_ENABLE_TF32=0` with MLX's
+/// `-fno-fast-math` metallib). Cached == cold holds with either metallib: both arms run the same kernels.
 ///
 /// Controls that must FAIL (each first asserts it really reused a prefix the rule would not): the previous token-only
 /// reuse without aligned chunking (`VMLX_M3_ALIGNED_PREFIX=0`), aligned chunking with a misaligned continuation start,
@@ -822,7 +823,9 @@ struct MiniMaxM3AlignedPrefixCacheTests {
                 lines.append("turn \(turn + 1): tokens \(cold.tokens == pyTokens ? "==" : "!=") Python, "
                     + "first logits \(digest == pyDigest ? "==" : "!=") Python")
                 // The fixture was written with MLX_ENABLE_TF32=0: under strict f32 the two runtimes run the same
-                // pieces through the same kernels (with the -fno-fast-math metallib), so they must agree bit for bit.
+                // pieces through the same kernels, so they must agree bit for bit. That needs MLX's -fno-fast-math
+                // metallib (scripts/prepare-mlx-metal.sh), as the Python wheel uses: with SwiftPM's fast-math build the
+                // tokens still match here and the first logits do not (rope / rms_norm / SDPA rounding).
                 if strictF32 {
                     #expect(cold.tokens == pyTokens && digest == pyDigest, "turn \(turn + 1): Swift != Python")
                 }
