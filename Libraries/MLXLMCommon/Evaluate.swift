@@ -1764,6 +1764,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// generated token is fed back into the model.
     var promptCacheSnapshot: [KVCache]?
 
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): this request's absolute chunk cuts and store boundary, for a
+    /// model whose prompt prefill must be cut at absolute chunk boundaries (MiniMax-M3). nil for every other model, or
+    /// with `VMLX_M3_ALIGNED_PREFIX=0`.
+    var alignedPrefillPlan: AlignedPrefillPlan?
+
     /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
     /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
     /// the prompt with its trailing generation prompt stripped. `nil` when the
@@ -2013,6 +2018,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheSaltPlan = CacheBoundarySaltPlan.make(
             requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
             model: model, parameters: effectiveParameters)
+        // Aligned prefill: the same plan with or without a coordinator, so a cold prefill and a cached continuation
+        // cut the prompt at the same absolute positions.
+        self.alignedPrefillPlan = AlignedPrefill.plan(
+            model: model, cache: self.cache, promptTokenIds: cacheLookupTokenIds,
+            cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+            generationPromptSuffix: cacheCoordinator?.genPromptSuffixTokens ?? [],
+            prefillStepSize: effectiveParameters.prefillStepSize)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1",
            let prefix = cacheSaltPlan.mediaIndependentPrefix
         {
@@ -2105,8 +2117,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                     mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                 switch result {
                 case .hit(
-                    let matchedTokens, let remainingTokens, let detail, let blocks,
+                    let fetchedMatchedTokens, let fetchedRemainingTokens, let detail, let blocks,
                     let ssmStates, let diskArrays):
+                // An aligned-prefill restore may keep fewer rows than the entry held (below).
+                var matchedTokens = fetchedMatchedTokens
+                var remainingTokens = fetchedRemainingTokens
                 var restored = false
                 var retainedDiskRestore = false
                 var restoredTokenCount = 0
@@ -2220,6 +2235,21 @@ public struct TokenIterator: TokenIteratorProtocol {
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)
                     inputForPrepare = input
+                }
+                // Aligned prefill: keep only the rows a cold prefill of this request also ends a chunk at (the last
+                // chunk boundary, or all of its own store boundary when the rows were produced with it). None: the
+                // whole prompt prefills, exactly as a miss.
+                if restored, let plan = self.alignedPrefillPlan {
+                    let reuse = AlignedPrefill.alignRestoredPrefix(
+                        self.cache, matchedTokens: matchedTokens, plan: plan, detail: detail.rawValue)
+                    if reuse > 0 {
+                        matchedTokens = reuse
+                        remainingTokens = Array(cacheLookupTokenIds.dropFirst(reuse))
+                    } else {
+                        restored = false
+                        self.cache = self.model.newCache(parameters: effectiveParameters)
+                        inputForPrepare = input
+                    }
                 }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
@@ -2465,6 +2495,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 restoredTokenCount: Swift.max(
                     0, input.text.tokens.size - inputForPrepare.text.tokens.size))
         }
+        AlignedPrefill.install(self.alignedPrefillPlan, into: self.cache)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
@@ -3033,6 +3064,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // Aligned prefill: the model cuts the prompt at absolute chunk boundaries and the store boundary only. Any
+        // other split (stable-boundary captures) would be a cut a cold prefill of a different request does not make;
+        // the store loop takes those boundaries from the prompt snapshot (these caches trim) instead.
+        if alignedPrefillPlan != nil {
+            try prepareRemainder(
+                input: input, windowSize: windowSize, promptTokensForProcessor: input.text.tokens)
+            return
+        }
         // A warm input contains only the suffix after the restored prefix.
         // Snapshot keys and processor boundaries refer to the whole prompt.
         let inputStart = promptTokenIds.count - input.text.tokens.size

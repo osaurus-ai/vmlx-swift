@@ -78,6 +78,10 @@ struct BatchSlot {
     /// any generated token is fed back into the model. Cache stores use this,
     /// not the live decode cache, because coordinator keys are prompt-only.
     var promptCacheSnapshot: [KVCache]?
+
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): this request's absolute chunk cuts and store boundary (MiniMax-M3);
+    /// nil for every other model.
+    var alignedPrefillPlan: AlignedPrefillPlan?
     var appendOnlyPromptCheckpoint: AppendOnlyPromptCheckpoint?
     var appendOnlyDiskSeed: AppendOnlyPromptCheckpoint?
 
