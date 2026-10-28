@@ -18,7 +18,8 @@ import MLXLMCommon
 /// mistake this cache for one and drop the indexer lane; disk persistence goes through `DiskCacheStateProviding`,
 /// which restores all three lanes or nothing.
 public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
-    private var kv = KVCacheSimple()
+    /// The K/V lane. Readable in-module (tests poison its unused capacity to prove nothing reads past `offset`).
+    private(set) var kv = KVCacheSimple()
 
     /// Capacity buffer for the indexer keys; rows past `indexCount` are unused capacity, never visible.
     private var indexStorage: MLXArray?
