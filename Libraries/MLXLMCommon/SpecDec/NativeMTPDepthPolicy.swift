@@ -16,16 +16,17 @@ public enum NativeMTPDepthPolicy: Sendable, Equatable {
     /// only top. The library default and what an app's "On (Adaptive)" sends.
     public static let adaptiveToRuntimeCeiling: NativeMTPDepthPolicy = .adaptive(maximumDepth: .max)
 
-    /// The top rung of a recursive MTP head: the deepest draft depth the runtime's adaptive controller may climb
-    /// to when the model declares no other verifier capability. 5 is the value the controller was given when it
-    /// learned to climb past its start depth (e07b690fc, 2026-09-04; before: 3). It is NOT a verifier limit: the
-    /// native-MTP verifier is row-exact up to ``verifierTopRung`` (``FlashVerificationScope/rowExactVerifyRows``).
-    public static let recursiveHeadTopRung = 5
-
     /// The deepest draft the native-MTP verifier checks row-exactly: every verify row reproduces the AR step bit for
     /// bit for windows of ``FlashVerificationScope/rowExactVerifyRows`` (2...8 rows = depth 1...7). The copy proposer
     /// already verifies 8-row windows on these models (`NativeMTPCopyProposer.maxWidth`).
     public static let verifierTopRung = FlashVerificationScope.rowExactVerifyRows.upperBound - 1
+
+    /// The top rung of a recursive MTP head (a model that declares no other verifier capability): the verifier's
+    /// exact window, ``verifierTopRung``. Until 2026-10-29 it was 5, the value the controller was given when it
+    /// learned to climb past its start depth (e07b690fc, 2026-09-04; before: 3), a tuning number below what the
+    /// verifier checks exactly. Measured fixed depths on Flash-Next 4S (NativeMTPDepthChooser.swift, 2026-10-06)
+    /// were still rising at D5 on easy code (96.9 -> 100.1 tok/s); whether D6 / D7 pay is the controller's call.
+    public static var recursiveHeadTopRung: Int { verifierTopRung }
 
     /// The runtime's top rung for `model`, in this order:
     /// 1. `VMLX_MTP_DEPTH_CAP=<n>`: a diagnostic lever (benchmarks); the app never sets it;
