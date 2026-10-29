@@ -155,7 +155,8 @@ struct MiniMaxM3ColdPrefillTests {
         // [552, 700), [700, 1024) group; 7 / 23 / 17 / 40-row pieces stay on the decode kernels alone.
         let cuts = [7, 30, 47, 200, 333, 552, 700, 1100, 1290]
         let prompt = A.ids(1301, seed: 9).map { $0 % 250 }
-        try Self.withGPU {
+        // The stock routed rule (512 pairs); the sorted-tile rule has its own test below.
+        try MiniMaxM3Model.$prefillSortedAllOverride.withValue(false) { try Self.withGPU {
             let counter = Counter()
             let piecewise = try MiniMaxM3Model.$prefillGroupingOverride.withValue(false) {
                 try MiniMaxM3DecoderLayer.$groupedRoutedObserver.withValue({ counter.add($0, $1) }) {
@@ -180,7 +181,7 @@ struct MiniMaxM3ColdPrefillTests {
             #expect(diff.isEmpty, "grouped routed != piece by piece: \(diff.prefix(4))")
             let diff2 = Self.problems(piecewise, layerMajor)
             #expect(diff2.isEmpty, "layer-major (one routed call per piece) != piece by piece: \(diff2.prefix(4))")
-        }
+        } }
     }
 
     @Test("JANGHT M3, VMLX_M3_PREFILL_SORTED: pieces of >= 18 rows on the sorted tiles, one call per group == one call per piece; differs from the stock rule (control)")

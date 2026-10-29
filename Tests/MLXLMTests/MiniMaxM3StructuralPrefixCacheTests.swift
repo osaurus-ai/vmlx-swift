@@ -141,12 +141,14 @@ struct MiniMaxM3StructuralPrefixCacheTests {
             tokenizer: DS.FixtureTokenizer(), bosText: "]~b]", eosText: "[e~[", assistantRoleText: "ai\n") == nil)
         // The model resolves through ModelContext and puts the markers in its identity (cache salt).
         let model = try A.model()
-        #expect(model.alignedPrefillSchema == "minimax-m3:aligned-prefill-v1")
+        // The routed rule of non-final pieces (`VMLX_M3_PREFILL_SORTED`, on by default) is part of the identity.
+        let routed = MiniMaxM3Model.prefillSortedAll ? ":routed=sorted\(MiniMaxM3Model.prefillSortedMinPairs)" : ""
+        #expect(model.alignedPrefillSchema == "minimax-m3:aligned-prefill-v1" + routed)
         _ = ModelContext(
             configuration: ModelConfiguration(id: "m3"), model: model,
             processor: MiniMaxM3ServingFixesTests.StandInProcessor(), tokenizer: MarkerTokenizer())
         #expect(model.alignedPrefillTurnMarkers == m)
-        #expect(model.alignedPrefillSchema == "minimax-m3:aligned-prefill-v2-turns:turns=200019-200020-1361.10")
+        #expect(model.alignedPrefillSchema == "minimax-m3:aligned-prefill-v2-turns:turns=200019-200020-1361.10" + routed)
     }
 
     // MARK: - The tool loop
