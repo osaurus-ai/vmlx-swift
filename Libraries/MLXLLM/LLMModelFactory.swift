@@ -167,6 +167,9 @@ public enum LLMTypeRegistry {
                 let config = try JSONDecoder.json5().decode(MiniMaxConfiguration.self, from: data)
                 return MiniMaxModel(config)
             },
+            // MiniMax-M3 / M3.1: MSA attention, sigmoid-routed MoE, a separate architecture from M2.
+            "minimax_m3": dispatchMiniMaxM3,
+            "minimax_m3_vl": dispatchMiniMaxM3,
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -433,6 +436,15 @@ public enum LLMTypeRegistry {
             context = nil
         }
         return ZayaModel(config, moe: context)
+    }
+
+    /// MiniMax-M3 / M3.1 text model. A `minimax_m3_vl` bundle builds without its vision tower; a request for any
+    /// lane other than text is refused here instead of being served text-only.
+    private static func dispatchMiniMaxM3(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
+        _ = try Set.resolveForConstruction(requested: requesting, constructible: [.text])
+        return MiniMaxM3Model(try JSONDecoder.json5().decode(MiniMaxM3Configuration.self, from: data))
     }
 
     /// `model_type = "bailing_hybrid"` covers two architectures that share the
@@ -1701,6 +1713,10 @@ public final class LLMModelFactory: ModelFactory {
         let dsv41JANGHPreparation = try DeepseekV41JANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let dsv41JANGHPreparation { configData = dsv41JANGHPreparation.ordinaryConfiguration }
+        // MiniMax-M3 / M3.1 JANGHT (JANGT trellis routed experts; mxfp8 / affine trunk keyed by live module path).
+        let miniMaxM3JANGHPreparation = try MiniMaxM3JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let miniMaxM3JANGHPreparation { configData = miniMaxM3JANGHPreparation.ordinaryConfiguration }
 
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
@@ -1709,7 +1725,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1909,7 +1925,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil {
+        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -1989,6 +2005,8 @@ public final class LLMModelFactory: ModelFactory {
             } else if let dsv41JANGHPreparation {
                 model = try dsv41JANGHPreparation.construct(
                     configurationData: configData, requesting: configuration.requestedModalities)
+            } else if let miniMaxM3JANGHPreparation {
+                model = try miniMaxM3JANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: configData, modelType: baseConfig.modelType,
@@ -1996,7 +2014,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil { throw error }
+            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2138,7 +2156,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -2151,7 +2169,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -2185,13 +2203,15 @@ public final class LLMModelFactory: ModelFactory {
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
+                || miniMaxM3JANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil ? jangConfig : nil,
+            jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil
+                && miniMaxM3JANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask

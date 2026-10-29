@@ -140,6 +140,50 @@ public enum JANGTCode {
     }
 }
 
+/// The SwiGLU variant a routed stack applies to its gate pre-activation g and up pre-activation u. It belongs to the
+/// model, never to the bundle (vMLX Python `moe_kernels.ACTS`). With a limit L > 0 both variants first clamp
+/// g' = min(g, L) (from above only) and u' = clip(u, -L, L); with L = 0, g' = g and u' = u.
+public enum JANGTActivation: Sendable, Equatable {
+    /// h = silu(g') * u'. GLM-5.3 and DeepSeek-V4.1 (with a limit), Naive-N0.5 and MiMo (without).
+    case silu
+    /// SwiGLU-OAI: h = g' * sigmoid(alpha * g') * (u' + 1). MiniMax-M3 / M3.1 (alpha 1.702, limit 7).
+    case oai(alpha: Float)
+
+    /// Metal float expression of h from the (already clamped) `g` / `u`. `.silu` is the exact expression the kernels
+    /// carried before the variants existed, so their generated source is unchanged; `.oai` writes alpha by its float32
+    /// bit pattern (the value MLX multiplies a float32 array by).
+    func metalValue(g: String = "g", u: String = "u") -> String {
+        switch self {
+        case .silu:
+            return "(\(g) / (1.0f + metal::fast::exp(-\(g)))) * \(u)"
+        case .oai(let alpha):
+            return "(\(g) / (1.0f + metal::fast::exp(-(as_type<float>(\(alpha.bitPattern)u) * \(g))))) * (\(u) + 1.0f)"
+        }
+    }
+
+    /// Kernel-name suffix: empty for `.silu` (existing names unchanged), else the variant and alpha's bit pattern.
+    /// MLX caches compiled kernels by name, so every generated source needs its own.
+    var nameTag: String {
+        switch self {
+        case .silu: return ""
+        case .oai(let alpha): return "_oai\(String(alpha.bitPattern, radix: 16))"
+        }
+    }
+
+    /// The same activation in MLX ops (unfused fallbacks), in the inputs' dtype (Python `moe_kernels.act_mlx`).
+    public func callAsFunction(gate: MLXArray, up: MLXArray, limit: Float) -> MLXArray {
+        var g = gate, u = up
+        if limit > 0 {
+            g = minimum(g, limit)
+            u = clip(u, min: -limit, max: limit)
+        }
+        switch self {
+        case .silu: return g * sigmoid(g) * u
+        case .oai(let alpha): return g * sigmoid(alpha * g) * (u + 1)
+        }
+    }
+}
+
 /// Generated Metal for the JANGT decode set (Python `moe_kernels.py` v3 + `rotate_rows`).
 enum JANGTKernelSource {
     static let unroll = "_Pragma(\"clang loop unroll(full)\")"
@@ -231,7 +275,7 @@ enum JANGTKernelSource {
 
     /// Gathered gate+up+SwiGLU decode (Python `_gu_v3`, rot_out = false). Grid (64, N/8, T*k).
     static func gateUp(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int, xdt: String,
-                       odt: String, limit: Float) -> String {
+                       odt: String, limit: Float, activation: JANGTActivation = .silu) -> String {
         let (mu0, mu1, isd0, isd1) = statsLiterals(k)
         let pl = JANGTCode.laneBits(k)
         let outlPre = outliers == 0 ? "" : """
@@ -274,7 +318,7 @@ enum JANGTKernelSource {
               if (lane == 0u) {
                 float g = ((G0 - \(mu0) * SE) * \(isd0) + (G1 - \(mu1) * SO) * \(isd1)) * sg[(size_t)e * \(n)u + row0 + r];
                 float u = ((U0 - \(mu0) * SE) * \(isd0) + (U1 - \(mu1) * SO) * \(isd1)) * su_[(size_t)e * \(n)u + row0 + r];\(outl)\(clamp)
-                out[(size_t)ts * \(n)u + row0 + r] = \(odt)((g / (1.0f + metal::fast::exp(-g))) * u);
+                out[(size_t)ts * \(n)u + row0 + r] = \(odt)(\(activation.metalValue()));
               }
             }
             """
@@ -387,16 +431,17 @@ enum JANGTKernels {
 
     /// Gathered gate+up+SwiGLU: xr (T, kin) f32 rotated, x (T, kin) raw, idx (T, k) -> (T*k, N) `outputDType`.
     static func gateUp(xr: MLXArray, x: MLXArray, indices: MLXArray, gate: JANGTProjection, up: JANGTProjection,
-                       limit: Float, outputDType: DType) -> MLXArray {
+                       limit: Float, activation: JANGTActivation = .silu, outputDType: DType) -> MLXArray {
         let tokens = x.dim(0), kin = x.dim(1), slots = indices.dim(1)
         let n = gate.outputs, words = gate.words, outliers = gate.outlierColumns
         let lim = limit > 0 ? "_lim\(String(limit).replacingOccurrences(of: ".", with: "p"))" : ""
-        let name = "jt4_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_w\(words)_\(metalType(x.dtype))_\(metalType(outputDType))\(lim)"
+        let name = "jt4_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_w\(words)_\(metalType(x.dtype))_\(metalType(outputDType))\(lim)\(activation.nameTag)"
         var inputNames = ["xr", "x", "idx", "kslots", "wg", "sg", "wu", "su_"]
         if outliers > 0 { inputNames += ["ocol", "woutg", "woutu"] }
         let k = kernel(name, inputs: inputNames, outputs: ["out"]) {
             JANGTKernelSource.gateUp(kin: kin, n: n, k: gate.k, l: JANGTCode.stateBits, outliers: outliers,
-                                     words: words, xdt: metalType(x.dtype), odt: metalType(outputDType), limit: limit)
+                                     words: words, xdt: metalType(x.dtype), odt: metalType(outputDType), limit: limit,
+                                     activation: activation)
         }
         var inputs: [MLXArray] = [
             contiguous(xr), contiguous(x), contiguous(indices.flattened().asType(.uint32)),

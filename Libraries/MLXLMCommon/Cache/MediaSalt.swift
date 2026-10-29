@@ -262,7 +262,12 @@ public func computeCacheSalt(
         parameters.maxKVSize = nil
     }
     let base = computeCacheSalt(for: input, includingMedia: includingMedia)
-    let policy = cachePolicySalt(for: parameters)
+    var policy = cachePolicySalt(for: parameters)
+    // A model that prefills on aligned chunks (MiniMax-M3) stores states whose rows are only interchangeable with a
+    // cold prefill of the same step: entries of another step, or from before aligned prefill, are never served.
+    if let aligned = AlignedPrefill.saltComponent(model: model, prefillStepSize: parameters.prefillStepSize) {
+        policy += "|" + aligned
+    }
 
     var hasher = SHA256()
     if let base {

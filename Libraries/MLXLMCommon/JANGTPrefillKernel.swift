@@ -99,9 +99,15 @@ enum JANGTPrefillKernel {
     }
 
     /// `JANGHPrefillSource.nax` with the trellis loader, fp32 scales and word-strided rows (and, with
-    /// `outliers` > 0, the fused outlier epilogue).
-    static func naxSource(words: Int, outliers: Int = 0) -> String {
+    /// `outliers` > 0, the fused outlier epilogue). The fused epilogue applies `activation` after the source's clamp
+    /// at `lim`; `.silu` keeps the source's expression unchanged.
+    static func naxSource(words: Int, outliers: Int = 0, activation: JANGTActivation = .silu) -> String {
         var s = JANGHPrefillSource.nax
+        if activation != .silu {
+            let silu = "return \(JANGTActivation.silu.metalValue());"
+            precondition(s.components(separatedBy: silu).count == 2, "JANGT prefill: activation anchor missing")
+            s = s.replacingOccurrences(of: silu, with: "return \(activation.metalValue());")
+        }
         if outliers > 0 {
             let params = "const device uint32_t* indices, device T* y, const int M, const int N, const int K, const int EXPERTS, const float lim,"
             // The activation loop (whitespace-insensitive: the source is an indented multi-line literal).
@@ -139,11 +145,15 @@ enum JANGTPrefillKernel {
         return s
     }
 
-    private static func kernel(k: Double, words: Int, dtype: DType, fused: Bool, rotate: Bool, outliers: Int = 0)
+    private static func kernel(k: Double, words: Int, dtype: DType, fused: Bool, rotate: Bool, outliers: Int = 0,
+                               activation: JANGTActivation = .silu)
         -> MLXFast.MLXFastKernel
     {
         let type = dtype == .bfloat16 ? "bfloat16_t" : "half"
+        // Only the fused epilogue applies the activation: single-weight tiles share the SiLU source and name.
+        let activation = fused ? activation : .silu
         let name = "jangt_prefill_K\(JANGTKernels.kname(k))_w\(words)_\(type)_f\(fused ? 1 : 0)_r\(rotate ? 1 : 0)_o\(outliers)"
+            + activation.nameTag
         lock.lock()
         defer { lock.unlock() }
         if let cached = kernels[name] { return cached }
@@ -160,18 +170,20 @@ enum JANGTPrefillKernel {
             inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"] + (outliers > 0 ? ["xo", "wog", "wou"] : []),
             outputNames: ["y"],
             source: source,
-            header: JANGHPrefillHeaders.nax + loaderSource(k: k, words: words) + naxSource(words: words, outliers: outliers),
+            header: JANGHPrefillHeaders.nax + loaderSource(k: k, words: words)
+                + naxSource(words: words, outliers: outliers, activation: activation),
             ensureRowContiguous: false)
         kernels[name] = built
         return built
     }
 
     /// `x` (M, K_in) in the projection's ROTATED basis, rows sorted by expert (`indices` (M,) uint32, sorted).
-    /// Returns (M, N) in `x.dtype`: `x . W[e]^T` (or SwiGLU(gate, up) clamped at `limit` when `up` is given; with
-    /// `rotateOutput`, the result is Hadamard-32 rotated — the input basis of a JANGH down unit). No outlier columns.
+    /// Returns (M, N) in `x.dtype`: `x . W[e]^T` (or `activation`(gate, up) clamped at `limit` when `up` is given;
+    /// with `rotateOutput`, the result is Hadamard-32 rotated — the input basis of a JANGH down unit). No outlier
+    /// columns.
     static func project(
         _ x: MLXArray, _ projection: JANGTProjection, up: JANGTProjection? = nil, indices: MLXArray,
-        limit: Float = 0, rotateOutput: Bool = false
+        limit: Float = 0, activation: JANGTActivation = .silu, rotateOutput: Bool = false
     ) -> MLXArray {
         let m = x.dim(0), kin = x.dim(1), n = projection.outputs
         precondition(available && [.bfloat16, .float16].contains(x.dtype) && kin == projection.inputs
@@ -183,7 +195,8 @@ enum JANGTPrefillKernel {
             : indices
         let meta = MLXArray([Int32(m), Int32(n), Int32(kin), Int32(projection.experts)])
         let u = up ?? projection
-        return kernel(k: projection.k, words: projection.words, dtype: x.dtype, fused: up != nil, rotate: rotateOutput)(
+        return kernel(k: projection.k, words: projection.words, dtype: x.dtype, fused: up != nil, rotate: rotateOutput,
+                      activation: activation)(
             [contiguous(x), projection.packed, projection.scale, u.packed, u.scale, contiguous(idx.asType(.uint32)),
              meta, MLXArray([limit])],
             grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
@@ -191,11 +204,11 @@ enum JANGTPrefillKernel {
     }
 
     /// Fused gate/up for expert-sorted rows with the layer-wide outlier columns `columns` (NO,) added before the
-    /// (clamped) SwiGLU: `xr` rotated rows, `rawRows` raw-basis rows (M, K_in). Same output as two `project` passes
-    /// plus `outliers` on each, in one tile pass.
+    /// (clamped) `activation`: `xr` rotated rows, `rawRows` raw-basis rows (M, K_in). Same output as two `project`
+    /// passes plus `outliers` on each, in one tile pass.
     static func projectGateUpWithOutliers(
         _ xr: MLXArray, rawRows: MLXArray, gate: JANGTProjection, up: JANGTProjection, columns: MLXArray,
-        indices: MLXArray, limit: Float = 0
+        indices: MLXArray, limit: Float = 0, activation: JANGTActivation = .silu
     ) -> MLXArray {
         let m = xr.dim(0), kin = xr.dim(1), n = gate.outputs, count = columns.size
         precondition(available && [.bfloat16, .float16].contains(xr.dtype) && kin == gate.inputs && kin % 64 == 0
@@ -206,7 +219,8 @@ enum JANGTPrefillKernel {
             : indices
         let xo = take(rawRows, columns.asType(.int32), axis: 1).asType(.float32)
         let meta = MLXArray([Int32(m), Int32(n), Int32(kin), Int32(gate.experts)])
-        return kernel(k: gate.k, words: gate.words, dtype: xr.dtype, fused: true, rotate: false, outliers: count)(
+        return kernel(k: gate.k, words: gate.words, dtype: xr.dtype, fused: true, rotate: false, outliers: count,
+                      activation: activation)(
             [contiguous(xr), gate.packed, gate.scale, up.packed, up.scale, contiguous(idx.asType(.uint32)),
              meta, MLXArray([limit]), contiguous(xo), gate.outlierWeights, up.outlierWeights],
             grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),

@@ -647,11 +647,37 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return local
     }
 
-    /// Model types that carry a dSpark head in `dspark/` (DeepSeek-V4.1 only; DSV4-0731 has none).
-    public static let dsparkModelTypes: Set<String> = ["deepseek_v41", "deepseek_v41_text"]
+    /// Model types that carry a dSpark head in `dspark/`: DeepSeek-V4.1 (DSV4-0731 has none) and
+    /// MiniMax-M3 / M3.1 (a DSpark block drafter, ``miniMaxDSparkModelTypes``).
+    public static let dsparkModelTypes: Set<String> = [
+        "deepseek_v41", "deepseek_v41_text", "minimax_m3", "minimax_m3_vl",
+    ]
 
-    /// The bundle-local DeepSeek-V4.1 `dspark/` head (holding `dspark.safetensors`) when the bundle is
-    /// V4.1 and speculation is not switched off. `VMLX_DSV41_DSPARK=0` can only turn it off.
+    /// MiniMax-M3 / M3.1: `dspark/` holds a block drafter with its own `config.json`
+    /// (`DSparkMiniMaxDraftModel`, as released or pre-quantized) and safetensors.
+    public static let miniMaxDSparkModelTypes: Set<String> = ["minimax_m3", "minimax_m3_vl"]
+
+    /// True when `directory/config.json` declares a DSpark drafter (an architecture naming DSpark, or a
+    /// `dspark` projector) and the directory holds its safetensors. The vMLX Python runtime's rule
+    /// (`config_declares_dspark`): a sidecar config that does not declare DSpark is not a DSpark drafter.
+    public static func declaresDSparkDrafter(_ directory: URL) -> Bool {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        let architectures = (config["architectures"] as? [Any])?.compactMap { $0 as? String } ?? []
+        let projector =
+            ((config["dflash_config"] as? [String: Any])?["projector_type"] ?? config["projector_type"]) as? String
+        guard architectures.contains(where: { $0.lowercased().contains("dspark") })
+            || projector?.lowercased() == "dspark"
+        else { return false }
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return files.contains { $0.hasSuffix(".safetensors") && !$0.hasPrefix("._") }
+    }
+
+    /// The bundle-local `dspark/` head when the bundle's model type carries one and speculation is not
+    /// switched off: DeepSeek-V4.1's `dspark.safetensors`, or a MiniMax-M3 drafter directory whose
+    /// `config.json` declares DSpark. `VMLX_DSV41_DSPARK=0` (and, for MiniMax-M3, the Python runtime's
+    /// `VMLX_DSPARK=0`) can only turn it off.
     public func bundledDSparkDrafter(
         configData: Data?, bundleDirectory: URL?,
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -666,6 +692,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         }
         guard types.contains(where: Self.dsparkModelTypes.contains) else { return nil }
         let local = bundleDirectory.appendingPathComponent("dspark", isDirectory: true)
+        if types.contains(where: Self.miniMaxDSparkModelTypes.contains) {
+            guard !DSparkEnvironment.miniMaxDisabled(environment), Self.declaresDSparkDrafter(local) else {
+                return nil
+            }
+            return local
+        }
         guard
             FileManager.default.fileExists(
                 atPath: local.appendingPathComponent("dspark.safetensors").path)
