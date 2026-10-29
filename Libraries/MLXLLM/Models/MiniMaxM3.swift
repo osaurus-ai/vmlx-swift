@@ -586,8 +586,7 @@ public final class MiniMaxM3ModelInner: Module {
     ) {
         let rows = pieces.map { $0.dim(1) }
         guard pieces.count > 1, pieces.allSatisfy({ $0.ndim == 2 && $0.dim(0) == 1 }),
-            cache.count == layers.count, cache.allSatisfy({ $0 is MiniMaxM3SparseCache }),
-            layers.allSatisfy({ $0.selfAttn.indexer != nil }),
+            cache.count == layers.count,
             rows.allSatisfy({ MiniMaxM3FusedDecode.active(rows: $0, batch: 1) == nil })
         else {
             prefillPieces(pieces, cache: cache, recordTaps: recordTaps, groupRouted: groupRouted, sortedAll: sortedAll)
@@ -607,51 +606,34 @@ public final class MiniMaxM3ModelInner: Module {
         func perPiece(_ xs: [MLXArray], _ f: (MLXArray) -> MLXArray) -> MLXArray {
             concatenated(xs.map(f), axis: 1)
         }
-        var h = concatenated(pieces.map { embedTokens($0) }, axis: 1)
-        var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
-        for (li, layer) in layers.enumerated() {
-            let attn = layer.selfAttn
-            let indexer = attn.indexer!
-            let c = cache[li] as! MiniMaxM3SparseCache
-            let offset = c.offset
-            // Attention half: `MiniMaxM3Attention.callAsFunction`, the row-wise ops on all rows at once.
-            let x = layer.inputLayerNorm(h)
-            let xs = split(x)
-            let queries = attn.rope(
-                attn.qNorm(perPiece(xs) { attn.wq($0) }.reshaped(1, total, attn.heads, attn.headDim))
-                    .transposed(0, 2, 1, 3), offset: offset)
-            let keysNew = attn.rope(
-                attn.kNorm(perPiece(xs) { attn.wk($0) }.reshaped(1, total, attn.kvHeads, attn.headDim))
-                    .transposed(0, 2, 1, 3), offset: offset)
-            let valuesNew = perPiece(xs) { attn.wv($0) }.reshaped(1, total, attn.kvHeads, attn.headDim)
-                .transposed(0, 2, 1, 3)
-            let (keysAll, valuesAll) = c.update(keys: keysNew, values: valuesNew)
-            let indexQueries = indexer.rope(
-                indexer.queryNorm(perPiece(xs) { indexer.queryProjection($0) }
-                    .reshaped(1, total, indexer.heads, indexer.headDim)).transposed(0, 2, 1, 3), offset: offset)
-            let indexKeysNew = indexer.rope(
-                indexer.keyNorm(perPiece(xs) { indexer.keyProjection($0) }.reshaped(1, total, 1, indexer.headDim))
-                    .transposed(0, 2, 1, 3), offset: offset)
-            let indexKeysAll = c.updateIndexKeys(indexKeysNew)
-            var attended: [MLXArray] = []
-            for (i, b) in bounds.enumerated() {
-                let end = offset + b.upperBound
-                let selection = indexer.select(
-                    queries: indexQueries[0..., 0..., b, 0...], keys: indexKeysAll[.ellipsis, ..<end, 0...],
-                    offset: offset + b.lowerBound)
-                let output = attn.attend(
-                    queries[0..., 0..., b, 0...], keysAll[.ellipsis, ..<end, 0...],
-                    valuesAll[.ellipsis, ..<end, 0...], selection: selection,
-                    mask: rows[i] > 1 ? .causal : .none)
-                attended.append(attn.wo(output.transposed(0, 2, 1, 3).reshaped(1, rows[i], -1)))
+        // A projection whose rows are invariant from `T` rows on, on this device (`MiniMaxM3RowInvariance`, probed
+        // once per shape): the pieces of at least `T` rows in one call, the others per piece.
+        let maxRows = max(total, MiniMaxM3RowInvariance.probeRows)
+        func project(_ linear: Linear, _ xs: [MLXArray]) -> MLXArray {
+            guard let t = MiniMaxM3RowInvariance.threshold(linear, maxRows: maxRows, dtype: xs[0].dtype) else {
+                return perPiece(xs) { linear($0) }
             }
-            h = h + concatenated(attended, axis: 1)
-            // MLP half.
+            let big = xs.indices.filter { xs[$0].dim(1) >= t }
+            guard big.count > 1 else { return perPiece(xs) { linear($0) } }
+            var out = [MLXArray?](repeating: nil, count: xs.count)
+            let y = linear(concatenated(big.map { xs[$0] }, axis: 1))
+            var at = 0
+            for i in big {
+                let n = xs[i].dim(1)
+                out[i] = y[0..., at ..< (at + n), 0...]
+                at += n
+            }
+            for i in xs.indices where out[i] == nil { out[i] = linear(xs[i]) }
+            return concatenated(out.map { $0! }, axis: 1)
+        }
+        // MLP half: post-norm, router (matmul per piece or admitted), routed experts (`routedRows`), shared expert /
+        // dense MLP projections (per piece or admitted), SwiGLU, combine and residual on all rows.
+        func batchedMLP(_ layer: MiniMaxM3DecoderLayer, _ h: MLXArray, _ li: Int) -> MLXArray {
             let xn = layer.postAttentionLayerNorm(h)
             let xns = split(xn)
             if let block = layer.mlp as? MiniMaxM3SparseMoeBlock {
                 // `MiniMaxM3SparseMoeBlock.route`, the router's matmul per piece, the rest on all rows.
-                let routerScores = sigmoid(perPiece(xns) { block.gate($0) }.asType(.float32))
+                let routerScores = sigmoid(project(block.gate, xns).asType(.float32))
                 let choice = routerScores + block.eScoreCorrectionBias
                 let indices = argPartition(-choice, kth: block.topK - 1, axis: -1)[.ellipsis, ..<block.topK]
                 var scores = takeAlong(routerScores, indices, axis: -1)
@@ -664,18 +646,69 @@ public final class MiniMaxM3ModelInner: Module {
                     sortedAll: sortedAll, layer: li)
                 let shared = block.sharedExperts
                 let activated = miniMaxM3SwiGLU(
-                    up: perPiece(xns) { shared.upProj($0) }, gate: perPiece(xns) { shared.gateProj($0) },
+                    up: project(shared.upProj, xns), gate: project(shared.gateProj, xns),
                     alpha: shared.alpha, limit: shared.limit)
-                let sharedOut = perPiece(split(activated)) { shared.downProj($0) }
-                h = h + (routed + sharedOut).asType(xn.dtype)
+                let sharedOut = project(shared.downProj, split(activated))
+                return h + (routed + sharedOut).asType(xn.dtype)
             } else if let dense = layer.mlp as? MiniMaxM3MLP {
                 let activated = miniMaxM3SwiGLU(
-                    up: perPiece(xns) { dense.upProj($0) }, gate: perPiece(xns) { dense.gateProj($0) },
+                    up: project(dense.upProj, xns), gate: project(dense.gateProj, xns),
                     alpha: dense.alpha, limit: dense.limit)
-                h = h + perPiece(split(activated)) { dense.downProj($0) }
+                return h + project(dense.downProj, split(activated))
             } else {
-                h = h + perPiece(xns) { layer.mlp($0) }
+                return h + perPiece(xns) { layer.mlp($0) }
             }
+        }
+        var h = concatenated(pieces.map { embedTokens($0) }, axis: 1)
+        var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
+        for (li, layer) in layers.enumerated() {
+            let attn = layer.selfAttn
+            guard let indexer = attn.indexer, let c = cache[li] as? MiniMaxM3SparseCache else {
+                // A dense-attention layer (M3: layers 0-2): its attention half per piece, the MLP half below batched.
+                let masks: [MLXFast.ScaledDotProductAttentionMaskMode] = rows.map { $0 > 1 ? .causal : .none }
+                h = concatenated(
+                    zip(split(h), masks).map { layer.attentionHalf($0.0, mask: $0.1, cache: cache[li]) }, axis: 1)
+                h = batchedMLP(layer, h, li)
+                if recording && dsparkTapLayers.contains(li) {
+                    let hs = split(h)
+                    for i in pieces.indices where recordTaps[i] { taps[i][li] = hs[i] }
+                }
+                continue
+            }
+            let offset = c.offset
+            // Attention half: `MiniMaxM3Attention.callAsFunction`, the row-wise ops on all rows at once.
+            let x = layer.inputLayerNorm(h)
+            let xs = split(x)
+            let queries = attn.rope(
+                attn.qNorm(project(attn.wq, xs).reshaped(1, total, attn.heads, attn.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let keysNew = attn.rope(
+                attn.kNorm(project(attn.wk, xs).reshaped(1, total, attn.kvHeads, attn.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let valuesNew = project(attn.wv, xs).reshaped(1, total, attn.kvHeads, attn.headDim)
+                .transposed(0, 2, 1, 3)
+            let (keysAll, valuesAll) = c.update(keys: keysNew, values: valuesNew)
+            let indexQueries = indexer.rope(
+                indexer.queryNorm(project(indexer.queryProjection, xs)
+                    .reshaped(1, total, indexer.heads, indexer.headDim)).transposed(0, 2, 1, 3), offset: offset)
+            let indexKeysNew = indexer.rope(
+                indexer.keyNorm(project(indexer.keyProjection, xs).reshaped(1, total, 1, indexer.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let indexKeysAll = c.updateIndexKeys(indexKeysNew)
+            var attended: [MLXArray] = []
+            for (i, b) in bounds.enumerated() {
+                let end = offset + b.upperBound
+                let selection = indexer.select(
+                    queries: indexQueries[0..., 0..., b, 0...], keys: indexKeysAll[.ellipsis, ..<end, 0...],
+                    offset: offset + b.lowerBound)
+                let output = attn.attend(
+                    queries[0..., 0..., b, 0...], keysAll[.ellipsis, ..<end, 0...],
+                    valuesAll[.ellipsis, ..<end, 0...], selection: selection,
+                    mask: rows[i] > 1 ? .causal : .none)
+                attended.append(output.transposed(0, 2, 1, 3).reshaped(1, rows[i], -1))
+            }
+            h = h + project(attn.wo, attended)
+            h = batchedMLP(layer, h, li)
             if recording && dsparkTapLayers.contains(li) {
                 let hs = split(h)
                 for i in pieces.indices where recordTaps[i] { taps[i][li] = hs[i] }
@@ -1295,4 +1328,64 @@ private func decodeLayerFlags<K: CodingKey>(
         return flags
     }
     return try container.decode([Bool].self, forKey: key).map { $0 ? 1 : 0 }
+}
+
+/// Per-device row invariance of a projection (`Linear` / `QuantizedLinear`): the smallest row count `T` from which a
+/// row's output does not depend on how many rows the call carries, up to `maxRows`, or nil. MLX picks split-K, tile
+/// sizes and the vector kernel by the row count M and the device, so it is measured, not assumed: once per (module type,
+/// shape, quantization, dtype, maxRows), on random inputs, op(x[..< m]) == op(x)[..< m] bit for bit for every m from
+/// the candidate to the candidate + 64 and then every 32 rows to `maxRows` (MLX's choices change at tile multiples).
+/// Candidates 33, 65, 129, 257, 513, 1025: the first that holds is admitted. (vMLX Python measured on MLX 0.32 / M5: q /
+/// o / shared-down / dense-down from 33 rows, shared gate / up from 65, k / v / index-q from 513, index-k and the fp32
+/// router only past ~1,500.) `VMLX_M3_ROW_INVARIANCE=0` admits nothing (every projection per piece).
+enum MiniMaxM3RowInvariance {
+    /// The row counts probed at least (a prefill step chunk).
+    static let probeRows = 2048
+    static let candidates = [33, 65, 129, 257, 513, 1025]
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var admitted: [String: Int?] = [:]
+    /// Tests: the probe results so far.
+    static var results: [String: Int?] { lock.withLock { admitted } }
+
+    static func key(_ linear: Linear, maxRows: Int, dtype: DType) -> String {
+        var key = "\(type(of: linear))|\(linear.weight.shape)|\(linear.weight.dtype)|\(dtype)|\(maxRows)"
+        if let q = linear as? QuantizedLinear {
+            key += "|\(q.mode)|\(q.bits)|\(q.groupSize)"
+        }
+        return key
+    }
+
+    /// CONTROL ONLY (tests that must fail): every projection admitted from this row count, unprobed.
+    @TaskLocal static var controlForcedThreshold: Int?
+
+    static func threshold(_ linear: Linear, maxRows: Int, dtype: DType) -> Int? {
+        if let forced = controlForcedThreshold { return forced }
+        guard ProcessInfo.processInfo.environment["VMLX_M3_ROW_INVARIANCE"] != "0" else { return nil }
+        let k = key(linear, maxRows: maxRows, dtype: dtype)
+        if let known = lock.withLock({ admitted[k] }) { return known }
+        let result = probe(linear, maxRows: maxRows, dtype: dtype)
+        lock.withLock { admitted[k] = result }
+        RuntimeDiagnostics.write(Data(
+            "[vmlx][minimax-m3] row invariance \(k): \(result.map { "from \($0) rows" } ?? "none")\n".utf8))
+        return result
+    }
+
+    static func probe(_ linear: Linear, maxRows: Int, dtype: DType) -> Int? {
+        let inputs = (linear as? QuantizedLinear).map { $0.scales.dim(-1) * $0.groupSize } ?? linear.weight.dim(-1)
+        let x = (MLXRandom.normal([1, maxRows, inputs], key: MLXRandom.key(29)) * Float(0.5)).asType(dtype)
+        let full = linear(x)
+        eval(full)
+        for candidate in candidates where candidate <= maxRows {
+            var sizes = Array(candidate ... min(maxRows, candidate + 64))
+            sizes += stride(from: candidate + 96, through: maxRows, by: 32)
+            if !sizes.contains(maxRows) { sizes.append(maxRows) }
+            var holds = true
+            for m in sizes where holds {
+                // Rows are independent inputs; the kernel a row count picks is what is probed.
+                holds = arrayEqual(linear(x[0..., ..<m, 0...]), full[0..., ..<m, 0...]).item(Bool.self)
+            }
+            if holds { return candidate }
+        }
+        return nil
+    }
 }
