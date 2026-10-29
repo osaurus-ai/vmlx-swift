@@ -405,8 +405,11 @@ final class MiniMaxM3DecoderLayer: Module {
     @ModuleInfo(key: "mlp") var mlp: UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: MiniMaxM3RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: MiniMaxM3RMSNorm
+    /// This layer's index in the stack (the fused-decode seam passes it to the kernels).
+    let index: Int
 
     init(_ config: MiniMaxM3Configuration, layer: Int, routed: (any WeightedRoutedExpertLayer)? = nil) {
+        index = layer
         _selfAttn.wrappedValue = MiniMaxM3Attention(config, layer: layer)
         _mlp.wrappedValue =
             config.isMoE(layer)
@@ -423,8 +426,13 @@ final class MiniMaxM3DecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        return h + mlp(postAttentionLayerNorm(h))
+        // Fused decode (`MiniMaxM3FusedDecode`, off by default): 1...16-row single-sequence calls, block by block.
+        let fused = MiniMaxM3FusedDecode.active(rows: x.dim(1), batch: x.dim(0))
+        let h =
+            fused?.attentionBlock(layer: index, module: self, x: x, cache: cache, verify: false)
+            ?? x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        return fused?.mlpBlock(layer: index, module: self, h: h, verify: false)
+            ?? h + mlp(postAttentionLayerNorm(h))
     }
 }
 
