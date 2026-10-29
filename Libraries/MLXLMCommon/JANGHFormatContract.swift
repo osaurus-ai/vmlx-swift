@@ -4,8 +4,16 @@ import Foundation
 /// Keep this separate from affine quantization: identical bit packing does not
 /// imply identical weight decoding or activation rotation.
 struct JANGHFormatContract: Sendable {
-    enum ValidationError: Error, Equatable {
+    enum ValidationError: Error, Equatable, LocalizedError {
         case invalid(String)
+
+        /// The message itself: apps show `localizedDescription`, which otherwise reads "The operation couldn't be
+        /// completed. (MLXLMCommon.JANGHFormatContract.ValidationError error 0.)".
+        var errorDescription: String? {
+            switch self {
+            case .invalid(let message): return "JANGH bundle: \(message)"
+            }
+        }
     }
 
     enum Rotation: String, Decodable, Sendable {
