@@ -1090,7 +1090,7 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     static var prefillClearEachChunk: Bool {
         prefillClearEachChunkOverride ?? flag("VMLX_M3_PREFILL_CLEAR_EACH_CHUNK", default: false)
     }
-    /// `VMLX_M3_PREFILL_SORTED` (default off while measured): the JANGT routed experts of every non-final piece of an
+    /// `VMLX_M3_PREFILL_SORTED` (default on; `=0` = the stock 128-row rule): the JANGT routed experts of every non-final piece of an
     /// aligned prefill with at least `prefillSortedMinPairs` (row, slot) pairs (18 rows at top-4, vMLX Python's rule) run
     /// on the expert-sorted prefill tiles; the stock rule sends pieces under 128 rows (512 pairs) to the decode kernels,
     /// where each small piece decoded nearly every expert on its own (on a many-message chat most pieces are small). A
@@ -1098,7 +1098,7 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// bit-identical; the pieces of 18-127 rows get another kernel family's numbers, so the rule is part of the cache
     /// identity (`alignedPrefillSchema`).
     @TaskLocal static var prefillSortedAllOverride: Bool?
-    static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: false) }
+    static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: true) }
     /// The (row, slot) pairs from which a non-final piece takes the sorted tiles under `prefillSortedAll`: a number
     /// value of `VMLX_M3_PREFILL_SORTED` (e.g. 128), never below `sortedFloorPairs`; any other "on" value = the floor.
     @TaskLocal static var prefillSortedMinPairsOverride: Int?
@@ -1111,11 +1111,12 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// sorted NAX tiles fail to build their Metal kernel for a 1-row call ("no matching function for call to
     /// jt_gather_qmm_nax", `M3RealT5 rowdep`, Studio 2026-10-29), so smaller pieces always keep the decode kernels.
     static let sortedFloorPairs = 72
-    /// `VMLX_M3_PREFILL_BATCH_ROWS` (default off while measured): inside a group, the row-wise ops of all pieces in
-    /// one call each (`MiniMaxM3ModelInner.prefillPiecesBatched`); the row-count-dependent matmuls stay per piece.
+    /// `VMLX_M3_PREFILL_BATCH_ROWS` (default on; `=0` = `prefillPieces`): inside a group, the row-wise ops of all pieces
+    /// in one call each (`MiniMaxM3ModelInner.prefillPiecesBatched`); the row-count-dependent matmuls stay per piece
+    /// unless this device's probe admits them. Bit-identical. Studio, raw held-out stream 8,269 tokens: 625 -> 701 pp/s.
     @TaskLocal static var prefillBatchRowsOverride: Bool?
     static var prefillBatchRows: Bool {
-        prefillBatchRowsOverride ?? flag("VMLX_M3_PREFILL_BATCH_ROWS", default: false)
+        prefillBatchRowsOverride ?? flag("VMLX_M3_PREFILL_BATCH_ROWS", default: true)
     }
     /// `VMLX_M3_PREFILL_ASYNC` (default off, A/B): evaluate each prefill group asynchronously, so the CPU builds the next
     /// group's graph while the GPU runs this one.
