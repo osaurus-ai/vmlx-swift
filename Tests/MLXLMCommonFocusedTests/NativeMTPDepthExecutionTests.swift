@@ -172,6 +172,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 iterator.finalizeGenerationStats(generatedTokenIds: generated)
                 return (iterator.adaptiveDepthCeiling, iterator.nativeMTPStats?.adaptiveCeiling)
             }
+            XCTAssertEqual(top, NativeMTPDepthPolicy.verifierTopRung, "a recursive head's rung is the exact verify window")
             let (resolved, reported) = try ceiling(nil)
             XCTAssertEqual(resolved, top, "default policy ceiling \(resolved) != runtime top rung \(top)")
             XCTAssertEqual(reported, top, "stats must report the real top rung")

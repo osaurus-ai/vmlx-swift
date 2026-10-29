@@ -12,10 +12,14 @@ import XCTest
 final class NativeMTPRuntimeTopRungTests: XCTestCase {
     private let noEnv: [String: String] = [:]
 
-    func testRecursiveHeadUsesTheRuntimesRecursiveTopRung() {
+    /// A recursive head's top rung is the verifier's exact window (8 verify rows = depth 7), not the former tuning
+    /// number 5.
+    func testRecursiveHeadTopRungIsTheExactVerifyWindow() {
+        let exactTop = FlashVerificationScope.rowExactVerifyRows.upperBound - 1
+        XCTAssertEqual(exactTop, 7)
         XCTAssertEqual(
-            NativeMTPDepthPolicy.runtimeTopRung(model: TopRungFake(block: nil), environment: noEnv),
-            NativeMTPDepthPolicy.recursiveHeadTopRung)
+            NativeMTPDepthPolicy.runtimeTopRung(model: TopRungFake(block: nil), environment: noEnv), exactTop)
+        XCTAssertEqual(NativeMTPDepthPolicy.recursiveHeadTopRung, exactTop)
     }
 
     /// A block drafter's top rung is its deepest proposal (block - 1) within the verifier's exact window,
