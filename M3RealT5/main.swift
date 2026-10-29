@@ -639,6 +639,8 @@ case "stepab": try await taskStepAB()
 case "vsplit": try await taskVerifySplit()
 case "serving": try await taskServing()
 case "servingloop": try await taskServingLoop()
+case "servingdoc": try await taskServingDoc()
+case "reload": try await taskReload()
 case "msainfo": log(msaDiagnostics())
 case "fdloop":
     // A long loop of one integer floorDivide per eval (for sampling the process from outside).

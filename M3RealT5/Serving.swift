@@ -306,3 +306,166 @@ func taskServingLoop() async throws {
     await warm.shutdown()
     await cold.shutdown()
 }
+
+// MARK: - servingdoc: a long document turn and same-mode follow-ups through BatchEngine (the Osaurus GUI shape)
+
+/// Turn 1: one user message with a ~`T5_DOC_TOKENS` document (+ a needle) and a question; turns 2..3: follow-ups in the
+/// same thinking mode (`T5_DOC_THINKING`: unset = adaptive, on, off). Warm = the container's engine with the coordinator;
+/// each follow-up is then replayed on a cold engine (no coordinator): output equality (greedy) and first-event latency.
+/// Per turn: rows the restore kept vs the rule's K_prev, prefill / decode speed, MLX active / peak, the scheduling limit.
+/// `T5_LANE=dspark` attaches the drafter (its per-request `[dSpark]` stats lines carry acceptance warm vs cold).
+func taskServingDoc() async throws {
+    let dir = bundleURL()
+    let lane = env["T5_LANE"] ?? "plain"
+    let step = Int(env["T5_STEP"] ?? "2048")!
+    let maxTokens = Int(env["T5_MAX_TOKENS"] ?? "160")!
+    let target = Int(env["T5_DOC_TOKENS"] ?? "35000")!
+    let thinking = env["T5_DOC_THINKING"]
+    let followups = Int(env["T5_DOC_FOLLOWUPS"] ?? "2")!
+    if let limit = env["T5_SERVE_PLAN_LIMIT"].flatMap(Int.init) {
+        // The old Safe Auto value on a 128 GB Mac (before the resident-pool policy): the scheduling floor must lift it.
+        Memory.memoryLimit = limit
+    }
+    let (context, plan, loadMs) = try await osaurusPlanLoad(dir)
+    if let limit = env["T5_SERVE_PLAN_LIMIT"].flatMap(Int.init) { Memory.memoryLimit = limit }
+    guard let model = context.model as? MiniMaxM3Model else { fatalError("not MiniMaxM3Model") }
+    let drafter = lane == "dspark" ? try attachDrafter(model, dir) : nil
+    if lane == "dspark" && drafter == nil { fatalError("no drafter resolved") }
+    let processor = context.processor
+    let tokenizer = context.tokenizer
+    let diskDir = outDir.appendingPathComponent("servingdoc-disk-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: diskDir) }
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache = plan.cache
+    let container = ModelContainer(context: context)
+    await container.enableCachingAsync(
+        config: settings.cacheCoordinatorConfig(modelKey: "m31-servingdoc-\(lane)", diskCacheDirectory: diskDir))
+    let warm = await container.makeBatchEngine(maxBatchSize: 1)
+    let cold = await container.perform { ctx in BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil) }
+    let suffix = generationPromptSuffix(tokenizer)
+    let recorder = LoopRecorder()
+    recorder.install()
+    log("servingdoc \(lane): step \(step), doc ~\(target) tokens, thinking \(thinking ?? "adaptive"), load \(Int(loadMs)) ms, MLX limit \(String(format: "%.2f", gib(Memory.memoryLimit))) GiB, plan: \(plan.displaySummary)")
+
+    let stream = try loadTokens().map(Int.init)
+    var parts: [String] = ["Field report archive, volume 7.\n"]
+    var budget = target - 300
+    var s = 0
+    while budget > 0, s < stream.count {
+        let e = min(s + 2000, stream.count)
+        let text = tokenizer.decode(tokenIds: Array(stream[s ..< e]), skipSpecialTokens: true)
+        let n = tokenizer.encode(text: text, addSpecialTokens: false).count
+        if n <= budget {
+            parts.append(text)
+            budget -= n
+        } else {
+            parts.append(String(text.prefix(Int(Double(text.count) * Double(budget) / Double(n)))))
+            budget = 0
+        }
+        s = e
+    }
+    parts.insert("\n\nIMPORTANT NOTE: The access code for the Meridian vault is 4471-KESTREL-8093.\n\n", at: parts.count * 3 / 5)
+    let document = parts.joined()
+    let questions = [
+        "Read the document and answer: what is the access code for the Meridian vault? Give the code on the first line, then summarize the document in about 120 words.",
+        "Follow-up: which word in the access code is the codename, and in which part of the document did the note appear?",
+        "Follow-up: list three topics the document covers besides the access code.",
+    ]
+    var messages: [Chat.Message] = [.user("<document>\n" + document + "\n</document>\n\n" + questions[0])]
+    func parameters() -> GenerateParameters {
+        var p = GenerateParameters(maxTokens: maxTokens, temperature: 0, prefillStepSize: step)
+        if let drafter { p.draftStrategy = .dspark(drafterPath: drafter) }
+        return p
+    }
+    var previousK = 0
+    var previous: [Int] = []
+    var turns: [[String: Any]] = []
+    for turn in 0 ... followups {
+        let input = try await processor.prepare(
+            input: UserInput(chat: messages, additionalContext: thinkingContext(thinking)))
+        let ids = tokenIds(input)
+        let k = AlignedPrefillGeometry.storeBoundary(
+            promptTokenIds: ids, cachePrefixTokenCounts: input.cachePrefixTokenCounts ?? [], generationPromptSuffix: suffix) ?? 0
+        let common = lcp(ids, previous)
+        Memory.peakMemory = 0
+        let r0 = recorder.prefills.count
+        let w = await serve(warm, input, parameters())
+        let reused = recorder.prefills.count > r0 ? recorder.prefills[r0].start : -1
+        let warmPeak = gib(Memory.peakMemory)
+        var row: [String: Any] = [
+            "turn": turn + 1, "prompt": ids.count, "K": k, "lcp_previous": common, "previous_K": previousK,
+            "reused": reused, "reuse_is_previous_K": turn == 0 ? reused == 0 : reused == previousK,
+            "warm_first_event_ms": w.firstEventMs, "warm_prompt_s": w.info?.promptTime ?? -1,
+            "warm_decode_tok_s": w.info.map { Double(max(0, $0.generationTokenCount - 1)) / max(1e-9, $0.generateTime) } ?? 0,
+            "warm_peak_GiB": warmPeak, "mlx_active_GiB": gib(Memory.activeMemory), "memory_limit_GiB": gib(Memory.memoryLimit),
+            "retrieved": (w.text + w.reasoning).contains("KESTREL"), "text": String(w.text.prefix(100)),
+        ]
+        if turn > 0 {
+            let coldInput = try await processor.prepare(
+                input: UserInput(chat: messages, additionalContext: thinkingContext(thinking)))
+            Memory.peakMemory = 0
+            let c = await serve(cold, coldInput, parameters())
+            let same = w.text == c.text && w.reasoning == c.reasoning && !(c.text.isEmpty && c.reasoning.isEmpty)
+            row["cold_first_event_ms"] = c.firstEventMs
+            row["cold_prompt_s"] = c.info?.promptTime ?? -1
+            row["output_equal"] = same
+            row["cold_peak_GiB"] = gib(Memory.peakMemory)
+        }
+        turns.append(row)
+        log("servingdoc \(lane) turn \(turn + 1): prompt \(ids.count) K \(k) lcp \(common) reused \(reused) (K_prev \(previousK)); first event warm \(Int(w.firstEventMs)) ms"
+            + (turn > 0 ? " / cold \(Int((row["cold_first_event_ms"] as? Double) ?? -1)) ms, equal \(row["output_equal"] ?? "?")" : "")
+            + "; decode \(String(format: "%.1f", (row["warm_decode_tok_s"] as? Double) ?? 0)) tok/s; peak \(String(format: "%.1f", warmPeak)) GiB, limit \(String(format: "%.1f", gib(Memory.memoryLimit))) GiB; retrieved \(row["retrieved"] ?? "?")")
+        try writeJSON(["lane": lane, "step": step, "thinking": thinking ?? "adaptive", "turns": turns], "servingdoc_\(tag)_\(lane).json")
+        previous = ids
+        previousK = k
+        if turn < followups {
+            messages.append(Chat.Message(role: .assistant, content: w.text))
+            messages.append(.user(questions[turn + 1]))
+        }
+    }
+    await warm.shutdown()
+    await cold.shutdown()
+}
+
+// MARK: - reload: unload + load in one process never holds two models (GUI proof run B: swap spike on the reload)
+
+/// Load (Osaurus' plan), a short generation through BatchEngine (fused MoE on when `VMLX_M3_FUSED_DECODE=1`: the path
+/// whose process-wide per-layer view kept a released model's routed banks alive), release every reference, then load
+/// again. Per phase: MLX active / cache memory, the process footprint, swap. PASS when the second load's active memory
+/// is within 10 % of the first's (one model), FAIL when it is ~2x.
+func taskReload() async throws {
+    let dir = bundleURL()
+    func phase(_ name: String) -> [String: Any] {
+        let row: [String: Any] = [
+            "phase": name, "mlx_active_GiB": gib(Memory.activeMemory), "mlx_cache_GiB": gib(Memory.cacheMemory),
+            "footprint_GiB": physFootprintMiB() / 1024, "swap_MiB": VMStat.now().swapUsedMiB,
+        ]
+        log("reload \(name): active \(String(format: "%.2f", gib(Memory.activeMemory))) GiB, cache \(String(format: "%.2f", gib(Memory.cacheMemory))) GiB, footprint \(String(format: "%.2f", physFootprintMiB() / 1024)) GiB, swap \(Int(VMStat.now().swapUsedMiB)) MiB")
+        return row
+    }
+    var rows: [[String: Any]] = [phase("start")]
+    var actives: [Double] = []
+    for round in 1 ... 2 {
+        do {
+            let (context, _, loadMs) = try await osaurusPlanLoad(dir)
+            rows.append(phase("loaded_\(round)"))
+            actives.append(gib(Memory.activeMemory))
+            log("reload: load \(round) \(Int(loadMs)) ms")
+            let container = ModelContainer(context: context)
+            let engine = await container.makeBatchEngine(maxBatchSize: 1)
+            let input = try await context.processor.prepare(
+                input: UserInput(chat: [.user("Count from one to twenty in words.")], additionalContext: thinkingContext("off")))
+            let r = await serve(engine, input, GenerateParameters(maxTokens: 32, temperature: 0, prefillStepSize: 2048))
+            rows.append(phase("generated_\(round)"))
+            log("reload: round \(round) text \(r.text.prefix(60))")
+            await engine.shutdown()
+        }
+        Stream.gpu.synchronize()
+        Memory.clearCache()
+        rows.append(phase("released_\(round)"))
+    }
+    let ratio = actives.count == 2 && actives[0] > 0 ? actives[1] / actives[0] : -1
+    let verdict = ratio > 0 && ratio < 1.1 ? "PASS" : "FAIL"
+    log("reload: active after load 1 \(String(format: "%.2f", actives.first ?? -1)) GiB, after load 2 \(String(format: "%.2f", actives.last ?? -1)) GiB, ratio \(String(format: "%.3f", ratio)): \(verdict)")
+    try writeJSON(["rows": rows, "ratio": ratio, "verdict": verdict, "fused": env["VMLX_M3_FUSED_DECODE"] ?? "0"], "reload_\(tag).json")
+}
