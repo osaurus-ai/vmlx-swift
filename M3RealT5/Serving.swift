@@ -74,7 +74,7 @@ func taskServing() async throws {
     let dir = bundleURL()
     let lane = env["T5_LANE"] ?? "plain"
     let step = Int(env["T5_STEP"] ?? "512")!
-    let decode = Int(env["T5_SERVE_DECODE"] ?? "96")!
+    let decode = Int(env["T5_SERVE_DECODE"] ?? "160")!
     let probes = Int(env["T5_SERVE_PROBES"] ?? "3")!
     let targets = (env["T5_SERVE_LENS"] ?? "4517,35665").split(separator: ",").map { Int($0)! }
     let arms = (env["T5_SERVE_ARMS"] ?? "plan,native").split(separator: ",").map(String.init)
@@ -139,7 +139,9 @@ func taskServing() async throws {
         }
         let code = "\(4000 + salt * 37 % 900)-KESTREL-\(1000 + salt * 911 % 9000)"
         parts.insert("\n\nIMPORTANT NOTE: The access code for the Meridian vault is \(code).\n\n", at: parts.count / 2)
-        var question = "Question: What is the access code for the Meridian vault? Reply with the code only."
+        // A long answer: decode tok/s over the whole `T5_SERVE_DECODE` budget, not a 10-token code.
+        var question = "Question: What is the access code for the Meridian vault? Give the code on the first line, "
+            + "then summarize the document in about 200 words."
         for _ in 0 ..< 8 {
             let messages: [Chat.Message] = [
                 .user("Read the document and answer.\n\n<document>\n" + parts.joined() + "\n</document>\n\n" + question)
@@ -191,7 +193,7 @@ func taskServing() async throws {
                     "generated": info?.generationTokenCount ?? -1, "generate_s": info?.generateTime ?? -1,
                     "pp_s": pp, "tok_s": tg, "first_event_ms": r.firstEventMs, "total_ms": r.totalMs,
                     "mlx_peak_GiB": gib(Memory.peakMemory), "mlx_active_end_GiB": gib(Memory.activeMemory),
-                    "text": String(r.text.prefix(120)), "vm": vmA.delta(vmB),
+                    "text": String(r.text.prefix(120)), "retrieved": r.text.contains("KESTREL"), "vm": vmA.delta(vmB),
                 ])
                 log("serving \(lane) \(n) \(arm) probe \(probe): \(Int(pp)) pp/s, \(String(format: "%.1f", tg)) tok/s, peak \(String(format: "%.1f", gib(Memory.peakMemory))) GiB, limit \(String(format: "%.1f", gib(Memory.memoryLimit))) GiB [\(r.text.prefix(40))]")
                 report["probes"] = rows
