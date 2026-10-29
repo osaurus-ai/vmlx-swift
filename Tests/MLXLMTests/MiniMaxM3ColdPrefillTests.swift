@@ -323,6 +323,19 @@ struct MiniMaxM3ColdPrefillTests {
             }
             let diff = Self.problems(piecewise, batched)
             #expect(diff.isEmpty, "batched rows != piece by piece: \(diff.prefix(4))")
+            // The probe admitted some projections (the batching of matmuls really ran) ...
+            let admitted = MiniMaxM3RowInvariance.results.filter { $0.value != nil }
+            if !cuts.isEmpty { #expect(!admitted.isEmpty, "no projection admitted: \(MiniMaxM3RowInvariance.results)") }
+            print("[MiniMaxM3ColdPrefillTests] row invariance: \(MiniMaxM3RowInvariance.results)")
+            // ... and admitting every projection from one row unprobed (control) is NOT bit-identical.
+            if cutSet == 0 {
+                let forced = try MiniMaxM3RowInvariance.$controlForcedThreshold.withValue(1) {
+                    try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(true) {
+                        try Self.run(model, prompt, step: 320, cuts: cuts)
+                    }
+                }
+                #expect(!Self.problems(piecewise, forced).isEmpty, "unprobed batching agreed: the oracle is blind")
+            }
         }
     }
 

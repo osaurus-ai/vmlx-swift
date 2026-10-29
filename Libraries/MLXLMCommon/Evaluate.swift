@@ -3928,6 +3928,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // M3.1 turn wrote three to four ~4.6 GiB entries (N, N-1, N-3 and earlier history boundaries) for what one
         // entry serves. `VMLX_M3_ALIGNED_SINGLE_STORE=0` = the previous stores (A/B).
         if let plan = alignedPrefillPlan, Self.alignedSingleStoreEnabled, !isReusablePrefixWarmup,
+            !originalInput.requiresPostPrepareCacheKey,
             let boundaries = Self.alignedStoreBoundaries(
                 plan: plan, promptTokenCount: promptTokenIds.count,
                 historyBoundaries: cachePrefixTokenCounts,
