@@ -627,6 +627,13 @@ case "speed": try await taskSpeed()
 case "floordiv": try taskFloorDiv()
 case "gathersort": try taskGatherSort()
 case "layers": try await taskLayers()
+case "bload": try await taskBundleLoad()
+case "evalrows": try await taskEvalRows()
+case "dspark": try await taskDSpark()
+case "think": try await taskThink()
+case "cacheloop": try await taskCacheLoop()
+case "longctx": try await taskLongContext()
+case "profile": try await taskProfile()
 case "msainfo": log(msaDiagnostics())
 case "fdloop":
     // A long loop of one integer floorDivide per eval (for sampling the process from outside).

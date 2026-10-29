@@ -810,7 +810,7 @@ let package = Package(
 
         .executableTarget(
             name: "M3RealT5",
-            dependencies: ["MLX", "MLXNN", "MLXLMCommon", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers"],
+            dependencies: ["Cmlx", "MLX", "MLXNN", "MLXLMCommon", "MLXLLM", "MLXHuggingFace", "VMLXTokenizers"],
             path: "M3RealT5",
             exclude: ["scripts"]
         ),
