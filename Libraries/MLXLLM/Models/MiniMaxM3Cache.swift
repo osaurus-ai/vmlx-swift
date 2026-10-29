@@ -26,6 +26,9 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
     private(set) var indexStorage: MLXArray?
     private var indexCount = 0
     private static let step = 256
+    /// Bumped whenever the lanes are replaced wholesale (`state` set, a disk restore): a row checkpoint taken before
+    /// it is meaningless after it.
+    private(set) var stateGeneration = 0
 
     /// DSpark (`MiniMaxM3DSpark`): the drafter's tap rows (target-layer outputs) of the last committed positions,
     /// recorded by every forward of this sequence while a drafter is attached, keyed by absolute position. Speed-only:
@@ -97,6 +100,7 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
         }
         set {
             dsparkTail = nil
+            stateGeneration += 1
             // New rows of unknown provenance: whoever sets a state that has a geometry (`copy`, a disk restore) sets
             // the tag after it.
             alignedPrefillTag = nil
@@ -195,25 +199,55 @@ extension MiniMaxM3SparseCache: AlignedPrefillCache {
 // MARK: - Speculative checkpoint (DSpark verify)
 
 extension MiniMaxM3SparseCache: SpeculativeCheckpointCache {
-    private struct Checkpoint {
+    /// The reference form (before 2026-10-29): saved array references of every lane.
+    private struct ReferenceCheckpoint {
         let kv: Any
         let indexStorage: MLXArray?
         let indexCount: Int
         let dsparkTail: HybridPoolHiddenTail?
     }
 
+    /// Row counts only. Every lane is append-only between a checkpoint and its restore (a verify appends rows at the
+    /// end, growth copies the old rows into a larger buffer unchanged, a rollback trims), so the rows below the saved
+    /// counts never change and a restore is a trim back to them.
+    private struct RowCheckpoint {
+        let offset: Int
+        let indexCount: Int
+        let dsparkTail: HybridPoolHiddenTail?
+        let generation: Int
+    }
+
+    /// `VMLX_M3_REFERENCE_CHECKPOINT=1` restores the reference checkpoint (A/B only). A saved reference is a second
+    /// owner of each lane's buffer, so MLX cannot donate it to the verify's first slice update: every DSpark round
+    /// copied every layer's full-capacity K, V and index-key buffers (at 35k context 4.6 GiB per round on M3.1).
+    static let referenceCheckpointEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_M3_REFERENCE_CHECKPOINT"] == "1"
+    /// Tests: the checkpoint form for the current task (nil = the environment's).
+    @TaskLocal static var referenceCheckpointOverride: Bool?
+    static var referenceCheckpoint: Bool { referenceCheckpointOverride ?? referenceCheckpointEnvironment }
+
     public var speculativeCheckpointIsExact: Bool { kv.speculativeCheckpointIsExact }
 
-    /// References only (O(1)): the K / V lane's own checkpoint, the index buffer (a separate wrapper, so a later slice
-    /// update into the live buffer cannot change it) and its row count, the DSpark tap tail.
     public func speculativeCheckpoint() -> Any {
-        Checkpoint(
-            kv: kv.speculativeCheckpoint(), indexStorage: indexStorage.map { $0[.ellipsis] }, indexCount: indexCount,
-            dsparkTail: dsparkTail)
+        if Self.referenceCheckpoint {
+            return ReferenceCheckpoint(
+                kv: kv.speculativeCheckpoint(), indexStorage: indexStorage.map { $0[.ellipsis] },
+                indexCount: indexCount, dsparkTail: dsparkTail)
+        }
+        return RowCheckpoint(offset: offset, indexCount: indexCount, dsparkTail: dsparkTail, generation: stateGeneration)
     }
 
     public func restoreSpeculativeCheckpoint(_ checkpoint: Any) {
-        guard let c = checkpoint as? Checkpoint else {
+        if let c = checkpoint as? RowCheckpoint {
+            precondition(
+                c.generation == stateGeneration && offset >= c.offset && indexCount >= c.indexCount,
+                "MiniMaxM3SparseCache: speculative checkpoint restored after the lanes were replaced or trimmed below it")
+            kv.trim(offset - c.offset)
+            indexCount = c.indexCount
+            dsparkTail = c.dsparkTail
+            return
+        }
+        guard let c = checkpoint as? ReferenceCheckpoint else {
             preconditionFailure("MiniMaxM3SparseCache: foreign speculative checkpoint")
         }
         kv.restoreSpeculativeCheckpoint(c.kv)
