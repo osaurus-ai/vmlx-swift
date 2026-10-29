@@ -171,7 +171,10 @@ struct MiniMaxM3PromptSnapshotViewTests {
         try A.withRecorder { recorder in
             let step = 320
             var counts: [Bool: (stores: Int, reused: Int)] = [:]
+            // The post-answer lever belongs to the per-boundary stores (`VMLX_M3_ALIGNED_SINGLE_STORE=0`); the single
+            // store (default) never writes a post-answer entry either (checked below).
             for skip in [true, false] {
+                try TokenIterator.$alignedSingleStoreOverride.withValue(false) {
                 try TokenIterator.$alignedPostAnswerStoreSkippedOverride.withValue(skip) {
                     let dir = A.temporaryDirectory("post-answer-\(skip)")
                     defer { try? FileManager.default.removeItem(at: dir) }
@@ -191,8 +194,30 @@ struct MiniMaxM3PromptSnapshotViewTests {
                     #expect(A.same(warm, cold), "skip \(skip): cached != cold")
                     counts[skip] = (stores, warm.cached)
                 }
+                }
             }
             let on = try #require(counts[true]), off = try #require(counts[false])
+            // Single store (default): one entry (the prompt's K), no post-answer entry, the same reuse.
+            try TokenIterator.$alignedSingleStoreOverride.withValue(true) {
+                try TokenIterator.$alignedPostAnswerStoreSkippedOverride.withValue(false) {
+                    let dir = A.temporaryDirectory("post-answer-single")
+                    defer { try? FileManager.default.removeItem(at: dir) }
+                    let model = try S.model()
+                    let coordinator = S.coordinator(dir, step: step)
+                    let prompt = S.opening() + S.gen
+                    var iterator = try Self.prefilled(model, prompt, coordinator: coordinator, step: step)
+                    var out: [Int] = []
+                    while let token = iterator.next() { out.append(token) }
+                    iterator.storeCacheAfterGeneration(generatedTokenIds: out, includeGeneratedBoundary: true)
+                    let stores = Self.diskEntries(coordinator)
+                    let next = S.opening() + S.message(S.ai, out.map { $0 % 990 })
+                        + S.message(S.tool, S.content(211, seed: 41)) + S.gen
+                    let warm = try S.run(model, next, coordinator: coordinator, step: step, recorder: recorder)
+                    let cold = try S.run(model, next, coordinator: nil, step: step, recorder: recorder)
+                    #expect(stores == 1, "single store: \(stores) entries")
+                    #expect(A.same(warm, cold) && warm.cached == on.reused, "single store: reused \(warm.cached)")
+                }
+            }
             #expect(off.stores == on.stores + 1, "stores with the post-answer entry \(off.stores), without \(on.stores)")
             #expect(on.reused == S.k(S.opening() + S.gen) && on.reused == off.reused)
         }
