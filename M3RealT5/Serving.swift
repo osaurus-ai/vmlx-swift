@@ -11,7 +11,9 @@
 //           differ in one thing. Per probe: prefill pp/s, decode tok/s, MLX active / peak, vm deltas, output text.
 //
 //   T5_SERVE_LENS=4517,35665 T5_SERVE_ARMS=plan,native T5_SERVE_PROBES=3 T5_LANE=plain|dspark T5_STEP=512
-//   T5_SERVE_DECODE=96
+//   T5_SERVE_DECODE=96 T5_SERVE_PLAN_LIMIT=<bytes>: the `plan` arm's limit instead of what this host's plan applied (the
+//   Studio's 256 GB resolve Safe Auto to 0.7 x RAM = 179 GiB; a 128 GB Mac to weights + 4 GiB = 104,518,001,232 B
+//   for M3.1 + drafter before the resident-pool fix, which is what the GUI proof ran under on erics-m5-max)
 
 import Foundation
 import MLX
@@ -81,7 +83,7 @@ func taskServing() async throws {
     let vm0 = VMStat.now()
     let (context, plan, loadMs) = try await osaurusPlanLoad(dir)
     guard let model = context.model as? MiniMaxM3Model else { fatalError("not MiniMaxM3Model") }
-    let planLimit = Memory.memoryLimit
+    let planLimit = Int(env["T5_SERVE_PLAN_LIMIT"] ?? "") ?? Memory.memoryLimit
     let nativeLimit: Int = {
         let physical = Int(ProcessInfo.processInfo.physicalMemory)
         let recommended = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
@@ -90,7 +92,7 @@ func taskServing() async throws {
     var report: [String: Any] = [
         "lane": lane, "step": step, "decode": decode, "load_ms": loadMs,
         "plan_summary": plan.displaySummary, "plan_memory_limit": "\(plan.loadConfiguration.memoryLimit)",
-        "mlx_memory_limit_after_load": planLimit, "mlx_cache_limit_after_load": Memory.cacheLimit,
+        "mlx_memory_limit_after_load": Memory.memoryLimit, "plan_arm_limit": planLimit, "mlx_cache_limit_after_load": Memory.cacheLimit,
         "native_memory_limit": nativeLimit, "pool_bytes_both_arms": pool,
         "mlx_active_after_load_GiB": gib(Memory.activeMemory), "vm_load": vm0.delta(VMStat.now()),
     ]
@@ -208,4 +210,97 @@ func taskServing() async throws {
     Memory.memoryLimit = planLimit
     await engine.shutdown()
     try writeJSON(report, "serving_\(tag)_\(lane).json")
+}
+
+// MARK: - servingloop: the per-tool-call prefix cache through BatchEngine (the path Osaurus drives)
+
+/// A 6-turn terminal-agent loop (as `cacheloop`) through Osaurus' load + ModelContainer + CacheCoordinator +
+/// BatchEngine.generate, warm (the container's engine) vs cold (an engine without a coordinator on the same model).
+/// Per turn: what the restore kept (AlignedPrefill hooks), the rule's expected reuse, first-event latency, output
+/// equality warm == cold (greedy). `T5_LANE=dspark` attaches the bundle's drafter.
+func taskServingLoop() async throws {
+    let dir = bundleURL()
+    let lane = env["T5_LANE"] ?? "plain"
+    let step = Int(env["T5_STEP"] ?? "2048")!
+    let maxTokens = Int(env["T5_MAX_TOKENS"] ?? "48")!
+    let (context, plan, _) = try await osaurusPlanLoad(dir)
+    guard let model = context.model as? MiniMaxM3Model else { fatalError("not MiniMaxM3Model") }
+    let drafter = lane == "dspark" ? try attachDrafter(model, dir) : nil
+    if lane == "dspark" && drafter == nil { fatalError("no drafter resolved") }
+    let markers = model.alignedPrefillTurnMarkers
+    log("servingloop \(lane): step \(step), markers \(markers.map(String.init(describing:)) ?? "none"), schema \(model.alignedPrefillSchema ?? "off"), MLX limit \(Memory.memoryLimit)")
+    let processor = context.processor
+    let tokenizer = context.tokenizer
+    let diskDir = outDir.appendingPathComponent("servingloop-disk-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: diskDir) }
+    var settings = VMLXServerRuntimeSettings()
+    settings.cache = plan.cache
+    let container = ModelContainer(context: context)
+    await container.enableCachingAsync(
+        config: settings.cacheCoordinatorConfig(modelKey: "m31-servingloop-\(lane)", diskCacheDirectory: diskDir))
+    let warm = await container.makeBatchEngine(maxBatchSize: 1)
+    let cold = await container.perform { ctx in BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil) }
+    let suffix = generationPromptSuffix(tokenizer)
+    let recorder = LoopRecorder()
+    recorder.install()
+
+    let toolLines = [21, 13, 50, 3, 82, 33]
+    let commands = [
+        "swift build 2>&1 | tail -40", "ls -la Sources/CacheKit", "swift test 2>&1 | tail -80",
+        "git status --short", "grep -rn \"DiskStore\" Sources Tests", "cat Package.swift",
+    ]
+    var messages: [Chat.Message] = [
+        .system(
+            "You are an autonomous coding agent working in a Linux terminal on the repository at /work/repo. Use "
+                + "run_shell to inspect and change it. Think briefly, then act."),
+        .user("The release build of CacheKit fails and two tests are flaky. Investigate and fix the build first."),
+    ]
+    var previous: [Int] = []
+    var previousK = 0
+    var turns: [[String: Any]] = []
+    var allEqual = true
+    func parameters() -> GenerateParameters {
+        var p = GenerateParameters(maxTokens: maxTokens, temperature: 0, prefillStepSize: step)
+        if let drafter { p.draftStrategy = .dspark(drafterPath: drafter) }
+        return p
+    }
+    for turn in 0 ..< 6 {
+        let input = try await processor.prepare(input: UserInput(chat: messages, tools: agentTools))
+        let ids = tokenIds(input)
+        let k = AlignedPrefillGeometry.storeBoundary(
+            promptTokenIds: ids, cachePrefixTokenCounts: input.cachePrefixTokenCounts ?? [], generationPromptSuffix: suffix) ?? 0
+        let common = lcp(ids, previous)
+        let cuts = AlignedPrefillGeometry.turnCuts(ids, markers: markers, end: k)
+        let rule = turn == 0 ? 0 : AlignedPrefillGeometry.reuseLimit(
+            matched: min(common, previousK), boundary: k, step: step, exactGeometry: false, turnCuts: cuts)
+        let r0 = recorder.prefills.count
+        let w = await serve(warm, input, parameters())
+        let warmPrefill = recorder.prefills.count > r0 ? recorder.prefills[r0].start : -1
+        let coldInput = try await processor.prepare(input: UserInput(chat: messages, tools: agentTools))
+        let c = await serve(cold, coldInput, parameters())
+        // Fail closed: an empty output on both arms is not equality.
+        let same = w.text == c.text && w.reasoning == c.reasoning && !(c.text.isEmpty && c.reasoning.isEmpty)
+        allEqual = allEqual && same
+        turns.append([
+            "turn": turn + 1, "prompt": ids.count, "K": k, "lcp_previous": common, "previous_K": previousK,
+            "reused": warmPrefill, "rule": rule, "reuse_equals_rule": warmPrefill == rule,
+            "warm_first_event_ms": w.firstEventMs, "cold_first_event_ms": c.firstEventMs,
+            "warm_prompt_s": w.info?.promptTime ?? -1, "cold_prompt_s": c.info?.promptTime ?? -1,
+            "warm_prefilled_tokens": w.info?.promptTokenCount ?? -1, "output_equal": same,
+            "text": String(w.text.prefix(80)),
+        ])
+        log("servingloop \(lane) turn \(turn + 1): prompt \(ids.count) K \(k) lcp \(common) reused \(warmPrefill) (rule \(rule)); first event warm \(Int(w.firstEventMs)) / cold \(Int(c.firstEventMs)) ms; equal \(same)")
+        previous = ids
+        previousK = k
+        if turn < 5 {
+            messages.append(
+                Chat.Message(
+                    role: .assistant, content: w.text,
+                    toolCalls: [ToolCall(function: .init(name: "run_shell", arguments: ["cmd": commands[turn]]))]))
+            messages.append(.tool(terminalOutput(lines: toolLines[turn], seed: turn)))
+        }
+        try writeJSON(["lane": lane, "step": step, "turns": turns, "all_equal": allEqual], "servingloop_\(tag)_\(lane).json")
+    }
+    await warm.shutdown()
+    await cold.shutdown()
 }

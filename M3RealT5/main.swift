@@ -638,6 +638,7 @@ case "vprofile": try await taskVerifyProfile()
 case "stepab": try await taskStepAB()
 case "vsplit": try await taskVerifySplit()
 case "serving": try await taskServing()
+case "servingloop": try await taskServingLoop()
 case "msainfo": log(msaDiagnostics())
 case "fdloop":
     // A long loop of one integer floorDivide per eval (for sampling the process from outside).
