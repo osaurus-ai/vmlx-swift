@@ -401,9 +401,13 @@ public struct DSparkDecoder {
     /// Rolling acceptance (`accept_ema`): the draft width W = clamp(round(ladderTop * ema), 1, ladderTop).
     /// Starts at blockSize / ladderTop, so the first width is the trained block.
     public private(set) var acceptEMA: Double = 1.0
+    /// Measured width pricing (`DSparkWidthPlanner`, `VMLX_DSPARK_MEASURED_WIDTH=1`); nil = the acceptance rule.
+    public private(set) var planner: DSparkWidthPlanner?
+    /// The planner's drafts for the step ``begin(remaining:)`` opened (nil until the planner has a measured round).
+    private var plannedDrafts: Int?
     let clock: () -> Double
     /// The step in flight; `timed` is false when it ran a forward width this process had not run yet.
-    private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double, timed: Bool)?
+    private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double, timed: Bool, drafts: Int)?
     /// Start time of the step ``begin(remaining:)`` opened.
     private var stepStart: Double = 0
 
@@ -412,6 +416,7 @@ public struct DSparkDecoder {
         sampling: DSparkSampling? = nil,
         governor: DSparkGovernor = DSparkGovernor(),
         ladderTop: Int? = nil, pinnedWidth: Int? = nil,
+        measuredWidth: Bool = DSparkWidthPlanner.enabledByEnvironment,
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
         precondition(blockSize >= 1, "dSpark block size must be at least 1")
@@ -425,11 +430,13 @@ public struct DSparkDecoder {
         stats.sampled = sampling != nil
         self.governor = governor
         self.clock = clock
+        planner = measuredWidth ? DSparkWidthPlanner(ladderTop: self.ladderTop) : nil
     }
 
     /// Current draft width.
     public var width: Int {
         if let pinnedWidth { return Swift.min(pinnedWidth, ladderTop) }
+        if planner != nil, let plannedDrafts { return Swift.max(1, Swift.min(ladderTop, plannedDrafts)) }
         return Swift.max(1, Swift.min(ladderTop, Int((Double(ladderTop) * acceptEMA).rounded())))
     }
 
@@ -461,9 +468,10 @@ public struct DSparkDecoder {
         // A block needs room for at least the seed plus one draft.
         guard governor.choose() == .spec, remaining >= 2 else {
             stats.arSteps += 1
-            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1))
+            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1), 0)
             return false
         }
+        plannedDrafts = planner?.plan(arStep: governor.ar)
         return true
     }
 
@@ -476,7 +484,7 @@ public struct DSparkDecoder {
         // No stop token may be pending.
         guard !stopTokenIDs.contains(seed), let checkpoint = SpeculativeCacheListCheckpoint(cache) else {
             stats.arSteps += 1
-            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1))
+            last = (.ar, 1, now, !DSparkForwardWidths.firstUse(1), 0)
             return .autoregressive
         }
 
@@ -529,6 +537,7 @@ public struct DSparkDecoder {
         while k < proposed.count, proposed[k] == truth[k] { k += 1 }
         stats.accepted += k
         acceptEMA = 0.7 * acceptEMA + 0.3 * (Double(k) / Double(Swift.max(1, proposed.count)))
+        planner?.observe(drafts: proposed.count, accepted: k)
 
         let fullAccept = k == proposed.count
         // Never commit past a stop token or the budget: the cache must end exactly where ordinary
@@ -584,7 +593,7 @@ public struct DSparkDecoder {
         if let commitWidth {
             newWidth = DSparkForwardWidths.firstUse(commitWidth) || newWidth
         }
-        last = (.spec, emit.count, now, !newWidth)
+        last = (.spec, emit.count, now, !newWidth, proposed.count)
         return .committed(emit, next: next)
     }
 
@@ -599,6 +608,7 @@ public struct DSparkDecoder {
         let seconds = Swift.max(0, now - last.start)
         if last.timed {
             governor.record(last.mode, seconds: seconds, emitted: last.emitted)
+            if last.mode == .spec { planner?.observeCost(drafts: last.drafts, seconds: seconds) }
         }
         switch last.mode {
         case .spec: stats.specSeconds += seconds
