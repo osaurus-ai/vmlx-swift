@@ -1,0 +1,136 @@
+{
+ "commit": "e2bb5b771",
+ "images": [
+  {
+   "name": "round_203x97",
+   "width": 203,
+   "height": 97,
+   "grid": [
+    1,
+    6,
+    14
+   ],
+   "pixel_values_sha256": "482d72d90fcbf3277864c18642d4140eb6a82d6899b143c1688dc6d93b20fce3",
+   "pixel_values_bf16_sha256": "38720b404f532030451ded21d823e1ea4697e11bae7321286f95308a86cc0f87"
+  },
+  {
+   "name": "min_50x40",
+   "width": 50,
+   "height": 40,
+   "grid": [
+    1,
+    4,
+    6
+   ],
+   "pixel_values_sha256": "c5aecac7f1a3f207acb137164d75f10ee8ebe8c13a84d7bfa1660519572ddee1",
+   "pixel_values_bf16_sha256": "5bece446ee5b26929e7cf7ab5631912c3115147562c2f1a745d2a3941ac00bfd"
+  },
+  {
+   "name": "max_1100x700",
+   "width": 1100,
+   "height": 700,
+   "grid": [
+    1,
+    38,
+    60
+   ],
+   "pixel_values_sha256": "2216069a517b1862087e16bc9be6d08e72bece6b6690e8b2b7e8547a051ee2c2",
+   "pixel_values_bf16_sha256": "b0f7a4e892bb1448b5ef8ab52b1e141b5798eccec242e2d60096d4a6b9886889"
+  },
+  {
+   "name": "same_112x112",
+   "width": 112,
+   "height": 112,
+   "grid": [
+    1,
+    8,
+    8
+   ],
+   "pixel_values_sha256": "3ac32a6e5e493357dc6eaaf08be8125c4ee7d112db2a3eec9bfd0d74e6504ccd",
+   "pixel_values_bf16_sha256": "f88a18e06a60dabb4e6e956c87e358f0f93461fdba4847e26a84e1b8cd51486a"
+  }
+ ],
+ "tiny_config": {
+  "hidden_size": 64,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 2,
+  "intermediate_size": 96,
+  "patch_size": 14,
+  "layer_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "num_channels": 3,
+  "img_token_compression_config": {
+   "spatial_merge_size": 2,
+   "temporal_patch_size": 2
+  }
+ },
+ "projector_hidden_size": 32,
+ "features": {
+  "round_203x97": {
+   "rows": 21,
+   "dtype": "mlx.core.float32",
+   "sha256_f32": "5548033c670c7c9a596e3fea861b3fa097e0a96349b55dee0b76bf926fd90851"
+  },
+  "same_112x112": {
+   "rows": 16,
+   "dtype": "mlx.core.float32",
+   "sha256_f32": "357a8f6f389e3b5399d294b1221cc04525dc2873bdafc63f62cd5d9c44245e8e"
+  },
+  "joint": {
+   "rows": 37,
+   "dtype": "mlx.core.float32",
+   "sha256_f32": "b02e32828b048939338d2178f2c70d6fefff18329c53a50725adf8892871d34e"
+  }
+ },
+ "weights": {
+  "multi_modal_projector.linear_1.bias": "mlx.core.bfloat16",
+  "multi_modal_projector.linear_1.weight": "mlx.core.bfloat16",
+  "multi_modal_projector.linear_2.bias": "mlx.core.bfloat16",
+  "multi_modal_projector.linear_2.weight": "mlx.core.bfloat16",
+  "patch_merge_mlp.linear_1.bias": "mlx.core.bfloat16",
+  "patch_merge_mlp.linear_1.weight": "mlx.core.bfloat16",
+  "patch_merge_mlp.linear_2.bias": "mlx.core.bfloat16",
+  "patch_merge_mlp.linear_2.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.embeddings.patch_embedding.weight": "mlx.core.float32",
+  "vision_tower.vision_model.encoder.layers.0.layer_norm1.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.layer_norm1.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.layer_norm2.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.layer_norm2.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.mlp.fc1.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.mlp.fc2.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.mlp.fc2.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.k_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.k_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.v_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.0.self_attn.v_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.layer_norm1.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.layer_norm1.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.layer_norm2.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.layer_norm2.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.mlp.fc1.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.mlp.fc1.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.mlp.fc2.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.mlp.fc2.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.k_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.k_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.out_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.out_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.q_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.q_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.v_proj.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.encoder.layers.1.self_attn.v_proj.weight": "mlx.core.bfloat16",
+  "vision_tower.vision_model.pre_layrnorm.bias": "mlx.core.bfloat16",
+  "vision_tower.vision_model.pre_layrnorm.weight": "mlx.core.bfloat16"
+ },
+ "renders": {
+  "one_image": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\n]<]image[>[What is in this image?[e~[\n]~b]ai\n",
+  "two_images": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\n]<]image[>[]<]image[>[Which has more circles?[e~[\n]~b]ai\n",
+  "follow_up": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are terse.[e~[\n]~b]user\n]<]image[>[Describe it.[e~[\n]~b]ai\n</mm:think>A red square.[e~[\n]~b]user\nWhat color was it?[e~[\n]~b]ai\n",
+  "image_only": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\n]<]image[>[[e~[\n]~b]ai\n"
+ }
+}
