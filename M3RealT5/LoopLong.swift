@@ -3,6 +3,7 @@
 //
 // Test harness (not shipped): the agentic prefix-cache loop and the long-context runs on the real MiniMax-M3.1 bundle.
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXNN
@@ -399,4 +400,195 @@ func taskStepAB() async throws {
         log("stepab n=\(n): " + steps.map { "C=\($0) \(Int(median(t[$0]!))) pp/s" }.joined(separator: ", "))
     }
     try writeJSON(report, "stepab_\(tag).json")
+}
+
+// MARK: - cutsab
+
+/// Cold prefill of the held-out stream (concatenated chat transcripts: a message end every ~140 tokens) at step 2048
+/// through TokenIterator, the arms interleaved per round in a rotating order, 1 discarded + T5_PROBES rounds:
+///   nocuts     v1 chunk-only rule (the model's turn markers removed): 2048-row chunks + the store boundary
+///   grouped    v2 turn cuts, the pieces of a chunk as one layer-major group (default since 2026-10-29)
+///   piecewise  v2 turn cuts, piece by piece (`VMLX_M3_PREFILL_GROUP=0`)
+///   old        piecewise + buffer cache released after every chunk + stock lane growth (the 10-29 pin's prefill)
+/// Per arm and probe: pp/s, the pieces, the first token and a sha of the first-token logits. grouped / piecewise / old
+/// run the same pieces and must agree bit for bit (fail closed: a mismatch is logged as INVALID).
+func taskCutsAB() async throws {
+    let (model, _, _) = try await productionLoad(bundleURL())
+    let tokens = try loadTokens()
+    let markers = model.alignedPrefillTurnMarkers
+    guard markers != nil else { fatalError("cutsab: the turn markers did not resolve (VMLX_M3_STRUCTURAL_CUTS=0?)") }
+    let probes = Int(env["T5_PROBES"] ?? "3")!
+    let armNames = (env["T5_CUTS_ARMS"] ?? "nocuts,grouped,piecewise,old").split(separator: ",").map(String.init)
+    var report: [String: Any] = ["arms": armNames, "probes": probes, "markers": markers!.signature]
+    var invalid: [String] = []
+    var probesLog: [[String: Any]] = []
+
+    func runArm(_ arm: String, _ n: Int) throws -> (ppS: Double, first: Int, sha: String, pieces: Int) {
+        model.setAlignedPrefillTurnMarkers(arm == "nocuts" ? nil : markers)
+        defer { model.setAlignedPrefillTurnMarkers(markers) }
+        var firstLogits: MLXArray?
+        var pieces = 0
+        AlignedPrefill.hooks.logitsObserver = { x in
+            if firstLogits == nil { firstLogits = x[0, -1].asType(.float32) }
+        }
+        AlignedPrefill.hooks.prefillObserver = { pieces = $0.pieces.count }
+        defer {
+            AlignedPrefill.hooks.logitsObserver = nil
+            AlignedPrefill.hooks.prefillObserver = nil
+        }
+        let input = LMInput(tokens: MLXArray(Array(tokens[0 ..< n])))
+        let piecewise = arm == "piecewise" || arm == "old" || arm == "sortedpw"
+        let (run, _) = try MiniMaxM3Model.$prefillSortedAllOverride.withValue(arm.hasPrefix("sorted")) {
+          try MiniMaxM3Model.$prefillGroupingOverride.withValue(!piecewise) {
+            try MiniMaxM3Model.$prefillClearEachChunkOverride.withValue(arm == "old") {
+                try MiniMaxM3SparseCache.$reserveOverride.withValue(arm == "old" ? false : nil) {
+                    try greedy(model, input, maxTokens: 2, drafter: nil, stopAtEOS: false, step: 2048)
+                }
+            }
+          }
+        }
+        let logits = try require2(firstLogits, "cutsab: no first-token logits for \(arm)")
+        let sha = logits.asArray(Float.self).withUnsafeBufferPointer { sha8Bytes(Data(buffer: $0)) }
+        return (Double(n) / (run.prefillMs / 1000), run.tokens.first ?? -1, sha, pieces)
+    }
+
+    _ = try greedy(model, LMInput(tokens: MLXArray(Array(tokens[0 ..< 3011]))), maxTokens: 2, drafter: nil)
+    for n in lens {
+        var pp: [String: [Double]] = [:]
+        var shas: [String: Set<String>] = [:]
+        var pieces: [String: Int] = [:]
+        for p in 0 ..< probes + 1 {
+            let order = (0 ..< armNames.count).map { armNames[($0 + p) % armNames.count] }
+            for arm in order {
+                Memory.clearCache()
+                let t0 = Date().timeIntervalSince1970
+                let r = try runArm(arm, n)
+                probesLog.append([
+                    "n": n, "round": p, "arm": arm, "t0": t0, "t1": Date().timeIntervalSince1970, "pp_s": r.ppS,
+                ])
+                shas[arm, default: []].insert("\(r.first):\(r.sha)")
+                pieces[arm] = r.pieces
+                if p > 0 { pp[arm, default: []].append(r.ppS) }
+                log("cutsab n=\(n) round \(p) \(arm): \(Int(r.ppS)) pp/s, \(r.pieces) pieces, first \(r.first) sha \(r.sha)")
+            }
+        }
+        // Same pieces, same kernels: the stock cut arms agree bit for bit, and so do the sorted-tile arms.
+        let cutArms = armNames.filter { ["grouped", "piecewise", "old"].contains($0) }
+        let cutShas = Set(cutArms.flatMap { shas[$0] ?? [] })
+        if cutShas.count > 1 { invalid.append("n=\(n): cut arms disagree \(cutShas.sorted())") }
+        let sortedShas = Set(armNames.filter { $0.hasPrefix("sorted") }.flatMap { shas[$0] ?? [] })
+        if sortedShas.count > 1 { invalid.append("n=\(n): sorted arms disagree \(sortedShas.sorted())") }
+        for arm in armNames where (shas[arm]?.count ?? 0) != 1 { invalid.append("n=\(n) \(arm): not repeatable \(shas[arm] ?? [])") }
+        report["\(n)"] = Dictionary(uniqueKeysWithValues: armNames.map { arm in
+            (arm, [
+                "pp_s_runs": pp[arm] ?? [], "pp_s_median": median(pp[arm] ?? [0]), "pieces": pieces[arm] ?? 0,
+                "first_sha": Array(shas[arm] ?? []),
+            ] as [String: Any])
+        })
+        log("cutsab n=\(n): " + armNames.map { "\($0) \(Int(median(pp[$0] ?? [0]))) pp/s (\(pieces[$0] ?? 0) pieces)" }
+            .joined(separator: ", ") + (cutShas.count <= 1 && sortedShas.count <= 1
+                ? "; cut arms bit-identical (stock / sorted)" : "; INVALID: cut arms differ"))
+    }
+    report["invalid"] = invalid
+    report["probes_log"] = probesLog
+    if !invalid.isEmpty { log("cutsab INVALID: \(invalid)") }
+    try writeJSON(report, "cutsab_\(tag).json")
+}
+
+func sha8Bytes(_ data: Data) -> String {
+    SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+}
+
+func require2<T>(_ value: T?, _ message: String) throws -> T {
+    guard let value else { throw NSError(domain: "M3RealT5", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    return value
+}
+
+// MARK: - prefprof
+
+/// Where a cold prefill chunk's time goes (vMLX Python `prefill_prof --components`, 13-PY-COLD-PREFILL.md §3): the raw
+/// held-out stream's first `T5_PROF_CTX` tokens (default 32845) in aligned 2048-row chunks, every chunk run layer by
+/// layer with an evaluation after each component (the same ops `MiniMaxM3DecoderLayer` runs), seconds per component
+/// summed over the full chunks and divided by their count. Also one uninstrumented cold prefill of the same tokens
+/// (TokenIterator, the plan) for the instrumentation overhead.
+func taskPrefillProfile() async throws {
+    let (model, _, _) = try await productionLoad(bundleURL())
+    let tokens = try loadTokens()
+    let n = Int(env["T5_PROF_CTX"] ?? "32845")!
+    let step = 2048
+    _ = try greedy(model, LMInput(tokens: MLXArray(Array(tokens[0 ..< 3011]))), maxTokens: 2, drafter: nil)
+    // Uninstrumented reference (markers removed: chunk-only pieces, as the instrumented loop runs).
+    let markers = model.alignedPrefillTurnMarkers
+    model.setAlignedPrefillTurnMarkers(nil)
+    defer { model.setAlignedPrefillTurnMarkers(markers) }
+    Memory.clearCache()
+    let (plain, _) = try greedy(
+        model, LMInput(tokens: MLXArray(Array(tokens[0 ..< n]))), maxTokens: 2, drafter: nil, stopAtEOS: false,
+        step: step)
+    log("prefprof n=\(n): uninstrumented cold prefill \(Int(Double(n) / (plain.prefillMs / 1000))) pp/s")
+
+    var seconds: [String: Double] = [:]
+    var fullChunks = 0
+    let cache = model.newCache(parameters: nil)
+    func timed<T>(_ name: String, _ body: () -> T, _ arrays: (T) -> [MLXArray]) -> T {
+        let t0 = nowMs()
+        let r = body()
+        eval(arrays(r))
+        seconds[name, default: 0] += (nowMs() - t0) / 1000
+        return r
+    }
+    var start = 0
+    Memory.clearCache()
+    while start < n - 1 {
+        let end = min(start + step, n - 1)
+        let full = end - start == step
+        if full { fullChunks += 1 }
+        let before = seconds
+        var h = timed("embed", { model.model.embedTokens(MLXArray(Array(tokens[start ..< end])).reshaped(1, -1)) }, { [$0] })
+        for (li, layer) in model.model.layers.enumerated() {
+            let attn = layer.selfAttn
+            let c = cache[li] as! MiniMaxM3SparseCache
+            let offset = c.offset
+            let xn = timed("norms", { layer.inputLayerNorm(h) }, { [$0] })
+            let qkv = timed("qkv_proj_norm_rope", { attn.project(xn, offset: offset) }, { [$0.queries, $0.keys, $0.values] })
+            let kv = timed("kv_append", { c.update(keys: qkv.keys, values: qkv.values) }, { [$0.0, $0.1] })
+            let selection: MiniMaxM3MSASelection?
+            if let indexer = attn.indexer {
+                let iqk = timed("index_proj_norm_rope", { indexer.project(xn, offset: offset) }, { [$0.queries, $0.keys] })
+                let allKeys = timed("index_append", { c.updateIndexKeys(iqk.keys) }, { [$0] })
+                selection = timed("selection", { indexer.select(queries: iqk.queries, keys: allKeys, offset: offset) },
+                                  { $0.map { [$0.topIndices] } ?? [] })
+            } else {
+                selection = nil
+            }
+            let o = timed("attention", { attn.attend(qkv.queries, kv.0, kv.1, selection: selection, mask: .causal) }, { [$0] })
+            h = timed("o_proj_residual", {
+                h + attn.wo(o.transposed(0, 2, 1, 3).reshaped(1, end - start, -1))
+            }, { [$0] })
+            let xn2 = timed("norms", { layer.postAttentionLayerNorm(h) }, { [$0] })
+            if let block = layer.mlp as? MiniMaxM3SparseMoeBlock {
+                let r = timed("router", { block.route(xn2) }, { [$0.indices, $0.scores] })
+                let routed = timed("routed_experts", {
+                    (block.experts as! any WeightedRoutedExpertLayer).callRouted(xn2, indices: r.indices, scores: r.scores)
+                }, { [$0] })
+                let shared = timed("shared_expert", { block.sharedExperts(xn2) }, { [$0] })
+                h = timed("combine_residual", { h + (routed + shared).asType(xn2.dtype) }, { [$0] })
+            } else {
+                h = timed("dense_mlp", { h + layer.mlp(xn2) }, { [$0] })
+            }
+        }
+        if !full { seconds = before }  // per full chunk only
+        start = end
+    }
+    let perChunk = seconds.mapValues { $0 / Double(max(1, fullChunks)) }
+    let total = perChunk.values.reduce(0, +)
+    for (k, v) in perChunk.sorted(by: { $0.value > $1.value }) {
+        log(String(format: "prefprof %@: %.3f s / chunk (%.1f %%)", k, v, 100 * v / total))
+    }
+    log(String(format: "prefprof full chunk (instrumented): %.3f s over %d full chunks; uninstrumented %.0f pp/s",
+               total, fullChunks, Double(n) / (plain.prefillMs / 1000)))
+    try writeJSON([
+        "n": n, "full_chunks": fullChunks, "per_chunk_s": perChunk, "instrumented_chunk_s": total,
+        "uninstrumented_pp_s": Double(n) / (plain.prefillMs / 1000),
+    ], "prefprof_\(tag).json")
 }
