@@ -85,6 +85,7 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
         ],
         "m3_moe_down": [
             "fc", "hr", "h", "inds", "scores", "wd", "sd", "ocol", "wout", "hs", "sdw", "sds", "sdb", "resid", "sdo",
+            "ry",
         ],
     ]
     static let outputs: [String: [String]] = [
@@ -191,13 +192,14 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
         return MLXArray([mu0, mu1, isd0, isd1] + [Float](repeating: 0, count: 12))
     }
 
-    /// K6: (sig [rows, E] f32, xr [rows, D] f32).
-    func router(_ L: Layer, _ x2: MLXArray) -> (MLXArray, MLXArray) {
+    /// K6: (sig [rows, E] f32, xr [rows, D] f32 -- not written with `rot` false: the fast routed kernels pack their
+    /// own input).
+    func router(_ L: Layer, _ x2: MLXArray, rot: Bool = true) -> (MLXArray, MLXArray) {
         let rows = x2.dim(0)
-        let ntg = L.E + rows * ((L.D + 1023) / 1024)
+        let ntg = L.E + (rot ? rows * ((L.D + 1023) / 1024) : 0)
         let out = kernel("m3_router")(
             [x2, L.gw, L.trellis.gateUpSigns],
-            template: [("T", x2.dtype), ("D", L.D), ("E", L.E), ("ROWS", rows)],
+            template: [("T", x2.dtype), ("D", L.D), ("E", L.E), ("ROWS", rows), ("ROT", rot ? 1 : 0)],
             grid: (256 * ntg, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[rows, L.E], [rows, L.D]], outputDTypes: [.float32, .float32])
         return (out[0], out[1])
@@ -207,22 +209,25 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
         [("T", dtype), ("D", L.D), ("I", L.I), ("E", L.E), ("ROWS", rows), ("KS", L.KS), ("L", 12)]
     }
 
-    /// K7: (h [rows * KS, I] f32, hs [rows, I], inds [rows, KS] u32, scores [rows, KS] f32).
-    func gateUp(_ L: Layer, _ x2: MLXArray, sig: MLXArray, xr: MLXArray, shared: Bool)
+    /// K7: (h [rows * KS, I] f32 -- not written with `routed` false, hs [rows, I], inds [rows, KS] u32, scores
+    /// [rows, KS] f32). `xr` nil (only with `routed` false): K6 ran without the rotation; `sig` stands in (vMLX).
+    func gateUp(_ L: Layer, _ x2: MLXArray, sig: MLXArray, xr: MLXArray?, shared: Bool, routed: Bool = true)
         -> (h: MLXArray, hs: MLXArray, inds: MLXArray, scores: MLXArray)
     {
+        precondition(xr != nil || !routed, "fused M3 MoE: K7 needs the rotated input for the routed experts")
         let rows = x2.dim(0)
         let (g, u) = (L.trellis.gate, L.trellis.up)
         let template =
             common(L, rows: rows, dtype: x2.dtype) + [
-                ("KB2", Int(g.k * 2)), ("W", g.packed.dim(-1)), ("NOUT", g.outlierColumns), ("SHARED", shared ? 1 : 0),
-                ("ALPHA", Self.fbits(L.alpha)), ("LIMIT", Self.fbits(L.limit)), ("RSF", Self.fbits(L.rsf)),
+                ("KB2", Int(g.k * 2)), ("W", g.packed.dim(-1)), ("NOUT", g.outlierColumns), ("ROUTED", routed ? 1 : 0),
+                ("SHARED", shared ? 1 : 0), ("ALPHA", Self.fbits(L.alpha)), ("LIMIT", Self.fbits(L.limit)),
+                ("RSF", Self.fbits(L.rsf)),
             ]
         let out = kernel("m3_moe_gate_up")(
             [
-                Self.fc(g.k), xr, x2, sig, L.bias, g.packed, g.scale, u.packed, u.scale, L.ocolGU, L.woutG, L.woutU,
-                L.sharedGate.weight, L.sharedGate.scales, L.sharedGate.biases!, L.sharedUp.weight, L.sharedUp.scales,
-                L.sharedUp.biases!,
+                Self.fc(g.k), xr ?? sig, x2, sig, L.bias, g.packed, g.scale, u.packed, u.scale, L.ocolGU, L.woutG,
+                L.woutU, L.sharedGate.weight, L.sharedGate.scales, L.sharedGate.biases!, L.sharedUp.weight,
+                L.sharedUp.scales, L.sharedUp.biases!,
             ],
             template: template,
             grid: (64, rows * L.KS + (shared ? rows : 0), L.I / 8), threadGroup: (64, 1, 1),
@@ -237,26 +242,32 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
     }
 
     /// K8: the new residual rows [rows, D]; `sdo` = the shared expert's output computed by the caller (else K8
-    /// computes it from `hs`).
+    /// computes it from `hs`); `ry` = the routed experts' router-weighted sum [rows, D] f32 computed by the caller (the
+    /// fast JANGT kernels; else K8 runs the routed down from `hr`).
     func down(
-        _ L: Layer, hr: MLXArray, h: MLXArray, inds: MLXArray, scores: MLXArray, hs: MLXArray?, r2: MLXArray,
-        sdo: MLXArray?
+        _ L: Layer, hr: MLXArray?, h: MLXArray, inds: MLXArray, scores: MLXArray, hs: MLXArray?, r2: MLXArray,
+        sdo: MLXArray?, ry: MLXArray? = nil
     ) -> MLXArray {
+        precondition(hr != nil || ry != nil, "fused M3 MoE: K8 needs the rotated down input or the routed sum")
         let rows = r2.dim(0)
         let d = L.trellis.down
         let shared = sdo == nil
         let template =
             common(L, rows: rows, dtype: r2.dtype) + [
                 ("KB2", Int(d.k * 2)), ("W", d.packed.dim(-1)), ("NOUT", d.outlierColumns), ("SHARED", shared ? 1 : 0),
+                ("ROUTED", ry == nil ? 1 : 0),
             ]
         return kernel("m3_moe_down")(
             [
-                Self.fc(d.k), hr, h, inds, scores, d.packed, d.scale, L.ocolDn, L.woutDn, hs ?? r2,
-                L.sharedDown.weight, L.sharedDown.scales, L.sharedDown.biases!, r2, sdo ?? r2,
+                Self.fc(d.k), hr ?? h, h, inds, scores, d.packed, d.scale, L.ocolDn, L.woutDn, hs ?? r2,
+                L.sharedDown.weight, L.sharedDown.scales, L.sharedDown.biases!, r2, sdo ?? r2, ry ?? Self.zeroFC,
             ],
             template: template, grid: (64, rows, L.D / 8), threadGroup: (64, 1, 1),
             outputShapes: [[rows, L.D]], outputDTypes: [r2.dtype])[0]
     }
+
+    /// vMLX `_fc((0.0,))`: the placeholder `ry` when K8 runs the routed experts itself.
+    static var zeroFC: MLXArray { MLXArray([Float](repeating: 0, count: 16)) }
 
     // MARK: forward
 
@@ -286,13 +297,26 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
         let L = layer(block)!
         let x2 = contiguous(xNormed.reshaped(R, L.D))
         let r2 = contiguous(resid.reshaped(R, L.D).asType(x2.dtype))
-        let (sig, xr) = router(L, x2)
         let shared = R <= Self.sharedInKernelRows
-        let gu = gateUp(L, x2, sig: sig, xr: xr, shared: shared)
         let sdo = shared ? nil : sharedRows(L, x2)
-        let out = down(
-            L, hr: downInput(L, gu.h, inds: gu.inds), h: gu.h, inds: gu.inds, scores: gu.scores,
-            hs: shared ? gu.hs : nil, r2: r2, sdo: sdo)
+        let out: MLXArray
+        if JANGTFastDecode.isEnabled, JANGTFastDecode.supported(L.trellis) {
+            // VMLX_JANGT_FAST=1 (vMLX `fused_moe_residual`): routing + shared expert in K6 / K7, the routed experts on
+            // the fast JANGT kernels (what the JANGT routed layer runs with the lever), K8 adds shared + residual.
+            let (sig, _) = router(L, x2, rot: false)
+            let gu = gateUp(L, x2, sig: sig, xr: nil, shared: shared, routed: false)
+            let ry = JANGTFastDecode.routed(x2, ids: gu.inds, weights: gu.scores, L.trellis)
+            out = down(
+                L, hr: nil, h: gu.h, inds: gu.inds, scores: gu.scores, hs: shared ? gu.hs : nil, r2: r2, sdo: sdo,
+                ry: ry)
+            Self.stats.add("fast_routed")
+        } else {
+            let (sig, xr) = router(L, x2)
+            let gu = gateUp(L, x2, sig: sig, xr: xr, shared: shared)
+            out = down(
+                L, hr: downInput(L, gu.h, inds: gu.inds), h: gu.h, inds: gu.inds, scores: gu.scores,
+                hs: shared ? gu.hs : nil, r2: r2, sdo: sdo)
+        }
         Self.stats.add("calls")
         Self.stats.add("rows", R)
         return out.reshaped(1, R, L.D)
