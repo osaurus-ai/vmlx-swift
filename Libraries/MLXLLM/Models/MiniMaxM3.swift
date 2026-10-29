@@ -571,6 +571,170 @@ public final class MiniMaxM3ModelInner: Module {
         return norm(h)
     }
 
+    /// `prefillPieces` with the row-wise work of the group's pieces in ONE call per op (`VMLX_M3_PREFILL_BATCH_ROWS`):
+    /// the RMS norms, the q / k / index RoPE, the K / V / index-key appends (one append of all the group's rows; each
+    /// piece's attention reads the lane up to its own end, the arrays its own append returns), the router's sigmoid /
+    /// top-k / normalization, the SwiGLU of the shared expert and the dense MLP, the combine and the residual adds. Every
+    /// matrix product whose rows depend on the row count (MLX picks split-K / tiles / the vector kernel by M: q / k / v /
+    /// o, the indexer projections, the router, the shared expert and dense MLP projections) still runs per piece on the
+    /// piece's own rows, as do the block selection and the attention (their key length and path are the piece's). The
+    /// routed experts follow `mlpHalves`' rule (one call per group on the sorted tiles). Rows, lanes and logits equal
+    /// piece by piece; a piece the fused decode path would take, or a layer without the sparse cache, falls back to
+    /// `prefillPieces` (the whole group).
+    func prefillPiecesBatched(
+        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool
+    ) {
+        let rows = pieces.map { $0.dim(1) }
+        guard pieces.count > 1, pieces.allSatisfy({ $0.ndim == 2 && $0.dim(0) == 1 }),
+            cache.count == layers.count, cache.allSatisfy({ $0 is MiniMaxM3SparseCache }),
+            layers.allSatisfy({ $0.selfAttn.indexer != nil }),
+            rows.allSatisfy({ MiniMaxM3FusedDecode.active(rows: $0, batch: 1) == nil })
+        else {
+            prefillPieces(pieces, cache: cache, recordTaps: recordTaps, groupRouted: groupRouted, sortedAll: sortedAll)
+            return
+        }
+        let holder = MiniMaxM3DSpark.tapHolder(cache)
+        let recording = !dsparkTapLayers.isEmpty && holder != nil
+        let start0 = cache[0].offset
+        var bounds: [Range<Int>] = []  // rows of each piece inside the group
+        var at = 0
+        for n in rows {
+            bounds.append(at ..< (at + n))
+            at += n
+        }
+        let total = at
+        func split(_ x: MLXArray) -> [MLXArray] { bounds.map { x[0..., $0, 0...] } }
+        func perPiece(_ xs: [MLXArray], _ f: (MLXArray) -> MLXArray) -> MLXArray {
+            concatenated(xs.map(f), axis: 1)
+        }
+        var h = concatenated(pieces.map { embedTokens($0) }, axis: 1)
+        var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
+        for (li, layer) in layers.enumerated() {
+            let attn = layer.selfAttn
+            let indexer = attn.indexer!
+            let c = cache[li] as! MiniMaxM3SparseCache
+            let offset = c.offset
+            // Attention half: `MiniMaxM3Attention.callAsFunction`, the row-wise ops on all rows at once.
+            let x = layer.inputLayerNorm(h)
+            let xs = split(x)
+            let queries = attn.rope(
+                attn.qNorm(perPiece(xs) { attn.wq($0) }.reshaped(1, total, attn.heads, attn.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let keysNew = attn.rope(
+                attn.kNorm(perPiece(xs) { attn.wk($0) }.reshaped(1, total, attn.kvHeads, attn.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let valuesNew = perPiece(xs) { attn.wv($0) }.reshaped(1, total, attn.kvHeads, attn.headDim)
+                .transposed(0, 2, 1, 3)
+            let (keysAll, valuesAll) = c.update(keys: keysNew, values: valuesNew)
+            let indexQueries = indexer.rope(
+                indexer.queryNorm(perPiece(xs) { indexer.queryProjection($0) }
+                    .reshaped(1, total, indexer.heads, indexer.headDim)).transposed(0, 2, 1, 3), offset: offset)
+            let indexKeysNew = indexer.rope(
+                indexer.keyNorm(perPiece(xs) { indexer.keyProjection($0) }.reshaped(1, total, 1, indexer.headDim))
+                    .transposed(0, 2, 1, 3), offset: offset)
+            let indexKeysAll = c.updateIndexKeys(indexKeysNew)
+            var attended: [MLXArray] = []
+            for (i, b) in bounds.enumerated() {
+                let end = offset + b.upperBound
+                let selection = indexer.select(
+                    queries: indexQueries[0..., 0..., b, 0...], keys: indexKeysAll[.ellipsis, ..<end, 0...],
+                    offset: offset + b.lowerBound)
+                let output = attn.attend(
+                    queries[0..., 0..., b, 0...], keysAll[.ellipsis, ..<end, 0...],
+                    valuesAll[.ellipsis, ..<end, 0...], selection: selection,
+                    mask: rows[i] > 1 ? .causal : .none)
+                attended.append(attn.wo(output.transposed(0, 2, 1, 3).reshaped(1, rows[i], -1)))
+            }
+            h = h + concatenated(attended, axis: 1)
+            // MLP half.
+            let xn = layer.postAttentionLayerNorm(h)
+            let xns = split(xn)
+            if let block = layer.mlp as? MiniMaxM3SparseMoeBlock {
+                // `MiniMaxM3SparseMoeBlock.route`, the router's matmul per piece, the rest on all rows.
+                let routerScores = sigmoid(perPiece(xns) { block.gate($0) }.asType(.float32))
+                let choice = routerScores + block.eScoreCorrectionBias
+                let indices = argPartition(-choice, kth: block.topK - 1, axis: -1)[.ellipsis, ..<block.topK]
+                var scores = takeAlong(routerScores, indices, axis: -1)
+                if block.topK > 1 && block.normTopKProb {
+                    scores = scores / scores.sum(axis: -1, keepDims: true)
+                }
+                scores = scores * block.routedScalingFactor
+                let routed = routedRows(
+                    block: block, xns: xns, indices: split(indices), scores: split(scores), groupRouted: groupRouted,
+                    sortedAll: sortedAll, layer: li)
+                let shared = block.sharedExperts
+                let activated = miniMaxM3SwiGLU(
+                    up: perPiece(xns) { shared.upProj($0) }, gate: perPiece(xns) { shared.gateProj($0) },
+                    alpha: shared.alpha, limit: shared.limit)
+                let sharedOut = perPiece(split(activated)) { shared.downProj($0) }
+                h = h + (routed + sharedOut).asType(xn.dtype)
+            } else if let dense = layer.mlp as? MiniMaxM3MLP {
+                let activated = miniMaxM3SwiGLU(
+                    up: perPiece(xns) { dense.upProj($0) }, gate: perPiece(xns) { dense.gateProj($0) },
+                    alpha: dense.alpha, limit: dense.limit)
+                h = h + perPiece(split(activated)) { dense.downProj($0) }
+            } else {
+                h = h + perPiece(xns) { layer.mlp($0) }
+            }
+            if recording && dsparkTapLayers.contains(li) {
+                let hs = split(h)
+                for i in pieces.indices where recordTaps[i] { taps[i][li] = hs[i] }
+            }
+        }
+        if recording, let holder {
+            var position = start0
+            for i in pieces.indices {
+                if recordTaps[i] { self.recordTaps(taps[i], start: position, holder: holder) }
+                position += rows[i]
+            }
+        }
+    }
+
+    /// The routed rows `[1, total, D]` of a batched group (`prefillPiecesBatched`): `mlpHalves`' rule per piece (the
+    /// sorted tiles in one call per group, the stock `callRouted` for the rest).
+    private func routedRows(
+        block: MiniMaxM3SparseMoeBlock, xns: [MLXArray], indices: [MLXArray], scores: [MLXArray], groupRouted: Bool,
+        sortedAll: Bool, layer: Int
+    ) -> MLXArray {
+        guard let bank = block.experts as? JANGTRoutedExpertLayer else {
+            return concatenated(
+                xns.indices.map { i in
+                    if let switchMLP = block.switchMLP {
+                        return (switchMLP(xns[i], indices[i]) * scores[i][.ellipsis, .newAxis]).sum(axis: -2)
+                    }
+                    return (block.experts as! any WeightedRoutedExpertLayer).callRouted(
+                        xns[i], indices: indices[i], scores: scores[i])
+                }, axis: 1)
+        }
+        let sorted = xns.indices.filter { i in
+            sortedAll
+                ? JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: xns[i].dtype)
+                : !JANGTRoutedExpertLayer.usesDecodeKernels(pairs: xns[i].dim(1) * block.topK, dtype: xns[i].dtype)
+        }
+        var out = [MLXArray?](repeating: nil, count: xns.count)
+        let together = groupRouted && (sortedAll ? sorted.count > 1 : sorted.count > 1)
+        if together {
+            MiniMaxM3DecoderLayer.groupedRoutedObserver?(layer, sorted.count)
+            let x = concatenated(sorted.map { xns[$0] }, axis: 1)
+            let ind = concatenated(sorted.map { indices[$0] }, axis: 1)
+            let sc = concatenated(sorted.map { scores[$0] }, axis: 1)
+            let y = sortedAll
+                ? bank.callRoutedSorted(x, indices: ind, scores: sc) : bank.callRouted(x, indices: ind, scores: sc)
+            var at = 0
+            for i in sorted {
+                let n = xns[i].dim(1)
+                out[i] = y[0..., at ..< (at + n), 0...]
+                at += n
+            }
+        }
+        for i in xns.indices where out[i] == nil {
+            out[i] = sortedAll && sorted.contains(i)
+                ? bank.callRoutedSorted(xns[i], indices: indices[i], scores: scores[i])
+                : bank.callRouted(xns[i], indices: indices[i], scores: scores[i])
+        }
+        return concatenated(out.map { $0! }, axis: 1)
+    }
+
     /// Prefill consecutive prompt pieces (token arrays `[1, L_i]`, in order, appended to `cache`) LAYER BY LAYER, cache
     /// rows only (no final norm, no head): every piece runs exactly the ops of its own `callAsFunction` (same matrix
     /// shapes, the same cache rows visible to its attention, the fused paths for small pieces as before), except that
@@ -785,6 +949,10 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             }
             if group.count == 1 && !sortedAll {
                 _ = model(inputs[0], cache: cache.isEmpty ? nil : cache, recordTaps: wantsTaps(group[0]))
+            } else if group.count > 1 && Self.prefillBatchRows {
+                model.prefillPiecesBatched(
+                    inputs, cache: cache, recordTaps: group.map(wantsTaps), groupRouted: Self.prefillGroupRouted,
+                    sortedAll: sortedAll)
             } else {
                 model.prefillPieces(
                     inputs, cache: cache, recordTaps: group.map(wantsTaps), groupRouted: Self.prefillGroupRouted,
@@ -895,6 +1063,12 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// family), so the rule is part of the cache identity (`alignedPrefillSchema`).
     @TaskLocal static var prefillSortedAllOverride: Bool?
     static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: false) }
+    /// `VMLX_M3_PREFILL_BATCH_ROWS` (default off while measured): inside a group, the row-wise ops of all pieces in
+    /// one call each (`MiniMaxM3ModelInner.prefillPiecesBatched`); the row-count-dependent matmuls stay per piece.
+    @TaskLocal static var prefillBatchRowsOverride: Bool?
+    static var prefillBatchRows: Bool {
+        prefillBatchRowsOverride ?? flag("VMLX_M3_PREFILL_BATCH_ROWS", default: false)
+    }
     /// `VMLX_M3_PREFILL_ASYNC` (default off, A/B): evaluate each prefill group asynchronously, so the CPU builds the next
     /// group's graph while the GPU runs this one.
     @TaskLocal static var prefillAsyncOverride: Bool?

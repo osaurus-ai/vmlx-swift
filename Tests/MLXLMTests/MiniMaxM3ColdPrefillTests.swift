@@ -308,6 +308,51 @@ struct MiniMaxM3ColdPrefillTests {
         }
     }
 
+    @Test("Row-wise ops batched across a group's pieces (VMLX_M3_PREFILL_BATCH_ROWS) == piece by piece, three cut sets",
+          arguments: [0, 1, 2])
+    func batchedRowsEqualPieceByPiece(cutSet: Int) throws {
+        try Self.withGPU {
+            let model = try A.model()
+            let prompt = A.ids(2701, seed: 404)
+            let cuts = Self.cutSets[cutSet]
+            let piecewise = try MiniMaxM3Model.$prefillGroupingOverride.withValue(false) {
+                try Self.run(model, prompt, step: 320, cuts: cuts)
+            }
+            let batched = try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(true) {
+                try Self.run(model, prompt, step: 320, cuts: cuts)
+            }
+            let diff = Self.problems(piecewise, batched)
+            #expect(diff.isEmpty, "batched rows != piece by piece: \(diff.prefix(4))")
+        }
+    }
+
+    @Test("JANGHT M3: batched rows + sorted-all routed == piece by piece (logits, lanes)")
+    func jangtBatchedRows() async throws {
+        guard JANGTPrefillKernel.available else { return }
+        let directory = try MiniMaxM3JANGHTTests.bundleCopy()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let context = try await LLMModelFactory.shared.load(from: directory, using: ByteTokenizerLoader())
+        let model = try #require(context.model as? MiniMaxM3Model)
+        let cuts = [7, 30, 47, 200, 333, 552, 700, 1100, 1290]
+        let prompt = A.ids(1301, seed: 9).map { $0 % 250 }
+        try Self.withGPU {
+            for sorted in [false, true] {
+                let piecewise = try MiniMaxM3Model.$prefillSortedAllOverride.withValue(sorted) {
+                    try MiniMaxM3Model.$prefillGroupingOverride.withValue(false) {
+                        try Self.run(model, prompt, step: 512, cuts: cuts)
+                    }
+                }
+                let batched = try MiniMaxM3Model.$prefillSortedAllOverride.withValue(sorted) {
+                    try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(true) {
+                        try Self.run(model, prompt, step: 512, cuts: cuts)
+                    }
+                }
+                let diff = Self.problems(piecewise, batched)
+                #expect(diff.isEmpty, "sorted \(sorted): batched rows != piece by piece: \(diff.prefix(4))")
+            }
+        }
+    }
+
     @Test("Prefill groups evaluated asynchronously (VMLX_M3_PREFILL_ASYNC) == synchronously (logits, lanes)")
     func asyncGroupsAreBitIdentical() throws {
         try Self.withGPU {
@@ -338,19 +383,25 @@ struct MiniMaxM3ColdPrefillTests {
             #expect(window == DS.draftWindow)
             let prompt = A.ids(2701, seed: 55)
             var arms: [String: Arm] = [:]
-            for (name, allTaps, grouping) in [("all", true, false), ("window", false, false), ("grouped", false, true)] {
+            for (name, allTaps, grouping, batched) in [
+                ("all", true, false, false), ("window", false, false, false), ("grouped", false, true, false),
+                ("batched", false, true, true),
+            ] {
                 arms[name] = try MiniMaxM3Model.$prefillAllTapsOverride.withValue(allTaps) {
                     try MiniMaxM3Model.$prefillGroupingOverride.withValue(grouping) {
-                        try Self.run(model, prompt, step: 320, cuts: Self.cutSets[0], decode: 0)
+                        try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(batched) {
+                            try Self.run(model, prompt, step: 320, cuts: Self.cutSets[0], decode: 0)
+                        }
                     }
                 }
             }
             let all = try #require(arms["all"]), inWindow = try #require(arms["window"]), grouped = try #require(arms["grouped"])
+            let batched = try #require(arms["batched"])
             // The tail covers at least the last `window` prompt rows (whole recorded pieces: it may start a little
             // earlier), the same rows in every arm (`problems` compares rows and start).
             #expect(all.tail != nil && (all.tailStart ?? .max) <= prompt.count - window,
                     "tail start \(String(describing: all.tailStart))")
-            for (name, arm) in [("window", inWindow), ("grouped", grouped)] {
+            for (name, arm) in [("window", inWindow), ("grouped", grouped), ("batched", batched)] {
                 let diff = Self.problems(all, arm)
                 #expect(diff.isEmpty, "\(name) != every piece tapped: \(diff.prefix(4))")
             }
