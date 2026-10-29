@@ -49,6 +49,12 @@ public enum JANGTCode {
 
     public static func isSupported(_ k: Double) -> Bool { mult[k] != nil }
 
+    /// (mu0, mu1, isd0, isd1) of width `k` as float32 (the values `stats` holds as bit patterns), nil when unsupported.
+    public static func codeStats(_ k: Double) -> (Float, Float, Float, Float)? {
+        guard let s = stats[k] else { return nil }
+        return (Float(bitPattern: s.0), Float(bitPattern: s.1), Float(bitPattern: s.2), Float(bitPattern: s.3))
+    }
+
     /// New bits entering at transition t >= 1: (even t, odd t). Integer K: (2K, 2K); K=2.5: (6, 4) = 10 bits per 4
     /// weights; K=1.5: (4, 2) = 6 bits per 4 weights. A lane's first step is always even (k0/2 + 8 * lane), so every
     /// 8-step lane segment starts on the same phase.
