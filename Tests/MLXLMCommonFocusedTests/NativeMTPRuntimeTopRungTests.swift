@@ -5,6 +5,7 @@ import XCTest
 
 @testable import MLXLLM
 @testable import MLXLMCommon
+@testable import MLXVLM
 
 /// The runtime's native-MTP top rung (`NativeMTPDepthPolicy.runtimeTopRung`): the only top of the adaptive ladder
 /// unless a diagnostic env lever or an explicit fixed depth says otherwise (no hard draft depth, Rule 0).
@@ -39,6 +40,15 @@ final class NativeMTPRuntimeTopRungTests: XCTestCase {
             NativeMTPDepthPolicy.runtimeTopRung(model: TopRungFake(block: 8), environment: ["VMLX_MTP_DEPTH_CAP": "3"]), 3)
         XCTAssertEqual(
             NativeMTPDepthPolicy.runtimeTopRung(model: DeclaredCeilingFake(), environment: ["VMLX_MTP_DEPTH_CAP": "6"]), 6)
+    }
+
+    /// Nemotron-H (and its Omni wrapper) declare no adaptive ceiling: their former 3 was a measured tuning cap
+    /// that also hid the LiLiCorr drafter's block - 1 = 7 rung. Re-adding a conformance fails here.
+    func testNemotronDeclaresNoTuningCeiling() {
+        XCTAssertFalse((NemotronHModel.self as Any.Type) is any NativeMTPAdaptiveCeilingModel.Type)
+        XCTAssertFalse((NemotronHOmni.self as Any.Type) is any NativeMTPAdaptiveCeilingModel.Type)
+        // They are block drafters (LiLiCorr) and recursive heads; the runtime resolves their rung.
+        XCTAssertTrue((NemotronHModel.self as Any.Type) is any NativeMTPBlockDraftModel.Type)
     }
 
     /// With the library's default policy, a block drafter reaches its block - 1 rung: the resolved maximum is the

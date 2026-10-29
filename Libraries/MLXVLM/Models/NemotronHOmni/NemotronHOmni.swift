@@ -1520,10 +1520,6 @@ extension NemotronHOmni: SafetensorsLoadKeyExcluding {
     public var requiresExactTensorMmapBuffers: Bool { languageModel.requiresExactTensorMmapBuffers }
 }
 
-extension NemotronHOmni: NativeMTPAdaptiveCeilingModel {
-    public var nativeMTPAdaptiveDepthCeiling: Int { nemotronLanguageModel.nativeMTPAdaptiveDepthCeiling }
-}
-
 extension NemotronHOmni: NativeMTPBlockDraftModel {
     public var nativeMTPUsesBlockDrafts: Bool { nemotronLanguageModel.nativeMTPUsesBlockDrafts }
     public var nativeMTPBlockDraftDepthLimit: Int { nemotronLanguageModel.nativeMTPBlockDraftDepthLimit }
