@@ -359,3 +359,31 @@ func taskLongContext() async throws {
         try writeJSON(["mlx_active_loaded_GiB": gib(activeLoaded), "thinking": mode, "rows": rows], "longctx_\(tag).json")
     }
 }
+
+// MARK: - prefill step A/B
+
+/// Cold prefill time at prefill step (aligned chunk) 2048 vs 1024 vs 512, interleaved: what a smaller step costs a cold
+/// prompt (the aligned prefix rule re-prefills up to step - 1 tokens of every continued turn, so a smaller step wastes
+/// less per tool call).
+func taskStepAB() async throws {
+    let (model, _, _) = try await productionLoad(bundleURL())
+    let tokens = try loadTokens()
+    let steps = (env["T5_STEPS_AB"] ?? "2048,1024,512").split(separator: ",").map { Int($0)! }
+    let probes = Int(env["T5_PROBES"] ?? "3")!
+    var report: [String: Any] = ["steps": steps, "probes": probes]
+    _ = try greedy(model, LMInput(tokens: MLXArray(Array(tokens[0 ..< 3011]))), maxTokens: 2, drafter: nil)
+    for n in lens {
+        var t: [Int: [Double]] = [:]
+        for p in 0 ..< probes + 1 {
+            for step in (p % 2 == 0 ? steps : steps.reversed()) {
+                Memory.clearCache()
+                let input = LMInput(tokens: MLXArray(Array(tokens[0 ..< n])))
+                let (run, _) = try greedy(model, input, maxTokens: 2, drafter: nil, stopAtEOS: false, step: step)
+                if p > 0 { t[step, default: []].append(Double(n) / (run.prefillMs / 1000)) }
+            }
+        }
+        report["\(n)"] = Dictionary(uniqueKeysWithValues: t.map { ("\($0.key)", ["pp_s_runs": $0.value, "pp_s_median": median($0.value)]) })
+        log("stepab n=\(n): " + steps.map { "C=\($0) \(Int(median(t[$0]!))) pp/s" }.joined(separator: ", "))
+    }
+    try writeJSON(report, "stepab_\(tag).json")
+}
