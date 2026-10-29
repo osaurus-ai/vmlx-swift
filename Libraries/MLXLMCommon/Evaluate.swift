@@ -1671,6 +1671,24 @@ public struct TokenIterator: TokenIteratorProtocol {
     // `y` advances to the next prediction before next() returns. Retain the
     // token actually forwarded into KV using the existing return-value sync.
     private var lastForwardedTokenId: Int?
+    /// `VMLX_RUNTIME_RECEIPTS=1`: this request's receipt number (0 when receipts are off).
+    var receiptRequestID = 0
+    /// Prompt rows whose end-of-turn snapshot is taken as views of the finished cache (``AppendOnlyRowsCache``) instead
+    /// of a copy retained through decode. Nil: the ordinary retained copy (or none).
+    var deferredPromptSnapshotRows: Int?
+    /// `VMLX_PROMPT_SNAPSHOT_VIEWS=0`: the retained copy as before (A/B only; tests: the task-local override).
+    static let promptSnapshotViewsEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_PROMPT_SNAPSHOT_VIEWS"] != "0"
+    @TaskLocal static var promptSnapshotViewsOverride: Bool?
+    static var promptSnapshotViewsEnabled: Bool { promptSnapshotViewsOverride ?? promptSnapshotViewsEnvironment }
+    /// `VMLX_ALIGNED_POST_ANSWER_STORE=1`: write the redundant post-answer entry of aligned-prefill caches (A/B only;
+    /// tests: the task-local override).
+    static let alignedPostAnswerStoreSkippedEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_ALIGNED_POST_ANSWER_STORE"] != "1"
+    @TaskLocal static var alignedPostAnswerStoreSkippedOverride: Bool?
+    static var alignedPostAnswerStoreSkipped: Bool {
+        alignedPostAnswerStoreSkippedOverride ?? alignedPostAnswerStoreSkippedEnvironment
+    }
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
     public var structuredOutputComplete: Bool? {
@@ -2413,6 +2431,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let remainingPromptUnits = Swift.max(0, inputForPrepare.text.tokens.size)
         let completedBeforePrefill = Swift.max(0, promptTokenCount - remainingPromptUnits)
+        if RuntimeReceipts.isEnabled {
+            let rid = RuntimeReceipts.currentRequestID ?? 0
+            self.receiptRequestID = rid
+            RuntimeReceipts.emit(
+                "request id=\(rid) prompt=\(promptTokenCount) "
+                    + "thinking_mode=\(RuntimeReceipts.thinkingMode(fromScopeSalt: originalInput.cacheScopeSalt)) "
+                    + "prompt_tail=\(self.promptTokenIds.last.map(String.init) ?? "none") "
+                    + "draft=\(RuntimeReceipts.draftName(effectiveParameters.draftStrategy)) "
+                    + "prefill_step=\(effectiveParameters.prefillStepSize) "
+                    + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                    + "cache_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.cacheLimit))")
+            RuntimeReceipts.emit(
+                "cache id=\(rid) prompt=\(promptTokenCount) restored=\(completedBeforePrefill) "
+                    + "tier=\(completedBeforePrefill > 0 ? (acceptedCacheRestoreDetail?.rawValue ?? "live") : "none") "
+                    + "prefilled=\(remainingPromptUnits) coordinator=\(cacheCoordinator == nil ? "off" : "on")")
+        }
         if let acceptedCacheRestoreDetail, completedBeforePrefill > 0 {
             prefillProgressHandler?(PrefillProgress(
                 stage: .cacheRestore,
@@ -2521,7 +2555,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
         if retainsPromptSnapshotForStores {
-            self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: self.cache)
+            // Append-only caches under aligned prefill (MiniMax-M3): the prompt rows never change after this point (decode
+            // and DSpark verify append past them, rollbacks trim back to them), so the end-of-turn stores take views of the
+            // finished cache instead of a copy held through the whole decode (4.5 GiB at 35k tokens on M3.1, and a
+            // second copy per boundary store).
+            if alignedPrefillPlan != nil, Self.promptSnapshotViewsEnabled,
+                cacheBoundaryLeafOffsets(self.cache).allSatisfy({ $0 == promptTokenIds.count }),
+                cacheSupportsPrefixViews(self.cache, rows: promptTokenIds.count)
+            {
+                self.deferredPromptSnapshotRows = promptTokenIds.count
+            } else {
+                self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: self.cache)
+            }
         }
         spillHybridStripBoundaryAfterPrefill()
         MemoryStageTrace.log(
@@ -3660,6 +3705,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         reconcileUnoCache()
         finishDSpark()
         MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count)
+        // Decode is over: the prompt rows of the finished cache are what prefill wrote (append-only lanes), so the stores
+        // below take views of them. No copy held through decode, none made here.
+        if let rows = deferredPromptSnapshotRows {
+            deferredPromptSnapshotRows = nil
+            promptCacheSnapshot = prefixViews(of: cache, rows: rows)
+        }
         defer {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count)
         }
@@ -3733,7 +3784,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // memory is already at its peak. A prefix-cache entry is only ever a
             // speed-up for some later request — it must never be able to take the
             // host down. If the copies won't fit, don't make them.
-            guard CacheStoreBudget.canStore(cacheToStore) else {
+            guard CacheStoreBudget.canStore(cacheToStore, ownsSnapshot: ownsSnapshot) else {
                 let gib = Double(CacheStoreBudget.cacheBytes(cacheToStore)) / 1_073_741_824
                 Self.logger.info(
                     """
@@ -3742,8 +3793,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     normally; only the cache entry was dropped.
                     """
                 )
+                RuntimeReceipts.emit(
+                    "store id=\(receiptRequestID) tokens=\(tokens.count) result=skipped "
+                        + "reason=store_budget kv_gib=\(String(format: "%.2f", gib))")
                 return
             }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(tokens.count) result=written "
+                    + "kv_gib=\(RuntimeReceipts.gib(CacheStoreBudget.cacheBytes(cacheToStore))) owned=\(ownsSnapshot)")
             // Prefill/boundary snapshots are already owned and evaluated. Only
             // a live post-answer cache needs sealing before the async writer.
             let snapshot = ownsSnapshot ? cacheToStore : cacheToStore.map { $0.copy() }
@@ -4078,6 +4135,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         else { return }
         guard !needsCacheQuantization else { return }
         guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary
+        // (`AlignedPrefill.alignRestoredPrefix`: decoded rows and the final piece are not what a cold prefill makes), so
+        // a post-answer entry can serve at most the rows the prompt-boundary entry above already serves. Writing it cost
+        // a full copy of the live cache plus its disk write every turn (4.6 GiB at 35k tokens on M3.1).
+        if alignedPrefillPlan != nil, Self.alignedPostAnswerStoreSkipped {
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_post_answer_redundant")
+            return
+        }
         // The async decode pipeline forwards the consumed stop token while
         // computing the never-consumed next step, so at store time every
         // cache layer can legitimately sit ONE token past
@@ -4187,12 +4254,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         else {
             return nil
         }
+        // A snapshot of views (deferred prompt snapshot): its boundaries are views too, nothing is copied.
+        let snapshotIsViews = cacheIsPrefixViews(storageSnapshot)
         if tokens.count == storageSnapshotTokenCount {
+            if snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) { return views }
             return storageSnapshot.map { $0.copy() }
         }
         guard let boundaryInput = originalInput.inputForCacheBoundary(
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
         let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
+        if keepsMedia, snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) {
+            return views
+        }
         let trimCount = storageSnapshotTokenCount - tokens.count
         if keepsMedia, canTrimPromptCache(storageSnapshot) {
             let trimmed = storageSnapshot.map { $0.copy() }
@@ -5608,11 +5681,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
+            let receiptID = RuntimeReceipts.isEnabled ? RuntimeReceipts.nextRequestID() : 0
             // Collect only errors escaping this operation's scoped handlers.
             // A process-wide counter also sees unrelated requests and probes
             // whose owners caught their errors and selected a valid fallback.
             do {
-                iterator = try MLX.withError { try makeIterator.consume()() }
+                let make = makeIterator.consume()
+                iterator = try RuntimeReceipts.$currentRequestID.withValue(receiptID) {
+                    try MLX.withError { try make() }
+                }
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -5676,8 +5753,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
+            // The prompt is resident now; keep MLX's scheduling limit above it (SchedulingMemoryFloor).
+            SchedulingMemoryFloor.observe()
             while true {
                 let nextToken: Int?
+                SchedulingMemoryFloor.observe()
                 do {
                     nextToken = try MLX.withError { iterator.next() }
                 } catch {
@@ -5811,6 +5891,20 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                         : nil)
             )
             _ = continuation.yield(handler.infoEvent(info))
+            if RuntimeReceipts.isEnabled {
+                let prefillSeconds = info.promptTime
+                RuntimeReceipts.emit(
+                    "done id=\(receiptID) prompt=\(promptTokenCount) "
+                        + "prefill_s=\(String(format: "%.2f", prefillSeconds)) "
+                        + "pp_s=\(String(format: "%.1f", prefillSeconds > 0 ? Double(promptTokenCount) / prefillSeconds : 0)) "
+                        + "generated=\(tokenCount) "
+                        + "decode_tok_s=\(String(format: "%.2f", generateTime > 0 ? Double(max(0, tokenCount - 1)) / generateTime : 0)) "
+                        + "stop=\(String(describing: info.stopReason)) "
+                        + "mlx_active_gib=\(RuntimeReceipts.gib(MLX.Memory.activeMemory)) "
+                        + "mlx_peak_gib=\(RuntimeReceipts.gib(MLX.Memory.peakMemory)) "
+                        + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                        + "floor_raises=\(SchedulingMemoryFloor.raises)")
+            }
 
             // Post-completion cleanup, still on the request path so the
             // stream does not FINISH until it is done. Timed to split

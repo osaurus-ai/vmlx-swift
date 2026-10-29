@@ -52,6 +52,13 @@ public enum MiniMaxM3ThinkingTemplateContext {
         guard applies(to: modelType) else { return additionalContext }
         var context = additionalContext ?? [:]
         let mode = resolvedMode(additionalContext)
+        if RuntimeReceipts.isEnabled {
+            let explicit = (additionalContext?[templateKey] as? String).map { "thinking_mode=\($0)" }
+            let toggle = (additionalContext?["enable_thinking"] as? Bool).map { "enable_thinking=\($0)" }
+            RuntimeReceipts.emit(
+                "thinking model_type=\(modelType ?? "nil") source=\(explicit ?? toggle ?? "none") "
+                    + "thinking_mode=\(mode ?? "adaptive")")
+        }
         context.removeValue(forKey: "enable_thinking")
         context.removeValue(forKey: "thinking")
         if let mode {
