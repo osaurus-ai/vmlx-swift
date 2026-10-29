@@ -424,7 +424,7 @@ func taskCutsAB() async throws {
     var probesLog: [[String: Any]] = []
 
     func runArm(_ arm: String, _ n: Int) throws -> (ppS: Double, first: Int, sha: String, pieces: Int) {
-        model.setAlignedPrefillTurnMarkers(arm == "nocuts" ? nil : markers)
+        model.setAlignedPrefillTurnMarkers(arm.hasPrefix("nocuts") ? nil : markers)
         defer { model.setAlignedPrefillTurnMarkers(markers) }
         var firstLogits: MLXArray?
         var pieces = 0
@@ -481,6 +481,8 @@ func taskCutsAB() async throws {
         }
         // Same pieces, same kernels: the stock cut arms agree bit for bit, and so do the sorted-tile arms.
         let cutArms = armNames.filter { ["grouped", "piecewise", "old", "async", "batched", "batchedasync"].contains($0) }
+        let nocutShas = Set(armNames.filter { $0.hasPrefix("nocuts") }.flatMap { shas[$0] ?? [] })
+        if nocutShas.count > 1 { invalid.append("n=\(n): no-cut arms disagree \(nocutShas.sorted())") }
         let cutShas = Set(cutArms.flatMap { shas[$0] ?? [] })
         if cutShas.count > 1 { invalid.append("n=\(n): cut arms disagree \(cutShas.sorted())") }
         let sortedShas = Set(armNames.filter { $0.hasPrefix("sorted") && !$0.hasPrefix("sorted72") }.flatMap { shas[$0] ?? [] })
