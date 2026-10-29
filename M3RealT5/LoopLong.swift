@@ -438,13 +438,18 @@ func taskCutsAB() async throws {
         }
         let input = LMInput(tokens: MLXArray(Array(tokens[0 ..< n])))
         let piecewise = arm == "piecewise" || arm == "old" || arm == "sortedpw"
-        let (run, _) = try MiniMaxM3Model.$prefillSortedAllOverride.withValue(arm.hasPrefix("sorted")) {
+        let batchRows = arm.contains("batched")
+        let (run, _) = try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(batchRows) {
+          try MiniMaxM3Model.$prefillAsyncOverride.withValue(arm.hasSuffix("async")) {
+          try MiniMaxM3Model.$prefillSortedAllOverride.withValue(arm.hasPrefix("sorted")) {
           try MiniMaxM3Model.$prefillGroupingOverride.withValue(!piecewise) {
             try MiniMaxM3Model.$prefillClearEachChunkOverride.withValue(arm == "old") {
                 try MiniMaxM3SparseCache.$reserveOverride.withValue(arm == "old" ? false : nil) {
                     try greedy(model, input, maxTokens: 2, drafter: nil, stopAtEOS: false, step: 2048)
                 }
             }
+          }
+          }
           }
         }
         let logits = try require2(firstLogits, "cutsab: no first-token logits for \(arm)")
@@ -473,7 +478,7 @@ func taskCutsAB() async throws {
             }
         }
         // Same pieces, same kernels: the stock cut arms agree bit for bit, and so do the sorted-tile arms.
-        let cutArms = armNames.filter { ["grouped", "piecewise", "old"].contains($0) }
+        let cutArms = armNames.filter { ["grouped", "piecewise", "old", "async", "batched", "batchedasync"].contains($0) }
         let cutShas = Set(cutArms.flatMap { shas[$0] ?? [] })
         if cutShas.count > 1 { invalid.append("n=\(n): cut arms disagree \(cutShas.sorted())") }
         let sortedShas = Set(armNames.filter { $0.hasPrefix("sorted") }.flatMap { shas[$0] ?? [] })
@@ -591,4 +596,59 @@ func taskPrefillProfile() async throws {
         "n": n, "full_chunks": fullChunks, "per_chunk_s": perChunk, "instrumented_chunk_s": total,
         "uninstrumented_pp_s": Double(n) / (plain.prefillMs / 1000),
     ], "prefprof_\(tag).json")
+}
+
+// MARK: - rowdep
+
+/// Which of the real layer's matrix products give a row a different result depending on how many rows the call
+/// carries (MLX picks split-K, tile sizes or the vector kernel by M): for each op of layer `T5_ROWDEP_LAYER` (default
+/// 10) and each row count M, op(x[a ..< a + M]) vs op(x)[a ..< a + M] bit for bit, x = 2048 real rows (the held-out
+/// stream's embeddings through the layer's input norm; the o / down projections get their real input shapes from the
+/// q / SwiGLU outputs). Per device: run on each machine.
+func taskRowDependence() async throws {
+    let (model, _, _) = try await productionLoad(bundleURL())
+    let tokens = try loadTokens()
+    let li = Int(env["T5_ROWDEP_LAYER"] ?? "10")!
+    let layer = model.model.layers[li]
+    let attn = layer.selfAttn
+    let block = layer.mlp as! MiniMaxM3SparseMoeBlock
+    let bank = block.experts as! JANGTRoutedExpertLayer
+    let x = layer.inputLayerNorm(model.model.embedTokens(MLXArray(Array(tokens[0 ..< 2048])).reshaped(1, -1)))
+    let qOut = attn.wq(x)
+    let shared = block.sharedExperts
+    let act = miniMaxM3SwiGLU(up: shared.upProj(x), gate: shared.gateProj(x), alpha: shared.alpha, limit: shared.limit)
+    let route = block.route(x)
+    eval(x, qOut, act, route.indices, route.scores)
+    let ops: [(String, MLXArray, (MLXArray, Range<Int>) -> MLXArray)] = [
+        ("q_proj", x, { a, _ in attn.wq(a) }), ("k_proj", x, { a, _ in attn.wk(a) }), ("v_proj", x, { a, _ in attn.wv(a) }),
+        ("o_proj", qOut, { a, _ in attn.wo(a) }),
+        ("index_q_proj", x, { a, _ in attn.indexer!.queryProjection(a) }),
+        ("index_k_proj", x, { a, _ in attn.indexer!.keyProjection(a) }),
+        ("router", x, { a, _ in block.gate(a).asType(.float32) }),
+        ("shared_gate", x, { a, _ in shared.gateProj(a) }), ("shared_up", x, { a, _ in shared.upProj(a) }),
+        ("shared_down", act, { a, _ in shared.downProj(a) }),
+        ("routed_stock", x, { a, r in bank.callRouted(a, indices: route.indices[0..., r, 0...], scores: route.scores[0..., r, 0...]) }),
+        ("routed_sorted", x, { a, r in bank.callRoutedSorted(a, indices: route.indices[0..., r, 0...], scores: route.scores[0..., r, 0...]) }),
+    ]
+    let sizes = (env["T5_ROWDEP_SIZES"] ?? "1,2,4,8,12,13,16,17,18,31,32,33,64,65,127,128,129,256,257,512,513,700,1024,1025,1344,1345,1500,2000")
+        .split(separator: ",").map { Int($0)! }
+    var report: [String: Any] = ["layer": li, "sizes": sizes]
+    for (name, input, f) in ops {
+        let full = f(input, 0 ..< 2048)
+        eval(full)
+        var differs: [Int] = []
+        for m in sizes {
+            for a in [0, 2048 - m] {
+                let part = f(input[0..., a ..< (a + m), 0...], a ..< (a + m))
+                let ref = full[0..., a ..< (a + m), 0...]
+                if !arrayEqual(part, ref).item(Bool.self) {
+                    differs.append(m)
+                    break
+                }
+            }
+        }
+        report[name] = ["differs_at_rows": differs]
+        log("rowdep \(name): rows differ from the 2048-row call at M = \(differs)")
+    }
+    try writeJSON(report, "rowdep_\(tag).json")
 }
