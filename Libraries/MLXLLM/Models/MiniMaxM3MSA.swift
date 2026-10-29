@@ -153,6 +153,15 @@ enum MiniMaxM3MSA {
         return path
     }
 
+    /// `choosePath` without telling the observer: the verify asks which path each row's one-row call would take
+    /// before it batches the rows' attention into one decode-kernel launch.
+    static func peekPath(
+        _ selection: MiniMaxM3MSASelection, queries: MLXArray, keys: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, kvHeads: Int
+    ) -> Path {
+        route(selection, queries: queries, keys: keys, mask: mask, kvHeads: kvHeads)
+    }
+
     private static func route(
         _ selection: MiniMaxM3MSASelection, queries: MLXArray, keys: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode, kvHeads: Int
