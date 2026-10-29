@@ -547,8 +547,11 @@ public final class MiniMaxM3ModelInner: Module {
     }
 
     /// `recordTaps` false: a prefill piece that ends before the drafter's window records no tap rows (they would leave
-    /// the tail before the drafter reads it; `MiniMaxM3Model.prepare`).
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?, recordTaps tapsWanted: Bool = true) -> MLXArray {
+    /// the tail before the drafter reads it; `MiniMaxM3Model.prepare`). `inputEmbeddings`: the rows to run instead of
+    /// `embedTokens(inputs)` (an image prefill piece, `MiniMaxM3ImageSplice`).
+    func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?, recordTaps tapsWanted: Bool = true, inputEmbeddings: MLXArray? = nil
+    ) -> MLXArray {
         let holder = MiniMaxM3DSpark.tapHolder(cache)
         if let holder, let cache, MiniMaxM3DSpark.verifies(inputs, holder: holder) {
             return verifyForward(inputs, cache: cache, holder: holder)
@@ -556,7 +559,7 @@ public final class MiniMaxM3ModelInner: Module {
         let start = cache?.first?.offset ?? 0
         let recording = tapsWanted && !dsparkTapLayers.isEmpty && holder != nil && inputs.dim(0) == 1
         var taps: [Int: MLXArray] = [:]
-        var h = embedTokens(inputs)
+        var h = inputEmbeddings ?? embedTokens(inputs)
         // The Python runtime's mask (mlx_lm create_attention_mask): symbolic causal for every multi-token call, at any
         // cache offset (MLX SDPA aligns a causal mask bottom-right, so the key length carries the offset); none for
         // one token. Dense layers use it as is; sparse layers fold causality into their block selection. The cache's
@@ -583,14 +586,17 @@ public final class MiniMaxM3ModelInner: Module {
     /// piece by piece; a piece the fused decode path would take, or a layer without the sparse cache, falls back to
     /// `prefillPieces` (the whole group).
     func prefillPiecesBatched(
-        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool
+        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool,
+        embeddings: [MLXArray?]? = nil
     ) {
         let rows = pieces.map { $0.dim(1) }
         guard pieces.count > 1, pieces.allSatisfy({ $0.ndim == 2 && $0.dim(0) == 1 }),
             cache.count == layers.count,
             rows.allSatisfy({ MiniMaxM3FusedDecode.active(rows: $0, batch: 1) == nil })
         else {
-            prefillPieces(pieces, cache: cache, recordTaps: recordTaps, groupRouted: groupRouted, sortedAll: sortedAll)
+            prefillPieces(
+                pieces, cache: cache, recordTaps: recordTaps, groupRouted: groupRouted, sortedAll: sortedAll,
+                embeddings: embeddings)
             return
         }
         let holder = MiniMaxM3DSpark.tapHolder(cache)
@@ -660,7 +666,7 @@ public final class MiniMaxM3ModelInner: Module {
                 return h + perPiece(xns) { layer.mlp($0) }
             }
         }
-        var h = concatenated(pieces.map { embedTokens($0) }, axis: 1)
+        var h = concatenated(pieces.indices.map { embeddings?[$0] ?? embedTokens(pieces[$0]) }, axis: 1)
         var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
         for (li, layer) in layers.enumerated() {
             let attn = layer.selfAttn
@@ -783,7 +789,8 @@ public final class MiniMaxM3ModelInner: Module {
     /// M3.1 bundle a few-hundred-row piece cost ~23 % of a full 2,048-row chunk). The pieces must stay pieces (the K / V
     /// / index projections' and the router's rows depend on the row count), the routed experts need not.
     func prefillPieces(
-        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool = false
+        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool = false,
+        embeddings: [MLXArray?]? = nil
     ) {
         precondition(pieces.count == recordTaps.count && !pieces.isEmpty && cache.count == layers.count)
         let holder = MiniMaxM3DSpark.tapHolder(cache)
@@ -795,7 +802,7 @@ public final class MiniMaxM3ModelInner: Module {
             starts.append(position)
             position += piece.dim(1)
         }
-        var hs = pieces.map { embedTokens($0) }
+        var hs = pieces.indices.map { embeddings?[$0] ?? embedTokens(pieces[$0]) }
         let masks: [MLXFast.ScaledDotProductAttentionMaskMode] = hs.map { $0.dim(1) > 1 ? .causal : .none }
         var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
         for (li, layer) in layers.enumerated() {
@@ -814,7 +821,7 @@ public final class MiniMaxM3ModelInner: Module {
 }
 
 public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding,
-    AlignedPrefillModel, AlignedPrefillTurnMarkerResolving
+    AlignedPrefillModel, AlignedPrefillTurnMarkerResolving, ModalityBearing
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -827,6 +834,13 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// The image path (`MiniMaxM3Vision.swift`): built when the config carries `vision_config` and the caller wants the
+    /// vision lane; nil for a text-only build (its tensors are then dropped at load).
+    @ModuleInfo(key: "vision") public var vision: MiniMaxM3VisionStack?
+
+    /// What this instance carries: text, plus vision when the stack is built.
+    public var modalities: Set<ModelRuntimeRequestModality> { vision == nil ? [.text] : [.text, .vision] }
+
     /// The attached DSpark drafter (`dspark/`), shared by every request; nil until `attachDSparkDraft`.
     var dsparkHead: MiniMaxM3DSparkHead?
     let dsparkAttachLock = NSLock()
@@ -834,7 +848,7 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     private var resolvedTurnMarkers: AlignedPrefillTurnMarkers?
     private let turnMarkersLock = NSLock()
 
-    public init(_ configuration: MiniMaxM3Configuration) {
+    public init(_ configuration: MiniMaxM3Configuration, vision: MiniMaxM3VisionConfiguration? = nil) {
         self.configuration = configuration
         vocabularySize = configuration.vocabularySize
         kvHeads = Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)
@@ -844,13 +858,14 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             _lmHead.wrappedValue = Linear(
                 configuration.hiddenSize, configuration.vocabularySize, bias: false)
         }
+        if let vision { _vision.wrappedValue = MiniMaxM3VisionStack(vision) }
     }
 
     /// A JANGHT bundle: every MoE layer runs its admitted mapped bank layer (`routedExperts`, keyed by layer), and
     /// `excludedTensorNames` are exactly those banks' tensors.
     init(
         _ configuration: MiniMaxM3Configuration, routedExperts: [Int: any WeightedRoutedExpertLayer],
-        excludedTensorNames: Set<String>
+        excludedTensorNames: Set<String>, vision: MiniMaxM3VisionConfiguration? = nil
     ) throws {
         let moeLayers = Set((0 ..< configuration.hiddenLayers).filter(configuration.isMoE))
         guard Set(routedExperts.keys) == moeLayers,
@@ -869,6 +884,7 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             _lmHead.wrappedValue = Linear(
                 configuration.hiddenSize, configuration.vocabularySize, bias: false)
         }
+        if let vision { _vision.wrappedValue = MiniMaxM3VisionStack(vision) }
     }
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool { customTensorNames.contains(key) }
@@ -948,6 +964,16 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             }
             if position < start + count || pieces.isEmpty { pieces.append(position ..< (start + count)) }
         }
+        // An image request: the features of the images whose tokens this input holds, and no cut inside an image run
+        // (a run meets its features in one forward; the request's turn cuts, chunk boundaries outside the runs and the
+        // store boundary stay).
+        var splice: MiniMaxM3ImageSplice?
+        if let image = input.image, let vision {
+            splice = try MiniMaxM3ImageSplice.make(
+                tokens: tokens.asType(.int32).asArray(Int32.self).map(Int.init), start: start, image: image,
+                vision: vision)
+            if let splice { pieces = splice.unsplit(pieces) }
+        }
         for layer in aligned {
             layer.alignedPrefillTag = followsPlan ? plan?.tag : nil
         }
@@ -982,16 +1008,21 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
                 let local = (piece.lowerBound - start) ..< (piece.upperBound - start)
                 return tokens[local][.newAxis, 0...]
             }
+            let embeddings = splice.map { splice in
+                zip(group, inputs).map { splice.embeddings(for: $0, ids: $1, embed: { model.embedTokens($0) }) }
+            }
             if group.count == 1 && !sortedAll {
-                _ = model(inputs[0], cache: cache.isEmpty ? nil : cache, recordTaps: wantsTaps(group[0]))
+                _ = model(
+                    inputs[0], cache: cache.isEmpty ? nil : cache, recordTaps: wantsTaps(group[0]),
+                    inputEmbeddings: embeddings?[0])
             } else if group.count > 1 && Self.prefillBatchRows {
                 model.prefillPiecesBatched(
                     inputs, cache: cache, recordTaps: group.map(wantsTaps), groupRouted: Self.prefillGroupRouted,
-                    sortedAll: sortedAll)
+                    sortedAll: sortedAll, embeddings: embeddings)
             } else {
                 model.prefillPieces(
                     inputs, cache: cache, recordTaps: group.map(wantsTaps), groupRouted: Self.prefillGroupRouted,
-                    sortedAll: sortedAll)
+                    sortedAll: sortedAll, embeddings: embeddings)
             }
             // `VMLX_M3_PREFILL_ASYNC=1` (A/B, default off): the next group's graph is built while this one runs.
             if Self.prefillAsync { asyncEval(cache) } else { MLX.eval(cache) }
@@ -1005,6 +1036,17 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             return .tokens(LMInput.Text(tokens: tokens, mask: mask))
         }
         let local = (last.lowerBound - start) ..< (last.upperBound - start)
+        if let splice, splice.touches(last) {
+            // Image tokens in the final piece (not produced by the chat template, whose generation prompt follows the
+            // last message): it runs here with its features, and its logits go to the sampler.
+            let ids = tokens[local][.newAxis, 0...]
+            let out = model(
+                ids, cache: cache.isEmpty ? nil : cache,
+                inputEmbeddings: splice.embeddings(for: last, ids: ids, embed: { model.embedTokens($0) }))
+            let logits = lmHead.map { $0(out) } ?? model.embedTokens.asLinear(out)
+            AlignedPrefill.hooks.logitsObserver?(logits)
+            return .logits(LMOutput(logits: logits))
+        }
         return .tokens(LMInput.Text(tokens: tokens[local], mask: mask.map { $0[local] }))
     }
 
@@ -1149,10 +1191,10 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
-            // MTP heads and the vision stack are not part of the text model.
-            if key.hasPrefix("mtp") || key.hasPrefix("vision_tower.")
-                || key.hasPrefix("multi_modal_projector.") || key.hasPrefix("patch_merge_mlp.")
-            {
+            // MTP heads are not part of the model; the vision stack is, when it is built.
+            if key.hasPrefix("mtp") { continue }
+            if let (name, tensor) = MiniMaxM3VisionStack.sanitize(key: key, value: value) {
+                if vision != nil { sanitized[name] = tensor }
                 continue
             }
             var name = key
