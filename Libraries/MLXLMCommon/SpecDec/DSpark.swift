@@ -346,6 +346,8 @@ public struct DSparkGenerationStats: Sendable, Equatable {
     public var arSecondsPerToken: Double?
     /// Sampled speculation (``DSparkSampling``) rather than greedy.
     public var sampled = false
+    /// Verify forwards by width (rows = the pending token + the drafts): the draft depths Adaptive chose.
+    public var verifyWidths: [Int: Int] = [:]
 
     public init() {}
 
@@ -502,6 +504,7 @@ public struct DSparkDecoder {
         let proposed = Array(drafts.prefix(w))
         let feed = [seed] + proposed
         stats.drafted += proposed.count
+        stats.verifyWidths[feed.count, default: 0] += 1
 
         // Ask the target to keep this forward's per-token cache inputs, so a partial accept can keep
         // the verified prefix without a second forward.
