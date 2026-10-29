@@ -155,12 +155,18 @@ final class MiniMaxM3Attention: Module {
     @ModuleInfo(key: "indexer") var indexer: MiniMaxM3Indexer?
 
     let rope: RoPE
+    /// The RoPE geometry of `rope` (and of the indexer's; both non-traditional, unscaled): the fused-decode kernels
+    /// rebuild the angles from it.
+    let rotaryDim: Int
+    let ropeTheta: Float
 
     init(_ config: MiniMaxM3Configuration, layer: Int) {
         heads = config.attentionHeads
         kvHeads = config.kvHeads
         headDim = config.headDim
         scale = pow(Float(headDim), -0.5)
+        rotaryDim = config.rotaryDim
+        ropeTheta = config.ropeTheta
         _wq.wrappedValue = Linear(config.hiddenSize, heads * headDim, bias: false)
         _wk.wrappedValue = Linear(config.hiddenSize, kvHeads * headDim, bias: false)
         _wv.wrappedValue = Linear(config.hiddenSize, kvHeads * headDim, bias: false)

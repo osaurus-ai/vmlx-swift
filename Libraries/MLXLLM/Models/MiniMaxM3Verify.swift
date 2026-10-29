@@ -290,7 +290,7 @@ extension MiniMaxM3ModelInner {
         var h = embedTokens(inputs)
         // The fused-decode seam with the same admission as the decode forward: its kernels are row-invariant, so a
         // verify row on them equals the decode step on them (`MiniMaxM3FusedDecode`).
-        let fused = MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0))
+        let fused = MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0), verify: true)
         for (i, layer) in layers.enumerated() {
             if let a = fused?.attentionBlock(layer: i, module: layer, x: h, cache: cache[i], verify: true) {
                 h = a
