@@ -441,6 +441,7 @@ func taskCutsAB() async throws {
         let batchRows = arm.contains("batched")
         let (run, _) = try MiniMaxM3Model.$prefillBatchRowsOverride.withValue(batchRows) {
           try MiniMaxM3Model.$prefillAsyncOverride.withValue(arm.hasSuffix("async")) {
+          try MiniMaxM3Model.$prefillSortedMinPairsOverride.withValue(arm.hasPrefix("sorted72") ? 72 : 1) {
           try MiniMaxM3Model.$prefillSortedAllOverride.withValue(arm.hasPrefix("sorted")) {
           try MiniMaxM3Model.$prefillGroupingOverride.withValue(!piecewise) {
             try MiniMaxM3Model.$prefillClearEachChunkOverride.withValue(arm == "old") {
@@ -448,6 +449,7 @@ func taskCutsAB() async throws {
                     try greedy(model, input, maxTokens: 2, drafter: nil, stopAtEOS: false, step: 2048)
                 }
             }
+          }
           }
           }
           }
@@ -481,7 +483,9 @@ func taskCutsAB() async throws {
         let cutArms = armNames.filter { ["grouped", "piecewise", "old", "async", "batched", "batchedasync"].contains($0) }
         let cutShas = Set(cutArms.flatMap { shas[$0] ?? [] })
         if cutShas.count > 1 { invalid.append("n=\(n): cut arms disagree \(cutShas.sorted())") }
-        let sortedShas = Set(armNames.filter { $0.hasPrefix("sorted") }.flatMap { shas[$0] ?? [] })
+        let sortedShas = Set(armNames.filter { $0.hasPrefix("sorted") && !$0.hasPrefix("sorted72") }.flatMap { shas[$0] ?? [] })
+        let sorted72Shas = Set(armNames.filter { $0.hasPrefix("sorted72") }.flatMap { shas[$0] ?? [] })
+        if sorted72Shas.count > 1 { invalid.append("n=\(n): sorted72 arms disagree \(sorted72Shas.sorted())") }
         if sortedShas.count > 1 { invalid.append("n=\(n): sorted arms disagree \(sortedShas.sorted())") }
         for arm in armNames where (shas[arm]?.count ?? 0) != 1 { invalid.append("n=\(n) \(arm): not repeatable \(shas[arm] ?? [])") }
         report["\(n)"] = Dictionary(uniqueKeysWithValues: armNames.map { arm in

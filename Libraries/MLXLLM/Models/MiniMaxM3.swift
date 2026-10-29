@@ -486,7 +486,8 @@ final class MiniMaxM3DecoderLayer: Module {
             let h = hs[i]
             guard MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0)) == nil else { return false }
             return sortedAll
-                ? JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: h.dtype)
+                ? h.dim(0) * h.dim(1) * block.topK >= MiniMaxM3Model.prefillSortedMinPairs
+                    && JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: h.dtype)
                 : !JANGTRoutedExpertLayer.usesDecodeKernels(pairs: h.dim(0) * h.dim(1) * block.topK, dtype: h.dtype)
         }
         guard sortedAll ? !grouped.isEmpty : grouped.count > 1 else { return hs.map(mlpHalf) }
@@ -741,7 +742,8 @@ public final class MiniMaxM3ModelInner: Module {
         }
         let sorted = xns.indices.filter { i in
             sortedAll
-                ? JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: xns[i].dtype)
+                ? xns[i].dim(1) * block.topK >= MiniMaxM3Model.prefillSortedMinPairs
+                    && JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: xns[i].dtype)
                 : !JANGTRoutedExpertLayer.usesDecodeKernels(pairs: xns[i].dim(1) * block.topK, dtype: xns[i].dtype)
         }
         var out = [MLXArray?](repeating: nil, count: xns.count)
@@ -1026,7 +1028,7 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     public var alignedPrefillSchema: String? {
         guard AlignedPrefillGeometry.isEnabled() else { return nil }
         // Pieces whose routed experts all run on the sorted tiles carry other numbers than the stock rule's.
-        let sorted = Self.prefillSortedAll ? ":routed=sorted" : ""
+        let sorted = Self.prefillSortedAll ? ":routed=sorted\(Self.prefillSortedMinPairs)" : ""
         if let markers = alignedPrefillTurnMarkers {
             return "minimax-m3:" + AlignedPrefillGeometry.turnsSchema + ":turns=" + markers.signature + sorted
         }
@@ -1096,6 +1098,15 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// family), so the rule is part of the cache identity (`alignedPrefillSchema`).
     @TaskLocal static var prefillSortedAllOverride: Bool?
     static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: false) }
+    /// The (row, slot) pairs from which a non-final piece takes the sorted tiles under `prefillSortedAll`:
+    /// `VMLX_M3_PREFILL_SORTED=72` = vMLX Python's `SORT_THRESHOLD` (18 rows at top-4; smaller pieces stay on the
+    /// decode kernels, alone), any other "on" value = every piece (1).
+    @TaskLocal static var prefillSortedMinPairsOverride: Int?
+    static var prefillSortedMinPairs: Int {
+        if let prefillSortedMinPairsOverride { return prefillSortedMinPairsOverride }
+        let raw = ProcessInfo.processInfo.environment["VMLX_M3_PREFILL_SORTED"]?.trimmingCharacters(in: .whitespaces)
+        return raw.flatMap(Int.init).map { $0 > 1 ? $0 : 1 } ?? 1
+    }
     /// `VMLX_M3_PREFILL_BATCH_ROWS` (default off while measured): inside a group, the row-wise ops of all pieces in
     /// one call each (`MiniMaxM3ModelInner.prefillPiecesBatched`); the row-count-dependent matmuls stay per piece.
     @TaskLocal static var prefillBatchRowsOverride: Bool?

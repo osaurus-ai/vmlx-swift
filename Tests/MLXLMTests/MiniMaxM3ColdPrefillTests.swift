@@ -217,6 +217,13 @@ struct MiniMaxM3ColdPrefillTests {
             #expect(diff.isEmpty, "sorted-all grouped != piece by piece: \(diff.prefix(4))")
             let stock = try arm(grouping: true, sorted: false)
             #expect(!Self.problems(stock, grouped).isEmpty, "the sorted rule changed nothing: the control is blind")
+            // vMLX Python's threshold (72 pairs = 18 rows): the 7 / 17-row pieces stay on the decode kernels.
+            let py = try MiniMaxM3Model.$prefillSortedMinPairsOverride.withValue(72) {
+                (try arm(grouping: false, sorted: true), try arm(grouping: true, sorted: true))
+            }
+            let diff72 = Self.problems(py.0, py.1)
+            #expect(diff72.isEmpty, "sorted-72 grouped != piece by piece: \(diff72.prefix(4))")
+            #expect(!Self.problems(py.1, grouped).isEmpty, "the 72-pair threshold changed nothing vs every piece sorted")
         }
     }
 
