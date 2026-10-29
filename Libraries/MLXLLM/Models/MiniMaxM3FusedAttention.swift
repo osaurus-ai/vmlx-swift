@@ -441,20 +441,38 @@ final class MiniMaxM3FusedAttention: @unchecked Sendable {
     }
 }
 
-/// The fused path registered with `MiniMaxM3FusedDecode`: K1-K5 attention (this file); the MoE half (K6-K8) is
-/// `mlpBlock` (nil = stock until ported).
+/// The fused path registered with `MiniMaxM3FusedDecode` by default: vMLX's K1-K5 attention
+/// (`MiniMaxM3FusedAttention`) and K6-K8 MoE (`MiniMaxM3FusedMoE`). Each half declines (stock path) for layers it does
+/// not cover: dense-attention layers, dense-MLP layers, other formats. `VMLX_M3_FUSED_ATTN=0` / `VMLX_M3_FUSED_MOE=0`
+/// switch one half off while the seam is on (A/B).
 final class MiniMaxM3FusedKernelPath: MiniMaxM3FusedPath, @unchecked Sendable {
     static let shared = MiniMaxM3FusedKernelPath()
+
+    static func lever(_ name: String) -> Bool {
+        let raw = (ProcessInfo.processInfo.environment[name] ?? "1").trimmingCharacters(in: .whitespaces).lowercased()
+        return !["0", "false", "off", "no"].contains(raw)
+    }
+    let attention: Bool
+    let moe: Bool
+
+    init(attention: Bool = lever("VMLX_M3_FUSED_ATTN"), moe: Bool = lever("VMLX_M3_FUSED_MOE")) {
+        self.attention = attention
+        self.moe = moe
+    }
 
     func attentionBlock(
         layer: Int, module: MiniMaxM3DecoderLayer, x: MLXArray, cache: KVCache?, verify: Bool
     ) -> MLXArray? {
         let fa = MiniMaxM3FusedAttention.shared
-        guard let sparse = cache as? MiniMaxM3SparseCache, fa.covers(module, x: x, cache: cache) else { return nil }
+        guard attention, let sparse = cache as? MiniMaxM3SparseCache, fa.covers(module, x: x, cache: cache) else {
+            return nil
+        }
         return fa.attentionBlock(module, x: x, cache: sparse)
     }
 
     func mlpBlock(layer: Int, module: MiniMaxM3DecoderLayer, h: MLXArray, verify: Bool) -> MLXArray? {
-        nil
+        let fm = MiniMaxM3FusedMoE.shared
+        guard moe, let block = module.mlp as? MiniMaxM3SparseMoeBlock, fm.covers(block, x: h) else { return nil }
+        return fm.residual(block, xNormed: module.postAttentionLayerNorm(h), resid: h)
     }
 }

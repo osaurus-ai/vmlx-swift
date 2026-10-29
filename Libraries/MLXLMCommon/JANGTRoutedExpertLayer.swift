@@ -197,6 +197,38 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     }
 
     /// (R, width) float32: 0 at each row's outlier columns (-1 entries are padding), else 1.
+    /// A pure-trellis layer's tensors as the decode kernels read them (fused-kernel hosts, e.g. vMLX's MiniMax-M3
+    /// fused MoE block): the gate / up / down projections, the gate/up input signs with the layer's outlier columns
+    /// zeroed (Python `_unit()["su_gu"]`), the down input's per-expert column scales x signs with each expert's outlier
+    /// columns zeroed (`sv_dn`), and the activation. nil for codebook (JANGH) groups.
+    public struct TrellisTensors {
+        public let gate: JANGTProjection
+        public let up: JANGTProjection
+        public let gateUpSigns: MLXArray
+        public let down: JANGTProjection
+        public let downSigns: MLXArray
+        public let hiddenSize: Int
+        public let intermediateSize: Int
+        /// The SwiGLU clamp (0: none).
+        public let limit: Float
+        public let activation: JANGTActivation
+    }
+
+    /// vMLX's `moe_kernels.rotate_rows` (same source and kernel name): x (R, K) -> float32 H128(x * s), s (K,) shared or
+    /// (E, K) selected per row by `rowExperts` (R,).
+    public static func rotateRows(_ x: MLXArray, signs: MLXArray, rowExperts: MLXArray? = nil) -> MLXArray {
+        JANGTKernels.rotateRows(x, signs: signs, rowExperts: rowExperts)
+    }
+
+    public var trellisTensors: TrellisTensors? {
+        guard case .trellis(let gate, let up, let signs) = gateUp, case .trellis(let d, let dSigns) = down else {
+            return nil
+        }
+        return TrellisTensors(
+            gate: gate, up: up, gateUpSigns: signs, down: d, downSigns: dSigns, hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize, limit: limit, activation: activation)
+    }
+
     static func keepMask(width: Int, columns: MLXArray) -> MLXArray {
         let positions = MLXArray(0 ..< Int32(width)).reshaped(1, width, 1)
         let hit = positions .== columns.asType(.int32).expandedDimensions(axis: 1)
