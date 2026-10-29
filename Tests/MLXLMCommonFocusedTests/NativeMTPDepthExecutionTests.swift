@@ -152,15 +152,44 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
         }
     }
 
+    /// A request with the library's default policy (what an app's On (Adaptive) sends) gets the runtime's top rung
+    /// as its adaptive ceiling, for a recursive head and for a block drafter alike, and reports it in its stats. A
+    /// host or library constant below the runtime's rung (the former `.adaptive(maximumDepth: 5)`) fails here as
+    /// soon as the runtime's rung is above it. Control: an explicit diagnostic limit and a fixed depth still bound it.
+    func testDefaultPolicyCeilingIsTheRuntimeTopRung() throws {
+        try FocusedMLXTestSupport.withLock {
+            let model = DepthDispatchTarget()
+            let top = NativeMTPDepthPolicy.runtimeTopRung(model: model)
+            func ceiling(_ policy: NativeMTPDepthPolicy?, depth: Int = 1) throws -> (Int, Int?) {
+                var parameters = GenerateParameters(maxTokens: 8, temperature: 0)
+                parameters.draftStrategy = .nativeMTP(depth: depth)
+                if let policy { parameters.nativeMTPDepthPolicy = policy }
+                var iterator = try NativeMTPTokenIterator(
+                    input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
+                    parameters: parameters, depth: depth)
+                var generated: [Int] = []
+                while let token = iterator.next() { generated.append(token) }
+                iterator.finalizeGenerationStats(generatedTokenIds: generated)
+                return (iterator.adaptiveDepthCeiling, iterator.nativeMTPStats?.adaptiveCeiling)
+            }
+            let (resolved, reported) = try ceiling(nil)
+            XCTAssertEqual(resolved, top, "default policy ceiling \(resolved) != runtime top rung \(top)")
+            XCTAssertEqual(reported, top, "stats must report the real top rung")
+            XCTAssertEqual(try ceiling(.adaptive(maximumDepth: 2)).0, min(2, top))
+            XCTAssertEqual(try ceiling(.fixed, depth: 2).0, min(2, top))
+        }
+    }
+
     private func requireIsolatedDepthRun() throws {
         guard ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_AR_SAFETY"] == "0" else {
             throw XCTSkip("Run this dispatch-only fixture with VMLX_NATIVE_MTP_AR_SAFETY=0; real governor speed qualification is separate")
         }
     }
 
-    private func run(depth: Int, policy: NativeMTPDepthPolicy) throws -> [Int] {
-        let model = DepthDispatchTarget()
-        var parameters = GenerateParameters(maxTokens: 160, temperature: 0)
+    private func run(
+        depth: Int, policy: NativeMTPDepthPolicy, tokens: Int = 160, model: DepthDispatchTarget = DepthDispatchTarget()
+    ) throws -> [Int] {
+        var parameters = GenerateParameters(maxTokens: tokens, temperature: 0)
         parameters.draftStrategy = .nativeMTP(depth: depth)
         parameters.nativeMTPDepthPolicy = policy
         var iterator = try NativeMTPTokenIterator(
@@ -171,9 +200,9 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
         while let token = iterator.next() {
             XCTAssertEqual(token, 1)
             count += 1
-            if count >= 160 { break }
+            if count >= tokens { break }
         }
-        XCTAssertEqual(count, 160)
+        XCTAssertEqual(count, tokens)
         XCTAssertGreaterThan(iterator.stagedVerifierCommitCount, 0)
         print("DEPTH-DISPATCH requested=\(depth) policy=\(policy) widths=\(Set(model.verifyWidths).sorted()) stagedCommits=\(iterator.stagedVerifierCommitCount) fixtureTokens=\(count) fixtureTokS=\(Double(count) / max(ProcessInfo.processInfo.systemUptime - start, 1e-9)) realModelSpeedProof=false")
         return model.verifyWidths
