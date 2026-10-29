@@ -88,8 +88,28 @@ final class NativeMTPDepthPolicyTests: XCTestCase {
             let resolution = try GenerateParameters().nativeMTPDepthPolicy.resolve(
                 requestedDepth: stamped, runtimeCap: 5)
             XCTAssertEqual(resolution.initialDepth, stamped)
-            XCTAssertEqual(resolution.maximumDepth, GenerateParameters.defaultAdaptiveDepthCeiling)
+            XCTAssertEqual(resolution.maximumDepth, 5, "the runtime's top rung, not the stamp")
         }
-        XCTAssertGreaterThanOrEqual(GenerateParameters.defaultAdaptiveDepthCeiling, 3)
+    }
+
+    /// No hard draft depth: the default policy's top rung is whatever the runtime reports for the loaded
+    /// model (its verifier capability), at every size, never a constant of the library. A default of
+    /// `.adaptive(maximumDepth: 5)` (the value before 2026-10-29) fails here from runtime cap 6 on: it
+    /// capped a block drafter whose blocks verify 7 drafts at 5.
+    func testDefaultPolicyTopRungIsTheRuntimeCeilingNotAConstant() throws {
+        XCTAssertEqual(GenerateParameters().nativeMTPDepthPolicy, .adaptiveToRuntimeCeiling)
+        for runtimeCap in [1, 2, 3, 5, 6, 7, 8, 15, 16, 64, 4096] {
+            for start in [1, 3] {
+                let resolution = try GenerateParameters().nativeMTPDepthPolicy.resolve(
+                    requestedDepth: start, runtimeCap: runtimeCap)
+                XCTAssertEqual(resolution.maximumDepth, runtimeCap, "runtime cap \(runtimeCap)")
+                XCTAssertEqual(resolution.initialDepth, min(start, runtimeCap))
+            }
+        }
+        // Control: an explicit finite adaptive limit (a diagnostic lever) still bounds the ladder, and an
+        // explicit fixed depth still pins it.
+        XCTAssertEqual(
+            try NativeMTPDepthPolicy.adaptive(maximumDepth: 5).resolve(requestedDepth: 1, runtimeCap: 7).maximumDepth, 5)
+        XCTAssertEqual(try NativeMTPDepthPolicy.fixed.resolve(requestedDepth: 2, runtimeCap: 7).maximumDepth, 2)
     }
 }

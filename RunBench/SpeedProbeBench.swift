@@ -9,8 +9,9 @@
 // Arms (BENCH_SPEED_ARM):
 //   default   bundle-aware production selection (the default when no arm is supplied)
 //   ar        explicit plain decode
-//   adaptive  .nativeMTP(depth: BENCH_SPEED_MTP_DEPTH=3) + .adaptive(maximumDepth: BENCH_SPEED_MTP_MAX=5),
-//             the Osaurus app's Adaptive mapping (MLXBatchAdapter.nativeMTPDepthPolicy)
+//   adaptive  .nativeMTP(depth: BENCH_SPEED_MTP_DEPTH=3) + .adaptiveToRuntimeCeiling (the runtime's top rung),
+//             the Osaurus app's Adaptive mapping (MLXBatchAdapter.nativeMTPDepthPolicy); BENCH_SPEED_MTP_MAX=<n>
+//             limits the ladder to n (diagnostic)
 //   dflash2   .dflash2(drafterPath: <bundle>/dflash2, blockSize: BENCH_SPEED_DFLASH2_BLOCK or nil)
 // Output: one JSON line per prompt plus a summary (medians) to stdout and BENCH_SPEED_OUT.
 
@@ -151,13 +152,14 @@ func runSpeedProbe(modelPath: String) async throws {
         case "default":
             p.draftStrategy = defaultStrategy
             if defaultStrategy?.nativeMTPDepth != nil {
-                p.nativeMTPDepthPolicy = .adaptive(maximumDepth: 5)
+                p.nativeMTPDepthPolicy = .adaptiveToRuntimeCeiling
             }
         case "adaptive":
             let depth = Int(env["BENCH_SPEED_MTP_DEPTH"] ?? "3") ?? 3
-            let maxDepth = Int(env["BENCH_SPEED_MTP_MAX"] ?? "5") ?? 5
             p.draftStrategy = .nativeMTP(depth: depth)
-            p.nativeMTPDepthPolicy = .adaptive(maximumDepth: maxDepth)
+            p.nativeMTPDepthPolicy =
+                env["BENCH_SPEED_MTP_MAX"].flatMap(Int.init).map { .adaptive(maximumDepth: $0) }
+                ?? .adaptiveToRuntimeCeiling
         case "dflash2":
             let block = env["BENCH_SPEED_DFLASH2_BLOCK"].flatMap(Int.init)
             p.draftStrategy = .dflash2(
