@@ -685,8 +685,13 @@ struct MiniMaxM3ImageSplice {
         var patchStart = 0
         for k in 0 ..< first { patchStart += grids[k].t * grids[k].h * grids[k].w }
         let pixels = first == 0 ? image.pixels : image.pixels[patchStart...]
+        let started = Date()
         let features = vision(pixels, grids: Array(grids[first...]))
         eval(features)
+        RuntimeReceipts.emit(
+            "m3vision stage=prefill images=\(counts.count - first)/\(counts.count) runs="
+                + runs.map { "\($0.lowerBound)-\($0.upperBound)" }.joined(separator: ",")
+                + " tower_ms=\(Int(Date().timeIntervalSince(started) * 1000)) dtype=\(features.dtype)")
         return MiniMaxM3ImageSplice(positions: runs.flatMap { Array($0) }, features: features, runs: runs)
     }
 

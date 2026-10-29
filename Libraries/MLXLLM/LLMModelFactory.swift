@@ -1596,6 +1596,11 @@ struct LLMUserInputProcessor: UserInputProcessor {
             endTokenId: try token(MiniMaxM3VisionPrompt.endToken),
             counts: processed.map { $0.grid.t * $0.grid.h * $0.grid.w / merge })
         let p = vision.processor
+        RuntimeReceipts.emit(
+            "m3vision stage=preprocess images=\(processed.count) grids="
+                + processed.map { "\($0.grid.t)x\($0.grid.h)x\($0.grid.w)" }.joined(separator: ",")
+                + " image_tokens=\(expansion.tokens.filter { $0 == vision.imageTokenId }.count)"
+                + " prompt_tokens=\(expansion.tokens.count)")
         return LMInput(
             text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
             image: MiniMaxM3ImagePreprocessor.processedImage(
