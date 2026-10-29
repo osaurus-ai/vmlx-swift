@@ -12,7 +12,9 @@ import MLXLMCommon
 ///   `mxfp8` or affine 4 / 6 / 8 (mixed per module), routers `model.layers.L.mlp.gate` unquantized F32;
 /// - routed experts `model.layers.L.mlp.switch_mlp.{gate,up,down}_proj` are `{"mode": "jangt", "kbits": K}` trellis
 ///   banks (`jt_packed`, `jt_scale`, `jt_su`, `jt_ocol`, `jt_wout`, plus `jt_cs` on down), or JANGH codebook banks;
-/// - the vision tower keeps its source names (dropped by `MiniMaxM3Model.sanitize`); `dspark/` is the drafter's.
+/// - the vision stack keeps its source names (`vision_tower.*`, `multi_modal_projector.*`, `patch_merge_mlp.*`, BF16 with
+///   an F32 patch embedding): loaded when the stack is built (`MiniMaxM3Vision.swift`), dropped by
+///   `MiniMaxM3Model.sanitize` otherwise; `dspark/` is the drafter's.
 ///
 /// config.json is the only format owner; jang_config.json (`format: jangtq2`, `format_name: JANGHT`) is runtime
 /// metadata. Admission is the shared JANGH preparation (strict partition, mapped banks, no dense expert placeholders);
@@ -32,6 +34,8 @@ struct MiniMaxM3JANGHPreparation {
 
     let configuration: MiniMaxM3Configuration
     let banks: JANGHModelPreparation
+    /// `vision_config`, when the bundle carries one.
+    let vision: MiniMaxM3VisionConfiguration?
 
     var ordinaryConfiguration: Data { banks.ordinaryConfiguration }
 
@@ -55,16 +59,20 @@ struct MiniMaxM3JANGHPreparation {
                 routesPerToken: config.numExpertsPerTok))
         // The ordinary plan must decode before any bank is mapped (JANGHModelPreparation contract).
         _ = try JSONDecoder.json5().decode(BaseConfiguration.self, from: banks.ordinaryConfiguration)
-        return Self(configuration: config, banks: banks)
+        return Self(
+            configuration: config, banks: banks,
+            vision: try MiniMaxM3VisionConfiguration.decode(configuration: configurationData))
     }
 
     func construct(requesting: Set<ModelRuntimeRequestModality>?) throws -> MiniMaxM3Model {
-        // Text model only, as the non-JANGHT dispatch: a vision lane is refused instead of served text-only.
-        _ = try Set.resolveForConstruction(requested: requesting, constructible: [.text])
+        // As the non-JANGHT dispatch: the vision stack unless the caller asks for text only; an unbuildable lane is refused.
+        let lanes = try Set.resolveForConstruction(
+            requested: requesting, constructible: vision == nil ? [.text] : [.text, .vision])
         let routed = try banks.makeRoutedExperts(
             activationLimit: configuration.swigluLimit > 0 ? configuration.swigluLimit : nil,
             activation: .oai(alpha: configuration.swigluAlpha))
         return try MiniMaxM3Model(
-            configuration, routedExperts: routed, excludedTensorNames: banks.excludedTensorNames)
+            configuration, routedExperts: routed, excludedTensorNames: banks.excludedTensorNames,
+            vision: lanes.contains(.vision) ? vision : nil)
     }
 }
