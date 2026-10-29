@@ -476,6 +476,12 @@ struct MiniMaxM3DSparkTests {
             // Both projection routes ran (multi-row exact kernels and one-row calls); routed experts batched only
             // below MiniMaxM3SwitchGLU's sort threshold.
             #expect((counters["linear_batched"] ?? 0) > 0 && (counters["linear_rows"] ?? 0) > 0, "\(counters)")
+            // Sparse layers: every row's selection is its own, the rows' attention one decode-kernel launch per 16 rows.
+            if MiniMaxM3RowExact.batchAttend {
+                #expect((counters["attend_batched"] ?? 0) > 0, "\(counters)")
+            } else {
+                #expect(counters["attend_batched"] == nil, "\(counters)")
+            }
             if width * Self.topK >= 64 {
                 #expect((counters["routed_rows"] ?? 0) > 0 && counters["routed_batched"] == nil, "\(counters)")
             } else {

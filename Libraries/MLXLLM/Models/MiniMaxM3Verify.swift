@@ -45,6 +45,16 @@ enum MiniMaxM3RowExact {
         return !["0", "false", "no", "off"].contains(raw)
     }()
 
+    /// `VMLX_MINIMAX_VERIFY_BATCH_ATTEND=0|false|no|off`: every verify row's sparse attention as its own decode-kernel
+    /// call (A/B and diagnosis). Default: when every row's one-row call would take the block-sparse decode kernel, the
+    /// rows' own selections go into ONE decode-kernel launch. Exact by construction: that kernel gives each
+    /// (row, KV group) its own threadgroups, reads only keys at or before the row's position, and merges a row's
+    /// chunks alone, so a row's result does not depend on the other rows in the launch (MiniMaxM3MSA decode kernel).
+    static let batchAttend: Bool = {
+        let raw = RuntimeEnvironment.value("VMLX_MINIMAX_VERIFY_BATCH_ATTEND")?.lowercased() ?? ""
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
     /// Verify cost diagnostics: projection calls that ran batched on an exact multi-row kernel vs as one-row calls,
     /// routed-expert layers batched vs per row (the Python runtime's `verify_paths`).
     final class Counters: @unchecked Sendable {
@@ -148,20 +158,68 @@ extension MiniMaxM3Attention {
         } else {
             (keys, values) = cache.update(keys: newKeys, values: newValues)
         }
-        let outputs = (0 ..< T).map { r -> MLXArray in
-            let end = offset + r + 1
-            var selection: MiniMaxM3MSASelection?
-            if let indexer, let indexQueries, let indexKeys {
-                selection = indexer.select(
-                    queries: indexQueries[0..., 0..., r ..< (r + 1)], keys: indexKeys[0..., 0..., ..<end],
-                    offset: offset + r)
-            }
-            return attend(
-                contiguous(queries[0..., 0..., r ..< (r + 1)]), keys[0..., 0..., ..<end],
-                values[0..., 0..., ..<end], selection: selection, mask: .none)
+        // Each row's selection is the one a decode step at `offset + r` makes (its own index-key prefix).
+        let selections: [MiniMaxM3MSASelection?] = (0 ..< T).map { r in
+            guard let indexer, let indexQueries, let indexKeys else { return nil }
+            return indexer.select(
+                queries: indexQueries[0..., 0..., r ..< (r + 1)], keys: indexKeys[0..., 0..., ..<(offset + r + 1)],
+                offset: offset + r)
         }
-        let o = concatenated(outputs, axis: 2)
+        let o: MLXArray
+        if let batched = batchedSparseAttend(queries, keys, values, selections: selections, offset: offset) {
+            o = batched
+        } else {
+            o = concatenated(
+                (0 ..< T).map { r -> MLXArray in
+                    let end = offset + r + 1
+                    return attend(
+                        contiguous(queries[0..., 0..., r ..< (r + 1)]), keys[0..., 0..., ..<end],
+                        values[0..., 0..., ..<end], selection: selections[r], mask: .none)
+                }, axis: 2)
+        }
         return MiniMaxM3RowExact.linear(wo, o.transposed(0, 2, 1, 3).reshaped(B, T, -1))
+    }
+
+    /// The T rows' sparse attention as block-sparse decode-kernel launches of up to 16 rows over their own selections
+    /// (one launch for any DSpark verify up to the ladder top), or nil when
+    /// any row would not take that kernel on its own (no selection: plain causal attention while every block is
+    /// visible; another path) or batching is off. Row r's result equals its one-row call bit for bit (see
+    /// `MiniMaxM3RowExact.batchAttend`); the path observer still sees one `.decode` per row.
+    private func batchedSparseAttend(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, selections: [MiniMaxM3MSASelection?], offset: Int
+    ) -> MLXArray? {
+        let T = selections.count
+        guard MiniMaxM3RowExact.batchAttend, T > 1, queries.dim(0) == 1 else { return nil }
+        var picked: [MiniMaxM3MSASelection] = []
+        for (r, selection) in selections.enumerated() {
+            guard let selection, selection.keep == selections.first??.keep,
+                selection.blockSize == selections.first??.blockSize
+            else { return nil }
+            let end = offset + r + 1
+            let path = MiniMaxM3MSA.peekPath(
+                selection, queries: queries[0..., 0..., r ..< (r + 1)], keys: keys[0..., 0..., ..<end], mask: .none,
+                kvHeads: kvHeads)
+            guard path == .decode else { return nil }
+            picked.append(selection)
+        }
+        // Launches of at most `decodeMaxRows` rows (the decode kernel's row range); each row's result is the same in
+        // any launch, so the split does not matter for exactness.
+        var outs: [MLXArray] = []
+        for (start, size) in MiniMaxM3RowExact.blocks(T, width: MiniMaxM3MSA.decodeMaxRows) {
+            let end = offset + start + size
+            let part = MiniMaxM3MSASelection(
+                topIndices: concatenated(picked[start ..< (start + size)].map(\.topIndices), axis: 2),
+                offset: offset + start, keyLength: end, blockSize: picked[0].blockSize)
+            let q = queries[0..., 0..., start ..< (start + size)]
+            guard MiniMaxM3MSA.decodeKernelSupported(queries: q, keys: keys, selection: part) else { return nil }
+            outs.append(
+                MiniMaxM3MSA.decodeKernelAttention(
+                    queries: q, keys: keys[0..., 0..., ..<end], values: values[0..., 0..., ..<end], selection: part,
+                    scale: scale))
+        }
+        for _ in 0 ..< T { MiniMaxM3MSA.hooks.pathObserver?(.decode) }
+        MiniMaxM3RowExact.counters.add("attend_batched")
+        return outs.count == 1 ? outs[0] : concatenated(outs, axis: 2)
     }
 }
 
