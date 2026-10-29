@@ -323,13 +323,16 @@ struct MiniMaxM3AlignedPrefixCacheTests {
 
     @Test("Geometry: absolute pieces, reuse limits, store boundary, the stored tag (Python prefill_geometry values)")
     func geometryRule() throws {
-        let P = AlignedPrefillGeometry.pieces
+        let P = { AlignedPrefillGeometry.pieces(start: $0, end: $1, step: $2, boundary: $3, atomic: $4) }
         #expect(P(0, 1013, 320, 1009, false) == [0 ..< 320, 320 ..< 640, 640 ..< 960, 960 ..< 1009, 1009 ..< 1013])
         #expect(P(640, 1013, 320, 1009, false) == [640 ..< 960, 960 ..< 1009, 1009 ..< 1013])
         #expect(P(1009, 1013, 320, 1009, false) == [1009 ..< 1013])
         #expect(P(0, 700, 320, 640, false) == [0 ..< 320, 320 ..< 640, 640 ..< 700])
         #expect(P(0, 1013, 320, 1009, true) == [0 ..< 1009, 1009 ..< 1013])
-        let R = AlignedPrefillGeometry.reuseLimit
+        let R = {
+            AlignedPrefillGeometry.reuseLimit(
+                matched: $0, boundary: $1, step: $2, exactGeometry: $3, atomic: $4, granule: $5)
+        }
         #expect(R(1009, 1009, 320, true, false, 1) == 1009)
         #expect(R(1009, 1009, 320, false, false, 1) == 960)
         #expect(R(1000, 1500, 320, true, false, 1) == 960)
