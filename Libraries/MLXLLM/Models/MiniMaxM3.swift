@@ -1090,23 +1090,27 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     static var prefillClearEachChunk: Bool {
         prefillClearEachChunkOverride ?? flag("VMLX_M3_PREFILL_CLEAR_EACH_CHUNK", default: false)
     }
-    /// `VMLX_M3_PREFILL_SORTED` (default off while measured): the JANGT routed experts of EVERY non-final piece of an
-    /// aligned prefill run on the expert-sorted prefill tiles, whatever the piece's row count (the stock rule sends
-    /// pieces under 128 rows to the decode kernels, so each small piece decoded nearly every expert on its own: on a
-    /// many-message chat most pieces are small). A row's output on those tiles depends only on its own input, so the
-    /// grouped and piece-by-piece forms stay bit-identical; the numbers of pieces under 128 rows change (another kernel
-    /// family), so the rule is part of the cache identity (`alignedPrefillSchema`).
+    /// `VMLX_M3_PREFILL_SORTED` (default off while measured): the JANGT routed experts of every non-final piece of an
+    /// aligned prefill with at least `prefillSortedMinPairs` (row, slot) pairs (18 rows at top-4, vMLX Python's rule) run
+    /// on the expert-sorted prefill tiles; the stock rule sends pieces under 128 rows (512 pairs) to the decode kernels,
+    /// where each small piece decoded nearly every expert on its own (on a many-message chat most pieces are small). A
+    /// row's output on those tiles depends only on its own input, so the grouped and piece-by-piece forms stay
+    /// bit-identical; the pieces of 18-127 rows get another kernel family's numbers, so the rule is part of the cache
+    /// identity (`alignedPrefillSchema`).
     @TaskLocal static var prefillSortedAllOverride: Bool?
     static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: false) }
-    /// The (row, slot) pairs from which a non-final piece takes the sorted tiles under `prefillSortedAll`:
-    /// `VMLX_M3_PREFILL_SORTED=72` = vMLX Python's `SORT_THRESHOLD` (18 rows at top-4; smaller pieces stay on the
-    /// decode kernels, alone), any other "on" value = every piece (1).
+    /// The (row, slot) pairs from which a non-final piece takes the sorted tiles under `prefillSortedAll`: a number
+    /// value of `VMLX_M3_PREFILL_SORTED` (e.g. 128), never below `sortedFloorPairs`; any other "on" value = the floor.
     @TaskLocal static var prefillSortedMinPairsOverride: Int?
     static var prefillSortedMinPairs: Int {
-        if let prefillSortedMinPairsOverride { return prefillSortedMinPairsOverride }
         let raw = ProcessInfo.processInfo.environment["VMLX_M3_PREFILL_SORTED"]?.trimmingCharacters(in: .whitespaces)
-        return raw.flatMap(Int.init).map { $0 > 1 ? $0 : 1 } ?? 1
+        let wanted = prefillSortedMinPairsOverride ?? raw.flatMap(Int.init) ?? sortedFloorPairs
+        return max(sortedFloorPairs, wanted)
     }
+    /// vMLX Python's `SORT_THRESHOLD` (72 pairs = 18 rows at top-4), and a floor: on the real M3.1 bundle the JANGT
+    /// sorted NAX tiles fail to build their Metal kernel for a 1-row call ("no matching function for call to
+    /// jt_gather_qmm_nax", `M3RealT5 rowdep`, Studio 2026-10-29), so smaller pieces always keep the decode kernels.
+    static let sortedFloorPairs = 72
     /// `VMLX_M3_PREFILL_BATCH_ROWS` (default off while measured): inside a group, the row-wise ops of all pieces in
     /// one call each (`MiniMaxM3ModelInner.prefillPiecesBatched`); the row-count-dependent matmuls stay per piece.
     @TaskLocal static var prefillBatchRowsOverride: Bool?
