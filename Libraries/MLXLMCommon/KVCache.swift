@@ -585,6 +585,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     public var step = 256
     /// Set on a cache made by ``prefixView(rows:)`` (``AppendOnlyRowsCache``).
     public internal(set) var isPrefixView = false
+    /// A capacity hint (``reserveRows(until:)``): the next growth allocates room up to this row count at once instead
+    /// of the rows of the update that needs it; consumed by that growth. Capacity only: rows and readers are unchanged.
+    public private(set) var reservedRowsUntil: Int?
 
     public override init() {
         super.init()
@@ -592,6 +595,18 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    /// Make the next capacity growth room for `until` rows in total (a prefill of known length: the lanes grow once,
+    /// not at every chunk). nil clears the hint. Nothing is allocated here.
+    public func reserveRows(until: Int?) {
+        reservedRowsUntil = until.flatMap { $0 > offset ? $0 : nil }
+    }
+
+    /// Bytes one more row costs on the K and V buffers (0 before the first update).
+    public var rowBytes: Int {
+        guard let keys, let values, keys.dim(2) > 0, values.dim(2) > 0 else { return 0 }
+        return keys.nbytes / keys.dim(2) + values.nbytes / values.dim(2)
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -609,7 +624,12 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
+            var needed = keys.dim(2)
+            if let until = reservedRowsUntil {
+                needed = Swift.max(needed, until - previous)
+                reservedRowsUntil = nil
+            }
+            let nSteps = (step + needed - 1) / step
             let kShape = [B, kvHeads, nSteps * step, kHeadDim]
             let vShape = [B, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)

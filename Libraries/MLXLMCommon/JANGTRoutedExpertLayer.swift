@@ -235,6 +235,31 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         return MLX.where(hit.any(axis: -1), MLXArray(Float(0)), MLXArray(Float(1)))
     }
 
+    /// True when `callRoutedSorted` runs the expert-sorted prefill tiles for a `dtype` input (VMLX_JANGT_PREFILL on, the
+    /// NAX kernel present, bf16 / fp16), at any row count.
+    public static func sortedPrefillAvailable(dtype: DType) -> Bool {
+        prefillEnabled && JANGTPrefillKernel.available && [.bfloat16, .float16].contains(dtype)
+    }
+
+    /// `callRouted` on the expert-sorted prefill tiles whatever the row count (`sortedPrefillAvailable`; otherwise the
+    /// ordinary `callRouted`). A row's output there depends only on its own input and routing, so a prompt prefill
+    /// that sends every piece here gets the same rows whether its pieces are called one by one or concatenated.
+    public func callRoutedSorted(_ input: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
+        guard Self.sortedPrefillAvailable(dtype: input.dtype), input.ndim >= 2, input.dim(-1) == hiddenSize,
+            indices.ndim == input.ndim, indices.shape.dropLast() == input.shape.dropLast(), indices.dim(-1) > 0,
+            scores.shape == indices.shape
+        else { return callRouted(input, indices: indices, scores: scores) }
+        let routes = indices.dim(-1)
+        do {
+            return try prefill(
+                input.reshaped(-1, hiddenSize), ids: indices.reshaped(-1, routes).asType(.uint32),
+                weights: scores.reshaped(-1, routes).asType(.float32)
+            ).asType(input.dtype).reshaped(input.shape)
+        } catch {
+            preconditionFailure("JANGT routed prefill rejected admitted bank: \(error)")
+        }
+    }
+
     public func callRouted(_ input: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
         precondition(input.ndim >= 2 && input.dim(-1) == hiddenSize,
                      "JANGT routed input does not match admitted architecture")

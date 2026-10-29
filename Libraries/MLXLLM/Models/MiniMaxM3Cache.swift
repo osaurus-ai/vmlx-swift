@@ -26,6 +26,8 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding, AppendOnlyRows
     private(set) var indexStorage: MLXArray?
     private var indexCount = 0
     private static let step = 256
+    /// The index lane's capacity hint (`reserve(rows:)`), consumed by its next growth.
+    private var indexReservedUntil: Int?
     /// Bumped whenever the lanes are replaced wholesale (`state` set, a disk restore): a row checkpoint taken before
     /// it is meaningless after it.
     private(set) var stateGeneration = 0
@@ -53,6 +55,74 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding, AppendOnlyRows
     var indexRows: Int { indexCount }
     public var maxSize: Int? { nil }
 
+    // MARK: Prefill reservation (vMLX Python `MiniMaxM3SparseCache.reserve` / `reserve_prefill`, 9d71d160 + 7cbde44c)
+
+    /// Make the next capacity growth of the K / V and index lanes room for `rows` rows past the current offset (a
+    /// prefill of known length), so they grow once instead of re-allocating and copying every row at each chunk. A hint
+    /// only: nothing is allocated here, rows and readers are unchanged.
+    public func reserve(rows: Int) {
+        let until = offset + max(0, rows)
+        kv.reserveRows(until: until)
+        indexReservedUntil = until > indexCount ? until : nil
+    }
+
+    /// Bytes one more row costs on the K / V / index lanes (0 while a lane does not exist yet).
+    public var rowBytes: Int {
+        let kvBytes = kv.rowBytes
+        guard kvBytes > 0, let storage = indexStorage, storage.dim(2) > 0 else { return 0 }
+        return kvBytes + storage.nbytes / storage.dim(2)
+    }
+
+    public static let reserveEnvironmentKey = "VMLX_M3_PREFILL_RESERVE"
+    public static let reserveMarginEnvironmentKey = "VMLX_M3_PREFILL_RESERVE_MARGIN_GB"
+    /// Tests: per-task override of `VMLX_M3_PREFILL_RESERVE` (nil = the environment's).
+    @TaskLocal static var reserveOverride: Bool?
+    /// Tests: per-task override of the allocator headroom (nil = MLX's own numbers).
+    @TaskLocal static var headroomOverride: Int?
+
+    /// Bytes MLX's Metal allocator can still hand out before it starts releasing its buffer cache on every allocation
+    /// that misses it (its GC threshold: min(the memory limit, 0.95 x the device's recommended working set), MLX
+    /// `MetalAllocator`), minus what is active now. nil when MLX does not report a working set.
+    static func allocatorHeadroomBytes() -> Int? {
+        if let headroomOverride { return headroomOverride }
+        guard let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0 else { return nil }
+        var threshold = Int(0.95 * Double(recommended))
+        let limit = Memory.memoryLimit
+        if limit > 0 { threshold = min(threshold, limit) }
+        return threshold - Memory.activeMemory
+    }
+
+    /// Reserve every sparse layer's lanes for the next `rows` prompt rows (`reserve(rows:)`). The prefill asks before
+    /// each piece group until this returns true or false:
+    ///
+    /// * nil: the lanes do not exist yet (a cold cache before its first piece); ask again before the next group;
+    /// * false: not reserved, the lanes keep the stock chunk-by-chunk growth: `VMLX_M3_PREFILL_RESERVE=0`, or the
+    ///   reserved rows would leave MLX's allocator less than `VMLX_M3_PREFILL_RESERVE_MARGIN_GB` (default 4) below its
+    ///   GC threshold (vMLX measured on a 128 GB M5 Max at 100k tokens: the whole KV reserved up front kept the
+    ///   allocator over that threshold for the entire prefill, so every chunk's transients came back as fresh,
+    ///   zero-filled buffers and the prefill ran 2 % slower). Only the growth strategy is decided here; the prefill
+    ///   runs either way;
+    /// * true: reserved.
+    public static func reservePrefill(_ cache: [KVCache], rows: Int) -> Bool? {
+        let enabled = reserveOverride ?? {
+            let raw = (ProcessInfo.processInfo.environment[reserveEnvironmentKey] ?? "1")
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            return !["0", "false", "off", "no"].contains(raw)
+        }()
+        guard enabled, rows > 0 else { return false }
+        let layers = cache.compactMap { $0 as? MiniMaxM3SparseCache }
+        guard !layers.isEmpty else { return false }
+        let perRow = layers.map(\.rowBytes)
+        if perRow.contains(0) { return nil }
+        if let headroom = allocatorHeadroomBytes() {
+            let marginGiB = Double(ProcessInfo.processInfo.environment[reserveMarginEnvironmentKey] ?? "") ?? 4
+            let needed = perRow.reduce(0, +) * rows + Int(marginGiB * 1_073_741_824)
+            if needed > headroom { return false }
+        }
+        for layer in layers { layer.reserve(rows: rows) }
+        return true
+    }
+
     public func innerState() -> [MLXArray] {
         kv.innerState() + [indexStorage].compactMap { $0 }
     }
@@ -78,7 +148,10 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding, AppendOnlyRows
                     + "new \(keys.shape) \(keys.dtype)")
         }
         if indexStorage == nil || end > indexStorage!.dim(2) {
-            let capacity = (end + Self.step - 1) / Self.step * Self.step
+            // A prefill reservation (`reserve(rows:)`) sizes this growth for the whole prompt at once.
+            let target = Swift.max(end, indexReservedUntil ?? 0)
+            indexReservedUntil = nil
+            let capacity = (target + Self.step - 1) / Self.step * Self.step
             var grown = MLXArray.zeros(
                 [keys.dim(0), keys.dim(1), capacity, keys.dim(3)], dtype: keys.dtype)
             if previous > 0, let storage = indexStorage {

@@ -389,16 +389,7 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Sigmoid router; the correction bias steers the choice but not the weights.
-        let routerScores = sigmoid(gate(x).asType(.float32))
-        let choice = routerScores + eScoreCorrectionBias
-        let indices = argPartition(-choice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        var scores = takeAlong(routerScores, indices, axis: -1)
-        if topK > 1 && normTopKProb {
-            scores = scores / scores.sum(axis: -1, keepDims: true)
-        }
-        scores = scores * routedScalingFactor
-
+        let (indices, scores) = route(x)
         let routed: MLXArray
         if let switchMLP {
             routed = (switchMLP(x, indices) * scores[.ellipsis, .newAxis]).sum(axis: -2)
@@ -406,7 +397,25 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
             // Mapped banks: the router-weighted sum in F32, returned in x's dtype (Python `JTMixedSwitchGLU.routed`).
             routed = (experts as! any WeightedRoutedExpertLayer).callRouted(x, indices: indices, scores: scores)
         }
-        return (routed + sharedExperts(x)).asType(x.dtype)
+        return combine(routed: routed, x: x)
+    }
+
+    /// Sigmoid router; the correction bias steers the choice but not the weights. `[..., topK]` expert indices and
+    /// their normalized, scaled weights (float32).
+    func route(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
+        let routerScores = sigmoid(gate(x).asType(.float32))
+        let choice = routerScores + eScoreCorrectionBias
+        let indices = argPartition(-choice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        var scores = takeAlong(routerScores, indices, axis: -1)
+        if topK > 1 && normTopKProb {
+            scores = scores / scores.sum(axis: -1, keepDims: true)
+        }
+        return (indices, scores * routedScalingFactor)
+    }
+
+    /// The routed rows plus the shared expert of `x`, in `x`'s dtype.
+    func combine(routed: MLXArray, x: MLXArray) -> MLXArray {
+        (routed + sharedExperts(x)).asType(x.dtype)
     }
 }
 
@@ -436,13 +445,83 @@ final class MiniMaxM3DecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        // Fused decode (`MiniMaxM3FusedDecode`, off by default): 1...16-row single-sequence calls, block by block.
-        let fused = MiniMaxM3FusedDecode.active(rows: x.dim(1), batch: x.dim(0))
-        let h =
-            fused?.attentionBlock(layer: index, module: self, x: x, cache: cache, verify: false)
+        mlpHalf(attentionHalf(x, mask: mask, cache: cache))
+    }
+
+    /// `x + attention(input_layernorm(x))`, appending this call's rows to `cache`. Fused decode
+    /// (`MiniMaxM3FusedDecode`, off by default) takes 1...16-row single-sequence calls, block by block.
+    func attentionHalf(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        MiniMaxM3FusedDecode.active(rows: x.dim(1), batch: x.dim(0))?
+            .attentionBlock(layer: index, module: self, x: x, cache: cache, verify: false)
             ?? x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        return fused?.mlpBlock(layer: index, module: self, h: h, verify: false)
+    }
+
+    /// `h + mlp(post_attention_layernorm(h))` (the fused MLP block for 1...16-row calls when it is on).
+    func mlpHalf(_ h: MLXArray) -> MLXArray {
+        MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0))?
+            .mlpBlock(layer: index, module: self, h: h, verify: false)
             ?? h + mlp(postAttentionLayerNorm(h))
+    }
+
+    /// The MLP half of every piece of a layer-major prefill group (`MiniMaxM3ModelInner.prefillPieces`): each piece's
+    /// rows are exactly `mlpHalf` of that piece, except that the JANGT routed experts of the pieces whose routed call
+    /// takes the expert-sorted prefill kernel (`JANGTRoutedExpertLayer.usesDecodeKernels` false: >= 512 (row, slot)
+    /// pairs, NAX) run in ONE call over all of those pieces' rows. That kernel's output rows depend only on their own
+    /// row and its routing (rows sorted by expert, each row's tile products and its fp32 routing sum are per row), so the
+    /// rows equal the per-piece calls bit for bit while every expert's weights are decoded once per group instead of once
+    /// per piece. The router, the shared expert and the combine stay per piece: their matmuls' rows depend on the row
+    /// count (split-K / tile choice), which is why the pieces themselves exist. `groupRouted` false = `mlpHalf` per piece.
+    /// Tests: told (layer, pieces) for every grouped routed-expert call.
+    @TaskLocal static var groupedRoutedObserver: (@Sendable (Int, Int) -> Void)?
+
+    func mlpHalves(_ hs: [MLXArray], groupRouted: Bool, sortedAll: Bool = false) -> [MLXArray] {
+        guard groupRouted || sortedAll, let block = mlp as? MiniMaxM3SparseMoeBlock,
+            let bank = block.experts as? JANGTRoutedExpertLayer
+        else { return hs.map(mlpHalf) }
+        // `sortedAll` (`MiniMaxM3Model.prefillSortedAll`): every non-fused piece's routed experts on the sorted tiles,
+        // whatever its row count; otherwise only the pieces whose own call takes them (>= 512 (row, slot) pairs).
+        let grouped = hs.indices.filter { i in
+            let h = hs[i]
+            guard MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0)) == nil else { return false }
+            return sortedAll
+                ? JANGTRoutedExpertLayer.sortedPrefillAvailable(dtype: h.dtype)
+                : !JANGTRoutedExpertLayer.usesDecodeKernels(pairs: h.dim(0) * h.dim(1) * block.topK, dtype: h.dtype)
+        }
+        guard sortedAll ? !grouped.isEmpty : grouped.count > 1 else { return hs.map(mlpHalf) }
+        func routedCall(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray {
+            sortedAll
+                ? bank.callRoutedSorted(x, indices: indices, scores: scores)
+                : bank.callRouted(x, indices: indices, scores: scores)
+        }
+        var out = [MLXArray?](repeating: nil, count: hs.count)
+        var normed: [MLXArray] = []
+        var routes: [(indices: MLXArray, scores: MLXArray)] = []
+        for i in grouped {
+            let xn = postAttentionLayerNorm(hs[i])
+            normed.append(xn)
+            routes.append(block.route(xn))
+        }
+        if groupRouted && grouped.count > 1 {
+            Self.groupedRoutedObserver?(index, grouped.count)
+            let routed = routedCall(
+                concatenated(normed, axis: 1), concatenated(routes.map(\.indices), axis: 1),
+                concatenated(routes.map(\.scores), axis: 1))
+            var at = 0
+            for (j, i) in grouped.enumerated() {
+                let n = hs[i].dim(1)
+                out[i] = hs[i] + block.combine(routed: routed[0..., at ..< (at + n), 0...], x: normed[j])
+                at += n
+            }
+        } else {
+            for (j, i) in grouped.enumerated() {
+                out[i] = hs[i] + block.combine(
+                    routed: routedCall(normed[j], routes[j].indices, routes[j].scores), x: normed[j])
+            }
+        }
+        for i in hs.indices where out[i] == nil { out[i] = mlpHalf(hs[i]) }
+        return out.map { $0! }
     }
 }
 
@@ -466,13 +545,15 @@ public final class MiniMaxM3ModelInner: Module {
         _norm.wrappedValue = MiniMaxM3RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+    /// `recordTaps` false: a prefill piece that ends before the drafter's window records no tap rows (they would leave
+    /// the tail before the drafter reads it; `MiniMaxM3Model.prepare`).
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?, recordTaps tapsWanted: Bool = true) -> MLXArray {
         let holder = MiniMaxM3DSpark.tapHolder(cache)
         if let holder, let cache, MiniMaxM3DSpark.verifies(inputs, holder: holder) {
             return verifyForward(inputs, cache: cache, holder: holder)
         }
         let start = cache?.first?.offset ?? 0
-        let recording = !dsparkTapLayers.isEmpty && holder != nil && inputs.dim(0) == 1
+        let recording = tapsWanted && !dsparkTapLayers.isEmpty && holder != nil && inputs.dim(0) == 1
         var taps: [Int: MLXArray] = [:]
         var h = embedTokens(inputs)
         // The Python runtime's mask (mlx_lm create_attention_mask): symbolic causal for every multi-token call, at any
@@ -488,6 +569,48 @@ public final class MiniMaxM3ModelInner: Module {
         }
         if recording, let holder { recordTaps(taps, start: start, holder: holder) }
         return norm(h)
+    }
+
+    /// Prefill consecutive prompt pieces (token arrays `[1, L_i]`, in order, appended to `cache`) LAYER BY LAYER, cache
+    /// rows only (no final norm, no head): every piece runs exactly the ops of its own `callAsFunction` (same matrix
+    /// shapes, the same cache rows visible to its attention, the fused paths for small pieces as before), except that
+    /// the routed experts of a MoE layer run once over the rows of the pieces that take the expert-sorted prefill kernel
+    /// (`MiniMaxM3DecoderLayer.mlpHalves`). Rows, lanes and every later logit equal piece by piece, bit for bit.
+    /// `recordTaps[i]`: piece `i` records its DSpark tap rows (in piece order, as piece-by-piece calls would).
+    ///
+    /// Why (vMLX Python `MiniMaxM3Model.forward_pieces`, 71aee382): the aligned prefill cuts an M3 prompt at every
+    /// multiple of the step, at every turn cut and at the store boundary, so a many-message chat prefills in many small
+    /// pieces; each piece's routed experts decode every expert it routes to once, whatever its row count (on the real
+    /// M3.1 bundle a few-hundred-row piece cost ~23 % of a full 2,048-row chunk). The pieces must stay pieces (the K / V
+    /// / index projections' and the router's rows depend on the row count), the routed experts need not.
+    func prefillPieces(
+        _ pieces: [MLXArray], cache: [KVCache], recordTaps: [Bool], groupRouted: Bool, sortedAll: Bool = false
+    ) {
+        precondition(pieces.count == recordTaps.count && !pieces.isEmpty && cache.count == layers.count)
+        let holder = MiniMaxM3DSpark.tapHolder(cache)
+        let recording = !dsparkTapLayers.isEmpty && holder != nil
+        var starts: [Int] = []
+        var position = cache.first?.offset ?? 0
+        for piece in pieces {
+            precondition(piece.ndim == 2 && piece.dim(0) == 1, "MiniMax-M3 prefill pieces are single-sequence [1, L]")
+            starts.append(position)
+            position += piece.dim(1)
+        }
+        var hs = pieces.map { embedTokens($0) }
+        let masks: [MLXFast.ScaledDotProductAttentionMaskMode] = hs.map { $0.dim(1) > 1 ? .causal : .none }
+        var taps = [[Int: MLXArray]](repeating: [:], count: pieces.count)
+        for (li, layer) in layers.enumerated() {
+            for i in hs.indices {
+                hs[i] = layer.attentionHalf(hs[i], mask: masks[i], cache: cache[li])
+            }
+            hs = layer.mlpHalves(hs, groupRouted: groupRouted, sortedAll: sortedAll)
+            if recording && dsparkTapLayers.contains(li) {
+                for i in hs.indices where recordTaps[i] { taps[i][li] = hs[i] }
+            }
+        }
+        if recording, let holder {
+            for i in hs.indices where recordTaps[i] { self.recordTaps(taps[i], start: starts[i], holder: holder) }
+        }
     }
 }
 
@@ -633,15 +756,48 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
             start: start, end: start + count, pieces: pieces, plan: plan, aligned: followsPlan,
             laneRowsBefore: laneRowsBefore))
 
-        for piece in pieces.dropLast() {
+        // DSpark: a piece that ends before the drafter's window (the last `dsparkTailCapacity` prompt rows) records no tap
+        // rows; the tail would drop them before the drafter reads them (vMLX 0f3eb8c0). `VMLX_DSPARK_PREFILL_ALL_TAPS=1`
+        // taps every piece.
+        let promptEnd = start + count
+        let tapsFrom: Int? =
+            model.dsparkTailCapacity > 0 && !Self.prefillAllTaps ? promptEnd - model.dsparkTailCapacity : nil
+        func wantsTaps(_ piece: Range<Int>) -> Bool { tapsFrom.map { piece.upperBound > $0 } ?? true }
+        // Pieces of one prefill chunk (turn cuts / the store boundary inside it) run as one layer-major group
+        // (`MiniMaxM3ModelInner.prefillPieces`: every piece's rows exactly its own forward's, the routed experts once
+        // per group). `VMLX_M3_PREFILL_GROUP=0` runs piece by piece; `VMLX_M3_PREFILL_GROUP_ROUTED=0` keeps the
+        // layer-major order with one routed call per piece (A/B).
+        let groups = Self.pieceGroups(
+            Array(pieces.dropLast()), step: step, grouping: followsPlan && !cache.isEmpty && Self.prefillGroupingEnabled)
+        // Every non-final piece of an aligned prefill on the sorted routed tiles (`prefillSortedAll`): one rule for the
+        // grouped and the piece-by-piece forms, so they stay bit-identical.
+        let sortedAll = followsPlan && !cache.isEmpty && Self.prefillSortedAll
+        var reserved: Bool? = nil
+        for group in groups {
             // A disconnected client cancels the producer; stop between chunks instead of encoding the whole prompt.
             try Task.checkCancellation()
-            let local = (piece.lowerBound - start) ..< (piece.upperBound - start)
-            _ = model(tokens[local][.newAxis, 0...], cache: cache.isEmpty ? nil : cache)
-            MLX.eval(cache)
-            PrefillProgressReporter.reportCompletedUnits(piece.upperBound - start)
-            Memory.clearCache()
+            if reserved == nil, !cache.isEmpty {
+                reserved = MiniMaxM3SparseCache.reservePrefill(cache, rows: promptEnd - group[0].lowerBound)
+            }
+            let inputs = group.map { piece -> MLXArray in
+                let local = (piece.lowerBound - start) ..< (piece.upperBound - start)
+                return tokens[local][.newAxis, 0...]
+            }
+            if group.count == 1 && !sortedAll {
+                _ = model(inputs[0], cache: cache.isEmpty ? nil : cache, recordTaps: wantsTaps(group[0]))
+            } else {
+                model.prefillPieces(
+                    inputs, cache: cache, recordTaps: group.map(wantsTaps), groupRouted: Self.prefillGroupRouted,
+                    sortedAll: sortedAll)
+            }
+            // `VMLX_M3_PREFILL_ASYNC=1` (A/B, default off): the next group's graph is built while this one runs.
+            if Self.prefillAsync { asyncEval(cache) } else { MLX.eval(cache) }
+            PrefillProgressReporter.reportCompletedUnits(group[group.count - 1].upperBound - start)
+            // The buffer cache is kept through the prefill (each chunk's transients are reused, not re-allocated) and
+            // released once at its end (vMLX 0967ec2f); `VMLX_M3_PREFILL_CLEAR_EACH_CHUNK=1` = the per-chunk release.
+            if Self.prefillClearEachChunk { Memory.clearCache() }
         }
+        if !groups.isEmpty, !Self.prefillClearEachChunk { Memory.clearCache() }
         guard let last = pieces.last else {
             return .tokens(LMInput.Text(tokens: tokens, mask: mask))
         }
@@ -668,10 +824,12 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// (v2 turn cuts; `VMLX_M3_STRUCTURAL_CUTS=0` keeps v1); the markers are part of the identity (cache salt).
     public var alignedPrefillSchema: String? {
         guard AlignedPrefillGeometry.isEnabled() else { return nil }
+        // Pieces whose routed experts all run on the sorted tiles carry other numbers than the stock rule's.
+        let sorted = Self.prefillSortedAll ? ":routed=sorted" : ""
         if let markers = alignedPrefillTurnMarkers {
-            return "minimax-m3:" + AlignedPrefillGeometry.turnsSchema + ":turns=" + markers.signature
+            return "minimax-m3:" + AlignedPrefillGeometry.turnsSchema + ":turns=" + markers.signature + sorted
         }
-        return "minimax-m3:" + AlignedPrefillGeometry.schema
+        return "minimax-m3:" + AlignedPrefillGeometry.schema + sorted
     }
 
     /// The M3 chat template's message markers (`]~b]` + role, `[e~[`; assistant role `ai\n`), resolved through the
@@ -702,6 +860,64 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// nor a per-model tuning record picks a step; without it the library default 512 ran its 35k-token turns. It is
     /// also the aligned-prefill chunk C of vMLX Python's M3 runtime.
     public var recommendedPrefillStepSize: Int? { 2048 }
+
+    // MARK: Prefill levers (each A/B switch restores the previous behaviour; every default is bit-identical to it)
+
+    /// Tests: per-task overrides of the environment levers below (nil = the environment's).
+    @TaskLocal static var prefillGroupingOverride: Bool?
+    @TaskLocal static var prefillGroupRoutedOverride: Bool?
+    @TaskLocal static var prefillClearEachChunkOverride: Bool?
+    @TaskLocal static var prefillAllTapsOverride: Bool?
+
+    private static func flag(_ name: String, default value: Bool) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[name]?.trimmingCharacters(in: .whitespaces).lowercased(),
+            !raw.isEmpty
+        else { return value }
+        return !["0", "false", "off", "no"].contains(raw)
+    }
+
+    /// `VMLX_M3_PREFILL_GROUP` (default on): the pieces of one prefill chunk run as one layer-major group.
+    static var prefillGroupingEnabled: Bool { prefillGroupingOverride ?? flag("VMLX_M3_PREFILL_GROUP", default: true) }
+    /// `VMLX_M3_PREFILL_GROUP_ROUTED` (default on): inside a group, one routed-expert call for the sorted-kernel pieces.
+    static var prefillGroupRouted: Bool {
+        prefillGroupRoutedOverride ?? flag("VMLX_M3_PREFILL_GROUP_ROUTED", default: true)
+    }
+    /// `VMLX_M3_PREFILL_CLEAR_EACH_CHUNK` (default off): release MLX's buffer cache after every prefill chunk (before
+    /// 2026-10-29) instead of once at the end of the prefill.
+    static var prefillClearEachChunk: Bool {
+        prefillClearEachChunkOverride ?? flag("VMLX_M3_PREFILL_CLEAR_EACH_CHUNK", default: false)
+    }
+    /// `VMLX_M3_PREFILL_SORTED` (default off while measured): the JANGT routed experts of EVERY non-final piece of an
+    /// aligned prefill run on the expert-sorted prefill tiles, whatever the piece's row count (the stock rule sends
+    /// pieces under 128 rows to the decode kernels, so each small piece decoded nearly every expert on its own: on a
+    /// many-message chat most pieces are small). A row's output on those tiles depends only on its own input, so the
+    /// grouped and piece-by-piece forms stay bit-identical; the numbers of pieces under 128 rows change (another kernel
+    /// family), so the rule is part of the cache identity (`alignedPrefillSchema`).
+    @TaskLocal static var prefillSortedAllOverride: Bool?
+    static var prefillSortedAll: Bool { prefillSortedAllOverride ?? flag("VMLX_M3_PREFILL_SORTED", default: false) }
+    /// `VMLX_M3_PREFILL_ASYNC` (default off, A/B): evaluate each prefill group asynchronously, so the CPU builds the next
+    /// group's graph while the GPU runs this one.
+    @TaskLocal static var prefillAsyncOverride: Bool?
+    static var prefillAsync: Bool { prefillAsyncOverride ?? flag("VMLX_M3_PREFILL_ASYNC", default: false) }
+    /// `VMLX_DSPARK_PREFILL_ALL_TAPS` (default off): record DSpark taps for every prefill piece, also those before the
+    /// drafter's window.
+    static var prefillAllTaps: Bool { prefillAllTapsOverride ?? flag("VMLX_DSPARK_PREFILL_ALL_TAPS", default: false) }
+
+    /// `pieces` (absolute, consecutive) grouped by the prefill chunk they start in (`lowerBound / step`), or one group
+    /// per piece when `grouping` is false.
+    static func pieceGroups(_ pieces: [Range<Int>], step: Int, grouping: Bool) -> [[Range<Int>]] {
+        guard grouping else { return pieces.map { [$0] } }
+        var groups: [[Range<Int>]] = []
+        let step = max(1, step)
+        for piece in pieces {
+            if let first = groups.last?.first, first.lowerBound / step == piece.lowerBound / step {
+                groups[groups.count - 1].append(piece)
+            } else {
+                groups.append([piece])
+            }
+        }
+        return groups
+    }
 
     /// Keep the checkpoint's dtypes (F32 router and per-expert scales, BF16 norms and embeddings), as the Python
     /// runtime does; the model owns its activation casts.
