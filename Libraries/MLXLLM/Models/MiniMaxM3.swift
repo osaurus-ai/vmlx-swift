@@ -32,13 +32,42 @@ final class MiniMaxM3RMSNorm: Module, UnaryLayer {
     let weight: MLXArray
     let eps: Float
 
+    /// `1 + weight`, computed once per loaded weight instead of on every call (the same expression, so the same
+    /// values bit for bit). Per decode step M3.1 runs 361 of these norms; building `1 + weight` each time added an
+    /// AsType and an Add launch to each (722 of the step's ~4,960 kernel nodes). A module update replaces the
+    /// weight's contents in place (same object), so `update(parameters:...)` drops the cache.
+    /// `VMLX_M3_NORM_SCALE_CACHE=0` restores the per-call form (A/B lever).
+    private var cachedScale: MLXArray?
+    private let cacheLock = NSLock()
+    static let scaleCacheEnabled = ProcessInfo.processInfo.environment["VMLX_M3_NORM_SCALE_CACHE"] != "0"
+
     init(dimensions: Int, eps: Float) {
         self.weight = MLXArray.zeros([dimensions])
         self.eps = eps
     }
 
+    var scale: MLXArray {
+        guard Self.scaleCacheEnabled else { return 1 + weight }
+        return cacheLock.withLock {
+            if let cachedScale { return cachedScale }
+            let scale = 1 + weight
+            eval(scale)
+            cachedScale = scale
+            return scale
+        }
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: Module.VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        cacheLock.withLock { cachedScale = nil }
+        return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: 1 + weight, eps: eps)
+        MLXFast.rmsNorm(x, weight: scale, eps: eps)
     }
 }
 
