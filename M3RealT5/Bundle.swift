@@ -557,10 +557,13 @@ func taskDSpark() async throws {
     let rounds = Int(env["T5_ROUNDS"] ?? "3")!
     let mode = env["T5_THINKING"]  // nil = adaptive (the template default)
     var inputs: [(String, LMInput)] = []
-    for c in chatCases {
+    for c in promptCases() {
         inputs.append((c.name, try await prepare(context, c.messages, tools: c.tools, additional: thinkingContext(mode))))
     }
-    var report: [String: Any] = ["max_tokens": maxTokens, "rounds": rounds, "thinking": mode ?? "adaptive (unset)"]
+    var report: [String: Any] = [
+        "max_tokens": maxTokens, "rounds": rounds, "thinking": mode ?? "adaptive (unset)",
+        "prompt_set": env["T5_PROMPT_SET"] ?? "chat", "levers": prefillLevers(),
+    ]
     // Control: plain decode before the drafter is attached (no tap recording), first two prompts, 3 probes.
     var preAttach: [String: [Double]] = [:]
     _ = try greedy(model, inputs[0].1, maxTokens: 16, drafter: nil)  // warm-up
@@ -600,6 +603,7 @@ func taskDSpark() async throws {
             "speedup_median": median(sparkRuns.map(\.decodeTokS)) / median(plainRuns.map(\.decodeTokS)),
             "dspark_stats": sparkRuns.map { statsJSON($0.stats) },
             "text_head": String(text.prefix(400)),
+            "text": text, "sha8": sha8(reference),
         ]
         rows.append(row)
         // Determinism control (fail closed): every plain run == the first, and the output is not degenerate (a NUL /
