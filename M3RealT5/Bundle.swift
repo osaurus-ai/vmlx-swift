@@ -18,6 +18,7 @@
 // profile   one decode step: graph node counts by primitive and per-component time
 
 import Cmlx
+import CryptoKit
 import Foundation
 import MLX
 import MLXHuggingFace
@@ -601,7 +602,11 @@ func taskDSpark() async throws {
             "text_head": String(text.prefix(400)),
         ]
         rows.append(row)
-        log("dspark \(name): first diff \(diffs), plain \(median(plainRuns.map(\.decodeTokS))) dspark \(median(sparkRuns.map(\.decodeTokS))) tok/s, accept \(sparkRuns.last?.stats?.acceptanceRate ?? -1)")
+        // Determinism control (fail closed): every plain run == the first, and the output is not degenerate (a NUL /
+        // single-token run is what the M5 Ultra's broken fused attention produced).
+        let degenerate = Set(reference).count <= 2 || reference.isEmpty
+        let deterministic = plainDiffs.allSatisfy { $0 == nil } && !degenerate
+        log("dspark \(name): first diff \(diffs), plain vs plain \(plainDiffs) \(deterministic ? "DETERMINISTIC" : "NONDETERMINISTIC_OR_DEGENERATE"), plain \(median(plainRuns.map(\.decodeTokS))) dspark \(median(sparkRuns.map(\.decodeTokS))) tok/s, accept \(sparkRuns.last?.stats?.acceptanceRate ?? -1), sha \(sha8(reference))")
     }
     report["prompts"] = rows
     try writeJSON(report, "dspark_\(tag).json")
@@ -668,4 +673,12 @@ func taskThink() async throws {
         }
     }
     try writeJSON(["rows": rows, "dspark": drafter != nil], "think_\(tag).json")
+}
+
+
+/// First 8 hex digits of SHA-256 over the token ids (little-endian Int32): a run's identity for logs.
+func sha8(_ tokens: [Int]) -> String {
+    var data = Data()
+    for t in tokens { withUnsafeBytes(of: Int32(truncatingIfNeeded: t).littleEndian) { data.append(contentsOf: $0) } }
+    return SHA256.hash(data: data).prefix(4).map { String(format: "%02x", $0) }.joined()
 }
