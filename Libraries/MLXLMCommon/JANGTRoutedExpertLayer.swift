@@ -254,6 +254,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 preconditionFailure("JANGT routed prefill rejected admitted bank: \(error)")
             }
         }
+        if JANGTFastDecode.isEnabled, let t = trellisTensors, JANGTFastDecode.supported(t) {
+            // VMLX_JANGT_FAST=1: vMLX's fast decode kernels (packed rows, folded code statistics) for decode steps and
+            // verify rows alike: row-invariant, not bit-identical to the v3 kernels below (Python
+            // `JTMixedSwitchGLU.routed` with the lever).
+            return JANGTFastDecode.routed(x, ids: ids, weights: weights, t).asType(input.dtype).reshaped(input.shape)
+        }
         do {
             let hidden: MLXArray
             switch gateUp {
