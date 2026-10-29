@@ -112,7 +112,15 @@ func taskCacheLoop() async throws {
     let drafter = lane == "dspark" ? try attachDrafter(model, dir) : nil
     if lane == "dspark" && drafter == nil { fatalError("no drafter resolved") }
     let maxTokens = Int(env["T5_MAX_TOKENS"] ?? "48")!
-    let step = 2048
+    let step = Int(env["T5_STEP"] ?? "2048")!
+    let markers = model.alignedPrefillTurnMarkers
+    log("cacheloop \(lane): step \(step), turn markers \(markers.map(String.init(describing:)) ?? "none (v1 rule)"), schema \(model.alignedPrefillSchema ?? "off")")
+    /// What the rule allows a request reusing `common` shared rows of a prompt stored with boundary `previousK`.
+    func ruleReuse(_ ids: [Int], k: Int, common: Int, previousK: Int) -> Int {
+        let cuts = AlignedPrefillGeometry.turnCuts(ids, markers: markers, end: k)
+        return AlignedPrefillGeometry.reuseLimit(
+            matched: min(common, previousK), boundary: k, step: step, exactGeometry: false, turnCuts: cuts)
+    }
     let diskDir = outDir.appendingPathComponent("diskcache-\(lane)-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: diskDir) }
     var config = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
@@ -136,7 +144,10 @@ func taskCacheLoop() async throws {
                 + "run_shell to inspect and change it. Think briefly, then act."),
         .user("The release build of CacheKit fails and two tests are flaky. Investigate and fix the build first."),
     ]
-    var report: [String: Any] = ["lane": lane, "max_tokens": maxTokens, "step": step, "gen_suffix": suffix]
+    var report: [String: Any] = [
+        "lane": lane, "max_tokens": maxTokens, "step": step, "gen_suffix": suffix,
+        "turn_markers": markers.map(String.init(describing:)) ?? "none", "schema": model.alignedPrefillSchema ?? "off",
+    ]
     var turns: [[String: Any]] = []
     var previous: [Int] = []
     var previousK = 0
@@ -173,13 +184,15 @@ func taskCacheLoop() async throws {
         let cold = try loopRun(model, input, coordinator: nil, recorder: recorder, maxTokens: maxTokens, drafter: drafter)
         let (tokensSame, logitsSame, gap) = compare(warm, cold)
         let common = lcp(ids, previous)
-        let expectedMax = turn == 0 ? 0 : (min(common, previousK) / step) * step
+        let expectedMax = turn == 0 ? 0 : ruleReuse(ids, k: k, common: common, previousK: previousK)
         let ok = tokensSame && logitsSame && cold.cached == 0 && !cold.tokens.isEmpty
         allSame = allSame && ok
         turns.append([
             "turn": turn + 1, "prompt": ids.count, "K": k, "lcp_with_previous_prompt": common,
             "previous_K": previousK, "reuse": warm.cached, "rule_max_reuse": expectedMax,
-            "reuse_is_chunk_or_K": warm.cached % step == 0 || warm.cached == k,
+            "reuse_is_chunk_cut_or_K": warm.cached % step == 0 || warm.cached == k
+                || AlignedPrefillGeometry.turnCuts(ids, markers: markers, end: k).contains(warm.cached),
+            "v1_rule_reuse": turn == 0 ? 0 : (min(common, previousK) / step) * step,
             "reuse_equals_rule": warm.cached == expectedMax, "prefilled": ids.count - max(0, warm.cached),
             "restore_details": warm.restores.map {
                 "\($0.detail) matched \($0.matched) reuse \($0.reuse) exact \($0.exactGeometry) offsets \(Set($0.offsets)) "
@@ -237,7 +250,7 @@ func taskCacheLoop() async throws {
     let warm = try loopRun(model, input, coordinator: coordinator, recorder: recorder, maxTokens: maxTokens, drafter: drafter)
     let cold = try loopRun(model, input, coordinator: nil, recorder: recorder, maxTokens: maxTokens, drafter: drafter)
     let (t, l, g) = compare(warm, cold)
-    let rule = (min(common, previousK) / step) * step
+    let rule = ruleReuse(ids, k: boundary(ids, input), common: common, previousK: previousK)
     report["partial_hit"] = [
         "prompt": ids.count, "divergence": common, "divergence_mod_step": common % step, "reuse": warm.cached,
         "rule_max_reuse": rule, "tokens_identical": t, "logits_identical": l, "max_logit_gap": g,
