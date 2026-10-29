@@ -235,6 +235,30 @@ struct MiniMaxM3PromptSnapshotViewTests {
         }
     }
 
+    @Test("A prefill chunk boundary (PrefillProgressReporter) raises a limit below the live set, with or without a handler")
+    func floorAtPrefillChunks() throws {
+        try A.withRecorder { _ in
+            let prior = MLX.Memory.memoryLimit
+            defer { MLX.Memory.memoryLimit = prior }
+            let live = MLXArray.zeros([32 << 20]).asType(.uint8) + 1
+            MLX.eval(live)
+            try SchedulingMemoryFloor.$enabledOverride.withValue(true) {
+                MLX.Memory.memoryLimit = 1 << 20
+                PrefillProgressReporter.reportCompletedUnits(2048)
+                #expect(MLX.Memory.memoryLimit > 1 << 20)
+                MLX.Memory.memoryLimit = 1 << 20
+                final class Seen: @unchecked Sendable { var units = 0 }
+                let seen = Seen()
+                PrefillProgressReporter.withHandler({ seen.units += $0 }) {
+                    PrefillProgressReporter.reportCompletedUnits(512)
+                }
+                #expect(seen.units == 512)
+                #expect(MLX.Memory.memoryLimit > 1 << 20)
+            }
+            _ = live
+        }
+    }
+
     @Test("BatchEngine solo generation under a limit below the live set ends with the limit above it (the loop's floor)")
     func floorInGenerationLoop() async throws {
         let mlxLock = lockSerializedMLXTest()
