@@ -152,3 +152,67 @@ func taskProfile() async throws {
     }
     try writeJSON(report, "profile_\(tag).json")
 }
+
+// MARK: - DSpark round cost
+
+/// What a DSpark round costs on the real bundle at one context: a one-token decode step, the decode-exact verify
+/// forward of W rows (what DSpark runs), the stock W-row forward (not row-exact; what a batched verify could cost),
+/// and the drafter's proposal of W tokens. Interleaved, medians; the caches are trimmed back after every call.
+func taskVerifyProfile() async throws {
+    let dir = bundleURL()
+    let (model, _, _) = try await productionLoad(dir)
+    guard try attachDrafter(model, dir) != nil, let session = model.makeDSparkDraftSession() else {
+        fatalError("no drafter")
+    }
+    let lens = (env["T5_PROF_LENS"] ?? "3011,8269").split(separator: ",").map { Int($0)! }
+    let widths = (env["T5_VERIFY_WIDTHS"] ?? "2,4,7,8,11,14").split(separator: ",").map { Int($0)! }
+    let probes = Int(env["T5_PROBES"] ?? "7")!
+    let tokens = try loadTokens()
+    var report: [String: Any] = ["probes": probes, "widths": widths]
+    for n in lens {
+        let cache = model.newCache(parameters: nil)
+        var s = 0
+        while s < n {
+            let e = min(s + chunk, n)
+            eval(model(MLXArray(Array(tokens[s ..< e])).reshaped(1, e - s), cache: cache))
+            s = e
+        }
+        Memory.clearCache()
+        let seed = Int(tokens[n])
+        func trimTo(_ end: Int) { for c in cache where c.offset > end { _ = c.trim(c.offset - end) } }
+        func rows(_ w: Int) -> MLXArray { MLXArray(Array(tokens[n ..< (n + w)])).reshaped(1, w) }
+        _ = session.draft(seed: seed, cache: cache, count: 7)  // first sync of the drafter context (window rows)
+        var t: [String: [Double]] = [:]
+        for p in 0 ..< probes + 2 {
+            var jobs: [(String, () -> Void)] = [
+                ("decode_1", {
+                    eval(argMax(model(rows(1), cache: cache)[0, -1]))
+                    trimTo(n)
+                })
+            ]
+            for w in widths {
+                jobs.append(("verify_\(w)", {
+                    _ = session.beginVerifyCapture(cache: cache)
+                    eval(argMax(model(rows(w), cache: cache)[0], axis: -1))
+                    session.endVerifyCapture(cache: cache)
+                    trimTo(n)
+                }))
+                jobs.append(("stock_rows_\(w)", {
+                    eval(argMax(model(rows(w), cache: cache)[0], axis: -1))
+                    trimTo(n)
+                }))
+                jobs.append(("draft_\(w)", { _ = session.draft(seed: seed, cache: cache, count: w) }))
+            }
+            if p % 2 == 1 { jobs.reverse() }
+            for (name, job) in jobs {
+                let t0 = nowMs()
+                job()
+                if p >= 2 { t[name, default: []].append(nowMs() - t0) }
+            }
+        }
+        precondition(Set(cache.map(\.offset)) == [n])
+        report["\(n)"] = t.mapValues { ["median_ms": median($0), "runs": $0] }
+        log("vprofile n=\(n): " + t.keys.sorted().map { "\($0) \(String(format: "%.1f", median(t[$0]!)))" }.joined(separator: ", "))
+    }
+    try writeJSON(report, "vprofile_\(tag).json")
+}

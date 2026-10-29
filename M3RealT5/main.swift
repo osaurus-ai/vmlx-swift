@@ -634,6 +634,7 @@ case "think": try await taskThink()
 case "cacheloop": try await taskCacheLoop()
 case "longctx": try await taskLongContext()
 case "profile": try await taskProfile()
+case "vprofile": try await taskVerifyProfile()
 case "msainfo": log(msaDiagnostics())
 case "fdloop":
     // A long loop of one integer floorDivide per eval (for sampling the process from outside).
