@@ -452,7 +452,8 @@ struct MiniMaxM3AlignedPrefixCacheTests {
                 Issue.record("INVALID: the cached turn's prompt state is not on disk")
                 return
             }
-            #expect(detail == .disk && matched == prev.count - 1)
+            // One entry per reusable boundary (`TokenIterator.alignedStoreBoundaries`): the turn's own K, not N - 1.
+            #expect(detail == .disk && matched == Self.boundary(prev))
             var stored = model.newCache(parameters: nil)
             try #require(restoreFromDiskArrays(arrays, into: &stored, requirePromptBoundary: true) == matched)
             #expect(AlignedPrefill.tag(of: stored) == AlignedPrefillTag(step: step, boundary: Self.boundary(prev)))

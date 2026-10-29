@@ -106,7 +106,11 @@ public enum RuntimeReceipts {
     /// Set by the generation loop around iterator construction so the iterator's receipts carry the loop's number.
     @TaskLocal public static var currentRequestID: Int?
 
+    /// Tests: told every receipt line of the current task, whether or not receipts are logged.
+    @TaskLocal public static var observer: (@Sendable (String) -> Void)?
+
     public static func emit(_ line: String) {
+        observer?(line)
         guard isEnabled else { return }
         NSLog("%@", "[vmlx-receipt] " + line)
     }

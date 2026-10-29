@@ -346,6 +346,81 @@ struct MiniMaxM3StructuralPrefixCacheTests {
         }
     }
 
+    final class Lines: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func add(_ line: String) { lock.withLock { lines.append(line) } }
+        var count: Int { lock.withLock { lines.count } }
+        func since(_ start: Int) -> [String] { lock.withLock { Array(lines[start...]) } }
+    }
+
+    /// `tokens=<n>` of every `store ... result=written` receipt line.
+    static func written(_ lines: [String]) -> [Int] {
+        lines.filter { $0.hasPrefix("store ") && $0.contains("result=written") }.compactMap { line in
+            line.split(separator: " ").first { $0.hasPrefix("tokens=") }.flatMap { Int($0.dropFirst("tokens=".count)) }
+        }
+    }
+
+    @Test("One store per reusable boundary: K and the history boundaries' last cuts, never N / N-1 / N - gpl; reuse == K_prev, cached == cold; control: the old stores")
+    func oneStorePerReusableBoundary() throws {
+        try A.withRecorder { recorder in
+            for single in [true, false] {
+                let dir = A.temporaryDirectory("structural-single-store-\(single)")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                let model = try Self.model()
+                let coordinator = Self.coordinator(dir, step: 320)
+                let lines = Lines()
+                // The processor's message boundaries: system end (306), system + developer end (1018, the stable
+                // prefix), the generation-stripped history. Their reusable rows are the turn cuts 305 / 1017 and K.
+                let systemEnd = 306, developerEnd = 1018
+                try TokenIterator.$alignedSingleStoreOverride.withValue(single) {
+                    try RuntimeReceipts.$observer.withValue({ lines.add($0) }) {
+                        var history = Self.opening()
+                        var previousK = 0
+                        for turn in 0 ..< 4 {
+                            let prompt = history + Self.gen
+                            let before = lines.count
+                            let warm = try A.run(
+                                model, prompt, coordinator: coordinator, step: 320, recorder: recorder,
+                                boundaries: [systemEnd, developerEnd, prompt.count - Self.gen.count],
+                                stable: [developerEnd])
+                            let written = Self.written(lines.since(before))
+                            let k = Self.k(prompt)
+                            if single {
+                                let expected = turn == 0 ? [systemEnd - 1, developerEnd - 1, k] : [k]
+                                #expect(written.sorted() == expected, "turn \(turn + 1): stored \(written), expected \(expected)")
+                            } else {
+                                #expect(written.contains(prompt.count) && written.count > (turn == 0 ? 3 : 1),
+                                        "control turn \(turn + 1): the old stores \(written)")
+                            }
+                            if turn > 0 {
+                                #expect(warm.cached == previousK, "turn \(turn + 1): reused \(warm.cached), K_prev \(previousK)")
+                            }
+                            let cold = try A.run(
+                                model, prompt, coordinator: nil, step: 320, recorder: recorder,
+                                boundaries: [systemEnd, developerEnd, prompt.count - Self.gen.count], stable: [developerEnd])
+                            #expect(A.same(warm, cold), "turn \(turn + 1): cached != cold (single store \(single))")
+                            previousK = k
+                            history += Self.message(Self.ai, warm.tokens.map { $0 % 990 })
+                                + Self.message(Self.tool, Self.content(Self.toolSizes[turn], seed: UInt64(10 + turn)))
+                        }
+                    }
+                }
+                // A new conversation with the same system + developer messages restores the stable prefix's cut.
+                if single {
+                    let fresh = Self.message(Self.system, Self.content(301, seed: 1))
+                        + Self.message(Self.developer, Self.content(707, seed: 2))
+                        + Self.message(Self.user, Self.content(90, seed: 99)) + Self.gen
+                    let warm = try A.run(
+                        model, fresh, coordinator: coordinator, step: 320, recorder: recorder,
+                        boundaries: [systemEnd, developerEnd, fresh.count - Self.gen.count], stable: [developerEnd])
+                    let cold = try A.run(model, fresh, coordinator: nil, step: 320, recorder: recorder)
+                    #expect(warm.cached == developerEnd - 1 && A.same(warm, cold), "new chat: reused \(warm.cached)")
+                }
+            }
+        }
+    }
+
     @Test("v1 entries never serve a v2 request (and vice versa): the salt carries the rule")
     func v1AndV2DoNotMix() throws {
         try A.withRecorder { recorder in

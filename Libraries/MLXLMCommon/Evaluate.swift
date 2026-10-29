@@ -1689,6 +1689,41 @@ public struct TokenIterator: TokenIteratorProtocol {
     static var alignedPostAnswerStoreSkipped: Bool {
         alignedPostAnswerStoreSkippedOverride ?? alignedPostAnswerStoreSkippedEnvironment
     }
+    /// `VMLX_M3_ALIGNED_SINGLE_STORE=0`: aligned-prefill caches store every prompt boundary as before (N, N-1, the
+    /// generation-stripped boundary, each history boundary) instead of one entry per reusable row count (A/B only;
+    /// tests: the task-local override).
+    static let alignedSingleStoreEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_M3_ALIGNED_SINGLE_STORE"] != "0"
+    @TaskLocal static var alignedSingleStoreOverride: Bool?
+    static var alignedSingleStoreEnabled: Bool { alignedSingleStoreOverride ?? alignedSingleStoreEnvironment }
+
+    /// One aligned-prefill store: the rows it holds (= its key length) and whether a stable (shared-root) boundary maps
+    /// to it.
+    struct AlignedStoreBoundary: Equatable {
+        let rows: Int
+        let stable: Bool
+    }
+
+    /// The entries an aligned-prefill request stores at the end of its turn: its store boundary `K` (every prompt
+    /// boundary at or past it serves exactly `K` rows: `AlignedPrefill.alignRestoredPrefix` never reuses rows past the
+    /// producer's `K`, and a request sharing a longer boundary shares `[0, K)`), and for each history boundary `b` below
+    /// `K` the last row a later request sharing only `[0, b)` can reuse: the largest multiple of the step or turn cut of
+    /// this plan at or before `b` (a v1 plan: multiples only). One entry per distinct row count, ascending; nil when the
+    /// plan has no store boundary.
+    static func alignedStoreBoundaries(
+        plan: AlignedPrefillPlan, promptTokenCount: Int, historyBoundaries: [Int], stableBoundaries: [Int]
+    ) -> [AlignedStoreBoundary]? {
+        guard let k = plan.boundary, k > 0, k <= promptTokenCount else { return nil }
+        // A boundary at or past K is served by the K entry (a request sharing it shares [0, K)).
+        var rows: [Int: Bool] = [k: false]
+        for b in Set(historyBoundaries) where b > 0 && b < k {
+            var reusable = (b / plan.step) * plan.step
+            for c in plan.turnCuts ?? [] where reusable < c && c <= b { reusable = c }
+            guard reusable > 0 else { continue }
+            rows[reusable] = (rows[reusable] ?? false) || stableBoundaries.contains(b)
+        }
+        return rows.keys.sorted().map { AlignedStoreBoundary(rows: $0, stable: rows[$0]!) }
+    }
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
     public var structuredOutputComplete: Bool? {
@@ -3884,6 +3919,41 @@ public struct TokenIterator: TokenIteratorProtocol {
             ? diskSeedBoundary ?? promptTokenIds.count
             : promptTokenIds.count
         defer { diskSeedSnapshot = nil }
+
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary K, and
+        // below K only rows ending at a chunk boundary or a turn cut (`AlignedPrefill.alignRestoredPrefix`). The exact
+        // prompt (N), the N-1 seed and the generation-stripped boundary (N - gpl) therefore all serve the same K rows,
+        // and a history boundary serves only the last reusable row at or before it. Store ONE entry per reusable row
+        // count, keyed at exactly those rows, as views of the finished cache (zero-copy). Before 2026-10-29 a 35k-token
+        // M3.1 turn wrote three to four ~4.6 GiB entries (N, N-1, N-3 and earlier history boundaries) for what one
+        // entry serves. `VMLX_M3_ALIGNED_SINGLE_STORE=0` = the previous stores (A/B).
+        if let plan = alignedPrefillPlan, Self.alignedSingleStoreEnabled, !isReusablePrefixWarmup,
+            let boundaries = Self.alignedStoreBoundaries(
+                plan: plan, promptTokenCount: promptTokenIds.count,
+                historyBoundaries: cachePrefixTokenCounts,
+                stableBoundaries: originalInput.cacheStablePrefixTokenCounts),
+            boundaries.allSatisfy({ cacheSupportsPrefixViews(cache, rows: $0.rows) })
+        {
+            for boundary in boundaries {
+                let tokens = Array(promptTokenIds.prefix(boundary.rows))
+                if coordinator.hasDurableDiskEntry(
+                    tokens: tokens, mediaSalt: cacheSaltPlan.salt(forBoundary: boundary.rows))
+                {
+                    RuntimeReceipts.emit(
+                        "store id=\(receiptRequestID) tokens=\(boundary.rows) result=skipped reason=already_durable")
+                    continue
+                }
+                guard let views = prefixViews(of: cache, rows: boundary.rows) else { continue }
+                store(
+                    tokens: tokens, cache: views, kvBits: nil,
+                    kvMode: selectivePromptBoundaryDiskKVMode(cache: views, requested: kvMode),
+                    isStableBoundary: boundary.stable, isResumeBoundary: !boundary.stable, ownsSnapshot: true)
+            }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_single_store boundaries=\(boundaries.map(\.rows))")
+            return
+        }
 
         // A plain text KV prompt and its processor-declared history boundary
         // differ only by the template's actual generation rail. Persist that
