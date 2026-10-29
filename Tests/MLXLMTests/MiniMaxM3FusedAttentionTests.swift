@@ -254,6 +254,102 @@ struct MiniMaxM3FusedAttentionTests {
         }
     }
 
+    // MARK: repeat runs (the M5 Ultra defect: K4 read stale block partials of other threadgroups)
+
+    /// Hand MLX's buffer cache NaN-filled buffers of these byte sizes and free them, so the next allocations of those
+    /// sizes reuse them: a launch reading memory nothing ordered before it wrote then reads NaN, not a lucky leftover.
+    static func poison(_ sizes: [Int]) {
+        var junk: [MLXArray] = []
+        for n in sizes {
+            for _ in 0 ..< 2 { junk.append(MLXArray.full([max(1, n / 4)], values: MLXArray(Float.nan)) + 0) }
+        }
+        eval(junk)
+        junk.removeAll()
+    }
+
+    static func blockSizes(_ p: FA.Plan, rows: Int, ctx: Int, hidden: Int) -> [Int] {
+        let rg = rows * p.KVH, nb = (ctx + rows + p.block - 1) / p.block
+        let ntot = (p.H + 2 * p.KVH + p.GI + 1) * p.D
+        return [rows * ntot * 4, rows * p.H * p.D * 4, rows * p.GI * p.D * 4, rows * p.GI * nb * 4,
+                rg * p.keep * p.HG * p.D * 4, rg * p.keep * p.HG * 4, rows * hidden * 2]
+    }
+
+    @Test("Repeat runs on NaN-poisoned buffers: the block and K4 repeat bit for bit and stay finite; K4 == a float64 merge of its own block partials",
+          arguments: [(300, 1), (1031, 1), (1031, 16), (2040, 16), (3001, 5), (8269, 1), (8269, 16)])
+    func repeatRunsAreBitIdentical(ctx: Int, rows: Int) throws {
+        try Device.withDefaultDevice(.gpu) {
+            let (layer, _) = try Self.layer()
+            let fa = FA.shared
+            guard case .success(let p) = fa.plan(layer) else {
+                Issue.record("plan: \(fa.unsupportedReason(layer) ?? "?")")
+                return
+            }
+            let (_, _, _, xall) = Self.lanes(ctx: ctx, case: 70)
+            let x = xall[0..., ..<rows]
+            var runs: [(MLXArray, [MLXArray])] = []
+            for _ in 0 ..< 4 {
+                Self.poison(Self.blockSizes(p, rows: rows, ctx: ctx, hidden: Self.hidden))
+                runs.append(Self.block(layer, x, ctx: ctx, case: 70, perRow: false))
+            }
+            for (h, lanes) in runs {
+                #expect(MLX.all(MLX.isFinite(h)).item(Bool.self) && lanes.allSatisfy { MLX.all(MLX.isFinite($0)).item(Bool.self) })
+            }
+            for r in runs.dropFirst() {
+                #expect(arrayEqual(r.0, runs[0].0).item(Bool.self), "ctx \(ctx) rows \(rows): residual differs between runs")
+                for (a, b) in zip(r.1, runs[0].1) { #expect(arrayEqual(a, b).item(Bool.self), "lane rows differ between runs") }
+            }
+            // K4 alone, four launches on one set of inputs (fresh zero counters each).
+            let (k, v, ik, _) = Self.lanes(ctx: ctx, case: 70)
+            let x2 = x.reshaped(rows, Self.hidden)
+            let y = fa.qkv(layer, p, x2)
+            let nb = (ctx + rows + p.block - 1) / p.block
+            let meta = MLXArray([Int32(ctx), Int32(rows), Int32(nb), 0, 0, 0, 0, 0])
+            let h2 = fa.heads(layer, p, y, meta, laneDTypes: (.bfloat16, .bfloat16, .bfloat16))
+            let kl = concatenated([k, h2.k.transposed(1, 0, 2).expandedDimensions(axis: 0)], axis: 2)
+            let vl = concatenated([v, h2.v.transposed(1, 0, 2).expandedDimensions(axis: 0)], axis: 2)
+            let il = concatenated([ik, h2.ik.transposed(1, 0, 2).expandedDimensions(axis: 0)], axis: 2)
+            let sc = nb > p.keep ? fa.scores(p, h2.iq, il, meta, nb: nb) : fa.dummy()
+            eval(h2.q, kl, vl, sc)
+            var outs: [MLXArray] = []
+            for _ in 0 ..< 4 {
+                Self.poison(Self.blockSizes(p, rows: rows, ctx: ctx, hidden: Self.hidden))
+                let o = fa.msaOutputs(p, h2.q, kl, vl, sc, MLXArray.zeros(h2.cnt.shape, dtype: h2.cnt.dtype), meta)
+                eval(o)
+                let po = o[1].asArray(Float.self).map(Double.init), pm = o[2].asArray(Float.self).map(Double.init)
+                let pl = o[3].asArray(Float.self).map(Double.init), got = o[0].asArray(Float.self)
+                // ref[r, g, h, d] = sum_j w_j po_j / sum_j w_j pl_j, w_j = 2^(pm_j - max_j pm_j)
+                var maxErr = 0.0, maxRef = 0.0
+                var finite = true
+                for r in 0 ..< rows {
+                    for g in 0 ..< p.KVH {
+                        let rg = r * p.KVH + g
+                        for hh in 0 ..< p.HG {
+                            let ms = (0 ..< p.keep).map { pm[(rg * p.keep + $0) * p.HG + hh] }
+                            let mx = ms.max()!
+                            let w = ms.map { Foundation.exp2($0 - mx) }
+                            var den = 0.0
+                            for j in 0 ..< p.keep { den += w[j] * pl[(rg * p.keep + j) * p.HG + hh] }
+                            for d in 0 ..< p.D {
+                                var num = 0.0
+                                for j in 0 ..< p.keep { num += w[j] * po[((rg * p.keep + j) * p.HG + hh) * p.D + d] }
+                                let ref = num / den
+                                let val = Double(got[(r * p.H + g * p.HG + hh) * p.D + d])
+                                finite = finite && val.isFinite
+                                maxErr = max(maxErr, abs(val - ref))
+                                maxRef = max(maxRef, abs(ref))
+                            }
+                        }
+                    }
+                }
+                // vMLX's measure: max |got - ref| / max |ref| < 1e-5.
+                let rel = maxErr / max(maxRef, 1e-30)
+                #expect(finite && rel < 1e-5, "ctx \(ctx) rows \(rows): K4 vs the merge of its partials \(rel)")
+                outs.append(o[0])
+            }
+            for o in outs.dropFirst() { #expect(arrayEqual(o, outs[0]).item(Bool.self), "K4 output differs between launches") }
+        }
+    }
+
     // MARK: agreement with the unfused path (reported)
 
     static func rel(_ a: MLXArray, _ ref: MLXArray) -> Float {

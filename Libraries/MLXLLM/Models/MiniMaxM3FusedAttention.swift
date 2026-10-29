@@ -333,6 +333,16 @@ final class MiniMaxM3FusedAttention: @unchecked Sendable {
         _ p: Plan, _ q: MLXArray, _ kLane: MLXArray, _ vLane: MLXArray, _ sc: MLXArray, _ cnt: MLXArray,
         _ meta: MLXArray
     ) -> MLXArray {
+        msaOutputs(p, q, kLane, vLane, sc, cnt, meta)[0]
+    }
+
+    /// K4's four outputs: the attention `[R, H, D]` and its block partials po / pm / pl (tests: a merge of the partials
+    /// must equal the attention, and repeat launches must agree; the partials cross threadgroups through
+    /// device-coherent memory, vMLX 8da26375).
+    func msaOutputs(
+        _ p: Plan, _ q: MLXArray, _ kLane: MLXArray, _ vLane: MLXArray, _ sc: MLXArray, _ cnt: MLXArray,
+        _ meta: MLXArray
+    ) -> [MLXArray] {
         let R = q.dim(0)
         let nsg = p.HG / p.HS
         let threads = 32 * nsg * (p.block / 32)
@@ -346,7 +356,7 @@ final class MiniMaxM3FusedAttention: @unchecked Sendable {
             [q, kLane, vLane, sc, cnt, meta, MLXArray([p.scale])],
             grid: (threads * p.keep, rg, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[R, p.H, p.D], [rg * p.keep * p.HG * p.D], [rg * p.keep * p.HG], [rg * p.keep * p.HG]],
-            outputDTypes: [.float32, .float32, .float32, .float32])[0]
+            outputDTypes: [.float32, .float32, .float32, .float32])
     }
 
     /// K5: x2 + o_proj(o) [R, hidden] in x2's dtype.
