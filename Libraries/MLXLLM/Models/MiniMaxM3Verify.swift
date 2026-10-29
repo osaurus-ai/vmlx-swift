@@ -227,13 +227,24 @@ extension MiniMaxM3ModelInner {
         let offset = cache[0].offset
         var taps: [Int: MLXArray] = [:]
         var h = embedTokens(inputs)
+        // The fused-decode seam with the same admission as the decode forward: its kernels are row-invariant, so a
+        // verify row on them equals the decode step on them (`MiniMaxM3FusedDecode`).
+        let fused = MiniMaxM3FusedDecode.active(rows: h.dim(1), batch: h.dim(0))
         for (i, layer) in layers.enumerated() {
-            h = h + layer.selfAttn.verifyRows(layer.inputLayerNorm(h), cache: cache[i], offset: offset)
-            let y = layer.postAttentionLayerNorm(h)
-            switch layer.mlp {
-            case let moe as MiniMaxM3SparseMoeBlock: h = h + moe.verifyRows(y)
-            case let dense as MiniMaxM3MLP: h = h + dense.verifyRows(y)
-            default: h = h + MiniMaxM3RowExact.rows(y) { layer.mlp($0) }
+            if let a = fused?.attentionBlock(layer: i, module: layer, x: h, cache: cache[i], verify: true) {
+                h = a
+            } else {
+                h = h + layer.selfAttn.verifyRows(layer.inputLayerNorm(h), cache: cache[i], offset: offset)
+            }
+            if let m = fused?.mlpBlock(layer: i, module: layer, h: h, verify: true) {
+                h = m
+            } else {
+                let y = layer.postAttentionLayerNorm(h)
+                switch layer.mlp {
+                case let moe as MiniMaxM3SparseMoeBlock: h = h + moe.verifyRows(y)
+                case let dense as MiniMaxM3MLP: h = h + dense.verifyRows(y)
+                default: h = h + MiniMaxM3RowExact.rows(y) { layer.mlp($0) }
+                }
             }
             if dsparkTapLayers.contains(i) { taps[i] = h }
         }
