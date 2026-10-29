@@ -366,6 +366,10 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     /// call with the model's SwiGLU-OAI.
     @ModuleInfo(key: "switch_mlp") var experts: Module
     @ModuleInfo(key: "shared_experts") var sharedExperts: MiniMaxM3MLP
+    /// The fused MoE kernels' view of this block (`MiniMaxM3FusedMoE.layer`), built on first use. Stored on the block so
+    /// it dies with the model: a process-wide table keyed by block identity kept every layer's routed banks alive after
+    /// the model was released (a reload then held two models). Leading underscore: not a parameter.
+    var _fusedMoELayer: MiniMaxM3FusedMoE.LayerBox?
 
     /// The stacked routed experts; nil when the layer runs mapped JANGHT banks.
     var switchMLP: MiniMaxM3SwitchGLU? { experts as? MiniMaxM3SwitchGLU }
@@ -662,6 +666,13 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
 
     /// The three-lane sparse cache has no batched (B > 1) form yet.
     public var maximumSupportedDecodeBatchSize: Int? { 1 }
+
+    /// Measured on the real M3.1 JANGHT1.9 bundle (Mac Studio, `M3RealT5 stepab`, cold prefill, interleaved, 3 probes):
+    /// 8,269 tokens 959 / 719 / 621 pp/s and 32,845 tokens 938 / 657 / 608 pp/s at steps 2048 / 1024 / 512 (smaller
+    /// chunks run the routed experts at a quarter of the rows per expert). Osaurus applies it when neither the request
+    /// nor a per-model tuning record picks a step; without it the library default 512 ran its 35k-token turns. It is
+    /// also the aligned-prefill chunk C of vMLX Python's M3 runtime.
+    public var recommendedPrefillStepSize: Int? { 2048 }
 
     /// Keep the checkpoint's dtypes (F32 router and per-expert scales, BF16 norms and embeddings), as the Python
     /// runtime does; the model owns its activation casts.

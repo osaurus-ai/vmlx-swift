@@ -122,8 +122,11 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
         let ocolGU: MLXArray, woutG: MLXArray, woutU: MLXArray, ocolDn: MLXArray, woutDn: MLXArray
     }
 
-    private final class WeakBlock { weak var block: MiniMaxM3SparseMoeBlock?; init(_ b: MiniMaxM3SparseMoeBlock) { block = b } }
-    private var layers: [ObjectIdentifier: (WeakBlock, Layer?)] = [:]
+    /// The per-block cache (`MiniMaxM3SparseMoeBlock._fusedMoELayer`): nil `layer` = the block is not covered.
+    final class LayerBox: @unchecked Sendable {
+        let layer: Layer?
+        init(_ layer: Layer?) { self.layer = layer }
+    }
 
     private static func affine4(_ m: Linear) -> QuantizedLinear? {
         guard let q = m as? QuantizedLinear, q.mode == .affine, q.bits == 4, q.groupSize == 64, q.biases != nil,
@@ -167,14 +170,10 @@ final class MiniMaxM3FusedMoE: @unchecked Sendable {
     }
 
     func layer(_ block: MiniMaxM3SparseMoeBlock) -> Layer? {
-        let key = ObjectIdentifier(block)
-        if let (ref, cached) = lock.withLock({ layers[key] }), ref.block === block { return cached }
-        let built = Self.build(block)
-        lock.withLock {
-            layers = layers.filter { $0.value.0.block != nil }
-            layers[key] = (WeakBlock(block), built)
-        }
-        return built
+        if let box = lock.withLock({ block._fusedMoELayer }) { return box.layer }
+        let box = LayerBox(Self.build(block))
+        lock.withLock { block._fusedMoELayer = box }
+        return box.layer
     }
 
     // MARK: launches (fused_moe.py)
