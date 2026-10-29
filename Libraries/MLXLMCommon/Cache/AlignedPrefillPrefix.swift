@@ -35,11 +35,57 @@ import MLX
 //
 // `VMLX_M3_ALIGNED_PREFIX=0` restores the previous behaviour (prefill chunked relative to the restored offset, any
 // stored prefix reused whole) for comparisons.
+//
+// Turn cuts (v2, the port of vMLX Python's structural rule, 05-PY-STRUCTURAL-CACHE.md): when the model resolves its
+// chat template's message markers through the serving tokenizer (`AlignedPrefillTurnMarkers`), a text prefill is ALSO
+// cut at every TURN CUT: the position right after an end-of-message token that closes a message other than an
+// assistant turn (system, developer, user, tool). The cut is decided by the tokens before it (lookbehind), so the cut
+// set below any row r depends only on tokens [0, r): any stored prefix whose first r tokens a request shares was
+// computed in exactly the chunks that request's cold prefill runs below r, whenever r is one of its cuts and r is at or
+// below the producer's K. A tool loop's next request then reuses the whole previous prompt up to its K (the end of
+// the last tool / user message) instead of its last C multiple. Assistant ends are not cuts (a tool call's increment
+// [K_prev, K) stays one piece). `VMLX_M3_STRUCTURAL_CUTS=0` keeps the v1 chunk-only rule; v1 and v2 entries never
+// serve each other (schema in the salt and the tag).
 
 /// The aligned-prefill rule: pure functions of positions, no model state.
 public enum AlignedPrefillGeometry {
     /// Identity of the rule. Part of the cache salt and of every stored state's tag.
     public static let schema = "aligned-prefill-v1"
+    /// The rule with turn cuts (v2).
+    public static let turnsSchema = "aligned-prefill-v2-turns"
+    /// `VMLX_M3_STRUCTURAL_CUTS=0` (or false / off / no): the v1 chunk-only rule even when markers resolve.
+    public static let structuralEnvironmentKey = "VMLX_M3_STRUCTURAL_CUTS"
+
+    public static func structuralCutsEnabled(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        let value = (environment[structuralEnvironmentKey] ?? "1").trimmingCharacters(in: .whitespaces).lowercased()
+        return !["0", "false", "off", "no"].contains(value)
+    }
+
+    /// Every turn cut `c` in `(0, end]`: `tokens[c - 1]` is `markers.eos` and the message it closes (the one opened by
+    /// the last `markers.bos` before it) is not an assistant turn; an end-of-message with no open message counts as a
+    /// non-assistant end. Python `prefill_geometry.turn_cuts`, bit for bit.
+    public static func turnCuts(_ tokens: [Int], markers: AlignedPrefillTurnMarkers?, end: Int? = nil) -> [Int] {
+        guard let markers else { return [] }
+        let n = end.map { max(0, min($0, tokens.count)) } ?? tokens.count
+        let width = markers.assistant.count
+        var cuts: [Int] = []
+        var assistantOpen = false
+        var i = 0
+        while i < n {
+            let t = tokens[i]
+            if t == markers.bos {
+                let lo = i + 1, hi = min(tokens.count, i + 1 + width)
+                assistantOpen = hi - lo == width && Array(tokens[lo ..< hi]) == markers.assistant
+            } else if t == markers.eos {
+                if !assistantOpen { cuts.append(i + 1) }
+                assistantOpen = false
+            }
+            i += 1
+        }
+        return cuts
+    }
     /// `VMLX_M3_ALIGNED_PREFIX=0` (or false / off / no) turns aligned prefill off.
     public static let environmentKey = "VMLX_M3_ALIGNED_PREFIX"
 
@@ -50,10 +96,10 @@ public enum AlignedPrefillGeometry {
         return !["0", "false", "off", "no"].contains(value)
     }
 
-    /// Absolute `[a, b)` pieces that prefill `[start, end)`: cut at every multiple of `step` (not for an atomic media
-    /// prefill) and at `boundary`, when they fall strictly inside.
+    /// Absolute `[a, b)` pieces that prefill `[start, end)`: cut at every multiple of `step` and every turn cut in
+    /// `turnCuts` (neither for an atomic media prefill), and at `boundary`, when they fall strictly inside.
     public static func pieces(
-        start: Int, end: Int, step: Int, boundary: Int?, atomic: Bool = false
+        start: Int, end: Int, step: Int, boundary: Int?, atomic: Bool = false, turnCuts: [Int] = []
     ) -> [Range<Int>] {
         guard end > start else { return [] }
         var cuts: Set<Int> = [start, end]
@@ -65,6 +111,7 @@ public enum AlignedPrefillGeometry {
                 cuts.insert(cut)
                 cut += step
             }
+            for c in turnCuts where start < c && c < end { cuts.insert(c) }
         }
         let ordered = cuts.sorted()
         return zip(ordered.dropLast(), ordered.dropFirst()).map { $0 ..< $1 }
@@ -80,15 +127,21 @@ public enum AlignedPrefillGeometry {
     /// rows: its boundary when the rows were produced with that same boundary (`exactGeometry`), else the largest chunk
     /// boundary <= min(matched, boundary) (0 for an atomic media request). `granule` rounds the chunk boundary down
     /// further (block-granular tiers that cannot cut inside a block; lcm with the step).
+    /// With `turnCuts` (this request's), the largest of those at or below the limit also qualifies (only when a
+    /// multiple of `granule` on a block-granular tier). Python `reuse_limit`.
     public static func reuseLimit(
-        matched: Int, boundary: Int, step: Int, exactGeometry: Bool, atomic: Bool = false, granule: Int = 1
+        matched: Int, boundary: Int, step: Int, exactGeometry: Bool, atomic: Bool = false, granule: Int = 1,
+        turnCuts: [Int] = []
     ) -> Int {
         guard matched > 0, boundary > 0 else { return 0 }
         if exactGeometry && matched == boundary { return boundary }
         if atomic { return 0 }
         var unit = max(1, step)
         if granule > 1 { unit = unit / gcd(unit, granule) * granule }
-        return (min(matched, boundary) / unit) * unit
+        let limit = min(matched, boundary)
+        var best = (limit / unit) * unit
+        for c in turnCuts where best < c && c <= limit && (granule <= 1 || c % granule == 0) { best = c }
+        return best
     }
 
     /// The store boundary `K` of a request: the prompt with its generation-prompt suffix stripped (the template's
@@ -123,18 +176,24 @@ public struct AlignedPrefillPlan: Sendable, Equatable, CustomStringConvertible {
     public let step: Int
     public let boundary: Int?
     public let promptTokenCount: Int
+    /// The request's turn cuts (v2), all at or below `boundary`; nil = the v1 chunk-only rule (no markers).
+    public let turnCuts: [Int]?
 
-    public init(step: Int, boundary: Int?, promptTokenCount: Int) {
+    public init(step: Int, boundary: Int?, promptTokenCount: Int, turnCuts: [Int]? = nil) {
         self.step = max(1, step)
         self.boundary = boundary
         self.promptTokenCount = promptTokenCount
+        self.turnCuts = turnCuts
     }
 
     /// The geometry the rows of a prefill with this plan are produced in.
-    public var tag: AlignedPrefillTag { AlignedPrefillTag(step: step, boundary: boundary ?? 0) }
+    public var tag: AlignedPrefillTag {
+        AlignedPrefillTag(step: step, boundary: boundary ?? 0, turns: turnCuts != nil)
+    }
 
     public var description: String {
         "step=\(step) boundary=\(boundary.map(String.init) ?? "none") prompt=\(promptTokenCount)"
+            + (turnCuts.map { " turns=\($0.count)" } ?? "")
     }
 }
 
@@ -143,33 +202,37 @@ public struct AlignedPrefillPlan: Sendable, Equatable, CustomStringConvertible {
 public struct AlignedPrefillTag: Sendable, Equatable, CustomStringConvertible {
     public let step: Int
     public let boundary: Int
+    /// Produced by a prefill that also cut at its turn cuts (v2).
+    public let turns: Bool
 
-    public init(step: Int, boundary: Int) {
+    public init(step: Int, boundary: Int, turns: Bool = false) {
         self.step = step
         self.boundary = boundary
+        self.turns = turns
     }
 
     /// Rows of every full aligned chunk at or before the producing boundary: reusable by any request whose prompt
     /// shares them.
     public var cleanPrefix: Int { AlignedPrefillGeometry.trailingChunkStart(boundary: boundary, step: step) }
 
-    /// `[schema, "step=C", "boundary=K"]`, appended to a cache's own `metaState`.
+    /// `[schema, "step=C", "boundary=K"]`, appended to a cache's own `metaState` (schema v1 or v2-turns).
     public var metaState: [String] {
-        [AlignedPrefillGeometry.schema, "step=\(step)", "boundary=\(boundary)"]
+        [turns ? AlignedPrefillGeometry.turnsSchema : AlignedPrefillGeometry.schema, "step=\(step)", "boundary=\(boundary)"]
     }
 
     /// Parses `metaState`; nil for anything else (a malformed or foreign tag is no tag).
     public init?(metaState: [String]) {
-        guard metaState.count == 3, metaState[0] == AlignedPrefillGeometry.schema,
+        guard metaState.count == 3,
+            metaState[0] == AlignedPrefillGeometry.schema || metaState[0] == AlignedPrefillGeometry.turnsSchema,
             metaState[1].hasPrefix("step="), metaState[2].hasPrefix("boundary="),
             let step = Int(metaState[1].dropFirst("step=".count)),
             let boundary = Int(metaState[2].dropFirst("boundary=".count)),
             step > 0, boundary >= 0
         else { return nil }
-        self.init(step: step, boundary: boundary)
+        self.init(step: step, boundary: boundary, turns: metaState[0] == AlignedPrefillGeometry.turnsSchema)
     }
 
-    public var description: String { "step=\(step) boundary=\(boundary)" }
+    public var description: String { "step=\(step) boundary=\(boundary)" + (turns ? " turns" : "") }
 }
 
 /// A cache layer of a model that prefills on aligned chunks: it carries the request's plan into `prepare` and the
@@ -187,6 +250,53 @@ public protocol AlignedPrefillCache: AnyObject {
 public protocol AlignedPrefillModel {
     /// The rule's identity when aligned prefill is on for this model, nil when it is off (the environment lever).
     var alignedPrefillSchema: String? { get }
+    /// The chat template's message markers when the rule cuts at turns (v2), nil for the chunk-only rule.
+    var alignedPrefillTurnMarkers: AlignedPrefillTurnMarkers? { get }
+}
+
+extension AlignedPrefillModel {
+    public var alignedPrefillTurnMarkers: AlignedPrefillTurnMarkers? { nil }
+}
+
+/// An aligned model whose turn markers come from the serving tokenizer: `ModelContext` hands it the tokenizer it was
+/// loaded with (every load path builds one), so the salt and every plan agree on the markers.
+public protocol AlignedPrefillTurnMarkerResolving: AnyObject {
+    func resolveAlignedPrefillTurnMarkers(tokenizer: any Tokenizer)
+}
+
+/// Token ids of a chat template's message structure: `bos` starts a message (followed by its role tokens), `eos` ends
+/// one; `assistant` = the role tokens that follow `bos` in an assistant turn. Python `prefill_geometry.TurnMarkers`.
+public struct AlignedPrefillTurnMarkers: Sendable, Equatable, CustomStringConvertible {
+    public let bos: Int
+    public let eos: Int
+    public let assistant: [Int]
+
+    public init(bos: Int, eos: Int, assistant: [Int]) {
+        self.bos = bos
+        self.eos = eos
+        self.assistant = assistant
+    }
+
+    /// `<bos>-<eos>-<role ids>`: part of the cache salt, so entries cut at other markers are never served.
+    public var signature: String { "\(bos)-\(eos)-" + assistant.map(String.init).joined(separator: ".") }
+    public var description: String { signature }
+
+    /// Resolve through the serving tokenizer. Accepted only when the tokenizer encodes the template's joint exactly as
+    /// the template renders it: `eosText + "\n" + bosText + assistantRoleText` as `[eos, <newline ids>, bos, <role
+    /// ids>]` with single-token `bos` / `eos` (Python `turn_markers_from_tokenizer`). Anything else: nil (no cuts).
+    public static func resolve(
+        tokenizer: any Tokenizer, bosText: String, eosText: String, assistantRoleText: String
+    ) -> AlignedPrefillTurnMarkers? {
+        let bos = tokenizer.encode(text: bosText, addSpecialTokens: false)
+        let eos = tokenizer.encode(text: eosText, addSpecialTokens: false)
+        let role = tokenizer.encode(text: assistantRoleText, addSpecialTokens: false)
+        let newline = tokenizer.encode(text: "\n", addSpecialTokens: false)
+        let joint = tokenizer.encode(text: eosText + "\n" + bosText + assistantRoleText, addSpecialTokens: false)
+        guard bos.count == 1, eos.count == 1, !role.isEmpty, !newline.isEmpty, bos[0] != eos[0],
+            joint == eos + newline + bos + role
+        else { return nil }
+        return AlignedPrefillTurnMarkers(bos: bos[0], eos: eos[0], assistant: role)
+    }
 }
 
 /// What a restore alignment decided (test / diagnostics observers).
@@ -256,6 +366,7 @@ public enum AlignedPrefill {
 
         private var reuseControl: ((AlignedPrefillRestoreRecord) -> Int?)?
         private var omitBoundaryCut = false
+        private var omitTurnCuts = false
 
         /// CONTROL ONLY (tests that must fail): replaces the reuse a restore alignment computed (nil keeps it), with no
         /// chunk-boundary check, so a continuation can start mid-chunk. Never set in production.
@@ -270,6 +381,13 @@ public enum AlignedPrefill {
         public var controlOmitsBoundaryCut: Bool {
             get { lock.withLock { omitBoundaryCut } }
             set { lock.withLock { omitBoundaryCut = newValue } }
+        }
+
+        /// CONTROL ONLY: an aligned prefill does not cut at the plan's turn cuts (the rows still carry the v2 tag), so a
+        /// later request reuses rows at a turn cut its producer never cut at. Never set in production.
+        public var controlOmitsTurnCuts: Bool {
+            get { lock.withLock { omitTurnCuts } }
+            set { lock.withLock { omitTurnCuts = newValue } }
         }
     }
 
@@ -303,15 +421,17 @@ public enum AlignedPrefill {
         model: any LanguageModel, cache: [any KVCache], promptTokenIds: [Int], cachePrefixTokenCounts: [Int],
         generationPromptSuffix: [Int], prefillStepSize: Int
     ) -> AlignedPrefillPlan? {
-        guard (model as? any AlignedPrefillModel)?.alignedPrefillSchema != nil, !promptTokenIds.isEmpty,
-            !layers(cache).isEmpty
+        guard let aligned = model as? any AlignedPrefillModel, aligned.alignedPrefillSchema != nil,
+            !promptTokenIds.isEmpty, !layers(cache).isEmpty
         else { return nil }
+        let boundary = AlignedPrefillGeometry.storeBoundary(
+            promptTokenIds: promptTokenIds, cachePrefixTokenCounts: cachePrefixTokenCounts,
+            generationPromptSuffix: generationPromptSuffix)
+        let cuts = aligned.alignedPrefillTurnMarkers.map {
+            AlignedPrefillGeometry.turnCuts(promptTokenIds, markers: $0, end: boundary ?? 0)
+        }
         return AlignedPrefillPlan(
-            step: prefillStepSize,
-            boundary: AlignedPrefillGeometry.storeBoundary(
-                promptTokenIds: promptTokenIds, cachePrefixTokenCounts: cachePrefixTokenCounts,
-                generationPromptSuffix: generationPromptSuffix),
-            promptTokenCount: promptTokenIds.count)
+            step: prefillStepSize, boundary: boundary, promptTokenCount: promptTokenIds.count, turnCuts: cuts)
     }
 
     /// Hand the request's plan to its caches (the model's `prepare` reads it there). nil clears it.
@@ -340,12 +460,17 @@ public enum AlignedPrefill {
         var reason = "ok"
         if offsets.isEmpty || offsets.contains(where: { $0 != matchedTokens }) {
             reason = "restored offsets \(Array(Set(offsets)).sorted()) != matched \(matchedTokens)"
-        } else if let tag, tag.step == plan.step, let boundary = plan.boundary {
+        } else if let tag, tag.step == plan.step, let boundary = plan.boundary, tag.turns == (plan.turnCuts != nil) {
             exact = tag.boundary == boundary && matchedTokens >= boundary
-            // Rows past the producing boundary were computed in its final piece or decoded: never reusable.
-            let usable = exact ? boundary : min(matchedTokens, tag.cleanPrefix)
+            // Rows past the producing boundary were computed in its final piece or decoded: never reusable. Under the
+            // turn rule every row up to the producer's K was cut at the producer's cuts, which below any shared row r
+            // are this request's own (lookbehind); without it only whole chunks below the producer's K qualify.
+            let usable = exact ? boundary : min(matchedTokens, tag.turns ? tag.boundary : tag.cleanPrefix)
             reuse = AlignedPrefillGeometry.reuseLimit(
-                matched: usable, boundary: boundary, step: plan.step, exactGeometry: exact)
+                matched: usable, boundary: boundary, step: plan.step, exactGeometry: exact,
+                turnCuts: plan.turnCuts ?? [])
+        } else if let tag, tag.turns != (plan.turnCuts != nil) {
+            reason = "stored rule \(tag.turns ? "v2-turns" : "v1") != request rule \(plan.turnCuts != nil ? "v2-turns" : "v1")"
         } else if tag == nil {
             reason = "stored rows carry no aligned geometry"
         } else if plan.boundary == nil {
@@ -375,7 +500,8 @@ public enum AlignedPrefill {
         // reused rows, and the reuse is a chunk boundary or this request's own store boundary.
         if reuse > 0,
             after.contains(where: { $0 != reuse }) || laneRows.contains(where: { $0 != reuse })
-                || !(controlled || reuse % plan.step == 0 || reuse == plan.boundary)
+                || !(controlled || reuse % plan.step == 0 || reuse == plan.boundary
+                    || (plan.turnCuts ?? []).contains(reuse))
         {
             reason = "cut to \(reuse) left offsets \(Array(Set(after)).sorted()) lanes \(Array(Set(laneRows)).sorted())"
             reuse = 0

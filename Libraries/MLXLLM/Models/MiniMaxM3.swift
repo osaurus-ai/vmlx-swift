@@ -492,7 +492,7 @@ public final class MiniMaxM3ModelInner: Module {
 }
 
 public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, SafetensorsLoadKeyExcluding,
-    AlignedPrefillModel
+    AlignedPrefillModel, AlignedPrefillTurnMarkerResolving
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -508,6 +508,9 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     /// The attached DSpark drafter (`dspark/`), shared by every request; nil until `attachDSparkDraft`.
     var dsparkHead: MiniMaxM3DSparkHead?
     let dsparkAttachLock = NSLock()
+    /// The chat template's message markers, resolved through the serving tokenizer (`alignedPrefillTurnMarkers`).
+    private var resolvedTurnMarkers: AlignedPrefillTurnMarkers?
+    private let turnMarkersLock = NSLock()
 
     public init(_ configuration: MiniMaxM3Configuration) {
         self.configuration = configuration
@@ -603,7 +606,8 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
         {
             pieces = AlignedPrefillGeometry.pieces(
                 start: start, end: start + count, step: plan.step,
-                boundary: AlignedPrefill.hooks.controlOmitsBoundaryCut ? nil : plan.boundary)
+                boundary: AlignedPrefill.hooks.controlOmitsBoundaryCut ? nil : plan.boundary,
+                turnCuts: AlignedPrefill.hooks.controlOmitsTurnCuts ? [] : plan.turnCuts ?? [])
             followsPlan = true
         } else {
             if let plan {
@@ -659,9 +663,34 @@ public final class MiniMaxM3Model: Module, LLMModel, KVCacheDimensionProvider, S
     public var supportsWholeForwardCompilation: Bool { false }
 
     /// Every M3 prompt prefill is cut at absolute chunk boundaries and the store boundary (`prepare`), so prefix-cache
-    /// hits are bit-identical to a cold prefill. `VMLX_M3_ALIGNED_PREFIX=0` turns it off (previous behaviour).
+    /// hits are bit-identical to a cold prefill. `VMLX_M3_ALIGNED_PREFIX=0` turns it off (previous behaviour). With the
+    /// template's message markers resolved from the serving tokenizer it also cuts at every non-assistant message end
+    /// (v2 turn cuts; `VMLX_M3_STRUCTURAL_CUTS=0` keeps v1); the markers are part of the identity (cache salt).
     public var alignedPrefillSchema: String? {
-        AlignedPrefillGeometry.isEnabled() ? "minimax-m3:" + AlignedPrefillGeometry.schema : nil
+        guard AlignedPrefillGeometry.isEnabled() else { return nil }
+        if let markers = alignedPrefillTurnMarkers {
+            return "minimax-m3:" + AlignedPrefillGeometry.turnsSchema + ":turns=" + markers.signature
+        }
+        return "minimax-m3:" + AlignedPrefillGeometry.schema
+    }
+
+    /// The M3 chat template's message markers (`]~b]` + role, `[e~[`; assistant role `ai\n`), resolved through the
+    /// serving tokenizer by `ModelContext` (`resolveAlignedPrefillTurnMarkers`); nil without a resolving tokenizer or
+    /// with `VMLX_M3_STRUCTURAL_CUTS=0`.
+    public var alignedPrefillTurnMarkers: AlignedPrefillTurnMarkers? {
+        guard AlignedPrefillGeometry.structuralCutsEnabled() else { return nil }
+        return turnMarkersLock.withLock { resolvedTurnMarkers }
+    }
+
+    public func resolveAlignedPrefillTurnMarkers(tokenizer: any Tokenizer) {
+        let markers = AlignedPrefillTurnMarkers.resolve(
+            tokenizer: tokenizer, bosText: "]~b]", eosText: "[e~[", assistantRoleText: "ai\n")
+        turnMarkersLock.withLock { resolvedTurnMarkers = markers }
+    }
+
+    /// Tests: set the markers directly (a stand-in tokenizer has no M3 vocabulary).
+    func setAlignedPrefillTurnMarkers(_ markers: AlignedPrefillTurnMarkers?) {
+        turnMarkersLock.withLock { resolvedTurnMarkers = markers }
     }
 
     /// The three-lane sparse cache has no batched (B > 1) form yet.
