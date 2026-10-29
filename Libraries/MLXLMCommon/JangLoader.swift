@@ -2491,7 +2491,7 @@ public struct JangLoader: Sendable {
                 switch declared {
                 case .quantize(let quantization):
                     return quantization
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 }
             }
