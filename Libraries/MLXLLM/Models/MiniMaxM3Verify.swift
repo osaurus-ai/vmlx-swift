@@ -87,7 +87,10 @@ enum MiniMaxM3RowExact {
             return rows(x) { module($0) }
         }
         var batched = 0
-        let outs = blocks(n, width: rowsPerLaunch).map { start, size -> MLXArray in
+        // Affine projections: as many rows per launch as the row-exact kernel serves at this width (16 at 6 / 8 bits:
+        // one weight walk for a whole verify); mxfp8 keeps blocks of 4.
+        let width = q.mode == .affine ? RowExactAffineQMV.launchRows(bits: q.bits) : rowsPerLaunch
+        let outs = blocks(n, width: width).map { start, size -> MLXArray in
             let xb = x[0..., start ..< (start + size)]
             if size > 1, let y = multiRow(q, xb) {
                 batched += 1
