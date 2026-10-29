@@ -9,8 +9,8 @@ import Testing
 @testable import MLXLLM
 @testable import MLXLMCommon
 
-/// The fused-decode seam (`MiniMaxM3FusedDecode`) before any kernel exists: off by default, offered only 1...16-row
-/// single-sequence calls, consulted by both the decode forward and the DSpark verify forward with the same rule, a
+/// The fused-decode seam (`MiniMaxM3FusedDecode`) with a spy path: off by default, offered only 1...16-row
+/// single-sequence decode calls (any verify width), consulted by both the decode forward and the DSpark verify forward with the same rule, a
 /// decline runs the stock path unchanged, and a returned block output is what the layer uses.
 @Suite("MiniMax-M3 fused-decode seam", .serialized)
 struct MiniMaxM3FusedDecodeSeamTests {
@@ -107,8 +107,10 @@ struct MiniMaxM3FusedDecodeSeamTests {
             #expect(MiniMaxM3DSparkTests.equal(l3, refLast))  // prefill chunks are never offered
             #expect(!MiniMaxM3DSparkTests.equal(s3, refStep) && !MiniMaxM3DSparkTests.equal(v3, refVerify))
 
-            // More than 16 rows or a batch: not offered.
+            // More than 16 decode-forward rows or a batch: not offered; a verify of any width is (chunked by the path).
             #expect(MiniMaxM3FusedDecode.active(rows: 17, batch: 1) == nil)
+            #expect(MiniMaxM3FusedDecode.active(rows: 17, batch: 1, verify: true) != nil)
+            #expect(MiniMaxM3FusedDecode.active(rows: 17, batch: 2, verify: true) == nil)
             #expect(MiniMaxM3FusedDecode.active(rows: 4, batch: 2) == nil)
             #expect(MiniMaxM3FusedDecode.active(rows: 16, batch: 1) != nil)
         }

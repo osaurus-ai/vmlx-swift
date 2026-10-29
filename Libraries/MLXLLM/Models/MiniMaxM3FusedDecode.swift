@@ -5,7 +5,9 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// Integration seam for MiniMax-M3 / M3.1 fused decode kernels ("megakernels"), 1...16 rows. NO KERNELS LIVE HERE YET.
+/// Integration seam for MiniMax-M3 / M3.1 fused decode kernels ("megakernels"), 1...16 rows. The default path is
+/// `MiniMaxM3FusedKernelPath` (vMLX's K1-K5 attention kernels, `MiniMaxM3FusedAttention`; the MoE half declines until
+/// K6-K8 are ported); tests may register another.
 ///
 /// The fused path replaces whole halves of a decoder layer for small calls: the attention block (input RMSNorm,
 /// q / k / v and index projections, head norms + partial RoPE + casts, K / V / index-key appends, indexer selection,
@@ -24,8 +26,9 @@ import MLXLMCommon
 ///   (the caches stay in lockstep; DSpark rollback trims them).
 /// - **Decline is free.** Returning nil runs the stock path for that block unchanged.
 ///
-/// Off by default: `VMLX_M3_FUSED_DECODE=1` turns it on once a path is registered (`MiniMaxM3FusedDecode.path`). Only
-/// single-sequence calls of 1...16 rows are offered (prefill chunks keep the chunk kernels).
+/// Off by default: `VMLX_M3_FUSED_DECODE=1` turns it on. Only single-sequence calls are offered: decode-forward calls
+/// of 1...16 rows (prefill chunks keep the chunk kernels) and DSpark verify forwards of any width (a path runs rows
+/// past 16 in chunks, so a wide verify stays on the decode step's arithmetic).
 public enum MiniMaxM3FusedDecode {
     public static let environmentKey = "VMLX_M3_FUSED_DECODE"
     /// Rows a fused call may carry: a decode step (1) up to DSpark's verify of the ladder top (2 x block 7 + 1 = 15).
@@ -41,7 +44,7 @@ public enum MiniMaxM3FusedDecode {
     nonisolated(unsafe) private static var _path: (any MiniMaxM3FusedPath)?
     nonisolated(unsafe) private static var _forceEnabled: Bool?
 
-    /// The registered fused path (nil until the kernels are ported).
+    /// The registered fused path (nil = the default `MiniMaxM3FusedKernelPath`).
     static var path: (any MiniMaxM3FusedPath)? {
         get { lock.withLock { _path } }
         set { lock.withLock { _path = newValue } }
@@ -53,12 +56,13 @@ public enum MiniMaxM3FusedDecode {
         set { lock.withLock { _forceEnabled = newValue } }
     }
 
-    /// The path to use for a call of `rows` rows in a batch of `batch`, or nil (stock path).
-    static func active(rows: Int, batch: Int) -> (any MiniMaxM3FusedPath)? {
-        guard batch == 1, (1 ... maxRows).contains(rows) else { return nil }
+    /// The path to use for a call of `rows` rows in a batch of `batch` (`verify`: a DSpark verify forward, any width),
+    /// or nil (stock path).
+    static func active(rows: Int, batch: Int, verify: Bool = false) -> (any MiniMaxM3FusedPath)? {
+        guard batch == 1, rows >= 1, verify || rows <= maxRows else { return nil }
         let (path, force) = lock.withLock { (_path, _forceEnabled) }
         guard force ?? enabledByEnvironment else { return nil }
-        return path
+        return path ?? MiniMaxM3FusedKernelPath.shared
     }
 }
 
