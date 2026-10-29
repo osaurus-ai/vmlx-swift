@@ -183,7 +183,7 @@ struct MiniMaxM3ColdPrefillTests {
         }
     }
 
-    @Test("JANGHT M3, VMLX_M3_PREFILL_SORTED: every piece's routed experts on the sorted tiles, one call per group == one call per piece; differs from the stock rule (control)")
+    @Test("JANGHT M3, VMLX_M3_PREFILL_SORTED: pieces of >= 18 rows on the sorted tiles, one call per group == one call per piece; differs from the stock rule (control)")
     func jangtSortedAllGroupsBitIdentically() async throws {
         guard JANGTPrefillKernel.available else {
             print("[MiniMaxM3ColdPrefillTests] sorted JANGT prefill kernel unavailable (needs NAX): skipped")
@@ -193,8 +193,8 @@ struct MiniMaxM3ColdPrefillTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let context = try await LLMModelFactory.shared.load(from: directory, using: ByteTokenizerLoader())
         let model = try #require(context.model as? MiniMaxM3Model)
-        // 7 / 23 / 17 / 40 / 76-row pieces are below the stock rule's 128 rows: on the decode kernels there, on the
-        // sorted tiles here.
+        // The 23 / 40 / 76-row pieces are below the stock rule's 128 rows: on the decode kernels there, on the sorted
+        // tiles here (>= 18 rows).
         let cuts = [7, 30, 47, 200, 333, 552, 700, 1100, 1290]
         let prompt = A.ids(1301, seed: 9).map { $0 % 250 }
         try Self.withGPU {
@@ -211,19 +211,22 @@ struct MiniMaxM3ColdPrefillTests {
             let piecewise = try arm(grouping: false, sorted: true)
             #expect(counter.calls.isEmpty)
             let grouped = try arm(grouping: true, sorted: true)
-            // 2 MoE layers x 3 chunks, every piece in its chunk's call: 6, 3 and 3 pieces.
-            #expect(counter.calls.map(\.1).sorted() == [3, 3, 3, 3, 6, 6], "grouped routed calls \(counter.calls)")
+            // 2 MoE layers x 3 chunks, every piece of >= 18 rows (the 72-pair floor) in its chunk's call: 4, 3 and 2
+            // pieces (the 7 / 17 / 8-row pieces keep the decode kernels).
+            #expect(counter.calls.map(\.1).sorted() == [2, 2, 3, 3, 4, 4], "grouped routed calls \(counter.calls)")
             let diff = Self.problems(piecewise, grouped)
             #expect(diff.isEmpty, "sorted-all grouped != piece by piece: \(diff.prefix(4))")
             let stock = try arm(grouping: true, sorted: false)
             #expect(!Self.problems(stock, grouped).isEmpty, "the sorted rule changed nothing: the control is blind")
-            // vMLX Python's threshold (72 pairs = 18 rows): the 7 / 17-row pieces stay on the decode kernels.
-            let py = try MiniMaxM3Model.$prefillSortedMinPairsOverride.withValue(72) {
+            // 128 pairs (32 rows): the 17 / 23-row pieces go back to the decode kernels.
+            let py = try MiniMaxM3Model.$prefillSortedMinPairsOverride.withValue(128) {
                 (try arm(grouping: false, sorted: true), try arm(grouping: true, sorted: true))
             }
             let diff72 = Self.problems(py.0, py.1)
-            #expect(diff72.isEmpty, "sorted-72 grouped != piece by piece: \(diff72.prefix(4))")
-            #expect(!Self.problems(py.1, grouped).isEmpty, "the 72-pair threshold changed nothing vs every piece sorted")
+            #expect(diff72.isEmpty, "sorted-128 grouped != piece by piece: \(diff72.prefix(4))")
+            #expect(!Self.problems(py.1, grouped).isEmpty, "the 128-pair threshold changed nothing vs the 72-pair floor")
+            #expect(MiniMaxM3Model.$prefillSortedMinPairsOverride.withValue(1) { MiniMaxM3Model.prefillSortedMinPairs } == 72,
+                    "the sorted tiles' floor (72 pairs) can be undercut")
         }
     }
 

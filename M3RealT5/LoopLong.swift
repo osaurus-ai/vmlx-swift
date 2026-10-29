@@ -643,7 +643,9 @@ func taskRowDependence() async throws {
         let full = f(input, 0 ..< 2048)
         eval(full)
         var differs: [Int] = []
-        for m in sizes {
+        // The sorted tiles fail to build their kernel for tiny calls (a 1-row call: no matching jt_gather_qmm_nax);
+        // probe them from vMLX Python's 18-row threshold on.
+        for m in sizes where name != "routed_sorted" || m >= 18 {
             for a in [0, 2048 - m] {
                 let part = f(input[0..., a ..< (a + m), 0...], a ..< (a + m))
                 let ref = full[0..., a ..< (a + m), 0...]
