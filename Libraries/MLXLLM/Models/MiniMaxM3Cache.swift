@@ -17,7 +17,7 @@ import MLXLMCommon
 /// and restore visibly cover both buffers. Generic code that understands only plain K/V caches therefore cannot
 /// mistake this cache for one and drop the indexer lane; disk persistence goes through `DiskCacheStateProviding`,
 /// which restores all three lanes or nothing.
-public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
+public final class MiniMaxM3SparseCache: DiskCacheStateProviding, AppendOnlyRowsCache {
     /// The K/V lane. Readable in-module (tests poison its unused capacity to prove nothing reads past `offset`).
     private(set) var kv = KVCacheSimple()
 
@@ -158,6 +158,23 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding {
             copy.alignedPrefillTag = alignedPrefillTag
         }
         return copy
+    }
+
+    // MARK: AppendOnlyRowsCache
+
+    /// Set on a cache made by ``prefixView(rows:)``.
+    public private(set) var isPrefixView = false
+
+    /// Views of the first `rows` rows of the three lanes (no copy) and the rows' aligned-prefill tag. The DSpark tap
+    /// tail is not carried (speed-only, and its rows past `rows` would not belong to the view).
+    public func prefixView(rows: Int) -> any KVCache {
+        precondition(rows > 0 && rows <= offset && rows <= indexCount, "MiniMax-M3 prefix view of \(rows) rows, cache has \(offset)")
+        let view = MiniMaxM3SparseCache()
+        let current = state
+        view.state = current.map { $0[.ellipsis, ..<rows, 0...] }
+        view.alignedPrefillTag = alignedPrefillTag
+        view.isPrefixView = true
+        return view
     }
 
     // MARK: DiskCacheStateProviding

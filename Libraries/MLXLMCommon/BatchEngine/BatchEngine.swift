@@ -2080,6 +2080,8 @@ public actor BatchEngine {
 
     /// Run one scheduling step: prefill pending slots, then batch-decode active slots.
     private func step() {
+        // Keep MLX's scheduling limit above the slots' resident working set (`SchedulingMemoryFloor`).
+        SchedulingMemoryFloor.observe()
         // Phase 1: Process one prefill chunk per slot that's still prefilling.
         // Prefill is done sequentially per slot (each chunk is large, batching
         // prefill chunks of different lengths wastes compute on padding).

@@ -85,6 +85,57 @@ public protocol DiskCacheStateProviding: KVCache {
     func restoreDiskCacheState(_ state: [MLXArray], metadata: [String], offset: Int) -> Bool
 }
 
+/// A cache whose rows below `offset` never change once written: it only appends and trims (no rotation, compaction or
+/// in-place requantization), and growth copies the old rows into a larger buffer unchanged. A view of its first `rows`
+/// rows therefore stays exact while the cache is not updated in place, so the end-of-turn prompt-boundary stores can
+/// write views of the finished cache instead of copies (`TokenIterator.storeCacheAfterGeneration`).
+public protocol AppendOnlyRowsCache: KVCache {
+    /// A cache holding views (not copies) of this cache's first `rows` rows; it shares this cache's buffers. Take it only
+    /// when this cache will not be updated in place again (after generation) or is itself such a view.
+    func prefixView(rows: Int) -> any KVCache
+    /// True for a cache made by ``prefixView(rows:)``: its state is views, nothing was materialized for it.
+    var isPrefixView: Bool { get }
+    /// Whether this instance really is append-only (a conforming base class can have subclasses that are not).
+    var supportsPrefixViews: Bool { get }
+}
+
+extension AppendOnlyRowsCache {
+    public var supportsPrefixViews: Bool { true }
+}
+
+/// Plain K/V caches append and trim only; subclasses that rotate, chunk or quantize are excluded by exact type, as in
+/// ``AppendOnlyPromptCheckpoint``.
+extension KVCacheSimple: AppendOnlyRowsCache {
+    public var supportsPrefixViews: Bool { AppendOnlyPromptCheckpoint.isAppendOnly(self) }
+
+    public func prefixView(rows: Int) -> any KVCache {
+        guard let view = appendOnlyPrefix(self, count: rows, owned: false) as? KVCacheSimple else {
+            preconditionFailure("KVCacheSimple prefix view of \(rows) rows, cache has \(offset)")
+        }
+        view.isPrefixView = true
+        return view
+    }
+}
+
+/// Every layer appends only (``AppendOnlyRowsCache``) and holds at least `rows` rows.
+public func cacheSupportsPrefixViews(_ cache: [KVCache], rows: Int) -> Bool {
+    !cache.isEmpty && cache.allSatisfy {
+        ($0 as? AppendOnlyRowsCache).map { $0.supportsPrefixViews && $0.offset >= rows } ?? false
+    }
+}
+
+/// Views of the first `rows` rows of every layer (``AppendOnlyRowsCache/prefixView(rows:)``), or nil when a layer does
+/// not support them.
+public func prefixViews(of cache: [KVCache], rows: Int) -> [KVCache]? {
+    guard rows > 0, cacheSupportsPrefixViews(cache, rows: rows) else { return nil }
+    return cache.map { ($0 as! AppendOnlyRowsCache).prefixView(rows: rows) }
+}
+
+/// Every layer is a ``AppendOnlyRowsCache/prefixView(rows:)`` view (storing it materializes nothing).
+public func cacheIsPrefixViews(_ cache: [KVCache]) -> Bool {
+    !cache.isEmpty && cache.allSatisfy { ($0 as? AppendOnlyRowsCache)?.isPrefixView == true }
+}
+
 /// Materialize an OWNED copy of a cache state array for `copy()`.
 ///
 /// The previous idiom, `x[.ellipsis]`, is a slice — and `Slice::eval` shares
@@ -532,6 +583,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+    /// Set on a cache made by ``prefixView(rows:)`` (``AppendOnlyRowsCache``).
+    public internal(set) var isPrefixView = false
 
     public override init() {
         super.init()
