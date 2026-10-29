@@ -216,3 +216,94 @@ func taskVerifyProfile() async throws {
     }
     try writeJSON(report, "vprofile_\(tag).json")
 }
+
+// MARK: - per-part split vs rows
+
+/// Per-part cost of a W-row call on the real bundle, on the decode-exact verify arithmetic (what DSpark runs; W = 1 is
+/// the decode step) and on the stock multi-row arithmetic: attention blocks only, MLP blocks only, shared experts (+
+/// the dense MLPs) only, the whole forward, each + embed / final norm / head. Real token rows (real routing), caches
+/// trimmed back after every call, variants interleaved, medians. Baselines for the fused-kernel work.
+func taskVerifySplit() async throws {
+    let (model, _, _) = try await productionLoad(bundleURL())
+    let inner = model.model
+    let lens = (env["T5_PROF_LENS"] ?? "3011").split(separator: ",").map { Int($0)! }
+    let widths = (env["T5_SPLIT_WIDTHS"] ?? "1,2,4,8,15").split(separator: ",").map { Int($0)! }
+    let probes = Int(env["T5_PROBES"] ?? "7")!
+    let tokens = try loadTokens()
+    func head(_ h: MLXArray) -> MLXArray {
+        let n = inner.norm(h)
+        return model.lmHead.map { $0(n) } ?? inner.embedTokens.asLinear(n)
+    }
+    func attn(_ layer: MiniMaxM3DecoderLayer, _ h: MLXArray, _ c: KVCache, exact: Bool) -> MLXArray {
+        let x = layer.inputLayerNorm(h)
+        if exact && h.dim(1) > 1 { return layer.selfAttn.verifyRows(x, cache: c, offset: c.offset) }
+        return layer.selfAttn(x, mask: h.dim(1) > 1 ? .causal : .none, cache: c)
+    }
+    func mlp(_ layer: MiniMaxM3DecoderLayer, _ h: MLXArray, exact: Bool, sharedOnly: Bool) -> MLXArray {
+        let y = layer.postAttentionLayerNorm(h)
+        if let moe = layer.mlp as? MiniMaxM3SparseMoeBlock {
+            if sharedOnly { return exact && h.dim(1) > 1 ? moe.sharedExperts.verifyRows(y) : moe.sharedExperts(y) }
+            return exact && h.dim(1) > 1 ? moe.verifyRows(y) : moe(y)
+        }
+        let dense = layer.mlp as! MiniMaxM3MLP
+        return exact && h.dim(1) > 1 ? dense.verifyRows(y) : dense(y)
+    }
+    var report: [String: Any] = ["probes": probes, "widths": widths]
+    for n in lens {
+        let cache = model.newCache(parameters: nil)
+        var s = 0
+        while s < n {
+            let e = min(s + chunk, n)
+            eval(model(MLXArray(Array(tokens[s ..< e])).reshaped(1, e - s), cache: cache))
+            s = e
+        }
+        Memory.clearCache()
+        func trimTo(_ end: Int) { for c in cache where c.offset > end { _ = c.trim(c.offset - end) } }
+        var row: [String: Any] = [:]
+        for w in widths {
+            let x = MLXArray(Array(tokens[n ..< (n + w)])).reshaped(1, w)
+            var jobs: [(String, () -> MLXArray)] = [("head", { head(inner.embedTokens(x)) })]
+            for exact in [true, false] where exact || w > 1 {
+                let tag = exact ? "exact" : "stock"
+                jobs.append(("\(tag)_attention", {
+                    var h = inner.embedTokens(x)
+                    for (i, layer) in inner.layers.enumerated() { h = h + attn(layer, h, cache[i], exact: exact) }
+                    return head(h)
+                }))
+                jobs.append(("\(tag)_mlp", {
+                    var h = inner.embedTokens(x)
+                    for layer in inner.layers { h = h + mlp(layer, h, exact: exact, sharedOnly: false) }
+                    return head(h)
+                }))
+                jobs.append(("\(tag)_shared_dense", {
+                    var h = inner.embedTokens(x)
+                    for layer in inner.layers { h = h + mlp(layer, h, exact: exact, sharedOnly: true) }
+                    return head(h)
+                }))
+                jobs.append(("\(tag)_full", {
+                    var h = inner.embedTokens(x)
+                    for (i, layer) in inner.layers.enumerated() {
+                        h = h + attn(layer, h, cache[i], exact: exact)
+                        h = h + mlp(layer, h, exact: exact, sharedOnly: false)
+                    }
+                    return head(h)
+                }))
+            }
+            var t: [String: [Double]] = [:]
+            for p in 0 ..< probes + 2 {
+                for (name, job) in (p % 2 == 0 ? jobs : jobs.reversed()) {
+                    let t0 = nowMs()
+                    eval(job())
+                    let dt = nowMs() - t0
+                    trimTo(n)
+                    if p >= 2 { t[name, default: []].append(dt) }
+                }
+            }
+            precondition(Set(cache.map(\.offset)) == [n])
+            row["\(w)"] = t.mapValues { ["median_ms": median($0), "runs": $0] }
+            log("vsplit n=\(n) W=\(w): " + t.keys.sorted().map { "\($0) \(String(format: "%.1f", median(t[$0]!)))" }.joined(separator: ", "))
+        }
+        report["\(n)"] = row
+    }
+    try writeJSON(report, "vsplit_\(tag).json")
+}
