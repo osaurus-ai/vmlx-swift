@@ -143,7 +143,8 @@ struct MiniMaxM3BundleLoadRoutingTests {
                 loadConfiguration: LoadConfiguration())
             Issue.record("a per-file symlink farm loaded")
         } catch {
-            let message = "\(error.localizedDescription) | \(error)"
+            // What an app shows: `localizedDescription` must carry the reason itself.
+            let message = error.localizedDescription
             #expect(!message.contains("Missing field"), "the VLM parse error masked the LLM's: \(message)")
             #expect(message.contains("cannot open JANGH metadata file"), "\(message)")
             #expect(message.contains("symbolic link"), "\(message)")
