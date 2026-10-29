@@ -167,14 +167,14 @@
  "kernelSourcesSha256": {
   "attn_common": "ce90915dfb1c218ed09e82ed0f11a63b3fb07a630d5f6d44e0bd7b27c7386d0a",
   "attn_heads": "77d84e7f5483ddff691b7b3069e08345ee78fbd7cc5ce7a2a2d5aa91b5669c9c",
-  "attn_msa": "4af8430f13c2b1605808102c6efab5acf2309f603ab93e3dd4b5f0aaa08b96f8",
+  "attn_msa": "a7e0c435f27881c5cb7a6af909a809ac9f73f69476d4a150223b67035843da36",
   "attn_oproj": "9bb78c5644bd330512cb668aff5e1ec920c9d1915ee450526692c4ae5ec64f6e",
   "attn_qkv": "9399dd6f34e297f5df6b37b7503ab62d162a7e2b870ce942b774f7b96b53782d",
   "attn_scores": "c3cc4fe9aac60df36a9c9939445065e23b94c31fc1d9d494c64c231e466f829c"
  },
- "mlx": "0.32.2",
- "platform": "macOS-27.0-arm64-arm-64bit",
- "vmlxCommit": "8990f9bc",
+ "mlx": "0.32.4",
+ "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+ "vmlxCommit": "8da26375",
  "weights": {
   "input_layernorm.weight": "27c93066967550896bec4744f474cb4ea097d2bee97b0608b3b43a5246f9feb1",
   "self_attn.indexer.index_k_norm.weight": "f770935e61fd4428d9145f5d55ed5b899d60993d1881333a6a9956c204fb0192",
