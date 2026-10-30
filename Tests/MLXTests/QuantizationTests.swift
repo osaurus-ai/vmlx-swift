@@ -6,6 +6,34 @@ import MLXNN
 import XCTest
 
 class QuantizationTests: XCTestCase {
+
+    func testOneBitAffineNegativeEndpointsAndSmallKThroughCBridge() {
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            for width in [64, 128] {
+                for group in [32, 64, 128] where width.isMultiple(of: group) {
+                    for stream in [StreamOrDevice.cpu, .gpu] {
+                        let weights = MLXArray(
+                            (0 ..< 16 * width).map { $0.isMultiple(of: 2) ? Float(-2) : Float(-1) },
+                            [16, width]
+                        ).asType(dtype)
+                        let (packed, scales, biases) = MLX.quantized(
+                            weights, groupSize: group, bits: 1, mode: .affine, stream: stream)
+                        let restored = MLX.dequantized(
+                            packed, scales: scales, biases: biases, groupSize: group,
+                            bits: 1, mode: .affine, stream: stream)
+                        XCTAssertEqual(MLX.abs(restored - weights).max().item(Float.self), 0)
+                        let input = MLXArray.ones([1, width], dtype: dtype)
+                        let actual = MLX.quantizedMM(
+                            input, packed, scales: scales, biases: biases, transpose: true,
+                            groupSize: group, bits: 1, mode: .affine, stream: stream)
+                        let expected = MLXArray.full(
+                            [1, 16], values: MLXArray(Float(-width * 3 / 2)))
+                        XCTAssertEqual(MLX.abs(actual - expected).max().item(Float.self), 0)
+                    }
+                }
+            }
+        }
+    }
     func testQuantizedLinearShapeDesc() {
         let linear1 = Linear(512, 1024)
         let quantized1 = linear1.toQuantized(groupSize: 64, bits: 4)

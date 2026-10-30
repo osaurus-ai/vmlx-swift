@@ -70,7 +70,9 @@ MLX_API array mmap_file_region(
 
 // Named JANGH banks participate in canonical layer/expert cold-page advice.
 // Valid names are
-// model.layers.N.mlp.switch_mlp.{gate,up,down}_proj.tq2_{packed,scales}. The
+// model.layers.N.{mlp,feed_forward}.switch_mlp.{gate,up,down}_proj.tq2_{packed,scales}.
+// Routed names may have a language_model. wrapper. Nemotron-H relu2 routed
+// banks use backbone.layers.N.mixer.switch_mlp.{fc1,fc2}.tq2_{packed,scales}. The
 // array owns its mapping; registry entries hold only weak references. Advice
 // uses the existing process-global layer/expert namespace, not a model ID.
 MLX_API array mmap_file_region_named(
