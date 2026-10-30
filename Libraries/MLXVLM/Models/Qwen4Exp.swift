@@ -2581,7 +2581,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         for (originalKey, originalValue) in weights {
             var key = originalKey
             var value = originalValue
-            // An mlx-vlm-style converter (MLX-Serve) saves the module tree's own names,
+            // An mlx-vlm-style converter saves the module tree's own names,
             // `language_model.model.*`, `language_model.lm_head`, `language_model.mtp.*`, with every
             // value already through the reference sanitize: norms shifted, MTP fusion norms folded
             // to `1 + weight`, conv weights in MLX layout. Its values are not transformed twice.

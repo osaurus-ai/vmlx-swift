@@ -10,7 +10,7 @@ import Foundation
 /// 0.5). Those image values are never applied to a model: `Qwen4ExpConfiguration` without `vision_config` constructs
 /// no vision tower, its modalities are `[.text]`, and `Qwen4Exp.prepare` refuses image or video input.
 ///
-/// A bundle that declares a vision tower but ships no processor file (ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit)
+/// A bundle that declares a vision tower but ships no processor file (a mixed 4/8-bit mlx-vlm-converted Qwen3.8 Flash-Next)
 /// is made text-only first, by ``textOnlyConfiguration(_:modelDirectory:)``: its image geometry is undeclared, and
 /// filling it in from the vendor would apply values the bundle never stated.
 enum Qwen4ExpTextOnlyBundle {
