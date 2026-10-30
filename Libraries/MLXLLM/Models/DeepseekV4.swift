@@ -332,14 +332,27 @@ class DeepseekV4Attention: Module {
         }
         q = q.transposed(0, 2, 1, 3)
 
+        // --- Partial RoPE on last ropeDim dims of Q (K: `kvMath`) ---
+        let cosQ = cosT.expandedDimensions(axes: [0, 1])
+        let sinQ = sinT.expandedDimensions(axes: [0, 1])
+        q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
+
+        return (qResidual, q, kvMath(x, cosT: cosT, sinT: sinT))
+    }
+
+    /// The single latent KV head as the cache stores it: `kv_norm(wkv(x))`, partial RoPE, then the
+    /// activation-QAT round trip. Shared by `preMath` and ``updateCacheOnly(_:cache:)``.
+    private func kvMath(_ x: MLXArray, cosT: MLXArray, sinT: MLXArray) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
         // --- KV projection (single latent head) ---
         var kv = kvNorm(DeepseekV41FP8Rows.apply(wkv, x))
         kv = kv.reshaped(B, L, 1, headDim).transposed(0, 2, 1, 3)
 
-        // --- Partial RoPE on last ropeDim dims of Q and K ---
+        // --- Partial RoPE on last ropeDim dims of K ---
         let cosQ = cosT.expandedDimensions(axes: [0, 1])
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
-        q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
         kv = DeepseekV4Math.applyPartialRoPE(kv, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
 
         // Pinned 0731 graph contract: fake-quantize the 448 non-RoPE KV
@@ -350,7 +363,25 @@ class DeepseekV4Attention: Module {
         if config.activationQATEnabled && nopeDim >= 64 {
             kv = DeepseekV4Math.e4m3KVActivationRoundTrip(kv, ropeDim: ropeDim)
         }
-        return (qResidual, q, kv)
+        return kv
+    }
+
+    /// DeepSeek-V4.1 prompt-suffix pruning (``DeepseekV4ModelInner``, KV-source trim): only this layer's cache writes
+    /// for the rows `x` (one attention call's rows): the window rows, then the compressor (pool rows, the incomplete
+    /// group's buffer) and, on an index-key owner, the index keys of every completed group. The same calls, on the
+    /// same rows, as `callAsFunction` makes before its query side; nothing else of the attention runs.
+    func updateCacheOnly(_ x: MLXArray, cache: KVCache) {
+        let L = x.dim(1)
+        let offset = cache.offset
+        let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
+        let kv = kvMath(x, cosT: cosT, sinT: sinT)
+        _ = cache.update(keys: kv, values: kv)
+        guard compressRatio > 0, let comp = compressor else { return }
+        let v4Cache = cache as? DeepseekV4Cache
+        guard v4Cache != nil || L >= compressRatio else { return }
+        _ = comp(
+            x, rope: rope, v4Cache: v4Cache, startPos: offset,
+            latentSink: v4Cache.flatMap { indexKeySink($0) })
     }
 
     func callAsFunction(
@@ -1457,6 +1488,27 @@ class DeepseekV4DecoderLayer: Module {
         return (h: hF, ffnPre: fPre)
     }
 
+    /// The cache writes of an unpruned ``callStaggered(_:mask:cache:inputIds:preMix:compressShare:imageMask:attnPieces:)``
+    /// and nothing else (DeepSeek-V4.1 KV-source trim): the attention input `attn_norm(hc_pre(h))` over every row, then
+    /// ``DeepseekV4Attention/updateCacheOnly(_:cache:)`` on each attention call's rows, in the same sub-chunk partition
+    /// as the full layer, so every cache row comes from the same calls on the same rows. No query side, attention,
+    /// output projection or MoE, and no output: the caller reads nothing of this layer but its cache.
+    func updateCacheOnly(_ h: MLXArray, cache: KVCache, preMix: MLXArray) {
+        let normedA = inputLayerNorm(DeepseekV4Math.hcCollapse(h, pre: preMix))
+        let sub = DeepseekV4Math.attnSubchunkTokens
+        let rows = normedA.dim(1)
+        if sub > 0, rows >= 2 * sub {
+            var s = 0
+            while s < rows {
+                let e = min(s + sub, rows)
+                selfAttn.updateCacheOnly(normedA[0..., s ..< e], cache: cache)
+                s = e
+            }
+        } else {
+            selfAttn.updateCacheOnly(normedA, cache: cache)
+        }
+    }
+
     /// Forward. `h` shape: (B, L, hcMult, hiddenSize).
     func callAsFunction(
         _ h: MLXArray,
@@ -1663,8 +1715,16 @@ public class DeepseekV4ModelInner: Module {
     }
 
     /// Test hook: called after every pruned forward with its start position and the rows each
-    /// layer ran (0 = skipped).
+    /// layer ran (0 = skipped). A KV-source-trimmed forward reports the last kv-source layer with every row (its
+    /// cache side ran them) and the layers after it with 0.
     var suffixPruneObserver: ((_ start: Int, _ rows: [Int]) -> Void)?
+
+    /// KV-source trim (``DeepseekV4Math/kvSourceTrimEnabled``, `VMLX_DSV41_KV_SOURCE_TRIM`): a pruned forward that
+    /// ends before the first pruned layer's kept rows runs only the cache writes of the layer before it and stops
+    /// there. Per instance for A/B tests.
+    var kvSourceTrimEnabled = DeepseekV4Math.kvSourceTrimEnabled
+    /// Forwards that took the KV-source trim (test and diagnostic counter).
+    var kvSourceTrimmedForwards = 0
 
     /// DeepSeek-V4.1 decode / verify (<= `layerSubmitMaxRows` rows): submit each layer to the GPU as soon
     /// as its graph is built (`asyncEval(h, preMix)`), so the GPU runs layer i while the host builds layer
@@ -1940,6 +2000,20 @@ public class DeepseekV4ModelInner: Module {
                         hTail.mean(axis: 2).asType(.bfloat16),  // [1, n, d]
                         tailStart + (L - cur) + tailLo
                     )
+                }
+                if i == pruneFrom - 1, kvSourceTrimEnabled, let promptEnd, let cache,
+                    promptEnd - Self.suffixPruneKeep(
+                        layer: pruneFrom, numLayers: layers.count, window: config.slidingWindow) >= end
+                {
+                    // KV-source trim: no row of this forward reaches the prompt end through the next layer (it
+                    // would restart its window and stop below), so nothing reads this layer's output. Only its
+                    // cache (window, compressor pool and buffer, index keys) outlives the forward: run that,
+                    // over every row in the same calls, and stop. The later layers' windows restart at the end.
+                    layer.updateCacheOnly(h, cache: cache[i], preMix: preMix)
+                    for j in pruneFrom ..< layers.count { Self.restartWindow(cache[j], at: end) }
+                    prunedRows += Array(repeating: 0, count: layers.count - pruneFrom)
+                    kvSourceTrimmedForwards += 1
+                    break
                 }
                 let r = layer.callStaggered(
                     h, mask: layerMask, cache: cache?[i], inputIds: layerInputs, preMix: preMix,
