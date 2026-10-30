@@ -95,7 +95,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         // Solo and batched paths each gate both their N-1/generated stores;
         // native MTP has no N-1 writer and gates its generated store.
-        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 3)  // + the aligned single store
         #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
         #expect(mtp.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 1)
     }
