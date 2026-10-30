@@ -14,7 +14,8 @@ import Testing
 /// MiniMax-M3.1 image input (`MiniMaxM3Vision.swift`) against references computed by
 /// `scripts/minimax_m3_fixtures/generate_vision_fixtures.py` (`Fixtures/MiniMaxM3/vision`): the bundle's own image
 /// processor (torch uint8 antialiased bicubic) on seeded images taking every `smart_resize` branch, vMLX Python's vision
-/// stack (e2bb5b771) at a tiny width with seeded weights in the bundle's names and layouts, and the bundle tokenizer's
+/// stack (e2bb5b771) at a tiny width with seeded weights in the bundle's names and layouts (bit for bit with
+/// MLX_ENABLE_TF32=0), and the bundle tokenizer's
 /// template renders of image conversations. Then the serving path on the synthetic M3: image runs never split across
 /// prefill forwards, the image turn and its text follow-up through the disk prefix cache bit-identical to cold
 /// prefills, another image never served the cached rows, and DSpark off while media is prefilled, on for the follow-up.
@@ -155,12 +156,15 @@ struct MiniMaxM3VisionTests {
                     let diff = abs(out - expected).max().item(Float.self)
                     let scale = abs(expected).max().item(Float.self)
                     let identical = arrayEqual(out, expected).item(Bool.self)
-                    // The fixture ran with MLX_ENABLE_TF32=0. With it here too only the metallib's transcendental
-                    // rounding can differ (a fast-math build: 1-2 float32 ulps); with MLX's default TF32 the float32
-                    // matmuls of the stack round their inputs to TF32 on NAX devices (~1e-3 relative).
+                    // The fixture ran with MLX_ENABLE_TF32=0: with it here too the features are Python's bit for bit
+                    // (the rotary table on Metal's precise pow, as Python's GPU power). With MLX's default TF32 the
+                    // float32 matmuls of the stack round their inputs to TF32 on NAX devices (~1e-3 relative).
                     let tf32Off = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0"
-                    let tolerance: Float = (tf32Off ? 1e-6 : 5e-3) * max(1, scale)
-                    #expect(identical || diff <= tolerance, "\(label): max |diff| \(diff) (scale \(scale), TF32 off \(tf32Off))")
+                    if tf32Off {
+                        #expect(identical, "\(label): max |diff| \(diff) with TF32 off")
+                    } else {
+                        #expect(identical || diff <= 5e-3 * max(1, scale), "\(label): max |diff| \(diff) (scale \(scale))")
+                    }
                     print("[m3-vision] \(label): identical \(identical), max |diff| \(diff), max |feature| \(scale)")
                 }
             }
