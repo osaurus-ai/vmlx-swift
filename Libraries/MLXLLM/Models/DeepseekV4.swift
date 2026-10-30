@@ -336,6 +336,7 @@ class DeepseekV4Attention: Module {
         let cosQ = cosT.expandedDimensions(axes: [0, 1])
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
         q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
+        DeepseekV41PrefillProfile.mark("q_proj", [qResidual, q])
 
         return (qResidual, q, kvMath(x, cosT: cosT, sinT: sinT))
     }
@@ -363,6 +364,7 @@ class DeepseekV4Attention: Module {
         if config.activationQATEnabled && nopeDim >= 64 {
             kv = DeepseekV4Math.e4m3KVActivationRoundTrip(kv, ropeDim: ropeDim)
         }
+        DeepseekV41PrefillProfile.mark("kv_proj", [kv])
         return kv
     }
 
@@ -376,12 +378,14 @@ class DeepseekV4Attention: Module {
         let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
         let kv = kvMath(x, cosT: cosT, sinT: sinT)
         _ = cache.update(keys: kv, values: kv)
+        DeepseekV41PrefillProfile.mark("cache_append", cache.innerState())
         guard compressRatio > 0, let comp = compressor else { return }
         let v4Cache = cache as? DeepseekV4Cache
         guard v4Cache != nil || L >= compressRatio else { return }
         _ = comp(
             x, rope: rope, v4Cache: v4Cache, startPos: offset,
             latentSink: v4Cache.flatMap { indexKeySink($0) })
+        DeepseekV41PrefillProfile.mark("compressor", cache.innerState())
     }
 
     func callAsFunction(
@@ -434,6 +438,7 @@ class DeepseekV4Attention: Module {
         if let cache = cache {
             (keys, _) = cache.update(keys: kv, values: kv)
         }
+        DeepseekV41PrefillProfile.mark("cache_append", [keys])
         var fullKV = keys
         let windowLen = fullKV.dim(2)
 
@@ -492,6 +497,7 @@ class DeepseekV4Attention: Module {
                     let pv = comp(
                         x, rope: rope, v4Cache: v4Cache, startPos: offset,
                         latentSink: latentSink)
+                    DeepseekV41PrefillProfile.mark("compressor", v4Cache?.innerState() ?? [])
                     compressShare?.pool = pv
                     pooledViewOpt = pv
                     if latentSink != nil {
@@ -523,6 +529,7 @@ class DeepseekV4Attention: Module {
                             if idx.isCandidateSource, let cand = sel.candidates {
                                 compressShare?.setCandidates(cand, offset: offset, rows: L)
                             }
+                            DeepseekV41PrefillProfile.mark("indexer", [sel.topK, sel.candidates].compactMap { $0 })
                             topK = sel.topK
                         } else if let entry = compressShare?.selection(offset: offset, rows: L) {
                             topK = entry
@@ -701,6 +708,7 @@ class DeepseekV4Attention: Module {
                 scale: scale, mask: adjustedMask,
                 sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
         }
+        DeepseekV41PrefillProfile.mark("attn_core", [sdpaOut])
         // sdpaOut shape: (B, numHeads, L, headDim)
         if useRegions {
             let region = deepseekV4CachedRegion(regionLock, &outDecodeRegion) {
@@ -715,7 +723,9 @@ class DeepseekV4Attention: Module {
             }
             // Failed compiled evaluation — fall through to eager.
         }
-        return outMath(sdpaOut, cosT: cosT, sinT: sinT)
+        let out = outMath(sdpaOut, cosT: cosT, sinT: sinT)
+        DeepseekV41PrefillProfile.mark("o_proj", [out])
+        return out
     }
 
     /// V4.1 index-key owner: append the shared index keys derived from newly completed compressor
@@ -1074,9 +1084,11 @@ class DeepseekV4MoE: Module, UnaryLayer {
     /// through `routedSum`. Everything else is the graph.
     fileprivate func experts(_ x: MLXArray, indices: MLXArray, scores: MLXArray) -> MLXArray {
         func stock() -> MLXArray {
-            DeepseekV4Math.addSharedExpertFP32(
-                routedSum(x, indices, scores),
-                shared: sharedExperts(x), outputDType: x.dtype)
+            let routed = routedSum(x, indices, scores)
+            DeepseekV41PrefillProfile.mark("routed_experts", [routed])
+            let shared = sharedExperts(x)
+            DeepseekV41PrefillProfile.mark("shared_expert", [shared])
+            return DeepseekV4Math.addSharedExpertFP32(routed, shared: shared, outputDType: x.dtype)
         }
         if config.isDeepseekV41, x.dim(1) <= DeepseekV41FusedMoE.maxRows,
             let affine = switchMLP as? SwitchGLU,
@@ -1150,6 +1162,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
         }
 
         let (indices, scores) = gate(x, inputIds: ids)
+        DeepseekV41PrefillProfile.mark("router", [indices, scores])
         finishStage("gate", [indices, scores])
         if !profileStages, config.isDeepseekV41 {
             let y = experts(x, indices: indices, scores: scores)
@@ -1446,6 +1459,7 @@ class DeepseekV4DecoderLayer: Module {
         let residualA = h
         let (aPre, aPost, aComb) = attnHC.mixes(h)
         let normedA = inputLayerNorm(DeepseekV4Math.hcCollapse(h, pre: preMix))
+        DeepseekV41PrefillProfile.mark("hc_norm", [aPre, aPost, aComb, normedA])
         let attnOut: MLXArray
         let sub = DeepseekV4Math.attnSubchunkTokens
         if let cache, let attnPieces, attnPieces.count > 1 {
@@ -1483,8 +1497,10 @@ class DeepseekV4DecoderLayer: Module {
         let residualF = hA
         let (fPre, fPost, fComb) = ffnHC.mixes(hA)
         let normedF = postAttentionLayerNorm(DeepseekV4Math.hcCollapse(hA, pre: aPre))
+        DeepseekV41PrefillProfile.mark("hc_norm", [hA, fPre, fPost, fComb, normedF])
         let ffnOut = mlp(normedF, inputIds: inputIds, imageMask: imageMask)
         let hF = ffnHC.expand(blockOut: ffnOut, residual: residualF, post: fPost, comb: fComb)
+        DeepseekV41PrefillProfile.mark("hc_norm", [hF])
         return (h: hF, ffnPre: fPre)
     }
 
@@ -1495,6 +1511,7 @@ class DeepseekV4DecoderLayer: Module {
     /// output projection or MoE, and no output: the caller reads nothing of this layer but its cache.
     func updateCacheOnly(_ h: MLXArray, cache: KVCache, preMix: MLXArray) {
         let normedA = inputLayerNorm(DeepseekV4Math.hcCollapse(h, pre: preMix))
+        DeepseekV41PrefillProfile.mark("hc_norm", [normedA])
         let sub = DeepseekV4Math.attnSubchunkTokens
         let rows = normedA.dim(1)
         if sub > 0, rows >= 2 * sub {
@@ -1862,12 +1879,15 @@ public class DeepseekV4ModelInner: Module {
         _ inputs: MLXArray, cache: [KVCache]?, vision: DeepseekV41VisionChunk?,
         promptEnd: Int? = nil
     ) -> MLXArray {
+        DeepseekV41PrefillProfile.group = "model"
+        DeepseekV41PrefillProfile.begin([inputs])
         // embed: (B, L) → (B, L, hiddenSize)
         var h = vision?.embeddings ?? embedTokens(inputs)
         // Tile to mHC copies: (B, L, hiddenSize) → (B, L, hcMult, hiddenSize).
         // Python tiles via broadcast; Swift uses `repeated` along axis -2.
         h = h.expandedDimensions(axis: -2)  // (B, L, 1, H)
         h = repeated(h, count: config.hcMult, axis: -2)  // (B, L, hcMult, H)
+        DeepseekV41PrefillProfile.mark("embed", [h])
 
         let firstCache = cache?.first
         let hFlat2 = h.reshaped(h.dim(0), h.dim(1), -1)  // for createAttentionMask
@@ -1942,6 +1962,10 @@ public class DeepseekV4ModelInner: Module {
             // with their absolute start (pruned layers may hold fewer rows than the forward).
             var tailRows: [Int: (rows: MLXArray, start: Int)] = [:]
             for (i, layer) in layers.enumerated() {
+                if DeepseekV41PrefillProfile.active {
+                    let split = suffixPruneFrom ?? layers.count
+                    DeepseekV41PrefillProfile.group = i < split - 1 ? "layers<kvsrc" : (i == split - 1 ? "kvsrc" : "pruned")
+                }
                 var layerMask = mask
                 var attnPieces: [Int]? = nil
                 if i >= pruneFrom, let promptEnd, let cache {
@@ -1986,7 +2010,9 @@ public class DeepseekV4ModelInner: Module {
                     guard let rows = engramRows?.rows(layer: i) else {
                         fatalError("DeepSeek-V4.1 engram rows missing for engram layer \(i)")
                     }
+                    DeepseekV41PrefillProfile.mark("engram_rows", [rows])
                     h = eng(h, rows: rows, textMask: vision?.textMask)
+                    DeepseekV41PrefillProfile.mark("engram", [h])
                     if i == lastEngramLayer {
                         // This forward's reads are done: request the next chunk's rows now,
                         // so they read while the rest of this chunk computes.
@@ -2043,6 +2069,7 @@ public class DeepseekV4ModelInner: Module {
                 }
             }
             if pruneFrom < Int.max { suffixPruneObserver?(start, prunedRows) }
+            DeepseekV41PrefillProfile.group = "model"
             // Final collapse uses the last layer's ffnPre (ref `Block.hc_pre(h, pre_mix)`); V4.1 has NO
             // learned hc_head (those weights are absent from the bundle).
             out = DeepseekV4Math.hcCollapse(h, pre: preMix)
@@ -2307,7 +2334,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
+        DeepseekV41PrefillProfile.mark("collapse_norm", [h])
         let logits = DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
+        DeepseekV41PrefillProfile.mark("head", [logits])
         // Separated from the hidden-state stats on purpose: a normal `norm`
         // followed by an abnormal `logits` isolates the fused quantized head
         // (VMLX_DSV4_LM_HEAD_MODE) rather than the transformer stack.
@@ -2390,6 +2419,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             }
             if config.isDeepseekV41 { Self.compactSlidingWindows(cache) }
             MLX.eval(cache)
+            DeepseekV41PrefillProfile.mark("chunk_eval_cache", [])
             flatTokens = flatTokens[step...]
             if let m = flatMask { flatMask = m[step...] }
             PrefillProgressReporter.reportCompletedUnits(input.text.tokens.size - flatTokens.size)

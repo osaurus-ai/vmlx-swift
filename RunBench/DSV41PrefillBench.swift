@@ -14,6 +14,8 @@
 //   cache     BatchEngine with a disk prefix cache (fresh directory): turn A (cold), turn B (same first P ids as A,
 //             another suffix: a partial hit), turn C (A plus new ids: an appending hit), each greedy, then B and C cold
 //             on an engine without a cache. Restored tokens, TTFT and texts per turn ("[PF_CACHE]").
+//   profile   for n in BENCH_PF_PROFILE_LENS (default 32845): uninstrumented and component-instrumented prefills
+//             interleaved (`DeepseekV41PrefillProfile`), per-component seconds and the walls ("[PF_PROFILE]").
 // BENCH_PF_STEP (default 512) is the caller's prefill step; BENCH_PF_OUT appends every JSON line to a file.
 
 import CryptoKit
@@ -145,6 +147,36 @@ func runDSV41PrefillBench(modelPath: String) async throws {
                 ]
                 for (k, v) in mem() { r[k] = v }
                 emit("PF_SPEED", r)
+            }
+        }
+    }
+
+    // profile: per-component seconds of an instrumented prefill (`DeepseekV41PrefillProfile`: evaluate and wait at
+    // every component boundary) next to uninstrumented walls of the same prompt, interleaved, first probe discarded.
+    if phases.contains("profile") {
+        for n in ints("BENCH_PF_PROFILE_LENS", "32845") where n <= ids.count {
+            for (k, instrumented) in [false, false, true, false, true].enumerated() {
+                MLX.Memory.clearCache()
+                MLX.Memory.peakMemory = 0
+                DeepseekV41PrefillProfile.reset()
+                DeepseekV41PrefillProfile.active = instrumented
+                let w0 = Date().timeIntervalSince1970
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let (logits, _) = try prefill(tokens(ids[0 ..< n]))
+                let seconds = CFAbsoluteTimeGetCurrent() - t0
+                DeepseekV41PrefillProfile.active = false
+                var r: [String: Any] = [
+                    "n": n, "probe": k, "discard": k == 0, "instrumented": instrumented, "s": seconds,
+                    "pp_s": Double(n) / seconds, "wall": [w0, Date().timeIntervalSince1970],
+                    "first_token": logits.argMax(axis: -1).item(Int.self),
+                ]
+                if instrumented {
+                    r["components"] = DeepseekV41PrefillProfile.seconds
+                    r["counts"] = DeepseekV41PrefillProfile.counts
+                    r["sum_s"] = DeepseekV41PrefillProfile.seconds.values.reduce(0, +)
+                }
+                for (key, v) in mem() { r[key] = v }
+                emit("PF_PROFILE", r)
             }
         }
     }
