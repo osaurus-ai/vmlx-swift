@@ -15,6 +15,7 @@
 //          interleaved, 1 discarded + T5_PROBES probes.
 // floordiv integer floorDivide vs a shift and the composed op's primitives, per call, dependent chains.
 // gathersort SwitchLayers.gatherSort as shipped vs a floorDivide-free variant: bit identity + per-call cost.
+// visprep / visfeat / viseval / visgen  MiniMax-M3.1 image input vs vMLX Python's graded image set (Vision.swift).
 
 import Foundation
 import MLX
@@ -644,6 +645,10 @@ case "serving": try await taskServing()
 case "servingloop": try await taskServingLoop()
 case "servingdoc": try await taskServingDoc()
 case "reload": try await taskReload()
+case "visprep": try await taskVisPrep()
+case "visfeat": try await taskVisFeatures()
+case "viseval": try await taskVisEval()
+case "visgen": try await taskVisGen()
 case "msainfo": log(msaDiagnostics())
 case "fdloop":
     // A long loop of one integer floorDivide per eval (for sampling the process from outside).
