@@ -17,7 +17,7 @@ public enum PropertyMembers {
         switch object {
         case let .string(str):
             return try evaluateStringProperty(str, propertyName)
-        case let .namespace(attributes):
+        case .namespace(let attributes):
             return attributes[propertyName] ?? .undefined
         case let .object(obj):
             return try evaluateObjectProperty(obj, propertyName)

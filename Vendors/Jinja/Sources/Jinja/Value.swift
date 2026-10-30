@@ -477,7 +477,7 @@ extension Value: Equatable {
         case (.undefined, .undefined): return true
         case let (.array(lhs), .array(rhs)): return lhs == rhs
         case let (.object(lhs), .object(rhs)): return lhs == rhs
-        case let (.namespace(lhs), .namespace(rhs)): return lhs == rhs
+        case (.namespace(let lhs), .namespace(let rhs)): return lhs == rhs
         case (.function, .function): return false
         case let (.macro(lhs), .macro(rhs)): return lhs == rhs
         default: return false
@@ -499,7 +499,7 @@ extension Value: Hashable {
         case .undefined: hasher.combine(0)
         case let .array(value): hasher.combine(value)
         case let .object(value): hasher.combine(value)
-        case let .namespace(value): hasher.combine(value)
+        case .namespace(let value): hasher.combine(value)
         case .function: hasher.combine(0)
         case .macro(let m): hasher.combine(m)
         }
