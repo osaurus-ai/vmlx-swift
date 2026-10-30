@@ -1078,9 +1078,8 @@ struct DiskPrefixMatchSelectionTests {
     /// into exactly as `TokenIterator` does — the model's `newCache` over the
     /// parameters the salt was computed from; a head's or drafter's cache is
     /// a separate array — so a payload that does not fit theirs fits neither.
-    /// DFlash 2 has no offset check to report from. The diffusion iterator
-    /// applies no recurrent companion state, so its offset refusal is
-    /// reported only for a cache without such layers.
+    /// The diffusion iterator applies no recurrent companion state, so its
+    /// offset refusal is reported only for a cache without such layers.
     @Test func everyRestoreConsumerReportsStructuralRejectionsOfDiskHitsOnly() throws {
         let fits = "payload does not fit the runtime cache"
         let offsets = "restored offsets do not match the boundary"
@@ -1095,7 +1094,7 @@ struct DiskPrefixMatchSelectionTests {
                 "let unsafePartial ="
             ),
             (
-                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift", [fits],
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift", [fits, offsets],
                 "input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"
             ),
             (
