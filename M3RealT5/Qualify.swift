@@ -243,10 +243,11 @@ func taskTaps() async throws {
         let input = try await prepare(context, c.messages, tools: c.tools, additional: thinkingContext(env["T5_THINKING"]))
         let ids = tokenIds(input)
         let cache = model.newCache(parameters: nil)
-        // As TokenIterator without a coordinator (the `dspark` command): suffix [] -> boundary = prompt - 1.
+        // As TokenIterator without a coordinator (the `dspark` command): no generation-prompt suffix, so the store
+        // boundary comes from the processor's history boundaries (`cachePrefixTokenCounts`), else prompt - 1.
         let plan = AlignedPrefill.plan(
-            model: model, cache: cache, promptTokenIds: ids, cachePrefixTokenCounts: [], generationPromptSuffix: [],
-            prefillStepSize: step)
+            model: model, cache: cache, promptTokenIds: ids, cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+            generationPromptSuffix: [], prefillStepSize: step)
         AlignedPrefill.install(plan, into: cache)
         var record: AlignedPrefillPrefillRecord?
         AlignedPrefill.hooks.prefillObserver = { record = $0 }
@@ -288,7 +289,8 @@ func taskTaps() async throws {
         let meanAccepted = accepted.isEmpty ? 0 : Double(accepted.reduce(0, +)) / Double(accepted.count)
         let nonFinal = (record?.pieces.dropLast().map(\.count)) ?? []
         rows.append([
-            "name": c.name, "prompt_tokens": ids.count, "pieces": record?.pieces.map { [$0.lowerBound, $0.upperBound] } ?? [],
+            "name": c.name, "prompt_tokens": ids.count, "cache_prefix_token_counts": input.cachePrefixTokenCounts,
+            "boundary": plan?.boundary ?? -1, "pieces": record?.pieces.map { [$0.lowerBound, $0.upperBound] } ?? [],
             "affected_pieces": nonFinal.filter { $0 * 4 >= 72 && $0 * 4 < 512 }.count,
             "first_logits_sha": firstSha, "taps_prefill_sha": tapsPrefill, "taps_prefill_range": tapsPrefillRange,
             "taps_end_sha": tapsEnd, "proposals_sha": propSha, "generated": generated.count,
