@@ -26,7 +26,8 @@ class QuantizationTests: XCTestCase {
                         let actual = MLX.quantizedMM(
                             input, packed, scales: scales, biases: biases, transpose: true,
                             groupSize: group, bits: 1, mode: .affine, stream: stream)
-                        let expected = MLXArray.full([1, 16], values: MLXArray(Float(-width * 3 / 2)))
+                        let expected = MLXArray.full(
+                            [1, 16], values: MLXArray(Float(-width * 3 / 2)))
                         XCTAssertEqual(MLX.abs(actual - expected).max().item(Float.self), 0)
                     }
                 }
