@@ -22,6 +22,8 @@ public enum Value: Sendable {
     case array([Value])
     /// Object containing key-value pairs with preserved insertion order.
     case object(OrderedDictionary<String, Value>)
+    /// Namespace attributes are data and never inherit dictionary methods.
+    case namespace(OrderedDictionary<String, Value>)
     /// Function value that can be called with arguments.
     case function(@Sendable ([Value], [String: Value], Environment) throws -> Value)
     /// Macro value that can be invoked with arguments.
@@ -148,6 +150,7 @@ public enum Value: Sendable {
         case .string(let s): !s.isEmpty
         case .array(let a): !a.isEmpty
         case .object(let o): !o.isEmpty
+        case .namespace: true
         case .function: true
         case .macro: true
         }
@@ -450,6 +453,8 @@ extension Value: CustomStringConvertible {
                 }
             }
             return "[\(elements.joined(separator: ", "))]"
+        case .namespace(let o):
+            return "<Namespace \(o)>"
         case .object(let o):
             return "{\(o.map { "\($0.key): \($0.value.description)" }.joined(separator: ", "))}"
         case .function: return "[Function]"
@@ -472,6 +477,7 @@ extension Value: Equatable {
         case (.undefined, .undefined): return true
         case let (.array(lhs), .array(rhs)): return lhs == rhs
         case let (.object(lhs), .object(rhs)): return lhs == rhs
+        case let (.namespace(lhs), .namespace(rhs)): return lhs == rhs
         case (.function, .function): return false
         case let (.macro(lhs), .macro(rhs)): return lhs == rhs
         default: return false
@@ -493,6 +499,7 @@ extension Value: Hashable {
         case .undefined: hasher.combine(0)
         case let .array(value): hasher.combine(value)
         case let .object(value): hasher.combine(value)
+        case let .namespace(value): hasher.combine(value)
         case .function: hasher.combine(0)
         case .macro(let m): hasher.combine(m)
         }
@@ -517,6 +524,8 @@ extension Value: Encodable {
 
     public func encode(to encoder: Encoder) throws {
         switch self {
+        case .namespace:
+            throw JinjaError.runtime("Namespace objects cannot be JSON encoded")
         case let .object(value):
             var keyedContainer = encoder.container(keyedBy: DynamicCodingKey.self)
             for key in value.keys.sorted() {

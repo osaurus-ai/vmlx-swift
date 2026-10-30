@@ -346,7 +346,7 @@ public enum Globals: Sendable {
         for (key, value) in kwargs.sorted(by: { $0.key < $1.key }) {
             namespaceDict[key] = value
         }
-        return .object(namespaceDict)
+        return .namespace(namespaceDict)
     }
 
     /// Retrieves the current date and time in a specific format.
