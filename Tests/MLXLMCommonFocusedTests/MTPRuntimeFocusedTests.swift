@@ -1443,7 +1443,7 @@ struct MTPRuntimeFocusedTests {
 
     @Test("recursive MTP contract models D3 hidden-state draft verify")
     func recursiveMTPContractModelsD3HiddenStateDraftVerify() {
-        let contract = MTPRecursiveDraftContract.mtplxDepth3
+        let contract = MTPRecursiveDraftContract.recursiveDepth3
 
         #expect(contract.depth == 3)
         #expect(contract.draftStepReturnsHiddenState)
