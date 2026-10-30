@@ -590,6 +590,24 @@ public final class MiniMaxM3VisionStack: Module {
 }
 
 enum MiniMaxM3VisionMath {
+    /// `theta ** exponents` with Metal's precise `pow`, the value vMLX Python's GPU `power` produces. Swift MLX's own
+    /// `pow` kernel returns other float32 roundings (10 of the 13 frequencies of the M3.1 tower differ by 1-2 ulps; its
+    /// sin / cos then flip bfloat16 roundings of ~0.4 % of the features); measured 2026-10-29: this kernel == Python on
+    /// every frequency of axis dims 4 / 26 / 78.
+    static let preciseKernel = MLXFast.metalKernel(
+        name: "vmlx_m3_vision_precise_pow", inputNames: ["base", "exponents"], outputNames: ["out"],
+        source: """
+            uint i = thread_position_in_grid.x;
+            out[i] = metal::precise::pow(base[0], exponents[i]);
+            """)
+
+    static func precisePower(_ base: Float, _ exponents: MLXArray) -> MLXArray {
+        let n = exponents.size
+        return preciseKernel(
+            [MLXArray([base]), exponents.asType(.float32)], grid: (n, 1, 1), threadGroup: (n, 1, 1),
+            outputShapes: [[n]], outputDTypes: [.float32])[0]
+    }
+
     /// Python `rotate_half` + `apply_rope_vision`: the first `cos.dim(-1)` head dims rotate (`x * cos +
     /// rotate_half(x) * sin`), the rest pass through. `x`: `[1, L, H, d]`.
     static func rope(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
@@ -624,7 +642,7 @@ enum MiniMaxM3VisionMath {
         }
         let c = MLXArray(coords, [coords.count / 3, 3])
         let exponents = MLXArray(stride(from: 0, to: axisDim, by: 2).map { Float($0) }) / Float(axisDim)
-        let invFreq = MLXArray(Float(1.0)) / MLX.pow(MLXArray(theta), exponents)
+        let invFreq = MLXArray(Float(1.0)) / precisePower(theta, exponents)
         let freqs = concatenated((0 ..< 3).map { c[0..., $0 ..< ($0 + 1)] * invFreq }, axis: -1)
         let emb = concatenated([freqs, freqs], axis: -1)
         return (MLX.cos(emb), MLX.sin(emb))
