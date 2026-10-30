@@ -88,34 +88,43 @@ struct ZayaResScaleTests {
 
 @Suite("Zaya JANGTQ backend selection", .serialized)
 struct ZayaJANGTQBackendSelectionTests {
-    @Test("Streaming experts flag selects StreamingTurboQuantSwitchGLU")
-    func streamingExpertsFlagSelectsStreamingBackend() throws {
-        let previous = getenv("MLXPRESS_STREAMING_EXPERTS").map { String(cString: $0) }
-        setenv("MLXPRESS_STREAMING_EXPERTS", "1", 1)
-        defer {
-            if let previous {
-                setenv("MLXPRESS_STREAMING_EXPERTS", previous, 1)
-            } else {
-                unsetenv("MLXPRESS_STREAMING_EXPERTS")
+    /// Streaming experts are retired as a production mechanism:
+    /// `JANGTQStreamingExperts.explicitStreamingEnabled` is `false` whatever
+    /// the environment says, so the legacy flag must leave Zaya's JANGTQ
+    /// experts on `TurboQuantSwitchGLU`.
+    @Test("Legacy streaming experts flag keeps TurboQuantSwitchGLU")
+    func legacyStreamingExpertsFlagKeepsTurboQuantBackend() throws {
+        // Building the experts is MLX work, so it holds the lock, as the
+        // file's other suites do.
+        try MLXMetalTestLock.withLock {
+            let previous = getenv("MLXPRESS_STREAMING_EXPERTS").map { String(cString: $0) }
+            setenv("MLXPRESS_STREAMING_EXPERTS", "1", 1)
+            defer {
+                if let previous {
+                    setenv("MLXPRESS_STREAMING_EXPERTS", previous, 1)
+                } else {
+                    unsetenv("MLXPRESS_STREAMING_EXPERTS")
+                }
             }
+
+            let cfg = try JSONDecoder().decode(ZayaConfiguration.self, from: """
+            {
+              "model_type": "zaya",
+              "hidden_size": 8,
+              "ffn_hidden_size": 16,
+              "num_experts": 2,
+              "weight_format": "mxtq",
+              "mxtq_bits": 2
+            }
+            """.data(using: .utf8)!)
+
+            let experts = ZayaExperts(
+                cfg.textConfig,
+                context: .jangtq(gateUpBits: 2, downBits: 2, seed: 42),
+                layerIdx: 1)
+
+            #expect(experts.switchMLP is TurboQuantSwitchGLU)
+            #expect(!(experts.switchMLP is StreamingTurboQuantSwitchGLU))
         }
-
-        let cfg = try JSONDecoder().decode(ZayaConfiguration.self, from: """
-        {
-          "model_type": "zaya",
-          "hidden_size": 8,
-          "ffn_hidden_size": 16,
-          "num_experts": 2,
-          "weight_format": "mxtq",
-          "mxtq_bits": 2
-        }
-        """.data(using: .utf8)!)
-
-        let experts = ZayaExperts(
-            cfg.textConfig,
-            context: .jangtq(gateUpBits: 2, downBits: 2, seed: 42),
-            layerIdx: 1)
-
-        #expect(experts.switchMLP is StreamingTurboQuantSwitchGLU)
     }
 }
