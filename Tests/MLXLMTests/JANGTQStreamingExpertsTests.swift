@@ -6,8 +6,12 @@ import Testing
 
 @Suite("JANGTQ streaming expert index", .serialized)
 struct JANGTQStreamingExpertsTests {
-    @Test("Qwen35 MoE JANGTQ bundles auto-enable streaming for large stacked experts")
-    func qwen35MoEJANGTQAutoEnablesLargeStackedExperts() throws {
+    /// Streaming experts are retired as a production mechanism:
+    /// `JANGTQStreamingExperts.explicitStreamingEnabled` is `false`, so a
+    /// Qwen35 MoE JANGTQ bundle with large stacked experts, which used to
+    /// auto-enable them, must no longer do so.
+    @Test("Qwen35 MoE JANGTQ bundles no longer auto-enable retired streaming experts")
+    func qwen35MoEJANGTQLargeStackedExpertsDoNotAutoEnableStreaming() throws {
         let bundle = try Self.makeBundle(name: "qwen35")
         defer { try? FileManager.default.removeItem(at: bundle) }
 
@@ -17,7 +21,7 @@ struct JANGTQStreamingExpertsTests {
             tensors: Self.qwen35SwitchMLPTensors(layer: 0, experts: 512))
 
         try Self.withStreamingEnv(value: nil) {
-            #expect(JANGTQStreamingExperts.shouldAutoEnableQwen35MoE(modelDirectory: bundle))
+            #expect(!JANGTQStreamingExperts.shouldAutoEnableQwen35MoE(modelDirectory: bundle))
         }
     }
 
