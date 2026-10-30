@@ -7,8 +7,8 @@ import MLXLMCommon
 
 /// Producer/consumer fusion: materialize the next residual AND its grouped HC
 /// normalization in one dispatch. Each group owns one disjoint residual slice.
-/// The producer structure follows ds4's Qwen HC combine/norm path; arithmetic
-/// follows this runtime's MLX rms_single_row, not ds4's FP32 residual equations.
+/// Arithmetic follows this runtime's MLX rms_single_row (not an FP32 residual
+/// formulation).
 /// Product, residual sum, normalization, and weight scaling round separately.
 /// No live cache array is overwritten, and neither output is retained here.
 final class Qwen4ExpHCCombineNorm {
