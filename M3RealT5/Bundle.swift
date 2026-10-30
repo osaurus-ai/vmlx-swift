@@ -113,6 +113,14 @@ func productionLoad(_ directory: URL) async throws -> (MiniMaxM3Model, ModelCont
     guard let model = context.model as? MiniMaxM3Model else {
         fatalError("loaded \(type(of: context.model)), not MiniMaxM3Model")
     }
+    if env["T5_DROP_VISION"] == "1" {
+        // Control for A/Bs of the vision change: the same binary with the loaded vision stack released (text only).
+        let before = Memory.activeMemory
+        try model.update(modules: ModuleChildren(values: ["vision": .none]), verify: .none)
+        Memory.clearCache()
+        log("T5_DROP_VISION: vision stack released (active \(String(format: "%.2f", gib(before))) -> "
+            + "\(String(format: "%.2f", gib(Memory.activeMemory))) GiB), modalities \(model.modalities)")
+    }
     return (model, context, ms)
 }
 
