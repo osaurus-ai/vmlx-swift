@@ -1,5 +1,6 @@
 @testable import MLX
 import Dispatch
+import Metal
 import Testing
 
 @Suite("MLXArray empty host reads")
@@ -18,6 +19,72 @@ struct MLXArrayEmptyHostReadTests {
 
         #expect(emptySuffix.shape == [1, 0])
         #expect(emptySuffix.asArray(Int32.self).isEmpty)
+    }
+
+    // A tensor with no elements has no backing buffer, so its data pointer is
+    // null, while its strides need not be zero.
+
+    @Test("asArray and asArrayChecked read [1, 0, 3, 448] as []")
+    func emptyRank4HostRead() throws {
+        let floats = MLXArray([Float](), [1, 0, 3, 448])
+        let ints = MLXArray([Int32](), [1, 0, 3, 448])
+        // The case that trapped: strides that span 3 * 448 elements, which a
+        // size taken from the strides paired with the null pointer.
+        #expect(floats.internalStrides == [0, 3 * 448, 448, 1])
+        #expect(ints.internalStrides == [0, 3 * 448, 448, 1])
+
+        try expectEmptyHostReads(floats, as: Float.self)
+        try expectEmptyHostReads(ints, as: Int32.self)
+    }
+
+    @Test("asArray and asArrayChecked read [0] as []")
+    func emptyVectorHostRead() throws {
+        try expectEmptyHostReads(MLXArray([Float](), [0]), as: Float.self)
+        try expectEmptyHostReads(MLXArray([Int32](), [0]), as: Int32.self)
+    }
+
+    @Test("asArray and asArrayChecked read a transposed [2, 0] as []")
+    func emptyTransposedHostRead() throws {
+        // The transpose's strides are not row-contiguous, so the copy takes
+        // its element-by-element path.
+        let floats = MLXArray([Float](), [2, 0]).T
+        let ints = MLXArray([Int32](), [2, 0]).T
+        #expect(floats.shape == [0, 2])
+
+        try expectEmptyHostReads(floats, as: Float.self)
+        try expectEmptyHostReads(ints, as: Int32.self)
+    }
+
+    /// Both host-read surfaces, in the array's own dtype so that no
+    /// conversion runs first.
+    private func expectEmptyHostReads<T: HasDType>(_ array: MLXArray, as type: T.Type) throws {
+        #expect(array.dtype == T.dtype)
+        #expect(array.size == 0)
+        #expect(array.asArray(type).isEmpty)
+        #expect(try array.asArrayChecked(type).isEmpty)
+    }
+
+    // `asMTLBuffer` has no bytes to wrap or copy for an array with no
+    // elements either: its no-copy path unwrapped the null data pointer.
+
+    @Test("asMTLBuffer returns nil for [0], with and without a copy")
+    func emptyVectorMTLBuffer() throws {
+        try expectNoMTLBuffer(MLXArray([Float](), [0]))
+    }
+
+    @Test("asMTLBuffer returns nil for [1, 0, 3, 448], with and without a copy")
+    func emptyRank4MTLBuffer() throws {
+        try expectNoMTLBuffer(MLXArray([Float](), [1, 0, 3, 448]))
+    }
+
+    /// The copy first, so that a trap in the no-copy path comes after the
+    /// copy's result is recorded.
+    private func expectNoMTLBuffer(_ array: MLXArray) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        #expect(array.size == 0)
+        #expect(array.contiguousToDimension() == 0)
+        #expect(array.asMTLBuffer(device: device, noCopy: false) == nil)
+        #expect(array.asMTLBuffer(device: device, noCopy: true) == nil)
     }
 
     @Test("evaluated host access holds the stream lock through the read")
