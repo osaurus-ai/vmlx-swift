@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import os
 
 /// Process-wide gate to serialize MLX Metal work across test suites.
 ///
@@ -13,13 +14,14 @@ import Darwin
 /// independent of `@Suite(.serialized)` (which only protects within a
 /// single suite).
 ///
-/// Implementation: a named POSIX semaphore enforces single-tenant access even
-/// across SwiftPM test targets. The async overload keeps a serial queue
-/// occupied until the async body finishes; a plain actor method would be
-/// reentrant at `await` points and would not protect Metal submissions that
-/// happen after suspension.
+/// Implementation: a lock file that every test process locks with `flock(2)`
+/// (``ProcessWideMLXTestLock``) enforces single-tenant access even across
+/// SwiftPM test targets, and the kernel releases it when its holder dies.
+/// The async overload keeps a serial queue occupied until the async body
+/// finishes; a plain actor method would be reentrant at `await` points and
+/// would not protect Metal submissions that happen after suspension.
 enum MLXMetalTestLock {
-    private static let semaphore = ProcessWideMLXTestSemaphore()
+    private static let lock = ProcessWideMLXTestLock()
     private static let repoRoot: URL = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
@@ -27,8 +29,8 @@ enum MLXMetalTestLock {
 
     static func withLock<T>(_ body: () throws -> T) rethrows -> T {
         _ = metallibAliasPrepared
-        semaphore.wait()
-        defer { semaphore.signal() }
+        lock.wait()
+        defer { lock.signal() }
         return try body()
     }
 
@@ -39,12 +41,12 @@ enum MLXMetalTestLock {
         return try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<T, Error>) in
             mlxTestSerializationQueue.async {
-                semaphore.wait()
-                defer { semaphore.signal() }
+                lock.wait()
+                defer { lock.signal() }
                 let done = DispatchSemaphore(value: 0)
                 // `nonisolated(unsafe)` is required because Swift 6 strict
                 // concurrency cannot prove the cross-isolation transfer is
-                // safe through the semaphore + queue boundary. The transfer
+                // safe through the lock + queue boundary. The transfer
                 // IS safe here: the Task signals `done` only after writing
                 // `output`, and `done.wait()` happens-before the read.
                 nonisolated(unsafe) var output: Result<T, Error>?
@@ -139,74 +141,141 @@ enum MLXMetalTestLock {
     }()
 }
 
-private final class ProcessWideMLXTestSemaphore: @unchecked Sendable {
-    private static let name = "/vmlx_mlx_lock"
-
-    /// How long to wait for the current holder before treating the semaphore
-    /// as abandoned. Real MLX sections here are well under a second; minutes
-    /// mean the holder is gone.
-    private static let staleAfter: TimeInterval = 90
-
-    private var pointer: UnsafeMutablePointer<sem_t>
-
-    init() {
-        pointer = Self.open()
-    }
-
-    private static func open() -> UnsafeMutablePointer<sem_t> {
-        guard let sem = sem_open(name, O_CREAT, 0o600, 1), sem != SEM_FAILED else {
-            fatalError("Unable to create MLX Metal test semaphore")
+/// A lock that the kernel releases when its holder dies: `flock(2)` on a file
+/// in the user's temporary directory. Every test process of the user opens the
+/// same file, so the lock serializes MLX work across SwiftPM test targets too.
+///
+/// It replaces a named POSIX semaphore, whose count outlived a holder killed
+/// inside `withLock`. Every later waiter then blocked, and the stale-lock
+/// recovery that reset it raced: two waiters reset it at once, and the loser
+/// trapped. A dead process holds no `flock` lock, so there is nothing to
+/// recover.
+///
+/// Waiting has no time limit: a holder that hangs blocks every waiter until
+/// it is killed. The first time a waiter finds the lock taken, it says so on
+/// standard error, with the path; `lsof <path>` names the holder.
+///
+/// Each acquisition opens the file anew. A `flock` lock belongs to the open
+/// file description, and a second `flock` on a description that holds it
+/// returns at once, so the threads of one process sharing a descriptor would
+/// all get the lock. The descriptor is close-on-exec, so that a child process
+/// never inherits a held lock. A waiter whose file was deleted or replaced
+/// while it waited does not keep that file's lock, which no longer excludes
+/// a process that opens the path; it opens the path again.
+final class ProcessWideMLXTestLock: Sendable {
+    /// The lock every test uses. `confstr(_CS_DARWIN_USER_TEMP_DIR)` is the
+    /// same for every process of the user. `NSTemporaryDirectory()` is no
+    /// fallback: it follows `TMPDIR`, which a test runner may set, and a lock
+    /// in another directory would exclude no one.
+    static let defaultPath: String = {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let length = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
+        let code = errno
+        guard length > 0, length <= buffer.count else {
+            let reason =
+                length == 0 ? ProcessWideMLXTestLock.describe(code) : "it needs \(length) bytes"
+            fatalError("No user temporary directory for the MLX Metal test lock: \(reason)")
         }
-        return sem
+        let directory = buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+        return (directory as NSString).appendingPathComponent("vmlx_mlx_lock")
+    }()
+
+    let path: String
+
+    /// The holder's descriptor, or -1.
+    private let held = OSAllocatedUnfairLock(initialState: Int32(-1))
+
+    /// Whether a waiter has said that the lock was taken.
+    private let saidItWaits = OSAllocatedUnfairLock(initialState: false)
+
+    init(path: String = ProcessWideMLXTestLock.defaultPath) {
+        self.path = path
     }
 
-    deinit {
-        sem_close(pointer)
-    }
-
-    /// Acquire, recovering from a holder that died without signalling.
-    ///
-    /// This is a NAMED POSIX semaphore, so its count outlives the process. A
-    /// test run killed mid-section (Ctrl-C, a CI timeout, a crash) leaves the
-    /// count at zero permanently, and every later run on that machine then
-    /// blocks forever at 0% CPU — including runs that only touch unrelated
-    /// tests, because the whole target shares this lock. Recovering that state
-    /// previously required knowing to call `sem_unlink` by hand.
-    ///
-    /// Poll instead of blocking outright: if nobody releases within
-    /// ``staleAfter``, unlink the abandoned semaphore and reopen a fresh one.
-    /// Unlinking only detaches the name — a live holder keeps its own handle
-    /// and its `signal()` stays valid — so the worst case for a false positive
-    /// is two runs briefly sharing MLX, not a corrupted lock.
     func wait() {
-        let deadline = Date().addingTimeInterval(Self.staleAfter)
         while true {
-            if sem_trywait(pointer) == 0 { return }
-            if errno != EAGAIN && errno != EINTR {
-                fatalError("Unable to wait on MLX Metal test semaphore")
+            let descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+            guard descriptor >= 0 else {
+                let code = errno
+                fatalError("Unable to open the MLX Metal test lock \(path): \(Self.describe(code))")
             }
-            if Date() >= deadline {
-                FileHandle.standardError.write(
-                    Data(
-                        """
-                        [vmlx-tests] MLX lock \(Self.name) held for >\(Int(Self.staleAfter))s; \
-                        assuming a killed run abandoned it and resetting.
-
-                        """.utf8))
-                sem_unlink(Self.name)
-                sem_close(pointer)
-                pointer = Self.open()
-                if sem_trywait(pointer) == 0 { return }
-                fatalError("Unable to recover abandoned MLX Metal test semaphore")
+            if !take(descriptor, LOCK_EX | LOCK_NB) {
+                sayItWaits()
+                _ = take(descriptor, LOCK_EX)
             }
-            usleep(20_000)
+            if isTheFileAtPath(descriptor) {
+                held.withLock { $0 = descriptor }
+                return
+            }
+            close(descriptor)
         }
     }
 
     func signal() {
-        if sem_post(pointer) == -1 {
-            fatalError("Unable to signal MLX Metal test semaphore")
+        let descriptor = held.withLock { held in
+            defer { held = -1 }
+            return held
         }
+        guard descriptor >= 0 else {
+            fatalError("The MLX Metal test lock \(path) was released without being held")
+        }
+        // Closing the only descriptor releases the lock as well; unlocking
+        // first says so.
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+
+    /// Locks `descriptor` with `operation`; false if `LOCK_NB` finds the lock
+    /// taken.
+    private func take(_ descriptor: Int32, _ operation: Int32) -> Bool {
+        while flock(descriptor, operation) != 0 {
+            let code = errno
+            if code == EWOULDBLOCK { return false }
+            guard code == EINTR else {
+                fatalError("Unable to take the MLX Metal test lock \(path): \(Self.describe(code))")
+            }
+        }
+        return true
+    }
+
+    /// Whether `descriptor` is still the file at `path`. A file deleted or
+    /// replaced after it was opened does not exclude a process that opens the
+    /// path now.
+    private func isTheFileAtPath(_ descriptor: Int32) -> Bool {
+        var locked = stat()
+        guard fstat(descriptor, &locked) == 0 else {
+            let code = errno
+            fatalError("Unable to inspect the MLX Metal test lock \(path): \(Self.describe(code))")
+        }
+        var current = stat()
+        guard stat(path, &current) == 0 else {
+            let code = errno
+            guard code == ENOENT else {
+                fatalError(
+                    "Unable to inspect the MLX Metal test lock \(path): \(Self.describe(code))")
+            }
+            return false
+        }
+        return locked.st_dev == current.st_dev && locked.st_ino == current.st_ino
+    }
+
+    private func sayItWaits() {
+        let first = saidItWaits.withLock { said in
+            defer { said = true }
+            return !said
+        }
+        guard first else { return }
+        FileHandle.standardError.write(
+            Data(
+                """
+                [vmlx-tests] The MLX Metal test lock \(path) is taken; waiting for it, with no \
+                time limit. `lsof \(path)` names the process that holds it.
+
+                """.utf8))
+    }
+
+    private static func describe(_ code: Int32) -> String {
+        String(cString: strerror(code))
     }
 }
 
