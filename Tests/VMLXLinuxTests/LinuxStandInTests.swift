@@ -8,6 +8,20 @@
 
     @testable import MLXLMCommon
 
+    /// Whether this process is x86-64 code translated by Rosetta (a linux/amd64 container on
+    /// Apple silicon), whose /proc/cpuinfo names Apple's virtual CPU. binfmt_misc does not tell:
+    /// it is not mounted inside the container. A native x86-64 or arm64 process says no.
+    private let runsUnderRosetta: Bool = {
+        #if arch(x86_64)
+            guard let cpuinfo = FileHandle(forReadingAtPath: "/proc/cpuinfo"),
+                let bytes = try? cpuinfo.readToEnd()
+            else { return false }
+            return String(decoding: bytes, as: UTF8.self).contains("VirtualApple")
+        #else
+            return false
+        #endif
+    }()
+
     /// The Linux stand-ins behave like the Apple APIs they replace.
     @Suite(.serialized) struct LinuxStandInTests {
 
@@ -53,15 +67,22 @@
             #expect(state == VM_PURGABLE_NONVOLATILE)
             #expect(vm_deallocate(mach_task_self_, address, size) == KERN_SUCCESS)
 
-            // No mapping of 4 EiB exists: mmap fails, and the stand-in reports it as vm_allocate
-            // does, without trapping. A size beyond Int.max fails the same way, before mmap or
-            // munmap sees it.
+            // A size beyond Int.max fails before mmap or munmap sees it.
+            var huge: vm_address_t = 0
+            #expect(vm_allocate(mach_task_self_, &huge, .max, VM_FLAGS_ANYWHERE) == KERN_FAILURE)
+            #expect(vm_deallocate(mach_task_self_, 0, .max) == KERN_FAILURE)
+        }
+
+        /// No mapping of 4 EiB exists: mmap fails, and the stand-in reports it as vm_allocate
+        /// does, without trapping. Under Rosetta the translator kills the process instead of
+        /// failing the mmap ("rosetta error: could not find free space for allocation size
+        /// 4000000000000000"), so this one request is skipped there.
+        @Test(.disabled(if: runsUnderRosetta, "Rosetta kills the process when this mmap fails"))
+        func virtualMemoryRefusesAnImpossibleSize() {
             var huge: vm_address_t = 0
             #expect(
                 vm_allocate(mach_task_self_, &huge, vm_size_t(1) << 62, VM_FLAGS_ANYWHERE)
                     == KERN_FAILURE)
-            #expect(vm_allocate(mach_task_self_, &huge, .max, VM_FLAGS_ANYWHERE) == KERN_FAILURE)
-            #expect(vm_deallocate(mach_task_self_, 0, .max) == KERN_FAILURE)
         }
 
         /// Stands for the ten former crash sites: on a CPU-only build they aborted with
