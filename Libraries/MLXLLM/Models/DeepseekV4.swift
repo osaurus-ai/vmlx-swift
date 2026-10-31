@@ -2784,3 +2784,20 @@ final class DSV41WeakKeyMap<Value: AnyObject> {
         entries[ObjectIdentifier(key)] = Entry(key: key, value: value)
     }
 }
+
+// MARK: - Prefix-cache invariants (DeepSeek-V4.1)
+
+extension DeepseekV4Model: PrefixCacheInvariantModel {
+    /// Not claimed: the V4.1 vision lane has no proof of media-independent pre-image state here.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { false }
+
+    /// DeepSeek-V4.1: every stored boundary is taken where a prefill ENDED there (the
+    /// prompt-minus-one seed, and the structural boundaries split off as their own prompts), with
+    /// prompt-suffix pruning aimed at that end, so the stored windows, pools, pending compressor
+    /// rows, indexer keys and Engram history are those of a cold prefill of exactly those tokens,
+    /// whatever follows. A restore followed by the suffix prefill is bit-identical to a cold
+    /// prefill split at the same boundary (RunBench `BENCH_DSV41_SPLIT_EXACT`). A forced tool
+    /// selection therefore keeps the ordinary longest-prefix restore instead of a full prefill.
+    /// DSV4-0731 is not claimed.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { config.isDeepseekV41 }
+}

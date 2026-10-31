@@ -597,7 +597,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         }
                         MLX.eval(self.cache)
                         restored = true
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: tokensToPrefill, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -610,7 +610,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "dflash2")
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: tokensToPrefill, boundary: matchedTokens,
                             mediaSalt: mediaSalt,

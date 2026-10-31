@@ -186,7 +186,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                                 diskArrays, into: &self.cache, requirePromptBoundary: true) > 0
                     if restored {
                         MLX.eval(self.cache)
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: promptTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -225,7 +225,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
                     // This path applies no recurrent companion state, so for
                     // a cache that has such layers the refusal may be this
                     // path's and not the entry's: said only when it has none.
-                    if detail == .disk, !cacheContainsPathDependentState(self.cache) {
+                    if detail.isDiskTierEntry, !cacheContainsPathDependentState(self.cache) {
                         coordinator.reportDiskRestoreRejected(
                             tokens: promptTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,

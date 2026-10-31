@@ -281,6 +281,14 @@ public final class MiniMaxM3SparseCache: DiskCacheStateProviding, AppendOnlyRows
     }
 }
 
+/// Exact-prefix restore (``ExactPrefixRestoreCache``): a stored boundary holds exactly the K, V and indexer-key rows the
+/// forward produced for those tokens (append-only lanes, no recurrent, pooled, rotated or quantized state), cut back by
+/// the aligned-prefill rule to rows a cold prefill of the same prompt computes identically. Forced tool selection
+/// (`tool_choice=required`) therefore restores it like any other turn. Without this every such Osaurus turn re-prefilled
+/// the whole prompt (live M3.1 GUI run 2026-10-29: `restored=0 tier=none prefilled=4295`, TTFT 8.7 s, on the m5 Max
+/// and the Studio alike).
+extension MiniMaxM3SparseCache: ExactPrefixRestoreCache {}
+
 extension MiniMaxM3SparseCache: AlignedPrefillCache {
     /// K/V rows and indexer-key rows.
     public var alignedPrefillLaneRows: [Int] { [offset, indexCount] }

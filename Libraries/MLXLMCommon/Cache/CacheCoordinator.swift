@@ -33,8 +33,15 @@ public enum CacheDetail: String, Sendable {
     case paged
     /// The on-disk L2 cache.
     case disk
+    /// An entry of the disk tier served from RAM: kept resident after its store or an earlier
+    /// read, or still being written (see ``DiskCache/residentByteBudget``). Restored exactly like
+    /// ``disk`` (the hit carries `diskArrays`); only the source of the bytes differs.
+    case memory
     /// No cache tier had a match.
     case miss
+
+    /// The hit carries a disk-tier payload (`diskArrays`): ``disk`` or ``memory``.
+    public var isDiskTierEntry: Bool { self == .disk || self == .memory }
 }
 
 // MARK: - CacheFetchResult
@@ -248,6 +255,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.diskCache = nil
         }
         self.diskCache?.writeBehind = config.diskWriteBehind
+        self.diskCache?.residentByteBudget = config.usePagedCache ? 0 : max(0, config.residentEntryBytes)
         self.diskRootKey = self.diskCache?.cacheDir.standardizedFileURL.path
 
         self.ssmStateCache = SSMStateCache(
@@ -621,6 +629,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                 _requiresPagedBoundaryCompanion = false
             }
         }
+        // A model the paged tier cannot hold gets its RAM tier from the disk tier's resident
+        // entries instead (with the paged tier off they are on for every model already).
+        if config.usePagedCache, let diskCache {
+            diskCache.residentByteBudget = incompatible ? max(0, config.residentEntryBytes) : 0
+        }
     }
 
     /// Require an exact-boundary typed companion beside paged KV blocks.
@@ -980,9 +993,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // Do not make rejected hybrid candidates hot: no recency
                 // touch and no hit until one is accepted.
                 let arrays: [String: MLXArray]
+                let servedFromMemory: Bool
                 switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: probeSalt) {
-                case .arrays(let found):
+                case .arrays(let found, let fromMemory):
                     arrays = found
+                    servedFromMemory = fromMemory
                 case .miss:
                     // A miss here means the content-addressed key over this
                     // prefix found no row; a rejection below means the row
@@ -1011,11 +1026,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                         matchedBoundary: boundary,
                         mediaSalt: probeSalt,
                         chainId: chainId)
-                    ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
+                    ftrace("HIT \(servedFromMemory ? "memory" : "disk") boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
                     return .hit(
                         matchedTokens: boundary,
                         remainingTokens: Array(tokens.dropFirst(boundary)),
-                        detail: .disk,
+                        detail: servedFromMemory ? .memory : .disk,
                         blocks: [],
                         ssmStates: ssmStates,
                         diskArrays: arrays
@@ -2201,6 +2216,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func releaseVolatile() {
         pagedCache?.clear()
         ssmStateCache.clear()
+        // The disk tier's resident payloads are RAM copies of files that stay on the SSD.
+        diskCache?.releaseResidentEntries()
     }
 
     /// Wait for disk stores still being written in the background (``DiskCache`` write-behind) to
