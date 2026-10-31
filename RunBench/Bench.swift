@@ -610,6 +610,10 @@ struct Bench {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DSV41_MISS_PARITY"] ?? "0") == "1" {
+            try await runDSV41MissParityBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_DSV41_SPLIT_EXACT"] ?? "0") == "1" {
             try await runDSV41SplitExactBench(modelPath: modelPath)
             return
