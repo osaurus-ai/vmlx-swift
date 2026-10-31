@@ -2,110 +2,68 @@
 
 import Foundation
 import Testing
+import VMLXJinja
 import VMLXTokenizers
 
-/// The gemma-4 templates close the assistant turn when a history message carries BOTH content
-/// AND tool calls, and `add_generation_prompt` then skips `<|turn>model` because the last thing
-/// emitted was a tool response. Generation starts after a CLOSED turn with no role header — the
-/// model has nothing telling it who is speaking, improvises the scaffolding it has seen around
-/// assistant turns, and locks into repeating it:
-///
-///     thought
-///     <channel|>£thought
-///     <channel|>o'thought
-///     <channel|>o'thought          ← forever
-///
-/// It only fires after real tool use. A turn with tool calls but no content leaves the turn
-/// open, which is why plain chat repros look clean and this survived for months.
-///
-/// Patching the bundle on disk does not hold — the loader re-fetches `tokenizer_config.json`
-/// from the Hub and silently restores the broken template — so the repair happens in memory at
-/// the point every path selects the template.
-@Suite("Chat template repair: a tool turn must not strand generation")
+@Suite("Selected chat templates retain their model-owned boundaries")
 struct ChatTemplateRepairTests {
+    private static let legacyMXFP = "{%- elif not (ns_tr_out.flag and not has_content) -%}"
+    private static let legacy8Bit =
+        "{%- if not (message['tool_responses'] and not message['content']) -%}"
 
-    /// Both dialects that ship in the wild spell the same mistake.
-    private static let brokenMXFP = "{%- elif not (ns_tr_out.flag and not has_content) -%}"
-    private static let broken8Bit = "{%- if not (message['tool_responses'] and not message['content']) -%}"
+    @Test("Legacy conditions can be diagnosed without rewriting the template")
+    func legacyTemplatesAreNotSilentlyChanged() {
+        for condition in [Self.legacyMXFP, Self.legacy8Bit] {
+            let source = "before \(condition) after"
+            #expect(ChatTemplateRepair.needsRepair(source))
+            #expect(ChatTemplateRepair.repaired(source) == source)
+        }
+    }
 
-    @Test("The MXFP/JANG dialect's stranded-turn close is repaired")
-    func repairsMXFPDialect() {
-        let template = """
-            {%- for message in messages -%}
-                {%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}
-                    {{- '<|tool_response>' -}}
-                \(Self.brokenMXFP)
-                    {{- '<turn|>\\n' -}}
-                {%- endif -%}
-            {%- endfor -%}
+    @Test("An in-memory rewrite must not erase a close before a new user")
+    func explicitUserBoundarySurvives() throws {
+        let source = """
+            {%- set ns_tr_out = namespace(flag=true) -%}
+            {%- set has_content = true -%}
+            {{- '<tool_response|>' -}}
+            {%- if false -%}
+            \(Self.legacyMXFP)
+                {{- '<turn|>\\n' -}}
+            {%- endif -%}
+            {{- '<|turn>user\\nNext user<turn|>\\n' -}}
             """
-
-        #expect(ChatTemplateRepair.needsRepair(template))
-
-        let fixed = ChatTemplateRepair.repaired(template)
-        #expect(fixed.contains("{%- elif not ns_tr_out.flag -%}"))
-        #expect(
-            !fixed.contains(Self.brokenMXFP),
-            "a turn that emitted a tool response must stay OPEN whether or not it had content"
-        )
+        let rendered = try Template(ChatTemplateRepair.repaired(source)).render([:])
+        #expect(rendered == "<tool_response|><turn|>\n<|turn>user\nNext user<turn|>\n")
     }
 
-    @Test("The 8-bit retention dialect's stranded-turn close is repaired")
-    func repairs8BitDialect() {
-        let template = """
-            {%- for message in messages -%}
-                \(Self.broken8Bit)
-                    {{- '<turn|>\\n' -}}
-                {%- endif -%}
-            {%- endfor -%}
-            """
-
-        #expect(ChatTemplateRepair.needsRepair(template))
-
-        let fixed = ChatTemplateRepair.repaired(template)
-        #expect(fixed.contains("{%- if not message['tool_responses'] -%}"))
-        #expect(!fixed.contains(Self.broken8Bit))
+    @Test("Templates without legacy spellings remain byte-identical")
+    func otherTemplateFamiliesAreUnchanged() {
+        for source in [
+            "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}",
+            "<|im_start|>assistant\n<think>",
+            "[INST] {{ messages[0].content }} [/INST]",
+        ] {
+            #expect(!ChatTemplateRepair.needsRepair(source))
+            #expect(ChatTemplateRepair.repaired(source) == source)
+        }
     }
 
-    @Test("A template without the bug is returned untouched")
-    func healthyTemplateIsUnchanged() {
-        // Nothing else may be rewritten — this runs on EVERY model's template, not just gemma.
-        let healthy = """
-            {%- for message in messages -%}
-                {{- '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' -}}
-            {%- endfor -%}
-            {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}{%- endif -%}
-            """
-        #expect(!ChatTemplateRepair.needsRepair(healthy))
-        #expect(ChatTemplateRepair.repaired(healthy) == healthy)
+    @Test("Repeated calls preserve the original source")
+    func repeatedCallsDoNotMutateSource() {
+        let source = "x \(Self.legacyMXFP) y \(Self.legacy8Bit) z"
+        #expect(ChatTemplateRepair.repaired(source) == source)
+        #expect(ChatTemplateRepair.repaired(ChatTemplateRepair.repaired(source)) == source)
     }
 
-    @Test("A template is inspected once, then answered from cache")
-    func templateIsInspectedOnce() {
-        // `applyChatTemplate` runs on every request and almost every template is healthy, so
-        // re-scanning it each turn is pure waste. Same input must give the same answer, and
-        // repeat lookups must not re-derive it.
-        let broken = "a \(Self.brokenMXFP) b"
-        let first = ChatTemplateRepair.repaired(broken)
-        let second = ChatTemplateRepair.repaired(broken)
-        #expect(first == second)
-        #expect(!ChatTemplateRepair.needsRepair(second))
-
-        // A healthy template must also be cached — it is the common case, and it must come
-        // back byte-identical, not merely equal-looking.
-        let healthy = "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}"
-        #expect(ChatTemplateRepair.repaired(healthy) == healthy)
-        #expect(ChatTemplateRepair.repaired(healthy) == healthy)
-    }
-
-    @Test("Repair is idempotent")
-    func repairIsIdempotent() {
-        // The loader may repair the same template more than once across reloads; doing so must
-        // not corrupt it.
-        let broken = "x \(Self.brokenMXFP) y \(Self.broken8Bit) z"
-        let once = ChatTemplateRepair.repaired(broken)
-        let twice = ChatTemplateRepair.repaired(once)
-        #expect(once == twice)
-        #expect(!ChatTemplateRepair.needsRepair(once))
+    @Test("The tokenizer compiles the selected source, without automatic repairs")
+    func tokenizerKeepsSelectedTemplateAuthoritative() throws {
+        let root =
+            ProcessInfo.processInfo.environment["VMLX_RUNTIME_SOURCE_ROOT"]
+            ?? FileManager.default.currentDirectoryPath
+        let url = URL(fileURLWithPath: root).appendingPathComponent(
+            "Vendors/swift-transformers/Sources/Tokenizers/Tokenizer.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        #expect(source.contains("compiledTemplate(for: selectedChatTemplate)"))
+        #expect(!source.contains("ChatTemplateRepair.repaired(selectedChatTemplate)"))
     }
 }
