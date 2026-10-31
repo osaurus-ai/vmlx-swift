@@ -808,6 +808,11 @@ let package = Package(
         ),
 
         .testTarget(
+            name: "ToolSchemaReferenceTests",
+            dependencies: ["MLXLMCommon", "VMLXJinja"],
+            path: "Tests/ToolSchemaReferenceTests"
+        ),
+        .testTarget(
             name: "JinjaReferenceTests",
             dependencies: ["VMLXJinja"],
             path: "Tests/JinjaReferenceTests",
