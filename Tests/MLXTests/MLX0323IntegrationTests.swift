@@ -2,7 +2,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import XCTest
 
 final class MLX0323IntegrationTests: XCTestCase {
