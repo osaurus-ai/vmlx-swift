@@ -1,0 +1,110 @@
+{
+ "architectures": [
+  "DSparkMiniMaxDraftModel"
+ ],
+ "enable_confidence_head": true,
+ "confidence_head_with_markov": true,
+ "text_config": {
+  "hidden_size": 64,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "rotary_dim": 8,
+  "rms_norm_eps": 1e-06,
+  "vocab_size": 128,
+  "dspark_ffn_hidden_size": 128,
+  "swiglu_alpha": 1.702,
+  "swiglu_limit": 7.0,
+  "sliding_window": 6,
+  "dspark_block_size": 4,
+  "rope_theta": 10000.0,
+  "dspark_noise_token_id": 127,
+  "dspark_target_layer_ids": [
+   1,
+   3
+  ],
+  "dspark_markov_rank": 64,
+  "layer_types": [
+   "sliding_attention",
+   "sliding_attention"
+  ],
+  "dense_intermediate_size": 128
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4,
+  "confidence_head.proj": {
+   "group_size": 64,
+   "bits": 8
+  },
+  "fc": {
+   "group_size": 64,
+   "bits": 8
+  },
+  "layers.0.mlp.down_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.mlp.gate_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.mlp.up_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.self_attn.k_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.self_attn.o_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.self_attn.q_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.0.self_attn.v_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.mlp.down_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.mlp.gate_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.mlp.up_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.self_attn.k_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.self_attn.o_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.self_attn.q_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "layers.1.self_attn.v_proj": {
+   "group_size": 64,
+   "bits": 4
+  },
+  "markov_head.markov_w1": {
+   "group_size": 64,
+   "bits": 8
+  },
+  "markov_head.markov_w2": {
+   "group_size": 64,
+   "bits": 8
+  }
+ }
+}

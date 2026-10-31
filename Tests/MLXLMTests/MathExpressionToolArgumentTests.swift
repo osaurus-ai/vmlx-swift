@@ -74,6 +74,10 @@ struct MathExpressionToolArgumentTests {
             return "<minimax:tool_call>\n<invoke name=\"calculate\">\n<parameter name=\"expression\">\(e)</parameter>\n</invoke>\n</minimax:tool_call>"
         case .minicpm5:
             return "<function name=\"calculate\"><param name=\"expression\">\(e)</param></function>"
+        case .minimaxM3:
+            // Every element behind the namespace separator token; the argument is named by its tag.
+            let ns = MiniMaxM3ToolCallParser.namespaceToken
+            return "\(ns)<tool_call>\n\(ns)<invoke name=\"calculate\">\n\(ns)<expression>\(e)\(ns)</expression>\n\(ns)</invoke>\n</tool_call>"
         case .atem:
             return "<atem:function_calls>\n<atem:invoke name=\"calculate\">\n<atem:parameter name=\"expression\">\(e)</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
         case .dsml:

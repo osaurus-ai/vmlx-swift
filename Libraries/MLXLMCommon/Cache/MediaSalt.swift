@@ -168,6 +168,14 @@ public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> S
     if let thinking = additionalContext["enable_thinking"] as? Bool {
         parts.append(thinking ? "reasoning=on" : "reasoning=off")
     }
+    // MiniMax-M3's control is `thinking_mode` (MiniMaxM3ThinkingTemplateContext drops `enable_thinking` once it has
+    // mapped it); enabled / disabled change the system line and the generation suffix.
+    if let mode = additionalContext["thinking_mode"] as? String {
+        let normalized = mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !normalized.isEmpty {
+            parts.append("thinking_mode=\(normalized)")
+        }
+    }
     if let effort = additionalContext["reasoning_effort"] as? String {
         let normalized = effort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalized.isEmpty {
@@ -262,7 +270,12 @@ public func computeCacheSalt(
         parameters.maxKVSize = nil
     }
     let base = computeCacheSalt(for: input, includingMedia: includingMedia)
-    let policy = cachePolicySalt(for: parameters)
+    var policy = cachePolicySalt(for: parameters)
+    // A model that prefills on aligned chunks (MiniMax-M3) stores states whose rows are only interchangeable with a
+    // cold prefill of the same step: entries of another step, or from before aligned prefill, are never served.
+    if let aligned = AlignedPrefill.saltComponent(model: model, prefillStepSize: parameters.prefillStepSize) {
+        policy += "|" + aligned
+    }
 
     var hasher = SHA256()
     if let base {

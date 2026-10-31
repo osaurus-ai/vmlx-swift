@@ -48,7 +48,7 @@ struct ReasoningStampFamilyMatrixTests {
         // GLM-4 MoE (glm4 base is .glm4 dispatch; only glm4_moe* gets think_xml)
         "glm4_moe", "glm4_moe_lite", "glm5",
         // MiniMax — user's looping report
-        "minimax", "minimax_m2", "minimax_m3",
+        "minimax", "minimax_m2",
         // Kimi K2 family
         "kimi", "kimi_k2", "kimi_k25", "kimi_k26",
         // Nemotron H
@@ -145,7 +145,8 @@ struct ToolFormatFamilyMatrixTests {
         ("gemma4_unified_text", .gemma4),
         ("minimax", .minimaxM2),
         ("minimax_m2", .minimaxM2),
-        ("minimax_m3", .minimaxM2),
+        ("minimax_m3", .minimaxM3),
+        ("minimax_m3_vl", .minimaxM3),
         ("nemotron_h", .nemotron),
         ("nemotron_h_omni", .nemotron),
         ("qwen3_5", .xmlFunction),
@@ -467,7 +468,7 @@ struct PerFamilyMultiTurnReasoningTests {
         "qwen3_next", "qwen3_next_moe",
         "deepseek_v3", "deepseek_v4", "deepseek_v4_flash",
         "glm4_moe", "glm4_moe_lite",
-        "minimax", "minimax_m2", "minimax_m3",
+        "minimax", "minimax_m2",
         "kimi_k2", "kimi_k25",
         "nemotron_h", "nemotron_h_omni",
         "holo3",

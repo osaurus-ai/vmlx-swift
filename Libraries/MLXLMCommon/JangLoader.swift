@@ -401,6 +401,11 @@ public enum ParserResolution {
                 .chatTemplate
             )
         }
+        // MiniMax-M3 / M3.1 templates render reasoning as `<mm:think>…</mm:think>` (and an answer without reasoning
+        // as `</mm:think>answer`): that envelope names the M3 parser, whatever generic tags the template also uses.
+        if let chatTemplate, chatTemplate.contains("<mm:think>"), chatTemplate.contains("</mm:think>") {
+            return (ReasoningParser.fromCapabilityName("minimax_m3"), .chatTemplate)
+        }
         // Template-native `<think>...</think>` envelope. This is the PRECISE
         // reasoning signal: a reasoning-tuned bundle (e.g. VibeThinker, a
         // qwen2-based thinker) carries the literal tag pair in its chat
@@ -430,6 +435,14 @@ public enum ParserResolution {
             ReasoningParser.fromCapabilityName(stamp),
             .modelTypeHeuristic
         )
+    }
+
+    /// The stamp name a factory records for a parser `reasoning(...)` resolved from the chat template (the
+    /// generation loop rebuilds the parser from this name): `minicpm5`, `minimax_m3` or the `<think>` family's `qwen3`.
+    public static func templateReasoningStampName(_ parser: ReasoningParser?) -> String {
+        if parser?.preservesXMLFunctionPayloads == true { return "minicpm5" }
+        if parser?.startTag == "<mm:think>" { return "minimax_m3" }
+        return "qwen3"
     }
 
     /// True when the chat template carries a literal `<think>...</think>`
@@ -2516,7 +2529,7 @@ public struct JangLoader: Sendable {
                 switch declared {
                 case .quantize(let quantization):
                     return quantization
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 }
             }

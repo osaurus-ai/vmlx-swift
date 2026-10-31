@@ -25,8 +25,9 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q38t-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
             let data = try f.fixture(directory, banks: f.makeBanks(seed: 1))
-            // The strict ordinary decoder refuses `mode: jangt`; only the custom partition may consume it.
-            XCTAssertThrowsError(try JSONDecoder.json5().decode(Qwen4ExpConfiguration.self, from: data))
+            // The ordinary decoder reads `mode: jangt` entries as format-owned (no MLX quantization, 69931bde0);
+            // only the custom partition consumes the banks.
+            XCTAssertNoThrow(try JSONDecoder.json5().decode(Qwen4ExpConfiguration.self, from: data))
             XCTAssertTrue(JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil))
             let prepared = try XCTUnwrap(Qwen4ExpJANGHPreparation.loadIfDeclared(directory: directory,
                                                                                  configurationData: data))

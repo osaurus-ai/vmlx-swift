@@ -281,16 +281,19 @@ public struct GenerateParameters: Sendable {
 
     /// Native-MTP depth policy. ADAPTIVE BY DEFAULT: the requested depth (a bundle's
     /// `recommended_num_drafts` / tuning sidecar / family default) is only where a request STARTS; the
-    /// request may climb to `defaultAdaptiveDepthCeiling` and steps down (or to AR) when a deeper depth
-    /// loses. `.fixed` turns the requested depth into a hard ceiling and is an explicit choice only (the
-    /// app's manual depth button, RunBench manual-depth runs). A `.fixed` default here was the vmlx
-    /// Python bug class of 2026-10-20 (Ornith's stamped D1 capped Adaptive at D1); never make a
-    /// resolved depth a ceiling implicitly. Either policy may descend to shallower work or AR.
-    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .adaptive(
-        maximumDepth: GenerateParameters.defaultAdaptiveDepthCeiling)
+    /// request may climb to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`: the model's
+    /// verifier capability) and steps down (or to AR) when a deeper depth loses. There is no request-level
+    /// ceiling by default (`defaultAdaptiveDepthCeiling`): a constant here capped every model at it, block
+    /// drafters (LiLiCorr, block - 1 = 7) included. `.fixed` turns the requested depth into a hard ceiling
+    /// and is an explicit choice only (the app's manual depth button, RunBench manual-depth runs). A `.fixed`
+    /// default here was the vmlx Python bug class of 2026-10-20 (Ornith's stamped D1 capped Adaptive at D1);
+    /// never make a resolved depth a ceiling implicitly. Either policy may descend to shallower work or AR.
+    public var nativeMTPDepthPolicy: NativeMTPDepthPolicy = .adaptiveToRuntimeCeiling
 
-    /// The adaptive ceiling every request gets unless it sets its own (matches the app's On (Adaptive)).
-    public static let defaultAdaptiveDepthCeiling = 5
+    /// The adaptive request-level ceiling every request gets unless it sets its own: none (`Int.max`), so the
+    /// runtime's top rung governs. Matches the app's On (Adaptive). A finite `.adaptive(maximumDepth:)` is a
+    /// diagnostic / benchmark limit only (`BENCH_PERF_MTP_ADAPTIVE_MAX`).
+    public static let defaultAdaptiveDepthCeiling = Int.max
 
     /// Additional text-level stop sequences. When any of these strings
     /// appears in the user-visible assistant output, the library halts
@@ -1671,6 +1674,59 @@ public struct TokenIterator: TokenIteratorProtocol {
     // `y` advances to the next prediction before next() returns. Retain the
     // token actually forwarded into KV using the existing return-value sync.
     private var lastForwardedTokenId: Int?
+    /// `VMLX_RUNTIME_RECEIPTS=1`: this request's receipt number (0 when receipts are off).
+    var receiptRequestID = 0
+    /// Prompt rows whose end-of-turn snapshot is taken as views of the finished cache (``AppendOnlyRowsCache``) instead
+    /// of a copy retained through decode. Nil: the ordinary retained copy (or none).
+    var deferredPromptSnapshotRows: Int?
+    /// `VMLX_PROMPT_SNAPSHOT_VIEWS=0`: the retained copy as before (A/B only; tests: the task-local override).
+    static let promptSnapshotViewsEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_PROMPT_SNAPSHOT_VIEWS"] != "0"
+    @TaskLocal static var promptSnapshotViewsOverride: Bool?
+    static var promptSnapshotViewsEnabled: Bool { promptSnapshotViewsOverride ?? promptSnapshotViewsEnvironment }
+    /// `VMLX_ALIGNED_POST_ANSWER_STORE=1`: write the redundant post-answer entry of aligned-prefill caches (A/B only;
+    /// tests: the task-local override).
+    static let alignedPostAnswerStoreSkippedEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_ALIGNED_POST_ANSWER_STORE"] != "1"
+    @TaskLocal static var alignedPostAnswerStoreSkippedOverride: Bool?
+    static var alignedPostAnswerStoreSkipped: Bool {
+        alignedPostAnswerStoreSkippedOverride ?? alignedPostAnswerStoreSkippedEnvironment
+    }
+    /// `VMLX_M3_ALIGNED_SINGLE_STORE=0`: aligned-prefill caches store every prompt boundary as before (N, N-1, the
+    /// generation-stripped boundary, each history boundary) instead of one entry per reusable row count (A/B only;
+    /// tests: the task-local override).
+    static let alignedSingleStoreEnvironment =
+        ProcessInfo.processInfo.environment["VMLX_M3_ALIGNED_SINGLE_STORE"] != "0"
+    @TaskLocal static var alignedSingleStoreOverride: Bool?
+    static var alignedSingleStoreEnabled: Bool { alignedSingleStoreOverride ?? alignedSingleStoreEnvironment }
+
+    /// One aligned-prefill store: the rows it holds (= its key length) and whether a stable (shared-root) boundary maps
+    /// to it.
+    struct AlignedStoreBoundary: Equatable {
+        let rows: Int
+        let stable: Bool
+    }
+
+    /// The entries an aligned-prefill request stores at the end of its turn: its store boundary `K` (every prompt
+    /// boundary at or past it serves exactly `K` rows: `AlignedPrefill.alignRestoredPrefix` never reuses rows past the
+    /// producer's `K`, and a request sharing a longer boundary shares `[0, K)`), and for each history boundary `b` below
+    /// `K` the last row a later request sharing only `[0, b)` can reuse: the largest multiple of the step or turn cut of
+    /// this plan at or before `b` (a v1 plan: multiples only). One entry per distinct row count, ascending; nil when the
+    /// plan has no store boundary.
+    static func alignedStoreBoundaries(
+        plan: AlignedPrefillPlan, promptTokenCount: Int, historyBoundaries: [Int], stableBoundaries: [Int]
+    ) -> [AlignedStoreBoundary]? {
+        guard let k = plan.boundary, k > 0, k <= promptTokenCount else { return nil }
+        // A boundary at or past K is served by the K entry (a request sharing it shares [0, K)).
+        var rows: [Int: Bool] = [k: false]
+        for b in Set(historyBoundaries) where b > 0 && b < k {
+            var reusable = (b / plan.step) * plan.step
+            for c in plan.turnCuts ?? [] where reusable < c && c <= b { reusable = c }
+            guard reusable > 0 else { continue }
+            rows[reusable] = (rows[reusable] ?? false) || stableBoundaries.contains(b)
+        }
+        return rows.keys.sorted().map { AlignedStoreBoundary(rows: $0, stable: rows[$0]!) }
+    }
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
     public var structuredOutputComplete: Bool? {
@@ -1763,6 +1819,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Clean cache state captured immediately after prefill and before any
     /// generated token is fed back into the model.
     var promptCacheSnapshot: [KVCache]?
+
+    /// Aligned prefill (`AlignedPrefillPrefix.swift`): this request's absolute chunk cuts and store boundary, for a
+    /// model whose prompt prefill must be cut at absolute chunk boundaries (MiniMax-M3). nil for every other model, or
+    /// with `VMLX_M3_ALIGNED_PREFIX=0`.
+    var alignedPrefillPlan: AlignedPrefillPlan?
 
     /// Absolute index into ``promptTokenIds`` of the generation-suffix-stripped
     /// cross-turn reuse boundary — the last turn-start token, i.e. the end of
@@ -2013,6 +2074,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.cacheSaltPlan = CacheBoundarySaltPlan.make(
             requestSalt: mediaSalt, input: input, lookupTokenIds: cacheLookupTokenIds,
             model: model, parameters: effectiveParameters)
+        // Aligned prefill: the same plan with or without a coordinator, so a cold prefill and a cached continuation
+        // cut the prompt at the same absolute positions.
+        self.alignedPrefillPlan = AlignedPrefill.plan(
+            model: model, cache: self.cache, promptTokenIds: cacheLookupTokenIds,
+            cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+            generationPromptSuffix: cacheCoordinator?.genPromptSuffixTokens ?? [],
+            prefillStepSize: effectiveParameters.prefillStepSize)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1",
            let prefix = cacheSaltPlan.mediaIndependentPrefix
         {
@@ -2105,8 +2173,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                     mediaIndependentPrefix: cacheSaltPlan.mediaIndependentPrefix)
                 switch result {
                 case .hit(
-                    let matchedTokens, let remainingTokens, let detail, let blocks,
+                    let fetchedMatchedTokens, let fetchedRemainingTokens, let detail, let blocks,
                     let ssmStates, let diskArrays):
+                // An aligned-prefill restore may keep fewer rows than the entry held (below).
+                var matchedTokens = fetchedMatchedTokens
+                var remainingTokens = fetchedRemainingTokens
                 var restored = false
                 var retainedDiskRestore = false
                 var restoredTokenCount = 0
@@ -2220,6 +2291,21 @@ public struct TokenIterator: TokenIteratorProtocol {
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)
                     inputForPrepare = input
+                }
+                // Aligned prefill: keep only the rows a cold prefill of this request also ends a chunk at (the last
+                // chunk boundary, or all of its own store boundary when the rows were produced with it). None: the
+                // whole prompt prefills, exactly as a miss.
+                if restored, let plan = self.alignedPrefillPlan {
+                    let reuse = AlignedPrefill.alignRestoredPrefix(
+                        self.cache, matchedTokens: matchedTokens, plan: plan, detail: detail.rawValue)
+                    if reuse > 0 {
+                        matchedTokens = reuse
+                        remainingTokens = Array(cacheLookupTokenIds.dropFirst(reuse))
+                    } else {
+                        restored = false
+                        self.cache = self.model.newCache(parameters: effectiveParameters)
+                        inputForPrepare = input
+                    }
                 }
                 if restored {
                     if cacheLookupUsesPostPrepareAlias {
@@ -2383,6 +2469,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let remainingPromptUnits = Swift.max(0, inputForPrepare.text.tokens.size)
         let completedBeforePrefill = Swift.max(0, promptTokenCount - remainingPromptUnits)
+        if RuntimeReceipts.isEnabled {
+            let rid = RuntimeReceipts.currentRequestID ?? 0
+            self.receiptRequestID = rid
+            RuntimeReceipts.emit(
+                "request id=\(rid) prompt=\(promptTokenCount) "
+                    + "thinking_mode=\(RuntimeReceipts.thinkingMode(fromScopeSalt: originalInput.cacheScopeSalt)) "
+                    + "prompt_tail=\(self.promptTokenIds.last.map(String.init) ?? "none") "
+                    + "draft=\(RuntimeReceipts.draftName(effectiveParameters.draftStrategy)) "
+                    + "prefill_step=\(effectiveParameters.prefillStepSize) "
+                    + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                    + "cache_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.cacheLimit))")
+            RuntimeReceipts.emit(
+                "cache id=\(rid) prompt=\(promptTokenCount) restored=\(completedBeforePrefill) "
+                    + "tier=\(completedBeforePrefill > 0 ? (acceptedCacheRestoreDetail?.rawValue ?? "live") : "none") "
+                    + "prefilled=\(remainingPromptUnits) coordinator=\(cacheCoordinator == nil ? "off" : "on")")
+        }
         if let acceptedCacheRestoreDetail, completedBeforePrefill > 0 {
             prefillProgressHandler?(PrefillProgress(
                 stage: .cacheRestore,
@@ -2465,6 +2567,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 restoredTokenCount: Swift.max(
                     0, input.text.tokens.size - inputForPrepare.text.tokens.size))
         }
+        AlignedPrefill.install(self.alignedPrefillPlan, into: self.cache)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
@@ -2490,7 +2593,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         // exact DSV4 replay can consume safely. Keep one retained snapshot,
         // not both N-1 and the deliberately skipped exact prompt boundary.
         if retainsPromptSnapshotForStores {
-            self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: self.cache)
+            // Append-only caches under aligned prefill (MiniMax-M3): the prompt rows never change after this point (decode
+            // and DSpark verify append past them, rollbacks trim back to them), so the end-of-turn stores take views of the
+            // finished cache instead of a copy held through the whole decode (4.5 GiB at 35k tokens on M3.1, and a
+            // second copy per boundary store).
+            if alignedPrefillPlan != nil, Self.promptSnapshotViewsEnabled,
+                cacheBoundaryLeafOffsets(self.cache).allSatisfy({ $0 == promptTokenIds.count }),
+                cacheSupportsPrefixViews(self.cache, rows: promptTokenIds.count)
+            {
+                self.deferredPromptSnapshotRows = promptTokenIds.count
+            } else {
+                self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(from: self.cache)
+            }
         }
         spillHybridStripBoundaryAfterPrefill()
         MemoryStageTrace.log(
@@ -2567,7 +2681,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let why = target.dsparkCacheUnsupportedReason(cache) { return why }
             dspark = DSparkDecoder(
                 session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs,
-                sampling: DSparkSampling(parameters: parameters))
+                sampling: DSparkSampling(parameters: parameters),
+                ladderTop: target.dsparkLadderTop, pinnedWidth: target.dsparkPinnedWidth)
             dsparkStartOffset = cache.map(\.offset).max() ?? 0
             return nil
         }()
@@ -3032,6 +3147,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // Aligned prefill: the model cuts the prompt at absolute chunk boundaries and the store boundary only. Any
+        // other split (stable-boundary captures) would be a cut a cold prefill of a different request does not make;
+        // the store loop takes those boundaries from the prompt snapshot (these caches trim) instead.
+        if alignedPrefillPlan != nil {
+            try prepareRemainder(
+                input: input, windowSize: windowSize, promptTokensForProcessor: input.text.tokens)
+            return
+        }
         // A warm input contains only the suffix after the restored prefix.
         // Snapshot keys and processor boundaries refer to the whole prompt.
         let inputStart = promptTokenIds.count - input.text.tokens.size
@@ -3620,6 +3743,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         reconcileUnoCache()
         finishDSpark()
         MemoryStageTrace.log("decode-end", tokens: promptTokenIds.count + generatedTokenIds.count)
+        // Decode is over: the prompt rows of the finished cache are what prefill wrote (append-only lanes), so the stores
+        // below take views of them. No copy held through decode, none made here.
+        if let rows = deferredPromptSnapshotRows {
+            deferredPromptSnapshotRows = nil
+            promptCacheSnapshot = prefixViews(of: cache, rows: rows)
+        }
         defer {
             MemoryStageTrace.log("stores-returned", tokens: promptTokenIds.count + generatedTokenIds.count)
         }
@@ -3693,7 +3822,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // memory is already at its peak. A prefix-cache entry is only ever a
             // speed-up for some later request — it must never be able to take the
             // host down. If the copies won't fit, don't make them.
-            guard CacheStoreBudget.canStore(cacheToStore) else {
+            guard CacheStoreBudget.canStore(cacheToStore, ownsSnapshot: ownsSnapshot) else {
                 let gib = Double(CacheStoreBudget.cacheBytes(cacheToStore)) / 1_073_741_824
                 Self.logger.info(
                     """
@@ -3702,8 +3831,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     normally; only the cache entry was dropped.
                     """
                 )
+                RuntimeReceipts.emit(
+                    "store id=\(receiptRequestID) tokens=\(tokens.count) result=skipped "
+                        + "reason=store_budget kv_gib=\(String(format: "%.2f", gib))")
                 return
             }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(tokens.count) result=written "
+                    + "kv_gib=\(RuntimeReceipts.gib(CacheStoreBudget.cacheBytes(cacheToStore))) owned=\(ownsSnapshot)")
             // Prefill/boundary snapshots are already owned and evaluated. Only
             // a live post-answer cache needs sealing before the async writer.
             let snapshot = ownsSnapshot ? cacheToStore : cacheToStore.map { $0.copy() }
@@ -3787,6 +3922,42 @@ public struct TokenIterator: TokenIteratorProtocol {
             ? diskSeedBoundary ?? promptTokenIds.count
             : promptTokenIds.count
         defer { diskSeedSnapshot = nil }
+
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary K, and
+        // below K only rows ending at a chunk boundary or a turn cut (`AlignedPrefill.alignRestoredPrefix`). The exact
+        // prompt (N), the N-1 seed and the generation-stripped boundary (N - gpl) therefore all serve the same K rows,
+        // and a history boundary serves only the last reusable row at or before it. Store ONE entry per reusable row
+        // count, keyed at exactly those rows, as views of the finished cache (zero-copy). Before 2026-10-29 a 35k-token
+        // M3.1 turn wrote three to four ~4.6 GiB entries (N, N-1, N-3 and earlier history boundaries) for what one
+        // entry serves. `VMLX_M3_ALIGNED_SINGLE_STORE=0` = the previous stores (A/B).
+        if let plan = alignedPrefillPlan, Self.alignedSingleStoreEnabled, !isReusablePrefixWarmup,
+            !originalInput.requiresPostPrepareCacheKey,
+            let boundaries = Self.alignedStoreBoundaries(
+                plan: plan, promptTokenCount: promptTokenIds.count,
+                historyBoundaries: cachePrefixTokenCounts,
+                stableBoundaries: originalInput.cacheStablePrefixTokenCounts),
+            boundaries.allSatisfy({ cacheSupportsPrefixViews(cache, rows: $0.rows) })
+        {
+            for boundary in boundaries {
+                let tokens = Array(promptTokenIds.prefix(boundary.rows))
+                if coordinator.hasDurableDiskEntry(
+                    tokens: tokens, mediaSalt: cacheSaltPlan.salt(forBoundary: boundary.rows))
+                {
+                    RuntimeReceipts.emit(
+                        "store id=\(receiptRequestID) tokens=\(boundary.rows) result=skipped reason=already_durable")
+                    continue
+                }
+                guard let views = prefixViews(of: cache, rows: boundary.rows) else { continue }
+                store(
+                    tokens: tokens, cache: views, kvBits: nil,
+                    kvMode: selectivePromptBoundaryDiskKVMode(cache: views, requested: kvMode),
+                    isStableBoundary: boundary.stable, isResumeBoundary: !boundary.stable, ownsSnapshot: true)
+            }
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_single_store boundaries=\(boundaries.map(\.rows))")
+            return
+        }
 
         // A plain text KV prompt and its processor-declared history boundary
         // differ only by the template's actual generation rail. Persist that
@@ -4038,6 +4209,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         else { return }
         guard !needsCacheQuantization else { return }
         guard !containsUnprovenZayaTurboQuantDiskState(cache) else { return }
+        // Aligned prefill (MiniMax-M3): a restore never reuses rows past the producing request's store boundary
+        // (`AlignedPrefill.alignRestoredPrefix`: decoded rows and the final piece are not what a cold prefill makes), so
+        // a post-answer entry can serve at most the rows the prompt-boundary entry above already serves. Writing it cost
+        // a full copy of the live cache plus its disk write every turn (4.6 GiB at 35k tokens on M3.1).
+        if alignedPrefillPlan != nil, Self.alignedPostAnswerStoreSkipped {
+            RuntimeReceipts.emit(
+                "store id=\(receiptRequestID) tokens=\(promptTokenIds.count + generatedTokenIds.count) result=skipped "
+                    + "reason=aligned_post_answer_redundant")
+            return
+        }
         // The async decode pipeline forwards the consumed stop token while
         // computing the never-consumed next step, so at store time every
         // cache layer can legitimately sit ONE token past
@@ -4147,12 +4328,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         else {
             return nil
         }
+        // A snapshot of views (deferred prompt snapshot): its boundaries are views too, nothing is copied.
+        let snapshotIsViews = cacheIsPrefixViews(storageSnapshot)
         if tokens.count == storageSnapshotTokenCount {
+            if snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) { return views }
             return storageSnapshot.map { $0.copy() }
         }
         guard let boundaryInput = originalInput.inputForCacheBoundary(
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
         let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
+        if keepsMedia, snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) {
+            return views
+        }
         let trimCount = storageSnapshotTokenCount - tokens.count
         if keepsMedia, canTrimPromptCache(storageSnapshot) {
             let trimmed = storageSnapshot.map { $0.copy() }
@@ -5568,11 +5755,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // returned (which happens when the iterator — and therefore the
             // whole prompt prefill — is built eagerly before the loop task).
             var iterator: any TokenIteratorProtocol
+            let receiptID = RuntimeReceipts.isEnabled ? RuntimeReceipts.nextRequestID() : 0
             // Collect only errors escaping this operation's scoped handlers.
             // A process-wide counter also sees unrelated requests and probes
             // whose owners caught their errors and selected a valid fallback.
             do {
-                iterator = try MLX.withError { try makeIterator.consume()() }
+                let make = makeIterator.consume()
+                iterator = try RuntimeReceipts.$currentRequestID.withValue(receiptID) {
+                    try MLX.withError { try make() }
+                }
             } catch is CancellationError {
                 // Client disconnected while the prompt was still prefilling —
                 // the chunked prepare loops bail between chunks. Not an error;
@@ -5636,8 +5827,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
+            // The prompt is resident now; keep MLX's scheduling limit above it (SchedulingMemoryFloor).
+            SchedulingMemoryFloor.observe()
             while true {
                 let nextToken: Int?
+                SchedulingMemoryFloor.observe()
                 do {
                     nextToken = try MLX.withError { iterator.next() }
                 } catch {
@@ -5771,6 +5965,20 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                         : nil)
             )
             _ = continuation.yield(handler.infoEvent(info))
+            if RuntimeReceipts.isEnabled {
+                let prefillSeconds = info.promptTime
+                RuntimeReceipts.emit(
+                    "done id=\(receiptID) prompt=\(promptTokenCount) "
+                        + "prefill_s=\(String(format: "%.2f", prefillSeconds)) "
+                        + "pp_s=\(String(format: "%.1f", prefillSeconds > 0 ? Double(promptTokenCount) / prefillSeconds : 0)) "
+                        + "generated=\(tokenCount) "
+                        + "decode_tok_s=\(String(format: "%.2f", generateTime > 0 ? Double(max(0, tokenCount - 1)) / generateTime : 0)) "
+                        + "stop=\(String(describing: info.stopReason)) "
+                        + "mlx_active_gib=\(RuntimeReceipts.gib(MLX.Memory.activeMemory)) "
+                        + "mlx_peak_gib=\(RuntimeReceipts.gib(MLX.Memory.peakMemory)) "
+                        + "memory_limit_gib=\(RuntimeReceipts.gib(MLX.Memory.memoryLimit)) "
+                        + "floor_raises=\(SchedulingMemoryFloor.raises)")
+            }
 
             // Post-completion cleanup, still on the request path so the
             // stream does not FINISH until it is done. Timed to split

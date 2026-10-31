@@ -1065,14 +1065,22 @@ public enum Filters {
         return try forceescape(args, kwargs: kwargs, env: env)
     }
 
-    /// Converts value to JSON string.
+    /// Converts value to JSON string, as Hugging Face transformers' chat-template `tojson` filter does:
+    /// `json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)` with
+    /// `ensure_ascii=False`, `indent=None`, `separators=None`, `sort_keys=False` by default. So, like the Python
+    /// reference every bundle's template is written and validated against: `", "` / `": "` separators (`","` / `": "`
+    /// with an indent), keys in the object's own order, `/` not escaped, non-ASCII kept unless `ensure_ascii`, floats
+    /// in Python's repr (`2.0`, `1e+16`).
+    ///
+    /// Before 2026-10-28 this filter wrote Foundation's compact JSON (`","` / `":"`, keys always sorted, `\/`,
+    /// `ensure_ascii` on by default), so every tool schema a template rendered with `tojson` differed from the vMLX
+    /// Python / HF prompt (MiniMax-M3.1's `<tools>` block: 12 bytes per tool).
     ///
     /// - Parameters:
-    ///   - indent: If greater than 0, enables pretty-printed output using
-    ///             Foundation's default indentation (optional).
-    ///   - ensure_ascii: If true (default), escape non-ASCII characters as `\uXXXX`.
-    ///                   If false, output Unicode characters directly.
-    ///   - separators: Accepts Python Jinja's compact JSON form `(',', ':')`.
+    ///   - indent: an int (spaces) or a string, as `json.dumps`.
+    ///   - ensure_ascii: escape non-ASCII characters as `\uXXXX` (default false, as transformers).
+    ///   - separators: an `(item, key)` pair of strings.
+    ///   - sort_keys: sort object keys (default false: the object's order).
     @Sendable public static func tojson(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -1083,53 +1091,121 @@ public enum Filters {
         let arguments = try resolveCallArguments(
             args: Array(args.dropFirst()),
             kwargs: kwargs,
-            parameters: ["indent", "ensure_ascii", "separators"],
-            defaults: ["indent": .null, "ensure_ascii": .boolean(true), "separators": .null]
+            parameters: ["ensure_ascii", "indent", "separators", "sort_keys"],
+            defaults: [
+                "ensure_ascii": .boolean(false), "indent": .null, "separators": .null, "sort_keys": .boolean(false),
+            ]
         )
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting.insert(.sortedKeys)
-        if let indent = arguments["indent"],
-            case .int(let count) = indent,
-            count > 0
-        {
-            encoder.outputFormatting.insert(.prettyPrinted)
+        var indent: String?
+        switch arguments["indent"] {
+        case .int(let n)?: indent = String(repeating: " ", count: Swift.max(0, n))
+        case .string(let s)?: indent = s
+        default: indent = nil
         }
-
-        let ensureASCII: Bool
-        if let ensureASCIIValue = arguments["ensure_ascii"] {
-            ensureASCII = ensureASCIIValue.isTruthy
-        } else {
-            ensureASCII = true
-        }
-
+        var itemSeparator = indent == nil ? ", " : ","
+        var keySeparator = ": "
         if let separators = arguments["separators"], separators != .null {
-            try validateCompactJSONSeparators(separators)
-        }
-
-        if let jsonData = (try? encoder.encode(value)),
-            let jsonString = String(data: jsonData, encoding: .utf8)
-        {
-            if ensureASCII {
-                return .string(escapeNonASCII(jsonString))
+            guard case let .array(items) = separators, items.count == 2,
+                case let .string(item) = items[0], case let .string(key) = items[1]
+            else {
+                throw JinjaError.runtime("tojson(separators:) expects a two-string tuple or array.")
             }
-            return .string(jsonString)
-        } else {
-            return .string("null")
+            itemSeparator = item
+            keySeparator = key
         }
+        var writer = PythonJSONWriter(
+            ensureASCII: arguments["ensure_ascii"]?.isTruthy ?? false, indent: indent,
+            itemSeparator: itemSeparator, keySeparator: keySeparator,
+            sortKeys: arguments["sort_keys"]?.isTruthy ?? false)
+        try writer.write(value, level: 0)
+        return .string(writer.output)
     }
 
-    private static func validateCompactJSONSeparators(_ value: Value) throws {
-        guard case let .array(items) = value,
-            items.count == 2,
-            case let .string(itemSeparator) = items[0],
-            case let .string(keySeparator) = items[1]
-        else {
-            throw JinjaError.runtime("tojson(separators:) expects a two-string tuple or array.")
+    /// `json.dumps` (CPython's encoder) over Jinja values.
+    struct PythonJSONWriter {
+        let ensureASCII: Bool
+        let indent: String?
+        let itemSeparator: String
+        let keySeparator: String
+        let sortKeys: Bool
+        var output = ""
+
+        mutating func newline(_ level: Int) {
+            guard let indent else { return }
+            output += "\n" + String(repeating: indent, count: level)
         }
-        guard itemSeparator == ",", keySeparator == ":" else {
-            throw JinjaError.runtime(
-                "tojson(separators:) currently supports only compact JSON separators (',', ':').")
+
+        mutating func write(_ value: Value, level: Int) throws {
+            switch value {
+            case .null, .undefined: output += "null"
+            case .boolean(let b): output += b ? "true" : "false"
+            case .int(let i): output += String(i)
+            case .double(let d): output += Self.pythonFloat(d)
+            case .string(let s): writeString(s)
+            case .array(let items):
+                if items.isEmpty {
+                    output += "[]"
+                    return
+                }
+                output += "["
+                for (i, item) in items.enumerated() {
+                    if i > 0 { output += itemSeparator }
+                    newline(level + 1)
+                    try write(item, level: level + 1)
+                }
+                newline(level)
+                output += "]"
+            case .object(let dict):
+                if dict.isEmpty {
+                    output += "{}"
+                    return
+                }
+                output += "{"
+                let keys = sortKeys ? dict.keys.sorted() : Array(dict.keys)
+                for (i, key) in keys.enumerated() {
+                    if i > 0 { output += itemSeparator }
+                    newline(level + 1)
+                    writeString(key)
+                    output += keySeparator
+                    try write(dict[key] ?? .null, level: level + 1)
+                }
+                newline(level)
+                output += "}"
+            case .function, .macro: output += "null"
+            // Anything else (a namespace) is not a JSON value: json.dumps raises, and so does the
+            // encoder this writer replaced.
+            default: throw JinjaError.runtime("\(value) cannot be JSON encoded")
+            }
+        }
+
+        mutating func writeString(_ s: String) {
+            output += "\""
+            for unit in s.unicodeScalars {
+                switch unit {
+                case "\"": output += "\\\""
+                case "\\": output += "\\\\"
+                case "\n": output += "\\n"
+                case "\r": output += "\\r"
+                case "\t": output += "\\t"
+                case "\u{08}": output += "\\b"
+                case "\u{0C}": output += "\\f"
+                default:
+                    if unit.value < 0x20 || (ensureASCII && unit.value > 0x7E) {
+                        for code in String(unit).utf16 { output += String(format: "\\u%04x", code) }
+                    } else {
+                        output.unicodeScalars.append(unit)
+                    }
+                }
+            }
+            output += "\""
+        }
+
+        /// CPython's `float.__repr__` as `json.dumps` writes it. Swift's `description` prints the same shortest
+        /// round-trip digits and switches to `1e+16` / `1e-05` at the same thresholds; only the specials differ.
+        static func pythonFloat(_ d: Double) -> String {
+            if d.isNaN { return "NaN" }
+            if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
+            return "\(d)"
         }
     }
 

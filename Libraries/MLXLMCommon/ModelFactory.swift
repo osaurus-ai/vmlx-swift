@@ -96,6 +96,7 @@ public struct ModelContext: @unchecked Sendable {
         self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
+        (model as? any AlignedPrefillTurnMarkerResolving)?.resolveAlignedPrefillTurnMarkers(tokenizer: tokenizer)
     }
 }
 
