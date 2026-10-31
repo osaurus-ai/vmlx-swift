@@ -2319,7 +2319,7 @@ public actor BatchEngine {
                             Self.logger.info(
                                 "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
                             )
-                        } else if detail == .disk {
+                        } else if detail.isDiskTierEntry {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,
@@ -2336,7 +2336,7 @@ public actor BatchEngine {
                             slot.cache, matchedTokens: matchedTokens,
                             restoredTokens: restoredTokenCount, detail: detail.rawValue)
                     {
-                        if detail == .disk {
+                        if detail.isDiskTierEntry {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,

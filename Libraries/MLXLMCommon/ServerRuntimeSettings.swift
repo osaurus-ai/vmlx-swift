@@ -1162,6 +1162,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             longPromptMultiplier: cache.longPromptMultiplier)
         // Serving: the end of a turn or tool call never waits for SSD writes (see DiskCache).
         config.diskWriteBehind = true
+        // Serving: the turn after a tool call or a reply restores its prefix from RAM.
+        config.residentEntryBytes = CacheCoordinatorConfig.automaticResidentEntryBytes
         return config
     }
 
