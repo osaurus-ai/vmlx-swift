@@ -9,8 +9,9 @@ import XCTest
 @testable import MLXLLM
 @testable import MLXLMCommon
 
-/// DeepSeek-V4.1 routed-expert prefill at the model's geometry (384 experts, top-6). Every case compares bits, not
-/// tolerances: the expert-aligned tiles and the sort glue must return exactly what they replace.
+/// DeepSeek-V4.1 prefill kernels at the model's geometry (384 experts, top-6; 64 heads x 512, one KV head, window 128,
+/// 512 picks). The routed-expert cases compare bits, not tolerances: the expert-aligned tiles and the sort glue must
+/// return exactly what they replace. The opt-in gathered attention core is checked against the fp32 reference.
 final class DeepseekV41PrefillKernelTests: XCTestCase {
     private func bits16(_ a: MLXArray) -> [UInt16] { a.view(dtype: .uint16).asArray(UInt16.self) }
 
@@ -19,6 +20,55 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
         if let value { setenv(name, value, 1) } else { unsetenv(name) }
         defer { if let old { setenv(name, old, 1) } else { unsetenv(name) } }
         return try body()
+    }
+
+    // MARK: attention
+
+    /// One heads16 case: q (1, 64, S, 512), window rows R, pool P, picks K per query (some -1, some past P, some
+    /// causally invisible), `offset` absolute position of the first query.
+    private func heads16Case(seed: UInt64, s: Int, r: Int, p: Int, k: Int, offset: Int, ratio: Int, dtype: DType)
+        -> (q: MLXArray, kv: MLXArray, pool: MLXArray, topk: MLXArray, sinks: MLXArray)
+    {
+        let key = MLXRandom.key(seed)
+        let ks = MLXRandom.split(key: key, into: 5)
+        let q = (MLXRandom.normal([1, 64, s, 512], key: ks[0]) * 0.6).asType(dtype)
+        let kv = (MLXRandom.normal([r, 512], key: ks[1]) * 0.6).asType(dtype)
+        let pool = (MLXRandom.normal([p, 512], key: ks[2]) * 0.6).asType(dtype)
+        // Picks in [-3, P + 3): negatives and past-the-end entries exercise the skip rule; others may be invisible.
+        let topk = MLXRandom.randInt(low: -3, high: Int32(p + 3), [s, k], key: ks[3]).asType(.int32)
+        let sinks = MLXRandom.normal([64], key: ks[4]).asType(.float32)
+        eval(q, kv, pool, topk, sinks)
+        return (q, kv, pool, topk, sinks)
+    }
+
+    /// The opt-in gathered core computes the heads-16 kernel's attention (not its bits): against the fp32 reference
+    /// of the stock dense-mask branch, both stay within rounding at the cold-prefill and mid-prompt shapes.
+    func testGatheredCoreMatchesReference() throws {
+        let scale = Float(pow(Double(512), -0.5))
+        for (i, (s, r, p, k, offset, ratio)) in [(64, 64, 40, 32, 0, 2), (37, 164, 300, 64, 900, 2),
+                                                 (20, 147, 400, 48, 380, 1)].enumerated() {
+            let c = heads16Case(seed: UInt64(77 + i), s: s, r: r, p: p, k: k, offset: offset, ratio: ratio,
+                                dtype: .bfloat16)
+            // The reference counts a duplicated pick once; use distinct picks (a permutation prefix per query).
+            let perm = argSort(MLXRandom.uniform(0 ..< 1, [s, p], key: MLXRandom.key(UInt64(5 + i))), axis: -1)
+            let topk = perm[0..., ..<k].asType(.int32)
+            let ref = DeepseekV4Math.heads16Reference(
+                q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks32: c.sinks,
+                offset: offset, window: 128, ratio: ratio, scale: scale).asType(.float32)
+            let h16 = DeepseekV4Math.heads16RunKernel(
+                q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks32: c.sinks,
+                offset: offset, window: 128, ratio: ratio, scale: scale).asType(.float32)
+            let got = try XCTUnwrap(DeepseekV4Math.gatheredPrefillAttention(
+                queries: c.q, localKV: c.kv.reshaped(1, 1, r, 512), pooled: c.pool.reshaped(1, p, 512),
+                topK: topk.reshaped(1, s, k), offset: offset, window: 128, ratio: ratio, scale: scale,
+                sinks: c.sinks)).asType(.float32)
+            let denom = MLX.abs(ref).max().item(Float.self)
+            let relG = MLX.abs(got - ref).max().item(Float.self) / denom
+            let relH = MLX.abs(h16 - ref).max().item(Float.self) / denom
+            XCTAssertLessThan(relG, 2e-2, "shape \(i): gathered rel \(relG)")
+            XCTAssertLessThan(relH, 2e-2, "shape \(i): heads16 rel \(relH)")
+            print("DSV41_GATHERED shape \(i) rel vs fp32 reference: gathered \(relG) heads16 \(relH)")
+        }
     }
 
     // MARK: routed experts
@@ -177,6 +227,36 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
             print(String(format: "DSV41_KERNEL_PERF %@ median %.2f ms (min %.2f max %.2f, n=%d)", name,
                          v[v.count / 2], v.first!, v.last!, rounds))
         }
+    }
+
+    func testAttentionCoreTiming() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["DSV41_PERF"] == "1")
+        // A 512-row prefill sub-chunk at ~16k context of a ratio-2 layer: window rows = 127 + 512, pool 8,192, 512 picks.
+        let s = 512, r = 639, p = 8_192, k = 512, offset = 16_000
+        let ks = MLXRandom.split(key: MLXRandom.key(7), into: 5)
+        let q = (MLXRandom.normal([1, 64, s, 512], key: ks[0]) * 0.6).asType(.bfloat16)
+        let kv = (MLXRandom.normal([1, 1, r, 512], key: ks[1]) * 0.6).asType(.bfloat16)
+        let pool = (MLXRandom.normal([1, p, 512], key: ks[2]) * 0.6).asType(.bfloat16)
+        // Distinct visible picks per query (a random permutation prefix), as the indexer's top-k gives.
+        let topk = argSort(MLXRandom.uniform(0 ..< 1, [s, p], key: ks[3]), axis: -1)[0..., ..<k].asType(.int32)
+            .reshaped(1, s, k)
+        let sinks = MLXRandom.normal([64], key: ks[4])
+        eval(q, kv, pool, topk, sinks)
+        let scale = Float(pow(Double(512), -0.5))
+        func h16() -> MLXArray {
+            DeepseekV4Math.heads16RunKernel(
+                q: q, kv2d: kv.reshaped(r, 512), pool2d: pool.reshaped(p, 512), topk2d: topk.reshaped(s, k),
+                sinks32: sinks, offset: offset, window: 128, ratio: 2, scale: scale)
+        }
+        let gathered = {
+            DeepseekV4Math.gatheredPrefillAttention(
+                queries: q, localKV: kv, pooled: pool, topK: topk, offset: offset, window: 128, ratio: 2,
+                scale: scale, sinks: sinks)!
+        }
+        let a = h16().asType(.float32), b = gathered().asType(.float32)
+        let rel = (MLX.abs(a - b).max() / MLX.abs(a).max()).item(Float.self)
+        print(String(format: "DSV41_KERNEL_PERF gathered vs heads16 max rel diff %.3e", rel))
+        interleaved([("heads16 kernel", h16), ("gathered core", gathered)])
     }
 
     func testRoutedPrefillTimingAtDSV41Shapes() throws {
