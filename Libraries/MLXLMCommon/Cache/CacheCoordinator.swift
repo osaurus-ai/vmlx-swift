@@ -2216,6 +2216,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     public func releaseVolatile() {
         pagedCache?.clear()
         ssmStateCache.clear()
+        // The disk tier's resident payloads are RAM copies of files that stay on the SSD.
+        diskCache?.releaseResidentEntries()
     }
 
     /// Wait for disk stores still being written in the background (``DiskCache`` write-behind) to

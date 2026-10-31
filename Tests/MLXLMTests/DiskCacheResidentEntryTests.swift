@@ -167,6 +167,26 @@ struct DiskCacheResidentEntryTests {
         }
     }
 
+    @Test func releaseVolatileDropsResidentEntriesAndKeepsTheFile() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("volatile")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let warm = Self.coordinator(root: root, residentBytes: 1 << 20)
+            let prompt = Self.chain(229)
+            warm.storePersistentBoundary(
+                tokens: Array(prompt.prefix(141)), diskArrays: Self.payload(23), ssmStates: nil)
+            #expect(Self.hit(warm.fetch(tokens: prompt))?.detail == .memory)
+            // Memory-pressure recovery: the RAM copy goes, the SSD entry still restores.
+            warm.releaseVolatile()
+            #expect(warm.diskCache?.residentStats.entries == 0)
+            #expect(warm.diskCache?.residentStats.bytes == 0)
+            let afterRelease = try #require(Self.hit(warm.fetch(tokens: prompt)))
+            #expect(afterRelease.matched == 141 && afterRelease.detail == .disk)
+            // The read keeps it resident again for the next turn.
+            #expect(Self.hit(warm.fetch(tokens: prompt))?.detail == .memory)
+        }
+    }
+
     @Test func pagedTierKeepsResidentEntriesOffUntilTheModelIsPagedIncompatible() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("paged")
