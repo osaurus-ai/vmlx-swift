@@ -215,6 +215,8 @@ func runCacheReuseLoopBench(modelPath: String) async throws {
             "open_after_last_s": last.map { end.timeIntervalSince($0) } ?? -1, "wall_s": end.timeIntervalSince(start),
             "gen": genTokens, "decode_tps": tps, "required": request.required,
             "boundaries": input.cachePrefixTokenCounts, "stable": input.cacheStablePrefixTokenCounts,
+            "resident_entries": coordinator?.diskCache?.residentStats.entries ?? -1,
+            "resident_gib": Double(coordinator?.diskCache?.residentStats.bytes ?? 0) / 1_073_741_824,
             "disk_hits": (stats1?.diskStats?.hits ?? 0) - (stats0?.diskStats?.hits ?? 0),
             "disk_stores": (stats1?.diskStats?.stores ?? 0) - (stats0?.diskStats?.stores ?? 0),
             "mlx_active_gib": Double(Memory.activeMemory) / 1_073_741_824,
