@@ -141,10 +141,14 @@ func runDSV41SplitExactBench(modelPath: String) async throws {
         MLX.Memory.clearCache()
         // split: the head as its own prompt, a copy at b, then the rest.
         let splitCache = model.newCache(parameters: nil)
+        let t0 = CFAbsoluteTimeGetCurrent()
         _ = try segment(ids[0 ..< c.b], splitCache)
+        let headSeconds = CFAbsoluteTimeGetCurrent() - t0
         let atBoundary = splitCache.map { $0.copy() }
         MLX.eval(atBoundary)
+        let t1 = CFAbsoluteTimeGetCurrent()
         let splitFirst = try finish(c.n, from: c.b, splitCache)
+        let tailSeconds = CFAbsoluteTimeGetCurrent() - t1
         let split = fingerprint(splitFirst, splitCache)
 
         // memory: store the copy, fetch the n-token prompt back from the same coordinator.
@@ -182,7 +186,9 @@ func runDSV41SplitExactBench(modelPath: String) async throws {
 
         // unsplit: no cut at b.
         let unsplitCache = model.newCache(parameters: nil)
+        let t2 = CFAbsoluteTimeGetCurrent()
         let unsplitFirst = try finish(c.n, from: 0, unsplitCache)
+        let unsplitSeconds = CFAbsoluteTimeGetCurrent() - t2
         let unsplit = fingerprint(unsplitFirst, unsplitCache)
 
         func same(_ a: [String: Any], _ b: [String: Any]) -> Bool {
@@ -195,6 +201,7 @@ func runDSV41SplitExactBench(modelPath: String) async throws {
         allPass = allPass && memoryPass && diskPass
         emit("SX_CASE", [
             "n": c.n, "b": c.b, "memory_tier": memory.tier, "disk_tier": disk.tier,
+            "split_head_s": headSeconds, "split_tail_s": tailSeconds, "unsplit_s": unsplitSeconds,
             "memory_matched": memory.matched, "disk_matched": disk.matched,
             "memory_equals_split": memoryPass, "disk_equals_split": diskPass,
             "unsplit_top1_equals_split": (unsplit["top1"] as? Int) == (split["top1"] as? Int),
