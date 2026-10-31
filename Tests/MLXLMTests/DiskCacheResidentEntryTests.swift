@@ -200,10 +200,22 @@ struct DiskCacheResidentEntryTests {
         }
     }
 
-    @Test func servingConfigurationKeepsResidentEntries() {
-        let config = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
-            modelKey: "resident-serving", diskCacheDirectory: Self.makeRoot("serving"))
-        #expect(config.residentEntryBytes == CacheCoordinatorConfig.automaticResidentEntryBytes)
+    @Test func servingConfigurationCachesOnTheSSDOnlyUnlessAskedForRAM() {
+        let saved = ProcessInfo.processInfo.environment["VMLX_RESIDENT_CACHE_GB"]
+        defer {
+            if let saved { setenv("VMLX_RESIDENT_CACHE_GB", saved, 1) } else { unsetenv("VMLX_RESIDENT_CACHE_GB") }
+        }
+        func servingBytes() -> Int {
+            VMLXServerRuntimeSettings().cacheCoordinatorConfig(
+                modelKey: "resident-serving", diskCacheDirectory: Self.makeRoot("serving")
+            ).residentEntryBytes
+        }
+        unsetenv("VMLX_RESIDENT_CACHE_GB")
+        #expect(servingBytes() == 0)
+        setenv("VMLX_RESIDENT_CACHE_GB", "1.5", 1)
+        #expect(servingBytes() == 1_610_612_736)
+        setenv("VMLX_RESIDENT_CACHE_GB", "0", 1)
+        #expect(servingBytes() == 0)
         #expect(CacheCoordinatorConfig().residentEntryBytes == 0)
     }
 }
