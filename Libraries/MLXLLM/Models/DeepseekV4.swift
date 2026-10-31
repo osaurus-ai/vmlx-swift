@@ -553,7 +553,18 @@ class DeepseekV4Attention: Module {
                         // 4-bit pool takes the split-by-keys kernels first
                         // (`VMLX_DSV41_ATTN_SPLIT`, default on; with no indexer selection yet, every
                         // visible pool row); nil keeps the path below.
-                        if isV41,
+                        if isV41, L > DSV41IndexedAttentionNAX.minRows, DSV41IndexedAttentionNAX.enabled,
+                            let tk = topK, config.useAttnSink, let slab = pooledView.nibbleSlab,
+                            let nax = DSV41IndexedAttentionNAX.attendSlab(
+                                q: q, kv2d: fullKV.reshaped(fullKV.dim(2), headDim), codes: slab.codes,
+                                scales: slab.scales, biases: slab.biases, groupSize: slab.groupSize,
+                                poolRows: W, topk2d: tk.reshaped(tk.dim(1), tk.dim(2)), sinks: attnSink,
+                                offset: offset, window: config.slidingWindow, ratio: compressRatio, scale: scale)
+                        {
+                            // Opt-in (VMLX_DSV41_ATTN_NAX=1), prompt chunks over the 4-bit slab (long context):
+                            // the indexed NAX kernel dequantizes the picked rows in place.
+                            tiledPoolOut = nax
+                        } else if isV41,
                             let split = DeepseekV41SplitAttention.attend(
                                 queries: q, localKV: fullKV, pooled: pooledView, topK: topK,
                                 offset: offset, window: config.slidingWindow, ratio: compressRatio,
@@ -604,7 +615,21 @@ class DeepseekV4Attention: Module {
                             // `dsv4_heads16_prefill_attention`). Otherwise
                             // flat pool, mask carries visibility.
                             var heads16Out: MLXArray? = nil
-                            if let tk = topK {
+                            if isV41, let tk = topK, config.useAttnSink, L > DSV41IndexedAttentionNAX.minRows,
+                                DSV41IndexedAttentionNAX.enabled
+                            {
+                                // Opt-in (VMLX_DSV41_ATTN_NAX=1): the same attention on the matrix units, keys
+                                // read in place by index; not bit-identical to the heads-16 kernel. Prompt
+                                // chunks only: a dSpark verify (<= 8 rows) keeps the heads-16 kernel.
+                                let rows = fullKV.dim(2)
+                                heads16Out = DSV41IndexedAttentionNAX.attend(
+                                    q: q, kv2d: fullKV.reshaped(rows, headDim),
+                                    pool2d: pooled.reshaped(pooled.dim(1), headDim),
+                                    topk2d: tk.reshaped(tk.dim(1), tk.dim(2)), sinks: attnSink,
+                                    offset: offset, window: config.slidingWindow, ratio: compressRatio,
+                                    scale: scale)
+                            }
+                            if heads16Out == nil, let tk = topK {
                                 heads16Out =
                                     DeepseekV4Math.heads16PrefillAttention(
                                         queries: q,

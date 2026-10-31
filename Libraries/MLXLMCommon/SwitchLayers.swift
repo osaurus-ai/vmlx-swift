@@ -206,16 +206,42 @@ private enum Qwen4ExpCompiledRoutedSwitchGLU {
 }
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    let sorted = gatherSortWithOrder(x: x, indices: indices)
+    return (sorted.x, sorted.indices, sorted.inverseOrder)
+}
+
+/// `gatherSort` that also returns the sort `order` (so a caller can align per-route values, e.g. routing scores, with
+/// the same permutation instead of sorting again).
+public func gatherSortWithOrder(x: MLXArray, indices: MLXArray)
+    -> (x: MLXArray, indices: MLXArray, inverseOrder: MLXArray, order: MLXArray)
+{
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
     let inverseOrder = argSort(order)
 
     return (
-        x.flattened(start: 0, end: -3)[order.floorDivide(m)],
+        x.flattened(start: 0, end: -3)[sortedRouteTokens(order, routes: m)],
         indices[order],
-        inverseOrder
+        inverseOrder,
+        order
     )
+}
+
+/// The token of each sorted (token, slot) route: `order / routes` for argSort's non-negative positions, without MLX's
+/// integer `floorDivide`, a composed op whose parts land on the C++ thread-local default stream rather than the
+/// caller's (each call split the command stream, once per MoE layer per prefill chunk). A right shift when `routes`
+/// is a power of two; otherwise a gather from the (token, slot) -> token table. Both are exact, so the result equals
+/// `order.floorDivide(routes)` element for element, in `order`'s dtype.
+public func sortedRouteTokens(_ order: MLXArray, routes: Int) -> MLXArray {
+    precondition(routes > 0, "sortedRouteTokens: routes must be positive")
+    if routes & (routes - 1) == 0 {
+        return rightShift(order, MLXArray(UInt32(routes.trailingZeroBitCount)).asType(order.dtype))
+    }
+    let tokens = order.size / routes
+    precondition(tokens * routes == order.size, "sortedRouteTokens: order is not tokens x routes")
+    let table = broadcast(MLXArray(0 ..< Int32(tokens)).reshaped(tokens, 1), to: [tokens, routes]).flattened()
+    return take(table, order).asType(order.dtype)
 }
 
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
@@ -585,11 +611,12 @@ public class SwitchGLU: Module, SwitchGLULayer {
         var alignedScores = preDownScores
 
         if doSort {
+            let sorted = gatherSortWithOrder(x: x, indices: indices)
+            (x, idx, inverseOrder) = (sorted.x, sorted.indices, sorted.inverseOrder)
+            // The scores take the routes' own sort order (the same argSort of the same ids: one sort, not two).
             if let scores = alignedScores {
-                let scoreOrder = argSort(indices.flattened())
-                alignedScores = scores.flattened()[scoreOrder]
+                alignedScores = scores.flattened()[sorted.order]
             }
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
         func activate(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {

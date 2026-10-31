@@ -321,15 +321,10 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         }
     }
 
-    /// The token of each sorted (token, slot) pair: `order / routes` for argSort's non-negative positions. A right
-    /// shift when `routes` is a power of two (top-4 / top-8): exact, and one kernel. MLX's integer `floorDivide` is a
-    /// composed op whose parts land on the C++ thread-local default stream, not Swift's: every call split the command
-    /// stream (4 command buffers, ~0.3 ms of sync; 01-LOG 10-28 "Integer floorDivide"), once per layer per chunk here.
+    /// The token of each sorted (token, slot) pair (`sortedRouteTokens`: no integer floorDivide, which split the
+    /// command stream once per layer per chunk here; DeepSeek-V4.1's top-6 takes the gather table).
     static func sourceRows(_ order: MLXArray, routes: Int) -> MLXArray {
-        if routes > 0 && routes & (routes - 1) == 0 {
-            return rightShift(order, MLXArray(UInt32(routes.trailingZeroBitCount)).asType(order.dtype))
-        }
-        return order.floorDivide(routes)
+        sortedRouteTokens(order, routes: routes)
     }
 
     /// Expert-sorted prefill (vMLX Python `JTMixedSwitchGLU._prefill`): rows sorted by expert, NAX tiles per group,
