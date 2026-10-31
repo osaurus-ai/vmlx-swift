@@ -70,11 +70,11 @@ func runCacheReuseLoopBench(modelPath: String) async throws {
         guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]) else { return }
         let line = String(decoding: data, as: UTF8.self)
         print("\(tag) \(line)")
-        if let handle = try? FileHandle(forWritingTo: out.appendingPathComponent("\(arm).jsonl"))
-            ?? { FileManager.default.createFile(atPath: out.appendingPathComponent("\(arm).jsonl").path,
-                    contents: nil)
-                return try? FileHandle(forWritingTo: out.appendingPathComponent("\(arm).jsonl")) }()
-        {
+        let file = out.appendingPathComponent("\(arm).jsonl")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            FileManager.default.createFile(atPath: file.path, contents: nil)
+        }
+        if let handle = try? FileHandle(forWritingTo: file) {
             handle.seekToEndOfFile()
             handle.write(Data((tag + " " + line + "\n").utf8))
             try? handle.close()
