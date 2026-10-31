@@ -287,6 +287,81 @@ final class JANGTKernelTests: XCTestCase {
         XCTAssertLessThan(e3, 1e-3)  // fp32 gather_mm runs in TF32 under MLX defaults (as in the reference)
     }
 
+    /// The expert-aligned schedule (`JANGTPrefillKernel.expertTilePlan`) returns the row-tiled schedule's output BIT
+    /// FOR BIT: every variant (single, fused SwiGLU clamped, fused + outlier epilogue, H32 output rotation), K 1.5 / 2 /
+    /// 2.5 / 3, ragged segments (empty experts, segments of 1, of exactly 64, of more than two tiles, row counts that
+    /// are not multiples of 64), a call of < 8 rows, and rows whose id is not a valid expert (NaN in both). Control: a
+    /// deliberately wrong plan (a segment shifted by one row) changes the output.
+    func testExpertAlignedTilesEqualRowTiledBitForBit() throws {
+        try XCTSkipUnless(JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
+        func bits(_ a: MLXArray) -> [UInt16] { a.asType(.bfloat16).view(dtype: .uint16).asArray(UInt16.self) }
+        let layouts: [[Int]] = [
+            [7, 40, 0, 49],                // the runPrefill split (96 rows)
+            [64, 1, 0, 0, 130, 64, 3, 65], // exact tile, singletons, empty experts, > 2 tiles (327 rows)
+            [0, 5, 0, 0],                  // 5 rows: < 8 (padded ids) and one tile
+            [200, 0, 17, 39, 0, 1, 0, 2],  // 259 rows
+        ]
+        var controls = 0
+        for (li, counts) in layouts.enumerated() {
+            for k in [1.5, 2, 2.5, 3] {
+                var rng = Rng(state: UInt64(k * 1000) + UInt64(li) * 7919 + 5)
+                let experts = counts.count, n = 128, kin = 512
+                let cols = (0 ..< experts).map { _ in [Int32(3), Int32(400)] }
+                let gate = try projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols,
+                                          columnScales: false).mlx()
+                let up = try projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols,
+                                        columnScales: false).mlx()
+                var ids: [UInt32] = []
+                for (e, c) in counts.enumerated() { ids += Array(repeating: UInt32(e), count: c) }
+                let rows = ids.count
+                let x = MLXArray((0 ..< rows * kin).map { _ in rng.normal() }, [rows, kin]).asType(.bfloat16)
+                let xo = MLXArray((0 ..< rows * 2).map { _ in rng.normal() }, [rows, 2])
+                let idx = MLXArray(ids)
+                let plan = JANGTPrefillKernel.expertTilePlan(sortedIndices: idx, experts: experts)
+                let cases: [(String, (JANGTPrefillKernel.ExpertTilePlan?) -> MLXArray)] = [
+                    ("single", { JANGTPrefillKernel.project(x, gate, indices: idx, plan: $0) }),
+                    ("fused", { JANGTPrefillKernel.project(x, gate, up: up, indices: idx, limit: 0.3, plan: $0) }),
+                    ("fused_h32", { JANGTPrefillKernel.project(x, gate, up: up, indices: idx, rotateOutput: true,
+                                                               plan: $0) }),
+                    ("fused_outliers", { JANGTPrefillKernel.projectGateUpWithOutliers(
+                        x, outlierRows: xo, gate: gate, up: up, columns: 2, indices: idx, limit: 0.3, plan: $0) }),
+                ]
+                for (name, f) in cases {
+                    let a = bits(f(nil)), b = bits(f(plan))
+                    XCTAssertEqual(a, b, "layout \(li) K=\(k) \(name): expert tiles != row tiles")
+                }
+                if li == 1 && k == 2 {
+                    // Control: a plan whose second segment starts one row late misses that row (and computes the next
+                    // expert's first row with the wrong weights): the comparison above can fail.
+                    var s = plan.starts.asArray(Int32.self)  // 8 experts: 10 entries, no padding
+                    s[1] += 1
+                    let bad = JANGTPrefillKernel.ExpertTilePlan(
+                        starts: MLXArray(s), tiles: plan.tiles, segments: plan.segments, rows: plan.rows)
+                    let a = bits(JANGTPrefillKernel.project(x, gate, indices: idx))
+                    let b = bits(JANGTPrefillKernel.project(x, gate, indices: idx, plan: bad))
+                    XCTAssertNotEqual(a, b, "control: a wrong plan must change the output")
+                    controls += 1
+                }
+            }
+        }
+        XCTAssertEqual(controls, 1)
+        // Rows whose id is not a valid expert: NaN rows on both schedules (the last plan segment), others equal.
+        var rng = Rng(state: 99)
+        let gate = try projection(&rng, k: 2, experts: 3, outputs: 64, inputs: 512, columns: [[3], [4], [5]],
+                                  columnScales: false).mlx()
+        let ids: [UInt32] = Array(repeating: 0, count: 10) + Array(repeating: 2, count: 70) + [7, 9, 9]
+        let x = MLXArray((0 ..< ids.count * 512).map { _ in rng.normal() }, [ids.count, 512]).asType(.bfloat16)
+        let idx = MLXArray(ids)
+        let plan = JANGTPrefillKernel.expertTilePlan(sortedIndices: idx, experts: 3)
+        let a = JANGTPrefillKernel.project(x, gate, indices: idx).asType(.float32)
+        let b = JANGTPrefillKernel.project(x, gate, indices: idx, plan: plan).asType(.float32)
+        XCTAssertEqual(isNaN(a[80...]).all().item(Bool.self), true, "row tiles: invalid ids -> NaN")
+        XCTAssertEqual(isNaN(b[80...]).all().item(Bool.self), true, "expert tiles: invalid ids -> NaN")
+        XCTAssertEqual(bits(a[..<80]), bits(b[..<80]))
+        XCTAssertEqual(plan.starts.asArray(Int32.self), [0, 10, 10, 80, 83, 83, 83, 83])  // padded to 8 (device ptr)
+        XCTAssertEqual(plan.tiles.asArray(Int32.self), [0, 1, 1, 3, 4, 4, 4, 4])
+    }
+
     func testPrefillTilesMatchCPUReferenceK2() throws { try runPrefill(k: 2) }
     func testPrefillTilesMatchCPUReferenceK25() throws { try runPrefill(k: 2.5) }
     func testPrefillTilesMatchCPUReferenceK3() throws { try runPrefill(k: 3) }
