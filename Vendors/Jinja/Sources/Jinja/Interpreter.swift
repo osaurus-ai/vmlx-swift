@@ -587,7 +587,12 @@ public enum Interpreter {
                 guard case let .string(key) = propertyValue else {
                     throw JinjaError.runtime("Computed property key must be a string")
                 }
-                if case var .object(dict) = objectValue {
+                if case .namespace(var dict) = objectValue {
+                    dict[key] = value
+                    if case .identifier(let name) = objectExpr {
+                        env.setInChain(name: name, value: .namespace(dict))
+                    }
+                } else if case var .object(dict) = objectValue {
                     dict[key] = value
                     // Update the object in the environment
                     if case let .identifier(name) = objectExpr {
@@ -598,7 +603,12 @@ public enum Interpreter {
                 guard case let .identifier(propertyName) = propertyExpr else {
                     throw JinjaError.runtime("Property assignment requires identifier")
                 }
-                if case var .object(dict) = objectValue {
+                if case .namespace(var dict) = objectValue {
+                    dict[propertyName] = value
+                    if case .identifier(let name) = objectExpr {
+                        env.setInChain(name: name, value: .namespace(dict))
+                    }
+                } else if case var .object(dict) = objectValue {
                     dict[propertyName] = value
                     // Update the object in the environment
                     if case let .identifier(name) = objectExpr {
@@ -744,7 +754,7 @@ public enum Interpreter {
             }
             return arr[safeIndex]
 
-        case let (.object(obj), .string(key)):
+        case (.object(let obj), .string(let key)), (.namespace(let obj), .string(let key)):
             return obj[key] ?? .undefined
 
         case let (.string(str), .int(index)):

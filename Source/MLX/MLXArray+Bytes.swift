@@ -31,6 +31,13 @@ extension MLXArray {
     /// Return the physical size of the backing (assuming it is evaluated) in elements.  This should
     /// only be used when accessing the backing directly, e.g. via `mlx_array_data_uint8()`
     var physicalSize: Int {
+        // an empty array (e.g. an empty slice like `a[128...]`) has no backing
+        // data pointer, so there is nothing to read even if some strides are
+        // non-zero
+        if self.size == 0 {
+            return 0
+        }
+
         // nbytes is the logical size of the input, not the physical size
         return zip(self.shape, self.internalStrides)
             .map { Swift.abs($0.0 * $0.1) }
@@ -43,7 +50,11 @@ extension MLXArray {
         let shape = self.shape
         let strides = self.internalStrides
 
-        if contiguousDimension == 0 {
+        if output.isEmpty {
+            // an empty array has nothing to copy (and no backing pointer)
+            return
+
+        } else if contiguousDimension == 0 {
             // entire backing is contiguous
             from.copyBytes(to: output)
 
@@ -121,12 +132,28 @@ extension MLXArray {
     /// - ``asData(noCopy:disambiguate:)``
     /// - ``asMTLBuffer(device:noCopy:)``
     public func asArray<T: HasDType>(_ type: T.Type) -> [T] {
+        // Resolve the default stream before taking the lock: a process's first
+        // resolution runs the initializer of `Stream.gpu` (or `.cpu`), which
+        // takes `evalLock` itself, so resolving it under the lock could
+        // deadlock against a thread inside that initializer. The converted
+        // array's `asArray` resolves it again under the lock, but by then the
+        // initializer has run.
+        let stream = StreamOrDevice.default
+        // `_updateInternal` replaces the C++ array behind `ctx` in place under
+        // `evalLock`, which frees the old array's description and buffer. Read
+        // nothing of `self` before taking the lock, not even its dtype, and
+        // make the `asType` conversion under it too: an unlocked dtype check
+        // here read a freed description (EXC_BAD_ACCESS in
+        // `mlx::core::array::dtype()`). The lock is recursive, so the
+        // converted array's own `asArray` takes it again safely.
+        evalLock.lock()
+        defer { evalLock.unlock() }
         guard isValid else {
             reportInvalidArrayUse("MLXArray.asArray")
             return []
         }
         if type.dtype != self.dtype {
-            return self.asType(type).asArray(type)
+            return self.asType(type, stream: stream).asArray(type)
         }
 
         // Keep the shared-stream lock through the host copy, not only through
@@ -155,7 +182,12 @@ extension MLXArray {
     /// - Throws: ``MLXError/caught(_:)`` carrying the MLX error message.
     public func asArrayChecked<T: HasDType>(_ type: T.Type) throws -> [T] {
         try withError { error in
-            let source = type.dtype == self.dtype ? self : self.asType(type)
+            // The dtype check and the conversion read `self`: hold `evalLock`
+            // from here, as `asArray` does, and resolve the stream before it.
+            let stream = StreamOrDevice.default
+            evalLock.lock()
+            defer { evalLock.unlock() }
+            let source = type.dtype == self.dtype ? self : self.asType(type, stream: stream)
             try error.check()
             return try source.withEvaluatedHostAccess { realized in
                 // Keep the diagnostic scoped to this read, including conversion.
@@ -229,7 +261,8 @@ extension MLXArray {
 
     /// Evaluate under the stream driver lock and report whether the array has
     /// a realized backing. Callers that read through the mlx-c item/data
-    /// accessors outside the lock use this to skip the read on failure.
+    /// accessors use this to skip the read on failure; they hold `evalLock`
+    /// themselves across the read that follows (it is recursive).
     func realizedForHostRead() -> Bool {
         evalLock.withLock { realizeForHostRead() }
     }
@@ -282,10 +315,8 @@ extension MLXArray {
 
     /// return a copy of the backing in contiguous layout
     internal func asDataCopy() -> MLXArrayData {
-        // An array with no elements has no backing buffer. `physicalSize` is
-        // derived from the strides and stays non-zero for a shape like
-        // [1, 0, 3, 448], so the null base would pair with a non-zero count —
-        // which `UnsafeRawBufferPointer` traps on.
+        // An array with no elements has no backing buffer, so the base is
+        // null: there is nothing to copy.
         guard let base = mlx_array_data_uint8(self.ctx) else {
             return MLXArrayData(
                 data: Data(),
@@ -324,6 +355,11 @@ extension MLXArray {
     /// - ``asArray(_:)``
     /// - ``asMTLBuffer(device:noCopy:)``
     public func asData(access: AccessMethod = .copy) -> MLXArrayData {
+        // Hold `evalLock` through the copy, not only through the realization,
+        // as `asArray` does: an in-place update would otherwise free the
+        // buffer while it is being read.
+        evalLock.lock()
+        defer { evalLock.unlock() }
         // Same realization gate as `asArray`: a failed eval leaves no
         // `array::Data`, and every branch below reads `mlx_array_data_uint8`.
         guard realizedForHostRead() else {

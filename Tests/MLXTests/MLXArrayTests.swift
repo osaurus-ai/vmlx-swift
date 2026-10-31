@@ -37,6 +37,46 @@ class MLXArrayTests: XCTestCase {
         XCTAssertEqual(b, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     }
 
+    func testAsArrayEmpty() {
+        // an empty slice has size 0 and no backing pointer; it should return
+        // an empty array rather than crashing (see issue #480)
+        let a = MLXArray.ones([1, 200])
+        let b = a[128...]
+        XCTAssertEqual(b.shape, [0, 200])
+        XCTAssertEqual(b.size, 0)
+        XCTAssertEqual(b.asArray(Int.self), [])
+        XCTAssertEqual(b.asArray(Float.self), [])
+
+        // a directly-constructed empty array behaves the same
+        let empty = MLXArray([Int32](), [0])
+        XCTAssertEqual(empty.asArray(Int32.self), [])
+
+        // a non-contiguous empty array goes through the strided copy path
+        let t = b.T
+        XCTAssertEqual(t.shape, [200, 0])
+        XCTAssertEqual(t.asArray(Float.self), [])
+    }
+
+    func testAsDataEmpty() {
+        // asData shares physicalSize with asArray, so it also returns empty
+        // data for an empty array (see issue #480)
+        let b = MLXArray.ones([1, 200])[128...]
+        for access in [MLXArray.AccessMethod.copy, .noCopyIfContiguous, .noCopy] {
+            let data = b.asData(access: access)
+            XCTAssertEqual(data.data.count, 0)
+            XCTAssertEqual(data.shape, [0, 200])
+        }
+        XCTAssertEqual(b.T.asData(access: .copy).data.count, 0)
+    }
+
+    func testAsArrayScalar() {
+        // a scalar (0-dimensional) array yields a single-element array
+        let a = MLXArray(7)
+        XCTAssertEqual(a.shape, [])
+        XCTAssertEqual(a.size, 1)
+        XCTAssertEqual(a.asArray(Int32.self), [7])
+    }
+
     func testAsArrayNonContiguous1() {
         // skipping elements via slicing
         let a = MLXArray(0 ..< 9, [3, 3])
@@ -168,6 +208,55 @@ class MLXArrayTests: XCTestCase {
             XCTAssertEqual(result.strides, [2, 1])
             XCTAssertEqual(result.dType, .int32)
         }
+    }
+
+    /// The unevaluated outputs of a multi-output primitive (`quantized`'s `Quantize`) hold
+    /// each other as siblings, and through the primitive its input `w`. Measures how much
+    /// of `w`'s buffer is still active once every handle is gone, after `retire` has run on
+    /// the three outputs.
+    private func activeBytesLeftBySiblings(
+        file: StaticString = #filePath, line: UInt = #line,
+        retire: (MLXArray, MLXArray, MLXArray?) -> Void
+    ) -> Int {
+        let bytes = 1024 * 1024 * MemoryLayout<Float>.size
+        // Earlier tests in the same process may still have GPU work in flight, whose
+        // buffers would be freed while this one measures.
+        Stream.gpu.synchronize()
+        let before = Memory.activeMemory
+        do {
+            let outputs: (MLXArray, MLXArray, MLXArray?)
+            do {
+                let w = MLXArray([Float](repeating: 1, count: 1024 * 1024), [1024, 1024])
+                // premise: the input's buffer is counted as active
+                XCTAssertGreaterThanOrEqual(
+                    Memory.activeMemory - before, bytes / 2, file: file, line: line)
+                outputs = quantized(w, groupSize: 64, bits: 4)
+            }
+            // `w`'s handle is gone, but the outputs' graph still holds its buffer; without
+            // this the measurement below could not fail
+            XCTAssertGreaterThanOrEqual(
+                Memory.activeMemory - before, bytes, file: file, line: line)
+            retire(outputs.0, outputs.1, outputs.2)
+        }
+        return Memory.activeMemory - before
+    }
+
+    func testDroppedSiblingOutputsFreeTheirGraph() {
+        // control: the outputs are dropped, so `~array` breaks the sibling cycle
+        let left = activeBytesLeftBySiblings { _, _, _ in }
+        XCTAssertLessThan(left, 1024 * 1024)
+    }
+
+    func testUpdateInternalOnSiblingOutputsFreesTheirGraph() {
+        // `Module.update(parameters:)` replaces each output of a freshly built
+        // `QuantizedLinear` like this; the last replacement must break the cycle
+        let left = activeBytesLeftBySiblings { wq, scales, biases in
+            let replacement = MLXArray(Float(0))
+            wq._updateInternal(replacement)
+            scales._updateInternal(replacement)
+            biases?._updateInternal(replacement)
+        }
+        XCTAssertLessThan(left, 1024 * 1024)
     }
 
 }

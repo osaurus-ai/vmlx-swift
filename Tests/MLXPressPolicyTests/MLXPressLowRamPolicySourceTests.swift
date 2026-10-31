@@ -50,13 +50,24 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(!factory.contains("JangPressPrestacker.prepareBundleIfNeeded"))
         #expect(!streamingExperts.contains("loadMachBackedTensor"))
         #expect(!streamingExperts.contains("MLXPRESS_STREAMING_MACH"))
-        #expect(factory.contains("SafetensorsStorageHealer.healBundleIfEligible"))
+        // Mapped weight loading is retired (1747b2bd, "Replace production mapped
+        // weight loading with owned packed allocations"): `loadModel` in
+        // ModelFactory.swift no longer heals bundles for mmap.
+        #expect(!factory.contains("SafetensorsStorageHealer.healBundleIfEligible"))
+        #expect(
+            factory.contains(
+                "Load original packed bytes into owned allocations; alignment repair and"))
         #expect(!factory.contains("context.configuration.id = .directory(directory)"))
         #expect(!factory.contains("MLXPRESS_PRESTACK=1 / JANGPRESS_PRESTACK=1"))
-        #expect(factory.contains("withMmapSafetensorsEnv"))
+        // The same commit removed `withMmapSafetensorsEnv`, which set the
+        // `MLX_SAFETENSORS_MMAP*` environment around the factory load. Load.swift
+        // now reads packed bytes into owned buffers.
+        #expect(!factory.contains("withMmapSafetensorsEnv"))
+        #expect(factory.contains("Owned tensor storage is the single model-loading path."))
         #expect(!factory.contains("adviseCanonicalMmapRoutedExpertsIfAvailable"))
-        #expect(factory.contains("MLX_SAFETENSORS_MMAP"))
-        #expect(factory.contains("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"))
+        #expect(!factory.contains("MLX_SAFETENSORS_MMAP"))
+        #expect(!factory.contains("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"))
+        #expect(load.contains("weight_storage=owned resident_reader=direct"))
         #expect(!factory.contains("MLXPRESS_MMAP_TENSOR_BUFFERS"))
         #expect(streamingExperts.contains("cachedDarwinFileDescriptor(for url: URL, useNoCache: Bool)"))
         #expect(streamingExperts.contains(#"let cacheKey = "\(useNoCache ? "nocache" : "cache"):\(key)""#))
@@ -177,7 +188,13 @@ struct MLXPressLowRamPolicySourceTests {
             streamingExperts.contains(
                 "let expertOffset = ref.offset + UInt64(expertIdx * expertByteCount)"))
         #expect(streamingExperts.contains("isStreamableRoutedTensorKey"))
-        #expect(streamingExperts.contains("JANGPRESS_STREAMING_EXPERTS"))
+        // Streaming experts are retired as a production mechanism: the
+        // `MLXPRESS_STREAMING_EXPERTS` flag and its `JANGPRESS_STREAMING_EXPERTS`
+        // alias are no longer read, and the switch is the constant `false`.
+        #expect(!streamingExperts.contains("JANGPRESS_STREAMING_EXPERTS"))
+        #expect(
+            streamingExperts.contains(
+                "public static var explicitStreamingEnabled: Bool? { false }"))
         #expect(streamingExperts.contains("configureModelDirectory"))
         #expect(streamingExperts.contains("configuredModelDirectory"))
         #expect(
@@ -212,7 +229,12 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(streamingExperts.contains("loadDirectStack"))
         #expect(streamingExperts.contains("canUseDirectStacked"))
         #expect(streamingExperts.contains("residentExpertsEnabled"))
-        #expect(streamingExperts.contains("MLXPRESS_RESIDENT_EXPERTS"))
+        // Resident experts are retired as a production mechanism too: the
+        // `MLXPRESS_RESIDENT_EXPERTS` flag is no longer read, and the switch is
+        // the constant `false`.
+        #expect(!streamingExperts.contains("MLXPRESS_RESIDENT_EXPERTS"))
+        #expect(
+            streamingExperts.contains("public static var residentExpertsEnabled: Bool { false }"))
         #expect(streamingExperts.contains("registerResidentTensor"))
         #expect(streamingExperts.contains("tensor.direct_stacked_mmap_load"))
         #expect(streamingExperts.contains("withMmapSafetensorsEnvForDirectStackedLoad"))
@@ -307,7 +329,15 @@ struct MLXPressLowRamPolicySourceTests {
         #expect(deepseekV3.contains("decode"))
         #expect(attentionUtils.contains("public func mlaScaledDotProductAttention"))
         #expect(attentionUtils.contains("let queryLength = queries.dim(2)"))
-        #expect(attentionUtils.contains("if queryLength == 1 && originalDtype != .float32"))
+        // #401 (e1f64fec) made MLA decode run SDPA in the cache dtype. The fp32
+        // cast in `mlaScaledDotProductAttention` (AttentionUtils.swift) is now
+        // opt-in through `VMLX_MLA_SDPA_FP32=1`.
+        #expect(
+            attentionUtils.contains(
+                "if MLAAttentionRuntime.decodeFP32Cast, queryLength == 1, originalDtype != .float32"
+            ))
+        #expect(
+            attentionUtils.contains(#"environment["VMLX_MLA_SDPA_FP32"] == "1""#))
         #expect(attentionUtils.contains("queries.asType(.float32)"))
         #expect(attentionUtils.contains("return out.asType(originalDtype)"))
         #expect(!deepseekJANGTQ.contains("MLXPressMmapColdSweep.afterLayer"))

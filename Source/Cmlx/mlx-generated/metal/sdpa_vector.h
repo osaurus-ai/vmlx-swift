@@ -176,7 +176,7 @@ template <typename T, int D, int V = D>
   }
 }
 
-template <typename T, int D, int V = D>
+template <typename T, int D, int V = D, int TK = 4>
 [[kernel]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -285,8 +285,73 @@ template <typename T, int D, int V = D>
   int next_mask_word = 0;
   uint active_mask_bits = 0;
 
+  int i = block_idx;
+  const int stride_k_tok = blocks * int(k_seq_stride);
+  const int stride_v_tok = blocks * int(v_seq_stride);
+  const int stride_mask_tok =
+      (bool_mask || float_mask) ? blocks * mask_kv_seq_stride : 0;
+
   // For each key
-  for (int i = block_idx; i < N; i += blocks) {
+  for (; !use_packed_mask && i + (TK - 1) * blocks < N; i += blocks * TK) {
+    // Prefetch: issue all TK K/V loads first so the HW can overlap them.
+    T k_reg[TK][qk_per_thread];
+    T v_reg[TK][v_per_thread];
+    for (int t = 0; t < TK; t++) {
+      const device T* kp = keys + t * stride_k_tok;
+      for (int j = 0; j < qk_per_thread; j++) {
+        k_reg[t][j] = kp[j];
+      }
+    }
+    for (int t = 0; t < TK; t++) {
+      const device T* vp = values + t * stride_v_tok;
+      for (int j = 0; j < v_per_thread; j++) {
+        v_reg[t][j] = vp[j];
+      }
+    }
+
+    for (int t = 0; t < TK; t++) {
+      int ii = i + t * blocks;
+      bool use_key = true;
+      if (do_causal) {
+        use_key = ii <= (N - q_seq_len + int(q_seq_idx));
+      } else if (bool_mask) {
+        use_key = bmask[t * stride_mask_tok];
+      } else if (float_mask) {
+        use_key = (fmask[t * stride_mask_tok] >= Limits<T>::finite_min);
+      }
+      if (use_key) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += q[j] * static_cast<U>(k_reg[t][j]);
+        }
+        score = simd_sum(score);
+        if (float_mask) {
+          score += static_cast<U>(fmask[t * stride_mask_tok]);
+        }
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * static_cast<U>(v_reg[t][j]);
+        }
+      }
+    }
+
+    keys += TK * stride_k_tok;
+    values += TK * stride_v_tok;
+    if (bool_mask) {
+      bmask += TK * stride_mask_tok;
+    }
+    if (float_mask) {
+      fmask += TK * stride_mask_tok;
+    }
+  }
+
+  // Retain the sparse packed-mask lane and handle the unrolled tail.
+  for (; i < N; i += blocks) {
     if (use_packed_mask) {
       while (active_mask_bits == 0 && next_mask_word < mask_word_count) {
         active_mask_bits = packed_mask_words[next_mask_word++];

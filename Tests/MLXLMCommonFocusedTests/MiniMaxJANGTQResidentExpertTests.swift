@@ -8,10 +8,14 @@ import MLX
 import XCTest
 
 final class MiniMaxJANGTQResidentExpertTests: XCTestCase {
-    func testStreamingFlagAcceptsJangPressAlias() {
+    /// Streaming experts are retired as a production mechanism, and with them
+    /// the `JANGPRESS_STREAMING_EXPERTS` alias of the flag:
+    /// `JANGTQStreamingExperts.explicitStreamingEnabled` is `false` whatever
+    /// the environment says, so the legacy alias must leave streaming off.
+    func testLegacyJangPressStreamingAliasLeavesStreamingDisabled() {
         withFocusedEnvironment("MLXPRESS_STREAMING_EXPERTS", value: nil) {
             withFocusedEnvironment("JANGPRESS_STREAMING_EXPERTS", value: "1") {
-                XCTAssertTrue(JANGTQStreamingExperts.isEnabled)
+                XCTAssertFalse(JANGTQStreamingExperts.isEnabled)
             }
         }
     }
@@ -32,31 +36,44 @@ final class MiniMaxJANGTQResidentExpertTests: XCTestCase {
         }
     }
 
-    func testResidentExpertModeDoesNotMaterializeSwitchMLPBanks() throws {
-        let config = try decodeMiniMaxConfig(
-            hiddenLayers: 1,
-            numLocalExperts: 2)
-        let model = MiniMaxJANGTQModel(config)
-        let prefix = "model.layers.0.block_sparse_moe"
-        var weights: [String: MLXArray] = [:]
-        for expert in 0..<2 {
-            for projection in ["w1", "w2", "w3"] {
-                weights["\(prefix).experts.\(expert).\(projection).tq_packed"] =
-                    MLXArray.zeros([1, 1], dtype: .uint32)
-                weights["\(prefix).experts.\(expert).\(projection).tq_norms"] =
-                    MLXArray.zeros([1], dtype: .float16)
+    /// Resident experts are retired as a production mechanism, like streaming
+    /// experts: `JANGTQStreamingExperts.residentExpertsEnabled` is `false`
+    /// whatever `MLXPRESS_RESIDENT_EXPERTS` says, so sanitize stacks the
+    /// per-expert tensors into `switch_mlp` banks, as it does without the flag.
+    func testLegacyResidentExpertsFlagStillStacksSwitchMLPBanks() throws {
+        // Building the model and stacking the banks is MLX work, so it holds
+        // the lock, as the bundle's other MLX tests do.
+        try FocusedMLXTestSupport.withLock {
+            let config = try decodeMiniMaxConfig(
+                hiddenLayers: 1,
+                numLocalExperts: 2)
+            let model = MiniMaxJANGTQModel(config)
+            let prefix = "model.layers.0.block_sparse_moe"
+            var weights: [String: MLXArray] = [:]
+            for expert in 0..<2 {
+                for projection in ["w1", "w2", "w3"] {
+                    weights["\(prefix).experts.\(expert).\(projection).tq_packed"] =
+                        MLXArray.zeros([1, 1], dtype: .uint32)
+                    weights["\(prefix).experts.\(expert).\(projection).tq_norms"] =
+                        MLXArray.zeros([1], dtype: .float16)
+                }
             }
-        }
 
-        withFocusedEnvironment("MLXPRESS_RESIDENT_EXPERTS", value: "1") {
-            let sanitized = model.sanitize(weights: weights)
+            withFocusedEnvironment("MLXPRESS_RESIDENT_EXPERTS", value: "1") {
+                let sanitized = model.sanitize(weights: weights)
 
-            XCTAssertNil(sanitized["\(prefix).switch_mlp.gate_proj.tq_packed"])
-            XCTAssertNil(sanitized["\(prefix).switch_mlp.up_proj.tq_packed"])
-            XCTAssertNil(sanitized["\(prefix).switch_mlp.down_proj.tq_packed"])
-            XCTAssertTrue(
-                sanitized.keys.allSatisfy { !$0.contains(".block_sparse_moe.experts.") },
-                "resident mode must move per-expert tensors out of model.update staging")
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    XCTAssertEqual(
+                        sanitized["\(prefix).switch_mlp.\(projection).tq_packed"]?.shape,
+                        [2, 1, 1])
+                    XCTAssertEqual(
+                        sanitized["\(prefix).switch_mlp.\(projection).tq_norms"]?.shape,
+                        [2, 1])
+                }
+                XCTAssertTrue(
+                    sanitized.keys.allSatisfy { !$0.contains(".block_sparse_moe.experts.") },
+                    "sanitize must move the per-expert tensors into the stacked banks")
+            }
         }
     }
 

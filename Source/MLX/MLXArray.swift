@@ -375,6 +375,12 @@ public final class MLXArray {
     /// let value = array[1].item(Float.self)
     /// ```
     public func item<T: HasDType>(_ type: T.Type) -> T {
+        // Hold `evalLock` from the first read of `self` to the last, as
+        // `asArray` does; the `item*` helpers below run under it. Resolve the
+        // stream for the conversion before taking it, as `asArray` does.
+        let stream = StreamOrDevice.default
+        evalLock.lock()
+        defer { evalLock.unlock() }
         guard isValid else {
             reportInvalidArrayUse("MLXArray.item")
             return Self.zeroFilled(count: 1)[0]
@@ -441,7 +447,7 @@ public final class MLXArray {
 
         // default handling -- convert the type if needed
         if type.dtype != self.dtype {
-            return self.asType(type).item(type)
+            return self.asType(type, stream: stream).item(type)
         }
 
         switch type {
@@ -690,7 +696,11 @@ extension MLXArray: Updatable, Evaluatable {
 extension MLXArray: CustomStringConvertible {
     public var description: String {
         var s = mlx_string_new()
-        mlx_array_tostring(&s, ctx)
+        // Formatting realizes and reads the array: a host read like
+        // `asArray`, so it holds `evalLock` too.
+        evalLock.withLock {
+            _ = mlx_array_tostring(&s, ctx)
+        }
         defer { mlx_string_free(s) }
         return String(cString: mlx_string_data(s), encoding: .utf8)!
     }

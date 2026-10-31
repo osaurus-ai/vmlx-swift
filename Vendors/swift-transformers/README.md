@@ -209,3 +209,23 @@ To format your code, run `swift format -i --recursive .`.
 ## License
 
 [Apache 2](LICENSE).
+
+## Local template selection contract
+
+The tokenizer compiles the selected bundle or explicit override template unchanged.
+Turn boundaries belong to the model template; a substring rewrite cannot determine
+whether a tool result is followed by another assistant fragment, a new user or
+pending generation. The former automatic Gemma rewrite suppressed valid closes
+before new users (osaurus-ai/osaurus#3237) and is no longer applied.
+
+`ChatTemplateRepair.needsRepair` remains a limited legacy-spelling diagnostic, not
+a template validator. The deprecated `repaired` symbol returns its input for
+source compatibility; it performs no rewriting and keeps no additional cache.
+Update stale templates at their bundle/export source, synchronizing file and
+embedded copies. Keep the selected-source compiled-template cache intact.
+
+Regression coverage includes exact source preservation, both old condition
+spellings, an explicit tool-result/user boundary, unrelated template formats and
+the tokenizer selection path. Full-model output, media and cache qualification
+require their own scoped native receipts; these source/render tests do not prove
+that repeated reasoning markers have a particular cause.
