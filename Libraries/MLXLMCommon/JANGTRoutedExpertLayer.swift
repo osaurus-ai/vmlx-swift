@@ -321,38 +321,62 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         }
     }
 
+    /// The token of each sorted (token, slot) pair: `order / routes` for argSort's non-negative positions. A right
+    /// shift when `routes` is a power of two (top-4 / top-8): exact, and one kernel. MLX's integer `floorDivide` is a
+    /// composed op whose parts land on the C++ thread-local default stream, not Swift's: every call split the command
+    /// stream (4 command buffers, ~0.3 ms of sync; 01-LOG 10-28 "Integer floorDivide"), once per layer per chunk here.
+    static func sourceRows(_ order: MLXArray, routes: Int) -> MLXArray {
+        if routes > 0 && routes & (routes - 1) == 0 {
+            return rightShift(order, MLXArray(UInt32(routes.trailingZeroBitCount)).asType(order.dtype))
+        }
+        return order.floorDivide(routes)
+    }
+
     /// Expert-sorted prefill (vMLX Python `JTMixedSwitchGLU._prefill`): rows sorted by expert, NAX tiles per group,
     /// outlier columns added in fp32, rows restored and combined with the routing weights in fp32.
+    ///
+    /// The trellis tiles run the expert-aligned schedule (one GPU-side `expertTilePlan` per layer, shared by gate/up
+    /// and down; vMLX Python edf7e36e8) unless `VMLX_JANGT_EXPERT_TILES=0`: same rows, same arithmetic per row.
     private func prefill(_ x: MLXArray, ids: MLXArray, weights: MLXArray) throws -> MLXArray {
         let tokens = x.dim(0), routes = ids.dim(1)
         let flat = ids.flattened()
         let order = argSort(flat)
         let sortedIDs = take(flat, order).asType(.uint32)
-        let tok = order.floorDivide(routes)
+        let tok = Self.sourceRows(order, routes: routes)
         let dtype = x.dtype
         let downIsCodebook: Bool
         if case .codebook = down { downIsCodebook = true } else { downIsCodebook = false }
+        var plan: JANGTPrefillKernel.ExpertTilePlan?
+        if JANGTPrefillKernel.expertTilesEnabled {
+            var experts: Int?
+            if case .trellis(let gate, _, _) = gateUp { experts = gate.experts }
+            if case .trellis(let projection, _) = down { experts = projection.experts }
+            plan = experts.map { JANGTPrefillKernel.expertTilePlan(sortedIndices: sortedIDs, experts: $0) }
+        }
 
         var hidden: MLXArray
         var hiddenRotated = false
         switch gateUp {
         case .trellis(let gate, let up, let signs):
-            let xr = take(JANGTKernels.rotateRows(x, signs: signs), tok, axis: 0).asType(dtype)
+            // Narrow to the input dtype before gathering the k copies of each row (exact: an elementwise cast).
+            let xr = take(JANGTKernels.rotateRows(x, signs: signs).asType(dtype), tok, axis: 0)
             if gate.outlierColumns == 0 {
                 // One NAX pass over both weight tiles with the (clamped) SwiGLU epilogue; a JANGH down gets its
                 // input already Hadamard-32 rotated (the H32 store epilogue).
                 let rotate = downIsCodebook && intermediateSize % 32 == 0
                 hidden = JANGTPrefillKernel.project(xr, gate, up: up, indices: sortedIDs, limit: limit,
-                                                    activation: activation, rotateOutput: rotate)
+                                                    activation: activation, rotateOutput: rotate, plan: plan)
                 hiddenRotated = rotate
             } else if let columns = _sharedOutlierColumns {
+                // The layer-wide outlier columns of each token, then its k copies (not k copies of every raw row).
                 hidden = JANGTPrefillKernel.projectGateUpWithOutliers(
-                    xr, rawRows: take(x, tok, axis: 0), gate: gate, up: up, columns: columns,
-                    indices: sortedIDs, limit: limit, activation: activation)
+                    xr, outlierRows: take(take(x, columns, axis: 1).asType(.float32), tok, axis: 0),
+                    gate: gate, up: up, columns: columns.size, indices: sortedIDs, limit: limit,
+                    activation: activation, plan: plan)
             } else {
                 let raw = take(x, tok, axis: 0)
-                var g = JANGTPrefillKernel.project(xr, gate, indices: sortedIDs).asType(.float32)
-                var u = JANGTPrefillKernel.project(xr, up, indices: sortedIDs).asType(.float32)
+                var g = JANGTPrefillKernel.project(xr, gate, indices: sortedIDs, plan: plan).asType(.float32)
+                var u = JANGTPrefillKernel.project(xr, up, indices: sortedIDs, plan: plan).asType(.float32)
                 if let o = JANGTPrefillKernel.outliers(raw, gate, indices: sortedIDs) { g = g + o }
                 if let o = JANGTPrefillKernel.outliers(raw, up, indices: sortedIDs) { u = u + o }
                 hidden = activation(gate: g, up: u, limit: limit).asType(dtype)
@@ -376,7 +400,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         switch down {
         case .trellis(let projection, let signs):
             let hr = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: sortedIDs).asType(dtype)
-            var y = JANGTPrefillKernel.project(hr, projection, indices: sortedIDs).asType(.float32)
+            var y = JANGTPrefillKernel.project(hr, projection, indices: sortedIDs, plan: plan).asType(.float32)
             if let o = JANGTPrefillKernel.outliers(hidden, projection, indices: sortedIDs) { y = y + o }
             sortedOutput = y
         case .codebook(let kernel, let prefillKernel, let bank):
