@@ -699,6 +699,142 @@ public final class DiskCache: @unchecked Sendable {
     }
     nonisolated(unsafe) static var inflightByteBudgetOverrideForTesting: Int?
 
+    // MARK: Resident entries (the RAM tier of whole-snapshot entries)
+    //
+    // A store's evaluated payload used to be dropped the moment its file landed, so the next turn
+    // of a chat, and the request after every tool call, read its prefix back from the SSD: open,
+    // `pread` every tensor, materialize on the CPU stream and screen the floating-point tensors
+    // for NaN/Inf, each time. Caches the paged tier cannot hold (DeepSeek-V4 pools, MiniMax-M3
+    // sparse lanes, every disk-backed topology) had no RAM tier at all, and with the paged tier
+    // off (the default serving settings) no model had one.
+    //
+    // Now a stored or read payload stays here, by content hash, within `residentByteBudget`
+    // (least recently used first out; the entry just stored or served is never the one evicted to
+    // make room for itself). A fetch serves it with no file read and no screen: it is the same
+    // evaluated arrays the store screened and wrote. An entry is served only while its index row
+    // exists and its file is the one written or read (size and modification time), so every way
+    // a payload leaves the disk tier (quota, clear, rejection, replacement by another process)
+    // also takes it out of RAM. The arrays are never mutated: a restore seats views of them and
+    // the next update writes new buffers.
+
+    private final class ResidentEntry {
+        let arrays: [String: MLXArray]
+        let tokenCount: Int
+        let bytes: Int
+        let file: ValidatedFileFingerprint
+        var lastUse: UInt64
+        init(arrays: [String: MLXArray], tokenCount: Int, bytes: Int, file: ValidatedFileFingerprint,
+             lastUse: UInt64) {
+            self.arrays = arrays
+            self.tokenCount = tokenCount
+            self.bytes = bytes
+            self.file = file
+            self.lastUse = lastUse
+        }
+    }
+
+    /// Resident payloads by content hash (under `lock`).
+    private var resident: [String: ResidentEntry] = [:]
+    private var residentBytes = 0
+    private var residentClock: UInt64 = 0
+    private(set) var residentHits = 0
+
+    /// Bytes of payload kept resident after a store or a read. 0 keeps none (the old behavior:
+    /// drop the payload once its file is on disk). The coordinator sets it from
+    /// ``CacheCoordinatorConfig/residentEntryBytes``.
+    public var residentByteBudget: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _residentByteBudget }
+        set {
+            lock.lock()
+            _residentByteBudget = max(0, newValue)
+            _trimResidentLocked(protecting: nil)
+            lock.unlock()
+        }
+    }
+    private var _residentByteBudget = 0
+
+    /// Entries, bytes and hits of the resident set.
+    public var residentStats: (entries: Int, bytes: Int, hits: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (resident.count, residentBytes, residentHits)
+    }
+
+    /// Fraction of MLX's memory limit above which a payload is not kept resident (advisory only:
+    /// the payload is then dropped once written, as before, and served from the SSD next time).
+    static let residentMemoryLimitFraction = 0.92
+
+    /// Keep `arrays` resident for `hash`. Caller holds `lock`.
+    private func _retainResidentLocked(
+        hash: String, arrays: [String: MLXArray], tokenCount: Int, file: ValidatedFileFingerprint
+    ) {
+        guard _residentByteBudget > 0 else { return }
+        let bytes = arrays.values.reduce(0) { partial, array in
+            let (sum, overflow) = partial.addingReportingOverflow(array.nbytes)
+            return overflow ? Int.max : sum
+        }
+        if let existing = resident.removeValue(forKey: hash) { residentBytes -= existing.bytes }
+        guard bytes <= _residentByteBudget else { return }
+        let limit = Memory.memoryLimit
+        if limit > 0, Double(Memory.activeMemory) > Self.residentMemoryLimitFraction * Double(limit) {
+            // Under memory pressure the RAM copy would be the first thing to cost the next prefill.
+            _trimResidentLocked(protecting: nil, toBytes: 0)
+            return
+        }
+        residentClock &+= 1
+        resident[hash] = ResidentEntry(
+            arrays: arrays, tokenCount: tokenCount, bytes: bytes, file: file, lastUse: residentClock)
+        residentBytes += bytes
+        _trimResidentLocked(protecting: hash)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            RuntimeDiagnostics.write(Data(
+                ("[vmlx][cache/resident] keep count=\(tokenCount) hash=\(hash.prefix(12)) bytes=\(bytes) "
+                    + "entries=\(resident.count) residentBytes=\(residentBytes) budget=\(_residentByteBudget)\n").utf8))
+        }
+    }
+
+    /// Evict least recently used entries until the set fits `toBytes` (default: the budget),
+    /// never `protecting`. Caller holds `lock`.
+    private func _trimResidentLocked(protecting: String?, toBytes: Int? = nil) {
+        let target = toBytes ?? _residentByteBudget
+        while residentBytes > target {
+            guard let victim = resident
+                .filter({ $0.key != protecting })
+                .min(by: { $0.value.lastUse < $1.value.lastUse })
+            else { break }
+            resident.removeValue(forKey: victim.key)
+            residentBytes -= victim.value.bytes
+        }
+    }
+
+    /// Drop the resident copy of `hash`. Caller holds `lock`.
+    private func _dropResidentLocked(_ hash: String) {
+        if let entry = resident.removeValue(forKey: hash) { residentBytes -= entry.bytes }
+    }
+
+    /// The resident payload of `hash` when it may still be served. Caller holds `lock`.
+    private func _residentPayloadLocked(hash: String, url: URL, tokenCount: Int) -> [String: MLXArray]? {
+        guard let entry = resident[hash] else { return nil }
+        guard entry.tokenCount == tokenCount, validatedFiles[hash]?.file == entry.file,
+              _fileFingerprint(url: url) == entry.file,
+              db == nil || _entryMetadataLocked(hash: hash) != nil
+        else {
+            _dropResidentLocked(hash)
+            return nil
+        }
+        residentClock &+= 1
+        entry.lastUse = residentClock
+        return entry.arrays
+    }
+
+    /// Release every resident payload (memory pressure, unload).
+    public func releaseResidentEntries() {
+        lock.lock()
+        resident.removeAll()
+        residentBytes = 0
+        lock.unlock()
+    }
+
     /// Number of stores whose file is still being written.
     public var pendingWriteCount: Int {
         lock.lock()
@@ -863,14 +999,18 @@ public final class DiskCache: @unchecked Sendable {
                     if insertResult != SQLITE_DONE {
                         _ = Self.removeRegularFile(at: finalURL)
                         validatedFiles.removeValue(forKey: hash)
+                        _dropResidentLocked(hash)
                         failedIndexWrites += 1
                         outcome = "index-insert-failed"
                     } else {
                         if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
                             validatedFiles[hash] = ValidatedRecord(
                                 file: fingerprint, layout: layout, recurrentGeometry: geometry)
+                            _retainResidentLocked(
+                                hash: hash, arrays: entry.arrays, tokenCount: tokenCount, file: fingerprint)
                         } else {
                             validatedFiles.removeValue(forKey: hash)
+                            _dropResidentLocked(hash)
                         }
                         if rejectedRestores.removeValue(forKey: hash) != nil {
                             rewrittenAfterRejection.insert(hash)
@@ -1172,7 +1312,7 @@ public final class DiskCache: @unchecked Sendable {
         guard queried else { return nil }
         for count in counts {
             let prefix = Array(targetTokens.prefix(count))
-            if case .arrays(let arrays) = fetchCandidate(
+            if case .arrays(let arrays, _) = fetchCandidate(
                 tokens: prefix, mediaSalt: contract.storageSalt(requestSalt: requestSalt))
             {
                 return (prefix, arrays)
@@ -1557,6 +1697,7 @@ public final class DiskCache: @unchecked Sendable {
                 // could ever see or evict it. Take it back rather than leak it.
                 _ = Self.removeRegularFile(at: finalURL)
                 validatedFiles.removeValue(forKey: hash)
+                _dropResidentLocked(hash)
                 failedIndexWrites += 1
                 RuntimeDiagnostics.write(Data(
                     ("[vmlx][cache/disk-store] index insert failed rc=\(insertResult) "
@@ -1568,8 +1709,10 @@ public final class DiskCache: @unchecked Sendable {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
                     recurrentGeometry: Self.recurrentGeometry(arrays))
+                _retainResidentLocked(hash: hash, arrays: arrays, tokenCount: tokenCount, file: fingerprint)
             } else {
                 validatedFiles.removeValue(forKey: hash)
+                _dropResidentLocked(hash)
             }
             // What was refused has just been replaced — the one time this
             // process does that for the entry.
@@ -1606,6 +1749,7 @@ public final class DiskCache: @unchecked Sendable {
     private func _recordRefusedOccupiedStoreLocked(finalURL: URL, hash: String, tokenCount: Int) {
         refusedOccupiedStores += 1
         validatedFiles.removeValue(forKey: hash)
+        _dropResidentLocked(hash)
         RuntimeDiagnostics.write(Data(
             ("[vmlx][cache/disk-store] REFUSED occupied path count=\(tokenCount) "
                 + "hash=\(hash.prefix(12)) — \(finalURL.lastPathComponent) is not a regular file "
@@ -1644,7 +1788,9 @@ public final class DiskCache: @unchecked Sendable {
 
     /// What ``fetchCandidate(tokens:mediaSalt:)`` found.
     enum CandidateFetch {
-        case arrays([String: MLXArray])
+        /// `servedFromMemory`: the payload came from RAM (resident, or still being written), not
+        /// from its file.
+        case arrays([String: MLXArray], servedFromMemory: Bool)
         case miss
         /// The entry is there, and an engine has already refused to restore
         /// this very payload. Nothing was read; not counted as a miss.
@@ -1674,6 +1820,7 @@ public final class DiskCache: @unchecked Sendable {
         let arrays = _fetchLocked(
             hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
             touchRecency: false, countHit: false)
+        let servedFromMemory = lastFetchServedFromMemory
         // Remember what was served only when the file was the same one on
         // both sides of the read (`_fetchLocked` fingerprints what it loaded).
         servedCandidates.removeAll { $0.hash == hash }
@@ -1683,7 +1830,7 @@ public final class DiskCache: @unchecked Sendable {
                 servedCandidates.removeFirst(servedCandidates.count - Self.servedCandidateLimit)
             }
         }
-        return arrays.map(CandidateFetch.arrays) ?? .miss
+        return arrays.map { CandidateFetch.arrays($0, servedFromMemory: servedFromMemory) } ?? .miss
     }
 
     /// An engine fetched this entry through the coordinator and could not
@@ -1709,10 +1856,12 @@ public final class DiskCache: @unchecked Sendable {
               rejectedRestores[hash] != current
         else { return false }
         rejectedRestores[hash] = current
+        _dropResidentLocked(hash)
         if rewrittenAfterRejection.contains(hash) {
             rejectedRewritesSuppressed += 1
         } else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
         }
         if countedHit { hits = max(0, hits - 1) }
         rejectedDiskRestores += 1
@@ -1730,16 +1879,21 @@ public final class DiskCache: @unchecked Sendable {
         rejectedRestores[hash] == current && !rewrittenAfterRejection.contains(hash)
     }
 
+    /// Whether the last `_fetchLocked` served RAM (resident or in-flight) arrays. Under `lock`.
+    private var lastFetchServedFromMemory = false
+
     /// Caller holds ``MLXDiskCacheIOLock`` and `lock`.
     private func _fetchLocked(
         hash: String, url: URL, tokens: [Int], mediaSalt: String?,
         touchRecency: Bool, countHit: Bool
     ) -> [String: MLXArray]? {
+        lastFetchServedFromMemory = false
         // Still being written: serve the payload the store validated and materialized. Same
         // content-addressed bytes the file will hold; no wait, no disk read.
         if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count,
             entry.awaitScreen().isEmpty
         {
+            lastFetchServedFromMemory = true
             inflightFetches += 1
             if countHit { hits += 1 }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -1748,8 +1902,21 @@ public final class DiskCache: @unchecked Sendable {
             }
             return entry.arrays
         }
+        // Resident: the payload this process stored or read, still the file on disk.
+        if let arrays = _residentPayloadLocked(hash: hash, url: url, tokenCount: tokens.count) {
+            lastFetchServedFromMemory = true
+            residentHits += 1
+            if touchRecency { _touchEntryLocked(hash: hash) }
+            if countHit { hits += 1 }
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                RuntimeDiagnostics.write(Data(
+                    "[vmlx][cache/disk-fetch] resident count=\(tokens.count) hash=\(hash.prefix(12))\n".utf8))
+            }
+            return arrays
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             // A row that outlives its payload keeps counting toward the quota
             // and keeps being offered as a candidate boundary. Most misses
@@ -1801,6 +1968,7 @@ public final class DiskCache: @unchecked Sendable {
         // index to be missing from, and the file alone decides as it always has.
         if db != nil, _entryMetadataLocked(hash: hash) == nil {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                 RuntimeDiagnostics.write(Data(
@@ -1828,6 +1996,7 @@ public final class DiskCache: @unchecked Sendable {
         case .missing:
             // Gone since `fileExists`: the next fetch settles the row.
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             misses += 1
             return nil
         }
@@ -1881,6 +2050,8 @@ public final class DiskCache: @unchecked Sendable {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
                     recurrentGeometry: Self.recurrentGeometry(arrays))
+                // Read and screened once: the next turn of this chat takes it from RAM.
+                _retainResidentLocked(hash: hash, arrays: arrays, tokenCount: tokens.count, file: fingerprint)
             }
             if touchRecency {
                 _touchEntryLocked(hash: hash)
@@ -1905,6 +2076,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             misses += 1
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             // A failed deserialize is almost always a corrupt safetensors
             // file — a 0-byte leftover from the pre-synchronous-store
             // bug, a partial write from an earlier crash, disk full
@@ -1962,6 +2134,7 @@ public final class DiskCache: @unchecked Sendable {
         misses += 1
         unreadablePayloadFetches += 1
         validatedFiles.removeValue(forKey: hash)
+        _dropResidentLocked(hash)
         if Self.isFirstReport(url.path, in: Self.reportedUnreadablePayloads) {
             RuntimeDiagnostics.write(Data(
                 ("[vmlx][cache/disk] fetch could not read \(url.lastPathComponent) "
@@ -2511,6 +2684,8 @@ public final class DiskCache: @unchecked Sendable {
     func forgetValidatedFiles() {
         lock.lock()
         validatedFiles.removeAll(keepingCapacity: true)
+        resident.removeAll()
+        residentBytes = 0
         lock.unlock()
     }
 
@@ -3130,6 +3305,7 @@ public final class DiskCache: @unchecked Sendable {
         for row in rowsWithoutPayload {
             _runLocked("DELETE FROM cache_entries WHERE rowid = ?", [.int(row.rowid)])
             validatedFiles.removeValue(forKey: row.hash)
+            _dropResidentLocked(row.hash)
             summary.rowsDeletedForMissingPayload += 1
         }
         // By rowid, inside this transaction; nothing under a newer build's
@@ -3257,6 +3433,7 @@ public final class DiskCache: @unchecked Sendable {
             let age = now.timeIntervalSince(modified)
             guard age >= guardAge else { continue }
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             let failure = Self.unlinkFile(at: url)
             if failure == 0 {
                 summary.unindexedPayloadsRemoved += 1
@@ -3296,6 +3473,7 @@ public final class DiskCache: @unchecked Sendable {
               indexed.fileSize == current.size
         else {
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
             return false
         }
         return _touchEntryLocked(hash: hash, at: date)
@@ -3339,6 +3517,7 @@ public final class DiskCache: @unchecked Sendable {
             }
             let payloadGone = Self.removeCacheFile(at: url)
             validatedFiles.removeValue(forKey: hash)
+            _dropResidentLocked(hash)
 
             var companionRemoved = false
             if indexHasV2Columns {
@@ -3539,6 +3718,8 @@ public final class DiskCache: @unchecked Sendable {
         lastOpaqueBytes = 0
         retireNotBefore = nil
         validatedFiles.removeAll(keepingCapacity: true)
+        resident.removeAll()
+        residentBytes = 0
         rejectedRestores.removeAll()
         rewrittenAfterRejection.removeAll()
         servedCandidates.removeAll()
@@ -4720,6 +4901,7 @@ public final class DiskCache: @unchecked Sendable {
         // once per pass and its bytes are not made up for by evicting more.
         func evict(_ entry: (hash: String, url: URL, fileSize: Int64)) {
             validatedFiles.removeValue(forKey: entry.hash)
+            _dropResidentLocked(entry.hash)
             guard Self.removeCacheFile(at: entry.url) else { return }
             _deleteEntryLocked(hash: entry.hash)
             evictions += 1
