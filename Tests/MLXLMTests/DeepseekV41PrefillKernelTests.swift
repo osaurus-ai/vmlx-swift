@@ -41,8 +41,8 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
         return (q, kv, pool, topk, sinks)
     }
 
-    /// The opt-in gathered core computes the heads-16 kernel's attention (not its bits): against the fp32 reference
-    /// of the stock dense-mask branch, both stay within rounding at the cold-prefill and mid-prompt shapes.
+    /// The opt-in gathered core and NAX kernel compute the heads-16 kernel's attention (not its bits): against the fp32
+    /// reference of the stock dense-mask branch, all stay within rounding at the cold-prefill and mid-prompt shapes.
     func testGatheredCoreMatchesReference() throws {
         let scale = Float(pow(Double(512), -0.5))
         for (i, (s, r, p, k, offset, ratio)) in [(64, 64, 40, 32, 0, 2), (37, 164, 300, 64, 900, 2),
@@ -67,7 +67,15 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
             let relH = MLX.abs(h16 - ref).max().item(Float.self) / denom
             XCTAssertLessThan(relG, 2e-2, "shape \(i): gathered rel \(relG)")
             XCTAssertLessThan(relH, 2e-2, "shape \(i): heads16 rel \(relH)")
-            print("DSV41_GATHERED shape \(i) rel vs fp32 reference: gathered \(relG) heads16 \(relH)")
+            var relN = Float.nan
+            if DSV41IndexedAttentionNAX.available {
+                let nax = try XCTUnwrap(DSV41IndexedAttentionNAX.attend(
+                    q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks: c.sinks, offset: offset, window: 128,
+                    ratio: ratio, scale: scale)).asType(.float32)
+                relN = MLX.abs(nax - ref).max().item(Float.self) / denom
+                XCTAssertLessThan(relN, 2e-2, "shape \(i): NAX rel \(relN)")
+            }
+            print("DSV41_GATHERED shape \(i) rel vs fp32 reference: gathered \(relG) heads16 \(relH) nax \(relN)")
         }
     }
 
@@ -256,7 +264,15 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
         let a = h16().asType(.float32), b = gathered().asType(.float32)
         let rel = (MLX.abs(a - b).max() / MLX.abs(a).max()).item(Float.self)
         print(String(format: "DSV41_KERNEL_PERF gathered vs heads16 max rel diff %.3e", rel))
-        interleaved([("heads16 kernel", h16), ("gathered core", gathered)])
+        let nax = {
+            DSV41IndexedAttentionNAX.attend(
+                q: q, kv2d: kv.reshaped(r, 512), pool2d: pool.reshaped(p, 512), topk2d: topk.reshaped(s, k),
+                sinks: sinks, offset: offset, window: 128, ratio: 2, scale: scale)!
+        }
+        let c = nax().asType(.float32)
+        let relN = (MLX.abs(a - c).max() / MLX.abs(a).max()).item(Float.self)
+        print(String(format: "DSV41_KERNEL_PERF nax vs heads16 max rel diff %.3e", relN))
+        interleaved([("heads16 kernel", h16), ("gathered core", gathered), ("nax indexed", nax)])
     }
 
     func testRoutedPrefillTimingAtDSV41Shapes() throws {
