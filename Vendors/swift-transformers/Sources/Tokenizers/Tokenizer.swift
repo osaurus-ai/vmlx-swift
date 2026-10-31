@@ -971,12 +971,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             throw TokenizerError.missingChatTemplate
         }
 
-        // A template that closes the assistant turn after a tool response and then skips the
-        // role header hands the model no turn to speak in; it improvises `<channel|>thought`
-        // scaffolding and, in an agent loop, repeats that header until the budget runs out.
-        // Repair it here, where every path converges — patching the bundle on disk does not
-        // survive the loader re-fetching it from the Hub.
-        let template = try compiledTemplate(for: ChatTemplateRepair.repaired(selectedChatTemplate))
+        // INVARIANT: the selected bundle/explicit override owns turn boundaries.
+        // A substring rewrite cannot infer the next role and previously erased
+        // Gemma's turn close before a new user. Fix stale templates at export.
+        let template = try compiledTemplate(for: selectedChatTemplate)
         var context: [String: VMLXJinja.Value] = try [
             "messages": .array(messages.map { try chatTemplateMessageValue($0) }),
             "add_generation_prompt": .boolean(addGenerationPrompt),
