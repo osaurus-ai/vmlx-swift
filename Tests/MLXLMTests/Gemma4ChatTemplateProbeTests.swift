@@ -206,7 +206,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         }
     }
 
-    func testGemma4TemplateRendersNullableToolSchemaAfterNormalization() throws {
+    func testGemma4TemplateRendersNullableToolSchemaWithoutRewriting() throws {
         guard let src = try loadGemma4Template() else {
             throw XCTSkip("Gemma-4 template not available on this machine.")
         }
@@ -242,7 +242,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             ]
         }
 
-        XCTAssertThrowsError(try template.renderAny(context(rawTools)))
+        let rawRendered = try template.renderAny(context(rawTools))
 
         let normalizedTools = try XCTUnwrap(normalizedToolsForChatTemplate(rawTools))
         let normalizedFunction = try XCTUnwrap(normalizedTools.first?["function"] as? [String: any Sendable])
@@ -250,13 +250,13 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         let normalizedProperties = try XCTUnwrap(normalizedParameters["properties"] as? [String: any Sendable])
         let normalizedLabel = try XCTUnwrap(normalizedProperties["label"] as? [String: any Sendable])
         let normalizedEnum = try XCTUnwrap(normalizedLabel["enum"] as? [any Sendable])
-        XCTAssertEqual(normalizedEnum.count, 2)
-        XCTAssertFalse(normalizedEnum.contains { $0 is NSNull })
+        XCTAssertEqual(normalizedEnum.count, 3)
+        XCTAssertTrue(normalizedEnum.contains { $0 is NSNull })
 
         let rendered = try template.renderAny(context(normalizedTools))
-        XCTAssertTrue(rendered.contains("nullable:true"))
-        XCTAssertTrue(rendered.contains("type:<|\"|>STRING<|\"|>"))
-        XCTAssertTrue(rendered.contains("enum:[<|\"|>fast<|\"|>,<|\"|>slow<|\"|>]"))
+        XCTAssertEqual(rendered, rawRendered)
+        XCTAssertTrue(rendered.contains("declaration:lookup"))
+
     }
 
     /// Iter 52: the minimal template must emit image / video placeholder

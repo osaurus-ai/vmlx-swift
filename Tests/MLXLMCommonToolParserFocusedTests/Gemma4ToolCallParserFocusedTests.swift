@@ -47,7 +47,7 @@ struct Gemma4ToolCallParserFocusedTests {
         #expect(toolCall.function.arguments[#""url""#] == nil)
     }
 
-    @Test("Gemma4 tool template renders browser schema with nullable enum")
+    @Test("Gemma4 tool template renders the original browser schema with nullable enum")
     func gemma4ToolTemplateRendersBrowserSchemaWithNullableEnum() throws {
         let tool: ToolSpec = [
             "type": "function",
@@ -78,11 +78,11 @@ struct Gemma4ToolCallParserFocusedTests {
         let parameters = try #require(function["parameters"] as? [String: any Sendable])
         let properties = try #require(parameters["properties"] as? [String: any Sendable])
         let waitUntil = try #require(properties["wait_until"] as? [String: any Sendable])
-        #expect(waitUntil["type"] as? String == "string")
-        #expect(waitUntil["nullable"] as? Bool == true)
+        #expect(waitUntil["type"] as? [String] == ["string", "null"])
+        #expect(waitUntil["nullable"] == nil)
         let enumValues = try #require(waitUntil["enum"] as? [any Sendable])
-        #expect(enumValues.count == 3)
-        #expect(!enumValues.contains { $0 is NSNull })
+        #expect(enumValues.count == 4)
+        #expect(enumValues.contains { $0 is NSNull })
 
         let rendered = try renderGemma4([
             "messages": [
@@ -140,8 +140,8 @@ struct Gemma4ToolCallParserFocusedTests {
         let normalized = try #require(normalizedToolsForChatTemplate([tool])?.first)
         let function = try #require(normalized["function"] as? [String: any Sendable])
         let parameters = try #require(function["parameters"] as? [String: any Sendable])
-        #expect(parameters["type"] as? String == "object")
-        #expect(parameters["nullable"] as? Bool == true)
+        #expect(parameters["type"] as? [String] == ["object", "null"])
+        #expect(parameters["nullable"] == nil)
 
         let properties = try #require(parameters["properties"] as? [String: any Sendable])
         let query = try #require(properties["query"] as? [String: any Sendable])
@@ -151,10 +151,10 @@ struct Gemma4ToolCallParserFocusedTests {
         let literalTypeProperty = try #require(
             nestedProperties["type"] as? [String: any Sendable])
 
-        #expect(query["type"] as? String == "string")
-        #expect(query["nullable"] as? Bool == true)
-        #expect(format["type"] as? String == "string")
-        #expect(nested["type"] as? String == "object")
+        #expect(query["type"] is NSNull)
+        #expect(query["nullable"] == nil)
+        #expect(format["type"] as? [String] == ["string", "integer"])
+        #expect(nested["type"] == nil)
         #expect(literalTypeProperty["type"] as? String == "string")
 
         let rendered = try renderGemma4([
@@ -178,8 +178,8 @@ struct Gemma4ToolCallParserFocusedTests {
         #expect(!rendered.contains("Cannot convert value of type Optional<Any> to Jinja Value"))
     }
 
-    @Test("Gemma4 tool template drops boolean additionalProperties in nested schemas")
-    func gemma4ToolTemplateDropsBooleanAdditionalPropertiesInNestedSchemas() throws {
+    @Test("Gemma4 tool template preserves boolean additionalProperties in nested schemas")
+    func gemma4ToolTemplatePreservesBooleanAdditionalPropertiesInNestedSchemas() throws {
         let tool: ToolSpec = [
             "type": "function",
             "function": [
@@ -219,9 +219,9 @@ struct Gemma4ToolCallParserFocusedTests {
         let setSchema = try #require(properties["set"] as? [String: any Sendable])
         let typedSchema = try #require(properties["typed"] as? [String: any Sendable])
 
-        #expect(parameters["additionalProperties"] == nil)
-        #expect(whereSchema["additionalProperties"] == nil)
-        #expect(setSchema["additionalProperties"] == nil)
+        #expect(parameters["additionalProperties"] as? Bool == false)
+        #expect(whereSchema["additionalProperties"] as? Bool == true)
+        #expect(setSchema["additionalProperties"] as? Bool == false)
         #expect(typedSchema["additionalProperties"] is [String: any Sendable])
 
         let rendered = try renderGemma4([
