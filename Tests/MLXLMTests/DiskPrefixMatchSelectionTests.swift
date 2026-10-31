@@ -1070,7 +1070,7 @@ struct DiskPrefixMatchSelectionTests {
     /// Every consumer of a disk hit reports a structural rejection of it,
     /// and only that: the reports sit on the refusals (`restoreFromDiskArrays`
     /// restored nothing; the restored offsets disagree with the boundary),
-    /// each behind `detail == .disk`, and before the contextual roll-backs
+    /// each behind `detail.isDiskTierEntry`, and before the contextual roll-backs
     /// (media placeholders in the suffix, a missing seed state), which say
     /// nothing about the entry.
     ///
@@ -1110,8 +1110,8 @@ struct DiskPrefixMatchSelectionTests {
                 calls.count - 1 == consumer.reasons.count, "\(path): \(calls.count - 1) reports")
             for before in calls.dropLast() {
                 #expect(
-                    before.suffix(120).contains("detail == .disk"),
-                    "\(path): a report that is not behind `detail == .disk`")
+                    before.suffix(120).contains("detail.isDiskTierEntry"),
+                    "\(path): a report that is not behind `detail.isDiskTierEntry`")
             }
             for reason in consumer.reasons {
                 #expect(source.components(separatedBy: reason).count - 1 == 1, "\(path)")
@@ -1124,7 +1124,7 @@ struct DiskPrefixMatchSelectionTests {
         let diffusion = try Self.packageSource(
             "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift")
         #expect(
-            diffusion.contains("if detail == .disk, !cacheContainsPathDependentState(self.cache) {"))
+            diffusion.contains("if detail.isDiskTierEntry, !cacheContainsPathDependentState(self.cache) {"))
     }
 
     // MARK: - 7. A hybrid veto comes after the payload is loaded

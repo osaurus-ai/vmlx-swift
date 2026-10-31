@@ -1074,7 +1074,8 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(writer.diskCache?.pendingWriteCount == 1, "native hybrid store must be deferred")
         #expect(writer.hasDurableDiskEntry(tokens: tokens))
         if case .hit(let matched, _, let detail, _, _, let arrays) = writer.fetch(tokens: tokens + [613]) {
-            #expect(matched == tokens.count && detail == .disk)
+            // Still being written: served from RAM, a disk-tier entry.
+            #expect(matched == tokens.count && detail == .memory && detail.isDiskTierEntry)
             #expect(arrays?.keys.contains { $0.hasPrefix("mamba_") } == true)
         } else {
             Issue.record("in-flight native hybrid entry must be served")
