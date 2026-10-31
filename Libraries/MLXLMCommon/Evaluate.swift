@@ -1915,8 +1915,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             input.cacheRestorePolicy == .freshRequiredToolSelection
         self.disableDiskBackedRequiredToolRestore =
             disableDiskBackedRequiredToolRestore || requiresFreshToolSelection
+        // A model whose exact-prefix restore is suffix-independent restores a
+        // forced tool selection like any other turn (see the fetch below), so
+        // its prompt-minus-one seed is as reusable as any other turn's: keep
+        // storing it, or the turn after every forced tool call re-prefills.
+        let requiredToolTurnKeepsReuse = (model as? PrefixCacheInvariantModel)?
+            .exactPrefixRestoreIsSuffixIndependent == true
         self.skipDiskBackedToolPromptSeedBoundary =
-            skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection
+            (skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection)
+            && !requiredToolTurnKeepsReuse
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -2192,7 +2199,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
                         )
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -2209,7 +2216,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: detail.rawValue)
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -3119,6 +3126,28 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// A hybrid-pool cache with no recurrent state (DeepSeek-V4 / V4.1): its
+    /// stable system / tool boundaries are captured while prefill crosses them,
+    /// the same split its prompt-minus-one seed already takes, instead of being
+    /// rebuilt by a second prefill of the whole prefix after the answer (11.5 s
+    /// with the stream held open, DSV4.1 at 3.4k tokens on an M5 Max).
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=0` keeps the store-time rebuild for comparisons.
+    private var poolCacheCapturesBoundariesInPrefill: Bool {
+        ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] != "0"
+            && cacheRequiresPrefillCapturedDiskSeed(cache)
+    }
+
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=history`: the published history boundaries
+    /// too (the newest message boundary and the ladder rungs). Opt-in: a split
+    /// far from the prompt end runs the pruned upper layers over the rows before
+    /// it as well, measured +1 to +4 s per split on a cold DSV4.1 prefill (M5 Max),
+    /// and the newest boundary sits one rail short of the prompt-minus-one seed
+    /// every request stores anyway.
+    private var poolCacheCapturesHistoryBoundaries: Bool {
+        ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] == "history"
+            && cacheRequiresPrefillCapturedDiskSeed(cache)
+    }
+
     /// Prefill in segments that end on each processor-declared stable boundary,
     /// keeping the cache state at every one.
     ///
@@ -3165,9 +3194,25 @@ public struct TokenIterator: TokenIteratorProtocol {
             // topologies. Retaining N as well would duplicate a KV payload
             // through decode even though no store uses it.
             let requiresDiskRestore = cacheRequiresDiskBackedCoordinatorRestore(cache)
-            wanted = Set(originalInput.cacheStablePrefixTokenCounts
+            let stable = Set(originalInput.cacheStablePrefixTokenCounts)
+            // History boundaries (the newest message boundary and the ladder
+            // rungs below it) too, when asked for, for pool caches: their state at a boundary
+            // exists only while prefill crosses it. After the prompt the
+            // sliding windows have moved past it and pool rows cannot be
+            // un-appended, so the store loop's trim / replay fallback has
+            // nothing to cut back and every rung but the prompt-minus-one
+            // seed went unstored: an edited or regenerated message, or a
+            // second chat diverging inside the history, re-prefilled all of
+            // it. The split runs the head as its own prompt (`model.prepare`
+            // ends its pruned chunks at the head's end), so the snapshot is
+            // the state a cold prefill of exactly those tokens produces.
+            let history = poolCacheCapturesHistoryBoundaries
+                ? originalInput.cachePrefixTokenCounts.filter { !stable.contains($0) }
+                : []
+            wanted = Set(stable
                 .filter { $0 > 0 && $0 <= segmentEnd && $0 < promptTokenIds.count }
-                .map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 })
+                .map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 }
+                + history.filter { $0 > 0 && $0 <= segmentEnd && $0 < promptTokenIds.count })
                 .filter { boundary in
                     boundary > alreadyConsumed && boundary < segmentEnd
                         && !(cacheCoordinator?.hasDurableDiskEntry(
@@ -3186,7 +3231,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         var remaining = input
         for boundary in wanted {
             guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary, inputStart: consumed),
+                let split = boundarySplit(
+                    of: remaining, at: boundary, inputStart: consumed,
+                    allowHybridPool: captureStoreSeedsOnly && poolCacheCapturesBoundariesInPrefill),
                 let head = split.head
             else { continue }
             try prepareBoundaryHead(head, windowSize: windowSize)

@@ -849,7 +849,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
                         restored = true
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -866,7 +866,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "native-mtp")
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -1926,7 +1926,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.requiresRecurrentSSMCompanion,
             !coordinator.requiresSeparateRecurrentPayload,
             let disk = coordinator.diskCache,
-            case .arrays(let arrays) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
+            case .arrays(let arrays, _) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
         else { return false }
         var scratch = model.newCache(parameters: cacheInitParameters)
         let restored = restoreFromDiskArrays(arrays, into: &scratch)

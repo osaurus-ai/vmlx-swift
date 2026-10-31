@@ -41,6 +41,23 @@ public struct CacheCoordinatorConfig: Sendable {
     /// directly keeps synchronous stores (its callers may inspect files and rows right after a
     /// store). `VMLX_DISK_WRITE_BEHIND=0` forces synchronous stores everywhere.
     public var diskWriteBehind: Bool = false
+    /// RAM kept for disk-tier entries after their store or a read (``DiskCache/residentByteBudget``):
+    /// the next request of a chat, and the request after a tool call, restores its prefix from RAM
+    /// instead of the SSD. Used for models the paged tier cannot hold, and for every model while
+    /// the paged tier is off. Entries above it are still written to and served from the SSD. `0`
+    /// keeps none; the serving configuration (`VMLXServerRuntimeSettings.cacheCoordinatorConfig`)
+    /// sets ``servingResidentEntryBytes``.
+    public var residentEntryBytes: Int = 0
+
+    /// The serving default: `0`, so serving caches whole-prefix entries on the SSD only (the RAM a
+    /// host gives the model is not spent on cache copies). `VMLX_RESIDENT_CACHE_GB=<GiB>` keeps that
+    /// many GiB of entries resident as well.
+    public static var servingResidentEntryBytes: Int {
+        guard let raw = ProcessInfo.processInfo.environment["VMLX_RESIDENT_CACHE_GB"], let gb = Double(raw) else {
+            return 0
+        }
+        return max(0, Int(gb * 1_073_741_824))
+    }
 
     /// Number of tokens per paged cache block.
     public var pagedBlockSize: Int
