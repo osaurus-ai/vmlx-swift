@@ -326,7 +326,7 @@ struct MiniMaxM3StructuralPrefixCacheTests {
             let reused = warm.1?.start ?? -1
             if turn > 0 {
                 #expect(reused == previousK, "turn \(turn + 1): reused \(reused), K_prev \(previousK)")
-                #expect(warm.2.contains { $0.reuse == previousK && $0.detail == "disk" }, "turn \(turn + 1): restores \(warm.2.map { "\($0.detail) \($0.reuse)" })")
+                #expect(warm.2.contains { $0.reuse == previousK && ["disk", "memory"].contains($0.detail) }, "turn \(turn + 1): restores \(warm.2.map { "\($0.detail) \($0.reuse)" })")
             }
             previousK = Self.k(prompt)
             history += Self.message(Self.ai, (0 ..< 5).map { (turn * 31 + $0 * 7) % 990 })

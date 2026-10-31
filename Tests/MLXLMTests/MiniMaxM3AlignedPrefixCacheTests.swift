@@ -435,10 +435,11 @@ struct MiniMaxM3AlignedPrefixCacheTests {
                 }
             }
             #expect(crossedSparse, "no continuation crossed the 2,048-key dense -> sparse switch")
-            // The paged tier cannot hold M3's three-lane cache: every restore came from the disk tier.
+            // The paged tier cannot hold M3's three-lane cache: every restore came from the disk tier, its RAM
+            // resident entries ("memory") or its files ("disk").
             #expect(coordinator.isPagedIncompatible)
             let details = Set(recorder.restores.map(\.detail))
-            #expect(details == ["disk"], "restore tiers \(details)")
+            #expect(!details.isEmpty && details.isSubset(of: ["disk", "memory"]), "restore tiers \(details)")
 
             // The state a CACHED turn (turn 6) stored, restored from disk, equals a direct cold prefill row for row.
             _ = coordinator.waitForPendingDiskWrites()
@@ -453,7 +454,7 @@ struct MiniMaxM3AlignedPrefixCacheTests {
                 return
             }
             // One entry per reusable boundary (`TokenIterator.alignedStoreBoundaries`): the turn's own K, not N - 1.
-            #expect(detail == .disk && matched == Self.boundary(prev))
+            #expect(detail.isDiskTierEntry && matched == Self.boundary(prev))
             var stored = model.newCache(parameters: nil)
             try #require(restoreFromDiskArrays(arrays, into: &stored, requirePromptBoundary: true) == matched)
             #expect(AlignedPrefill.tag(of: stored) == AlignedPrefillTag(step: step, boundary: Self.boundary(prev)))
