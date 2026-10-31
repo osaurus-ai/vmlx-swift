@@ -8,14 +8,14 @@ import Foundation
 public enum Filters {
     // MARK: - Basic String Filters
 
-    /// Converts a string to uppercase.
+    /// Converts the Python-style text representation of a value to uppercase.
     @Sendable public static func upper(
         _ args: [Value],
         kwargs: [String: Value] = [:],
         env: Environment
     ) throws -> Value {
-        guard case let .string(str) = args.first else {
-            throw JinjaError.runtime("upper filter requires string")
+        guard let value = args.first else {
+            throw JinjaError.runtime("upper filter requires a value")
         }
 
         _ = try resolveCallArguments(
@@ -25,7 +25,72 @@ public enum Filters {
             defaults: [:]
         )
 
-        return .string(str.uppercased())
+        return .string(pythonString(value).uppercased())
+    }
+
+    /// Jinja's case filter first stringifies values. In particular, a nullable
+    /// schema type is a list, and a missing schema member is undefined. Rejecting
+    /// either encouraged callers to silently rewrite otherwise valid schemas.
+    private static func pythonString(_ value: Value, quoted: Bool = false) -> String {
+        switch value {
+        case .string(let text):
+            return quoted ? pythonQuotedString(text) : text
+        case .null:
+            return "None"
+        case .undefined:
+            return quoted ? "Undefined" : ""
+        case .boolean(let flag):
+            return flag ? "True" : "False"
+        case .array(let values):
+            return "[" + values.map { pythonString($0, quoted: true) }.joined(separator: ", ") + "]"
+        case .object(let values):
+            return "{" + values.map {
+                pythonQuotedString($0.key) + ": " + pythonString($0.value, quoted: true)
+            }.joined(separator: ", ") + "}"
+        case .namespace(let values):
+            return "<Namespace " + pythonString(.object(values)) + ">"
+        default:
+            return value.description
+        }
+    }
+
+    private static func pythonQuotedString(_ text: String) -> String {
+        let quote = text.contains("'") && !text.contains("\"") ? "\"" : "'"
+        var result = quote
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\\":
+                result += "\\\\"
+            case "\n":
+                result += "\\n"
+            case "\r":
+                result += "\\r"
+            case "\t":
+                result += "\\t"
+            default:
+                if String(scalar) == quote {
+                    result += "\\" + quote
+                    continue
+                }
+                let nonPrinting: Bool
+                switch scalar.properties.generalCategory {
+                case .control, .format, .surrogate, .privateUse, .unassigned,
+                    .lineSeparator, .paragraphSeparator, .spaceSeparator:
+                    nonPrinting = scalar.value != 0x20
+                default:
+                    nonPrinting = false
+                }
+                if nonPrinting {
+                    let value = scalar.value
+                    if value <= 0xff { result += String(format: "\\x%02x", value) }
+                    else if value <= 0xffff { result += String(format: "\\u%04x", value) }
+                    else { result += String(format: "\\U%08x", value) }
+                } else {
+                    result.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return result + quote
     }
 
     /// Converts a string to lowercase.
@@ -1065,22 +1130,19 @@ public enum Filters {
         return try forceescape(args, kwargs: kwargs, env: env)
     }
 
-    /// Converts value to JSON string, as Hugging Face transformers' chat-template `tojson` filter does:
-    /// `json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)` with
-    /// `ensure_ascii=False`, `indent=None`, `separators=None`, `sort_keys=False` by default. So, like the Python
-    /// reference every bundle's template is written and validated against: `", "` / `": "` separators (`","` / `": "`
-    /// with an indent), keys in the object's own order, `/` not escaped, non-ASCII kept unless `ensure_ascii`, floats
-    /// in Python's repr (`2.0`, `1e+16`).
+    /// Serializes values using the Hugging Face chat-template JSON contract.
     ///
-    /// Before 2026-10-28 this filter wrote Foundation's compact JSON (`","` / `":"`, keys always sorted, `\/`,
-    /// `ensure_ascii` on by default), so every tool schema a template rendered with `tojson` differed from the vMLX
-    /// Python / HF prompt (MiniMax-M3.1's `<tools>` block: 12 bytes per tool).
+    /// INVARIANT: default separators, Unicode, escaping and object order must
+    /// match Python json.dumps. Changing them changes the model's prompt tokens.
+    /// Unordered host dictionaries are canonicalized by Value(any:); this filter
+    /// preserves the order of the resulting Jinja object unless sort_keys is set.
+    /// Guarded by JinjaToJSONReferenceTests and its pinned reference corpus.
     ///
     /// - Parameters:
-    ///   - indent: an int (spaces) or a string, as `json.dumps`.
-    ///   - ensure_ascii: escape non-ASCII characters as `\uXXXX` (default false, as transformers).
-    ///   - separators: an `(item, key)` pair of strings.
-    ///   - sort_keys: sort object keys (default false: the object's order).
+    ///   - indent: An integer, string, or null, following Python JSON indentation.
+    ///   - ensure_ascii: Escape non-ASCII characters when true; defaults to false.
+    ///   - separators: Optional item/key separator pair; defaults to `, ` / `: `.
+    ///   - sort_keys: Sort keys when true; otherwise preserve the Jinja object's order.
     @Sendable public static func tojson(
         _ args: [Value],
         kwargs: [String: Value] = [:],
@@ -1093,20 +1155,24 @@ public enum Filters {
             kwargs: kwargs,
             parameters: ["ensure_ascii", "indent", "separators", "sort_keys"],
             defaults: [
-                "ensure_ascii": .boolean(false), "indent": .null, "separators": .null, "sort_keys": .boolean(false),
+                "ensure_ascii": .boolean(false), "indent": .null, "separators": .null,
+                "sort_keys": .boolean(false),
             ]
         )
         var indent: String?
         switch arguments["indent"] {
         case .int(let n)?: indent = String(repeating: " ", count: Swift.max(0, n))
         case .string(let s)?: indent = s
-        default: indent = nil
+        case .boolean(let b)?: indent = b ? " " : ""
+        case .null?, nil: indent = nil
+        default:
+            throw JinjaError.runtime("tojson(indent:) expects an integer, string, or null.")
         }
         var itemSeparator = indent == nil ? ", " : ","
         var keySeparator = ": "
         if let separators = arguments["separators"], separators != .null {
-            guard case let .array(items) = separators, items.count == 2,
-                case let .string(item) = items[0], case let .string(key) = items[1]
+            guard case .array(let items) = separators, items.count == 2,
+                case .string(let item) = items[0], case .string(let key) = items[1]
             else {
                 throw JinjaError.runtime("tojson(separators:) expects a two-string tuple or array.")
             }
@@ -1137,7 +1203,7 @@ public enum Filters {
 
         mutating func write(_ value: Value, level: Int) throws {
             switch value {
-            case .null, .undefined: output += "null"
+            case .null: output += "null"
             case .boolean(let b): output += b ? "true" : "false"
             case .int(let i): output += String(i)
             case .double(let d): output += Self.pythonFloat(d)
@@ -1171,9 +1237,8 @@ public enum Filters {
                 }
                 newline(level)
                 output += "}"
-            case .function, .macro: output += "null"
-            // Anything else (a namespace) is not a JSON value: json.dumps raises, and so does the
-            // encoder this writer replaced.
+            // Undefined values, functions, macros and namespaces are not JSON
+            // values. Do not silently turn template errors into null fields.
             default: throw JinjaError.runtime("\(value) cannot be JSON encoded")
             }
         }
@@ -1207,21 +1272,6 @@ public enum Filters {
             if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
             return "\(d)"
         }
-    }
-
-    /// Escapes non-ASCII characters in a string as `\uXXXX` sequences.
-    private static func escapeNonASCII(_ string: String) -> String {
-        var result = ""
-        result.reserveCapacity(string.utf16.count)
-        // Iterate UTF-16 code units so non-BMP scalars emit surrogate pairs.
-        for codeUnit in string.utf16 {
-            if codeUnit > 127 {
-                result += String(format: "\\u%04x", codeUnit)
-            } else if let scalar = UnicodeScalar(codeUnit) {
-                result.append(Character(scalar))
-            }
-        }
-        return result
     }
 
     /// Returns absolute value of a number.

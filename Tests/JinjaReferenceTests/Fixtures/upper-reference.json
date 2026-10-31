@@ -1,0 +1,93 @@
+[
+  {
+    "id": "0",
+    "context": null,
+    "expected": "NONE"
+  },
+  {
+    "id": "1",
+    "context": true,
+    "expected": "TRUE"
+  },
+  {
+    "id": "2",
+    "context": false,
+    "expected": "FALSE"
+  },
+  {
+    "id": "3",
+    "context": 0,
+    "expected": "0"
+  },
+  {
+    "id": "4",
+    "context": 1.5,
+    "expected": "1.5"
+  },
+  {
+    "id": "5",
+    "context": "string",
+    "expected": "STRING"
+  },
+  {
+    "id": "6",
+    "context": [
+      "string",
+      "null"
+    ],
+    "expected": "['STRING', 'NULL']"
+  },
+  {
+    "id": "7",
+    "context": [
+      null,
+      true,
+      "text"
+    ],
+    "expected": "[NONE, TRUE, 'TEXT']"
+  },
+  {
+    "id": "8",
+    "context": {
+      "a": null,
+      "b": [
+        true,
+        "text"
+      ]
+    },
+    "expected": "{'A': NONE, 'B': [TRUE, 'TEXT']}"
+  },
+  {
+    "id": "9",
+    "context": [
+      "O'Reilly",
+      "a\"b",
+      "a'b\"c"
+    ],
+    "expected": "[\"O'REILLY\", 'A\"B', 'A\\'B\"C']"
+  },
+  {
+    "id": "10",
+    "context": [
+      "a\nb",
+      "\u0000 ",
+      "café 🦖"
+    ],
+    "expected": "['A\\NB', '\\X00\\X7F\\XA0', 'CAFÉ 🦖']"
+  },
+  {
+    "id": "11",
+    "context": {
+      "additionalProperties": false,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected": "{'ADDITIONALPROPERTIES': FALSE, 'TYPE': ['STRING', 'NULL']}"
+  },
+  {
+    "id": "undefined",
+    "expected": ""
+  }
+]
