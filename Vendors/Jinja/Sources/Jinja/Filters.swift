@@ -1117,7 +1117,7 @@ public enum Filters {
             ensureASCII: arguments["ensure_ascii"]?.isTruthy ?? false, indent: indent,
             itemSeparator: itemSeparator, keySeparator: keySeparator,
             sortKeys: arguments["sort_keys"]?.isTruthy ?? false)
-        writer.write(value, level: 0)
+        try writer.write(value, level: 0)
         return .string(writer.output)
     }
 
@@ -1135,7 +1135,7 @@ public enum Filters {
             output += "\n" + String(repeating: indent, count: level)
         }
 
-        mutating func write(_ value: Value, level: Int) {
+        mutating func write(_ value: Value, level: Int) throws {
             switch value {
             case .null, .undefined: output += "null"
             case .boolean(let b): output += b ? "true" : "false"
@@ -1151,7 +1151,7 @@ public enum Filters {
                 for (i, item) in items.enumerated() {
                     if i > 0 { output += itemSeparator }
                     newline(level + 1)
-                    write(item, level: level + 1)
+                    try write(item, level: level + 1)
                 }
                 newline(level)
                 output += "]"
@@ -1167,11 +1167,14 @@ public enum Filters {
                     newline(level + 1)
                     writeString(key)
                     output += keySeparator
-                    write(dict[key] ?? .null, level: level + 1)
+                    try write(dict[key] ?? .null, level: level + 1)
                 }
                 newline(level)
                 output += "}"
             case .function, .macro: output += "null"
+            // Anything else (a namespace) is not a JSON value: json.dumps raises, and so does the
+            // encoder this writer replaced.
+            default: throw JinjaError.runtime("\(value) cannot be JSON encoded")
             }
         }
 
