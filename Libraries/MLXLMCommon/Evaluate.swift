@@ -3250,11 +3250,24 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     /// A hybrid-pool cache with no recurrent state (DeepSeek-V4 / V4.1): its
-    /// structural boundaries are captured while prefill crosses them, the same
-    /// split its prompt-minus-one seed already takes. `VMLX_POOL_BOUNDARY_CAPTURE=0`
-    /// keeps the stable-only, store-time behaviour for comparisons.
+    /// stable system / tool boundaries are captured while prefill crosses them,
+    /// the same split its prompt-minus-one seed already takes, instead of being
+    /// rebuilt by a second prefill of the whole prefix after the answer (11.5 s
+    /// with the stream held open, DSV4.1 at 3.4k tokens on an M5 Max).
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=0` keeps the store-time rebuild for comparisons.
     private var poolCacheCapturesBoundariesInPrefill: Bool {
         ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] != "0"
+            && cacheRequiresPrefillCapturedDiskSeed(cache)
+    }
+
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=history`: the published history boundaries
+    /// too (the newest message boundary and the ladder rungs). Opt-in: a split
+    /// far from the prompt end runs the pruned upper layers over the rows before
+    /// it as well, measured +1 to +4 s per split on a cold DSV4.1 prefill (M5 Max),
+    /// and the newest boundary sits one rail short of the prompt-minus-one seed
+    /// every request stores anyway.
+    private var poolCacheCapturesHistoryBoundaries: Bool {
+        ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] == "history"
             && cacheRequiresPrefillCapturedDiskSeed(cache)
     }
 
@@ -3306,7 +3319,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             let requiresDiskRestore = cacheRequiresDiskBackedCoordinatorRestore(cache)
             let stable = Set(originalInput.cacheStablePrefixTokenCounts)
             // History boundaries (the newest message boundary and the ladder
-            // rungs below it) too, for pool caches: their state at a boundary
+            // rungs below it) too, when asked for, for pool caches: their state at a boundary
             // exists only while prefill crosses it. After the prompt the
             // sliding windows have moved past it and pool rows cannot be
             // un-appended, so the store loop's trim / replay fallback has
@@ -3316,7 +3329,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // it. The split runs the head as its own prompt (`model.prepare`
             // ends its pruned chunks at the head's end), so the snapshot is
             // the state a cold prefill of exactly those tokens produces.
-            let history = poolCacheCapturesBoundariesInPrefill
+            let history = poolCacheCapturesHistoryBoundaries
                 ? originalInput.cachePrefixTokenCounts.filter { !stable.contains($0) }
                 : []
             wanted = Set(stable
