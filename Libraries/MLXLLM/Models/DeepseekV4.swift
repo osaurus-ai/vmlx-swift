@@ -618,16 +618,6 @@ class DeepseekV4Attention: Module {
                                     offset: offset, window: config.slidingWindow, ratio: compressRatio,
                                     scale: scale)
                             }
-                            if heads16Out == nil, isV41, let tk = topK, config.useAttnSink,
-                                DeepseekV4Math.gatheredPrefillAttentionEnabled
-                            {
-                                // Opt-in (VMLX_DSV41_ATTN_GATHERED=1): the same attention as fp32 matrix
-                                // products on the matrix units; not bit-identical to the heads-16 kernel.
-                                heads16Out = DeepseekV4Math.gatheredPrefillAttention(
-                                    queries: q, localKV: fullKV, pooled: pooled, topK: tk,
-                                    offset: offset, window: config.slidingWindow,
-                                    ratio: compressRatio, scale: scale, sinks: attnSink)
-                            }
                             if heads16Out == nil, let tk = topK {
                                 heads16Out =
                                     DeepseekV4Math.heads16PrefillAttention(

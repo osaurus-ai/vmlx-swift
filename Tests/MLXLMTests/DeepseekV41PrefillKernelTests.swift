@@ -11,7 +11,7 @@ import XCTest
 
 /// DeepSeek-V4.1 prefill kernels at the model's geometry (384 experts, top-6; 64 heads x 512, one KV head, window 128,
 /// 512 picks). The routed-expert cases compare bits, not tolerances: the expert-aligned tiles and the sort glue must
-/// return exactly what they replace. The opt-in gathered attention core is checked against the fp32 reference.
+/// return exactly what they replace. The opt-in NAX attention kernel is checked against the fp32 reference.
 final class DeepseekV41PrefillKernelTests: XCTestCase {
     private func bits16(_ a: MLXArray) -> [UInt16] { a.view(dtype: .uint16).asArray(UInt16.self) }
 
@@ -41,9 +41,10 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
         return (q, kv, pool, topk, sinks)
     }
 
-    /// The opt-in gathered core and NAX kernel compute the heads-16 kernel's attention (not its bits): against the fp32
-    /// reference of the stock dense-mask branch, all stay within rounding at the cold-prefill and mid-prompt shapes.
-    func testGatheredCoreMatchesReference() throws {
+    /// The opt-in NAX kernel computes the heads-16 kernel's attention (not its bits): against the fp32 reference of the
+    /// stock dense-mask branch, both stay within bf16 output rounding at cold-prefill, mid-prompt and ratio-1 shapes.
+    func testIndexedNAXMatchesReference() throws {
+        try XCTSkipUnless(DSV41IndexedAttentionNAX.available, "NAX needs an M5-class GPU")
         let scale = Float(pow(Double(512), -0.5))
         for (i, (s, r, p, k, offset, ratio)) in [(64, 64, 40, 32, 0, 2), (37, 164, 300, 64, 900, 2),
                                                  (20, 147, 400, 48, 380, 1)].enumerated() {
@@ -58,25 +59,31 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
             let h16 = DeepseekV4Math.heads16RunKernel(
                 q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks32: c.sinks,
                 offset: offset, window: 128, ratio: ratio, scale: scale).asType(.float32)
-            let got = try XCTUnwrap(DeepseekV4Math.gatheredPrefillAttention(
-                queries: c.q, localKV: c.kv.reshaped(1, 1, r, 512), pooled: c.pool.reshaped(1, p, 512),
-                topK: topk.reshaped(1, s, k), offset: offset, window: 128, ratio: ratio, scale: scale,
-                sinks: c.sinks)).asType(.float32)
+            let nax = try XCTUnwrap(DSV41IndexedAttentionNAX.attend(
+                q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks: c.sinks, offset: offset, window: 128,
+                ratio: ratio, scale: scale)).asType(.float32)
             let denom = MLX.abs(ref).max().item(Float.self)
-            let relG = MLX.abs(got - ref).max().item(Float.self) / denom
+            let relN = MLX.abs(nax - ref).max().item(Float.self) / denom
             let relH = MLX.abs(h16 - ref).max().item(Float.self) / denom
-            XCTAssertLessThan(relG, 2e-2, "shape \(i): gathered rel \(relG)")
+            XCTAssertLessThan(relN, 2e-2, "shape \(i): NAX rel \(relN)")
             XCTAssertLessThan(relH, 2e-2, "shape \(i): heads16 rel \(relH)")
-            var relN = Float.nan
-            if DSV41IndexedAttentionNAX.available {
-                let nax = try XCTUnwrap(DSV41IndexedAttentionNAX.attend(
-                    q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks: c.sinks, offset: offset, window: 128,
-                    ratio: ratio, scale: scale)).asType(.float32)
-                relN = MLX.abs(nax - ref).max().item(Float.self) / denom
-                XCTAssertLessThan(relN, 2e-2, "shape \(i): NAX rel \(relN)")
-            }
-            print("DSV41_GATHERED shape \(i) rel vs fp32 reference: gathered \(relG) heads16 \(relH) nax \(relN)")
+            XCTAssertFalse(isNaN(nax).any().item(Bool.self))
+            print("DSV41_NAX shape \(i) rel vs fp32 reference: nax \(relN) heads16 \(relH)")
         }
+        // Control: a changed visible pool row changes the NAX output.
+        let (s, r, p, k, offset, ratio) = (37, 164, 300, 64, 900, 2)
+        let c = heads16Case(seed: 78, s: s, r: r, p: p, k: k, offset: offset, ratio: ratio, dtype: .bfloat16)
+        let perm = argSort(MLXRandom.uniform(0 ..< 1, [s, p], key: MLXRandom.key(6)), axis: -1)
+        let topk = perm[0..., ..<k].asType(.int32)
+        let picks = topk[s - 1].asArray(Int32.self)
+        let row = try XCTUnwrap(picks.first(where: { (Int($0) + 1) * ratio <= offset + s }))
+        let mask = (MLXArray(0 ..< Int32(p)) .== MLXArray(row)).reshaped(p, 1)
+        let bumped = MLX.where(mask, MLXArray(Float(0.25)).asType(.bfloat16), c.pool)
+        let a = DSV41IndexedAttentionNAX.attend(q: c.q, kv2d: c.kv, pool2d: c.pool, topk2d: topk, sinks: c.sinks,
+                                                offset: offset, window: 128, ratio: ratio, scale: scale)!
+        let b = DSV41IndexedAttentionNAX.attend(q: c.q, kv2d: c.kv, pool2d: bumped, topk2d: topk, sinks: c.sinks,
+                                                offset: offset, window: 128, ratio: ratio, scale: scale)!
+        XCTAssertNotEqual(bits16(a), bits16(b), "control: a changed visible pool row must change the output")
     }
 
     // MARK: routed experts
@@ -217,6 +224,84 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
     }
 }
 
+/// The routed layer against a re-implementation of the 2c35065b4 prefill glue (integer floorDivide, fp32 gather then
+/// narrow, k copies of every raw row for the outlier epilogue, widen-then-gather down outliers) at the real
+/// DeepSeek-V4.1 dimensions (`DSV41_PERF=1`: ~3 GB of synthetic banks).
+final class DeepseekV41RoutedGlueRealDimsTests: XCTestCase {
+    func testNewGlueEqualsOldGlueAtRealDims() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["DSV41_PERF"] == "1" && JANGTPrefillKernel.available)
+        let experts = 384, topK = 6, hidden = 5_120, inter = 2_304, tokens = 1_024
+        func proj(_ k: Double, out: Int, inp: Int, seed: UInt64, cols: MLXArray, colScales: Bool) throws
+            -> JANGTProjection
+        {
+            let ks = MLXRandom.split(key: MLXRandom.key(seed), into: 4)
+            let w = JANGTCode.wordsPerRow(inputs: inp, k: k)
+            return try JANGTProjection(
+                k: k, packed: MLXRandom.randInt(low: 0, high: Int32.max, [experts, out, w], key: ks[0]).asType(.uint32),
+                scale: MLXRandom.uniform(low: 0.002, high: 0.02, [experts, out], key: ks[1]),
+                signs: MLX.where(MLXRandom.uniform(0 ..< 1, [inp], key: ks[2]) .< 0.5, MLXArray(Float(-1)),
+                                 MLXArray(Float(1))),
+                outlierColumnIndices: cols,
+                outlierWeights: (MLXRandom.normal([experts, out, cols.dim(1)], key: ks[3]) * 0.05).asType(.float16),
+                columnScales: colScales ? MLXRandom.uniform(low: 0.5, high: 1.5, [experts, inp]) : nil)
+        }
+        let guCols = MLXArray((0 ..< experts).flatMap { _ in [Int32(3), Int32(400), Int32(4_000)] }, [experts, 3])
+        let dnCols = MLXArray((0 ..< experts).flatMap { e in (0 ..< 8).map { Int32((e * 31 + $0 * 277) % inter) } },
+                              [experts, 8])
+        for (kg, kd) in [(1.0, 1.5), (2.0, 2.5)] {
+            let gate = try proj(kg, out: inter, inp: hidden, seed: 11, cols: guCols, colScales: false)
+            let up = try proj(kg, out: inter, inp: hidden, seed: 12, cols: guCols, colScales: false)
+            let down = try proj(kd, out: hidden, inp: inter, seed: 13, cols: dnCols, colScales: true)
+            eval(gate.packed, up.packed, down.packed)
+            let layer = try JANGTRoutedExpertLayer(
+                gate: gate, up: up, down: down, hiddenSize: hidden, intermediateSize: inter, activationLimit: 10)
+            // Skewed routes: a few hot experts get > 64 rows (multi-tile segments), many get 0-3.
+            let bias = MLXArray((0 ..< experts).map { Float($0 < 8 ? 3.0 : -0.01 * Double($0 % 97)) })
+            let logits = MLXRandom.gumbel([tokens, experts], key: MLXRandom.key(21)) + bias
+            let ids = argPartition(-logits, kth: topK - 1, axis: -1)[0..., ..<topK].asType(.int32)
+            let w = MLXRandom.uniform(low: 0.05, high: 1, [tokens, topK], key: MLXRandom.key(22))
+            let x = (MLXRandom.normal([tokens, hidden], key: MLXRandom.key(23)) * 0.5).asType(.bfloat16)
+            eval(ids, w, x)
+
+            // The 2c35065b4 glue.
+            let flat = ids.flattened()
+            let order = argSort(flat)
+            let sortedIDs = take(flat, order).asType(.uint32)
+            let tok = order.floorDivide(topK)
+            let guSigns = gate.signs * JANGTRoutedExpertLayer.keepMask(
+                width: hidden, columns: gate.outlierColumnIndices[0 ..< 1])[0]
+            let xr = take(JANGTKernels.rotateRows(x, signs: guSigns), tok, axis: 0).asType(.bfloat16)
+            let h = JANGTPrefillKernel.projectGateUpWithOutliers(
+                xr, rawRows: take(x, tok, axis: 0), gate: gate, up: up,
+                columns: guCols[0].asType(.int32), indices: sortedIDs, limit: 10)
+            let dSigns = down.columnScales! * down.signs.expandedDimensions(axis: 0)
+                * JANGTRoutedExpertLayer.keepMask(width: inter, columns: down.outlierColumnIndices)
+            let hr = JANGTKernels.rotateRows(h, signs: dSigns, rowExperts: sortedIDs).asType(.bfloat16)
+            var y = JANGTPrefillKernel.project(hr, down, indices: sortedIDs).asType(.float32)
+            let cols = take(down.outlierColumnIndices, sortedIDs.asType(.int32), axis: 0)
+            let valid = (cols .>= MLXArray(Int32(0))).asType(.float32)
+            let xo = takeAlong(h.asType(.float32), maximum(cols, MLXArray(Int32(0))), axis: 1) * valid
+            let wT = down.outlierWeights.swappedAxes(-1, -2).asType(.float32)
+            y = y + gatherMM(xo.expandedDimensions(axis: 1), wT, rhsIndices: sortedIDs, sortedIndices: true)
+                .squeezed(axis: 1)
+            let restored = take(y, argSort(order), axis: 0).reshaped(tokens, topK, hidden).asType(.float32)
+            let old = matmul(w.reshaped(tokens, 1, topK), restored).reshaped(tokens, hidden).asType(.bfloat16)
+            eval(old)
+            for tiles in ["0", "1"] {
+                setenv("VMLX_JANGT_EXPERT_TILES", tiles, 1)
+                let new = layer.callRouted(x.reshaped(1, tokens, hidden), indices: ids.reshaped(1, tokens, topK),
+                                           scores: w.reshaped(1, tokens, topK)).reshaped(tokens, hidden)
+                eval(new)
+                let same = (old.view(dtype: .uint16) .== new.view(dtype: .uint16)).all().item(Bool.self)
+                let diff = MLX.abs(old.asType(.float32) - new.asType(.float32)).max().item(Float.self)
+                print("DSV41_GLUE K \(kg)/\(kd) tiles=\(tiles): new == old bitwise \(same), max |diff| \(diff)")
+                XCTAssertTrue(same, "K \(kg)/\(kd) tiles=\(tiles): new glue != 2c35065b4 glue")
+            }
+            unsetenv("VMLX_JANGT_EXPERT_TILES")
+        }
+    }
+}
+
 /// Timings at the real DeepSeek-V4.1 shapes (diagnostic, `DSV41_PERF=1`). Synthetic weights; the model-level speed is
 /// measured with RunBench `BENCH_DSV41_PREFILL`. Arms alternate call by call (A B C A B C ...), medians reported.
 final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
@@ -256,14 +341,7 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
                 q: q, kv2d: kv.reshaped(r, 512), pool2d: pool.reshaped(p, 512), topk2d: topk.reshaped(s, k),
                 sinks32: sinks, offset: offset, window: 128, ratio: 2, scale: scale)
         }
-        let gathered = {
-            DeepseekV4Math.gatheredPrefillAttention(
-                queries: q, localKV: kv, pooled: pool, topK: topk, offset: offset, window: 128, ratio: 2,
-                scale: scale, sinks: sinks)!
-        }
-        let a = h16().asType(.float32), b = gathered().asType(.float32)
-        let rel = (MLX.abs(a - b).max() / MLX.abs(a).max()).item(Float.self)
-        print(String(format: "DSV41_KERNEL_PERF gathered vs heads16 max rel diff %.3e", rel))
+        let a = h16().asType(.float32)
         let nax = {
             DSV41IndexedAttentionNAX.attend(
                 q: q, kv2d: kv.reshaped(r, 512), pool2d: pool.reshaped(p, 512), topk2d: topk.reshaped(s, k),
@@ -272,7 +350,7 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
         let c = nax().asType(.float32)
         let relN = (MLX.abs(a - c).max() / MLX.abs(a).max()).item(Float.self)
         print(String(format: "DSV41_KERNEL_PERF nax vs heads16 max rel diff %.3e", relN))
-        interleaved([("heads16 kernel", h16), ("gathered core", gathered), ("nax indexed", nax)])
+        interleaved([("heads16 kernel", h16), ("nax indexed", nax)])
     }
 
     func testRoutedPrefillTimingAtDSV41Shapes() throws {
@@ -308,6 +386,11 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
                 return layer.callRouted(x, indices: ids, scores: w)
             }
         }
+        let rowTiled = arm("0")(), aligned = arm("1")()
+        eval(rowTiled, aligned)
+        let same = (rowTiled.view(dtype: .uint16) .== aligned.view(dtype: .uint16)).all().item(Bool.self)
+        let diff = MLX.abs(rowTiled.asType(.float32) - aligned.asType(.float32)).max().item(Float.self)
+        print("DSV41_KERNEL_PERF routed layer real dims: aligned == row-tiled bitwise \(same), max |diff| \(diff)")
         interleaved([("routed layer 1024x6 row-tiled", arm("0")), ("routed layer 1024x6 expert-aligned", arm("1"))])
         unsetenv("VMLX_JANGT_EXPERT_TILES")
     }

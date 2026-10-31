@@ -1,7 +1,7 @@
 // BENCH_DSV41_KL=1 — teacher-forced A/B of a DeepSeek-V4.1 prefill switch on held-out chat sequences, in one process.
 //
 // Every sequence is run through two fresh caches in BENCH_KL_CHUNK-row forwards (default 1024, the served chunk
-// width), chunk by chunk: arm A with the environment variable BENCH_KL_ENV (default VMLX_DSV41_ATTN_GATHERED) unset,
+// width), chunk by chunk: arm A with the environment variable BENCH_KL_ENV (default VMLX_DSV41_ATTN_NAX) unset,
 // arm B with it set to "1" (the runtime reads the switch per call). Scored positions are the ASSISTANT positions:
 // position i is scored when token i+1 lies in an assistant span (after <｜Assistant｜>, through the next
 // <｜end▁of▁sentence｜>, or up to the next <｜User｜>). Per position: KL(A || B) over the full vocabulary (fp32 log
@@ -22,7 +22,7 @@ func runDSV41KLBench(modelPath: String) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let chunk = Int(env["BENCH_KL_CHUNK"] ?? "1024") ?? 1024
     let limit = Int(env["BENCH_KL_N"] ?? "") ?? Int.max
-    let switchName = env["BENCH_KL_ENV"] ?? "VMLX_DSV41_ATTN_GATHERED"
+    let switchName = env["BENCH_KL_ENV"] ?? "VMLX_DSV41_ATTN_NAX"
     let label = env["BENCH_KL_LABEL"] ?? "kl"
     guard let seqPath = env["BENCH_KL_SEQS"] else {
         print("[KL] INVALID: set BENCH_KL_SEQS")
