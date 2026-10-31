@@ -292,7 +292,15 @@ public struct LoadBundleFacts: Sendable, Equatable {
 
     /// Inspect the bundle directory at `url`. All probes are best-effort —
     /// failures degrade silently to safe defaults (zero bytes, dense).
-    public static func inspect(bundleURL url: URL) -> LoadBundleFacts {
+    public static func inspect(bundleURL: URL) -> LoadBundleFacts {
+        // A bundle reached through a symlinked directory (models kept on another volume and
+        // linked into the models folder) must report the same facts as its target.
+        // `contentsOfDirectory(at:)` throws ENOTDIR on a URL naming a symlink to a directory, so
+        // the unresolved URL listed nothing: zero weight bytes, so no Metal residency budget, so
+        // the whole model stayed reclaimable. DeepSeek-V4.1 JANG_2K (197 GiB) on a 256 GiB Mac
+        // then had 69-80 GiB of its weights compressed right after load, and the first command
+        // buffer that had to bring them back hit the GPU timeout.
+        let url = bundleURL.resolvingSymlinksInPath()
         let fm = FileManager.default
         let physical = HostPhysicalMemory.bytes
 
