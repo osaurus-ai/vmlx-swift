@@ -346,7 +346,7 @@ runtime families without copying code:
   `K` tokens, verifies `[primary, d1, ... dK]` in one target forward, accepts a
   draft prefix, emits the verifier token at the first rejected/bonus position,
   and trims rejected cache suffixes. That matches the Swift greedy structure.
-- MTPLX native MTP uses the model's own MTP heads, recursive draft hidden-state
+- Fast native MTP uses the model's own MTP heads, recursive draft hidden-state
   feedback, an MTP-private cache, target verification over
   `[primary, d1, d2, d3]`, exact probability-ratio acceptance at stochastic
   temperatures, residual correction sampling on rejection, accepted-prefix cache
@@ -548,7 +548,7 @@ until at least one family implements all of:
    fallback count, and token/s.
 
 Depth matters. A D1 loop that drafts one token and verifies two positions is not
-the MTPLX-style target. For a 256-token response, D1 still takes about 128
+the target shape. For a 256-token response, D1 still takes about 128
 verify cycles at full acceptance. A D3 path verifies `[primary, d1, d2, d3]` and
 can commit up to four tokens per cycle, so the full-acceptance lower bound is 64
 verify cycles, with real rows expected around 50-70 depending on bonus handling

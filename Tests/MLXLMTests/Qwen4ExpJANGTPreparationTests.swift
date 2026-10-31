@@ -211,7 +211,7 @@ final class Qwen4ExpJANGTPreparationTests: XCTestCase {
         XCTAssertNil(Qwen4ExpTextOnlyBundle.processorConfiguration(modelDirectory: directory, configData: vision))
     }
 
-    /// ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit ships a vision tower but no processor file. Its image
+    /// A mixed 4/8-bit mlx-vlm-converted Qwen3.8 Flash-Next ships a vision tower but no processor file. Its image
     /// geometry is then undeclared, so the bundle is constructed text-only rather than given vendor values.
     func testVisionBundleWithoutProcessorFileIsConstructedTextOnly() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q38t-vis-" + UUID().uuidString)
