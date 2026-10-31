@@ -32,7 +32,7 @@ public enum Lexer: Sendable {
     public static func tokenize(_ source: String) throws
         -> [Token]
     {
-        let preprocessed = preprocess(source)
+        let preprocessed = source
         var tokens: [Token] = []
         tokens.reserveCapacity(preprocessed.count / 4)
 
@@ -55,6 +55,26 @@ public enum Lexer: Sendable {
                 curlyBracketDepth: curlyBracketDepth
             )
             var newPosition = extractedPosition
+
+            // INVARIANT: trim only text adjacent to actual delimiters. Rewriting
+            // the source first can merge a literal brace into a delimiter, insert
+            // prompt bytes, or modify delimiter-looking text inside a string.
+            if (token.kind == .openExpression || token.kind == .openStatement),
+                newPosition < preprocessed.endIndex, preprocessed[newPosition] == "-"
+            {
+                if let previous = tokens.last, previous.kind == .text {
+                    var value = previous.value
+                    while value.last?.isWhitespace == true { value.removeLast() }
+                    tokens[tokens.count - 1] = Token(
+                        kind: .text, value: value, position: previous.position)
+                }
+                newPosition = preprocessed.index(after: newPosition)
+            }
+            if (token.kind == .closeExpression || token.kind == .closeStatement),
+                token.value.hasPrefix("-")
+            {
+                newPosition = skipWhitespace(in: preprocessed, at: newPosition)
+            }
 
             // Comments have the same explicit whitespace controls as statements.
             // Handle them only after lexing a real comment, never with a global
@@ -123,43 +143,6 @@ public enum Lexer: Sendable {
         return pos
     }
 
-    private static func preprocess(_ template: String) -> String {
-        // Optimized preprocessing with single pass
-        var result = template
-
-        // Handle whitespace control
-
-        // Note: We must avoid merging a literal '{' with the delimiter.
-        // For example, "{<newline>{%-" should become "{ {%" not "{{%" (which would be parsed as "{{" + "%").
-        // Since Swift Regex doesn't support lookbehind
-        // (see https://github.com/swiftlang/swift-evolution/blob/main/proposals/0448-regex-lookbehind-assertions.md),
-        // we use a multi-step approach:
-
-        // 1. Handle closing delimiters (these don't have the merging issue)
-        result = result.replacing(#/-%}\s*/#, with: "%}")
-        result = result.replacing(#/-}}\s*/#, with: "}}")
-
-        // 2. For opening delimiters, we need to be careful about preceding '{'
-        // When preceded by '{', we keep a single space to prevent token merging.
-        // When preceded by other characters, we strip the whitespace entirely.
-
-        // Handle {%- : if preceded by '{', keep one space; otherwise strip whitespace
-        result = result.replacing(#/\{\s+\{%-/#, with: "{ {%")
-        result = result.replacing(#/([^\{])\s*\{%-/#) { match in
-            "\(match.1){%"
-        }
-        result = result.replacing(#/^\s*\{%-/#, with: "{%")
-
-        // Handle {{- : if preceded by '{', keep one space; otherwise strip whitespace
-        result = result.replacing(#/\{\s+\{\{-/#, with: "{ {{")
-        result = result.replacing(#/([^\{])\s*\{\{-/#) { match in
-            "\(match.1){{"
-        }
-        result = result.replacing(#/^\s*\{\{-/#, with: "{{")
-
-        return result
-    }
-
     private static func extractToken(
         from source: String,
         at position: String.Index,
@@ -173,6 +156,16 @@ public enum Lexer: Sendable {
 
         let char = source[position]
         let charPosition = source.distance(from: source.startIndex, to: position)
+
+        if inTag, curlyBracketDepth == 0, char == "-" {
+            let tail = source[position...]
+            if tail.hasPrefix("-}}") || tail.hasPrefix("-%}") {
+                let endIndex = source.index(position, offsetBy: 3)
+                return (Token(
+                    kind: tail.hasPrefix("-}}") ? .closeExpression : .closeStatement,
+                    value: source[position..<endIndex], position: charPosition), endIndex)
+            }
+        }
 
         // Template delimiters - check for {{, {%, and {#
         if char == "{" {
@@ -204,7 +197,7 @@ public enum Lexer: Sendable {
         }
 
         // Check for closing delimiters
-        if char == "}" {
+        if inTag, char == "}" {
             let nextIndex = source.index(after: position)
             if nextIndex < source.endIndex && source[nextIndex] == "}" && curlyBracketDepth == 0 {
                 let endIndex = source.index(after: nextIndex)
@@ -217,7 +210,7 @@ public enum Lexer: Sendable {
                 )
             }
         }
-        if char == "%" {
+        if inTag, char == "%" {
             let nextIndex = source.index(after: position)
             if nextIndex < source.endIndex && source[nextIndex] == "}" {
                 let endIndex = source.index(after: nextIndex)

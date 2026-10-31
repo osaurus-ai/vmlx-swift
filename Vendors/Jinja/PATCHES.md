@@ -24,3 +24,12 @@ instead of requiring callers to rewrite valid JSON Schema.
 Run `bash .github/scripts/run-jinja-reference-tests.sh` for these CPU-only tests.
 Keep this contract and its tests when updating the vendored interpreter. These
 tests establish rendering parity, not model-output quality or tool-name fidelity.
+
+## Explicit whitespace trimming
+
+Apply `{{-`, `{%-`, `-}}` and `-%}` at real lexer delimiters, after text has
+been tokenized. Source-wide replacement previously inserted a synthetic space
+after a literal opening brace and rewrote delimiter-looking text inside quoted
+strings. Keeping the literal text and delimiter as separate tokens avoids both
+errors without modifying model templates. `JinjaWhitespaceReferenceTests` guards
+literal braces, quoted delimiter text, ordinary whitespace and subtraction.
