@@ -113,14 +113,16 @@ public enum DSV41IndexedAttentionNAX {
           if (!any) continue;  // uniform across the threadgroup
 
           // This lane's 4 key rows of the block: fragment ik = 0 / 1, element row i = 0 / 1 -> key ik * 16 + sm + i * 8.
-          const device T* krow[TK][2];
-          bool kval[TK][2];
+          int krid[TK][2];
           for (short ik = 0; ik < TK; ik++)
-            for (short i = 0; i < 2; i++) {
-              const int row = rows_tg[ik * kU + sm + i * 8];
-              kval[ik][i] = row >= 0;
-              krow[ik][i] = row < 0 ? kv : (row < R ? kv + size_t(row) * D : pool + size_t(row - R) * D);
-            }
+            for (short i = 0; i < 2; i++) krid[ik][i] = rows_tg[ik * kU + sm + i * 8];
+          // 4 consecutive elements of key row `row` at column c (c a multiple of 4): window rows and dense pool rows
+          // are one 8-byte load; 4-bit slab rows are one 2-byte load of 4 nibbles plus the group's scale and bias.
+          auto load4 = [&](int row, int c) -> vec4_t {
+            if (row < 0) return vec4_t(0);
+            if (row < R) return *(const device vec4_t*)(kv + size_t(row) * D + c);
+            VMLX_POOL_LOAD4
+          };
 
           // S = Q . K^T over this D group's 128 columns (2 x 16 keys).
           stile_t Stile; Stile.clear();
@@ -129,8 +131,8 @@ public enum DSV41IndexedAttentionNAX {
             const int c = col0 + id * kU + sn;
             for (short i = 0; i < 2; i++) {
               // 4 consecutive elements = one 8-byte load (c is a multiple of 4; rows are 1 KiB apart).
-              const vec4_t a = kval[0][i] ? *(const device vec4_t*)(krow[0][i] + c) : vec4_t(0);
-              const vec4_t b = kval[1][i] ? *(const device vec4_t*)(krow[1][i] + c) : vec4_t(0);
+              const vec4_t a = load4(krid[0][i], c);
+              const vec4_t b = load4(krid[1][i], c);
               for (short j = 0; j < 4; j++) { k0[i * 4 + j] = a[j]; k1[i * 4 + j] = b[j]; }
             }
             BaseNAXFrag::mma(Stile.frag_at(0, 0), Stile.frag_at(0, 1), Qf[id], metal::false_type{}, k0, k1,
@@ -199,8 +201,8 @@ public enum DSV41IndexedAttentionNAX {
               frag_t v0, v1;
               const int c = col0 + id * kU + sn;
               for (short i = 0; i < 2; i++) {
-                const vec4_t a = kval[ik][i] ? *(const device vec4_t*)(krow[ik][i] + c) : vec4_t(0);
-                const vec4_t b = kval[ik][i] ? *(const device vec4_t*)(krow[ik][i] + c + kU) : vec4_t(0);
+                const vec4_t a = load4(krid[ik][i], c);
+                const vec4_t b = load4(krid[ik][i], c + kU);
                 for (short j = 0; j < 4; j++) { v0[i * 4 + j] = a[j]; v1[i * 4 + j] = b[j]; }
               }
               BaseNAXFrag::mma(Otile.frag_at(0, id), Otile.frag_at(0, id + 1), Stile.frag_at(0, ik),
@@ -219,13 +221,60 @@ public enum DSV41IndexedAttentionNAX {
           }
         """
 
+    static let densePoolLoad = "return *(const device vec4_t*)(pool + size_t(row - R) * D + c);"
+    /// The 4-bit contiguous pool slab (`DeepseekV4PoolStorage.nibbleSlab`): row p is D / 2 code bytes, element e of a
+    /// 4-element run in nibble e of one 16-bit word; scale / bias per GS columns. Dequantized as the dense view is
+    /// (`DeepseekV4PoolStorage.dequantize`: fp32 code * scale + bias, then the pool dtype).
+    static let slabPoolLoad = """
+        { const size_t p = size_t(row - R);
+                      const ushort w = ((const device ushort*)codes)[p * (D / 4) + c / 4];
+                      const size_t g = p * (D / GS) + c / GS;
+                      const float sc = float(scales[g]), bi = float(biases[g]);
+                      vec4_t o;
+                      for (short e = 0; e < 4; e++) o[e] = T(float((w >> (4 * e)) & 0xFu) * sc + bi);
+                      return o; }
+        """
+
     private static let kernel = MLXFast.metalKernel(
         name: "vmlx_dsv41_indexed_attention_nax",
         inputNames: ["q", "kv", "pool", "topk", "sinks", "fscale", "params"],
         outputNames: ["out"],
-        source: source,
+        source: source.replacingOccurrences(of: "VMLX_POOL_LOAD4", with: densePoolLoad),
         header: JANGHPrefillHeaders.nax,
         ensureRowContiguous: true)
+
+    private static let slabKernel = MLXFast.metalKernel(
+        name: "vmlx_dsv41_indexed_attention_nax_slab4",
+        inputNames: ["q", "kv", "codes", "scales", "biases", "topk", "sinks", "fscale", "params"],
+        outputNames: ["out"],
+        source: source.replacingOccurrences(of: "VMLX_POOL_LOAD4", with: slabPoolLoad),
+        header: JANGHPrefillHeaders.nax,
+        ensureRowContiguous: true)
+
+    /// As `attend` with the pool read from its 4-bit slab (`codes` (P, 256) uint8, `scales` / `biases` (P, 512 / GS)),
+    /// the long-context form (pool rows past the dense-view cap), `poolRows` rows visible.
+    public static func attendSlab(
+        q: MLXArray, kv2d: MLXArray, codes: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int,
+        poolRows: Int, topk2d: MLXArray, sinks: MLXArray, offset: Int, window: Int, ratio: Int, scale: Float
+    ) -> MLXArray? {
+        guard available, q.ndim == 4, q.dim(0) == 1, q.dim(1) % 32 == 0, q.dim(3) == 512,
+            [.bfloat16, .float16].contains(q.dtype), kv2d.ndim == 2, kv2d.dim(1) == 512, topk2d.ndim == 2,
+            topk2d.dim(0) == q.dim(2), topk2d.dim(1) > 0, kv2d.dim(0) >= q.dim(2), window > 0, ratio > 0,
+            groupSize > 0, 512 % groupSize == 0, groupSize % 4 == 0, codes.dtype == .uint8, poolRows > 0,
+            codes.size >= poolRows * 256, scales.size >= poolRows * (512 / groupSize), scales.shape == biases.shape
+        else { return nil }
+        let heads = q.dim(1), s = q.dim(2)
+        let params = MLXArray([
+            Int32(s), Int32(kv2d.dim(0)), Int32(poolRows), Int32(topk2d.dim(1)), Int32(offset), Int32(window),
+            Int32(ratio),
+        ])
+        return slabKernel(
+            [q, kv2d.asType(q.dtype), codes.reshaped(-1), scales.reshaped(-1), biases.reshaped(-1),
+             topk2d.asType(.int32), sinks.asType(.float32), MLXArray([scale]), params],
+            template: [("T", q.dtype), ("GS", groupSize)],
+            grid: (256 * s, heads / 32, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, heads, s, 512]], outputDTypes: [q.dtype])[0]
+    }
 
     /// q (1, H, S, 512) bf16 / fp16 with H % 32 == 0; window rows `kv2d` (R, 512) whose last S rows are this forward's;
     /// dense pool `pool2d` (P, 512); picks `topk2d` (S, K) int32; `sinks` (H,) fp32. Returns (1, H, S, 512) in q's dtype,

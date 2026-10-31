@@ -86,6 +86,31 @@ final class DeepseekV41PrefillKernelTests: XCTestCase {
         XCTAssertNotEqual(bits16(a), bits16(b), "control: a changed visible pool row must change the output")
     }
 
+    /// The long-context variant reads the pool from its 4-bit slab and dequantizes the picked rows in place exactly as
+    /// the dense view does: its output equals the dense kernel's on the dequantized pool, bit for bit.
+    func testIndexedNAXSlabEqualsDenseOnDequantizedPool() throws {
+        try XCTSkipUnless(DSV41IndexedAttentionNAX.available, "NAX needs an M5-class GPU")
+        let scale = Float(pow(Double(512), -0.5))
+        for (i, (s, r, p, k, offset, ratio)) in [(37, 164, 300, 64, 900, 2), (129, 256, 4_000, 512, 3_900, 1)]
+            .enumerated()
+        {
+            let c = heads16Case(seed: UInt64(91 + i), s: s, r: r, p: p, k: k, offset: offset, ratio: ratio,
+                                dtype: .bfloat16)
+            let seg = DeepseekV4PoolStorage.quantize(c.pool, bits: 4, groupSize: 32)
+            XCTAssertEqual(seg.bits, 4)
+            let dense = DeepseekV4PoolStorage.dequantize(seg).reshaped(p, 512)
+            let a = try XCTUnwrap(DSV41IndexedAttentionNAX.attend(
+                q: c.q, kv2d: c.kv, pool2d: dense, topk2d: c.topk, sinks: c.sinks, offset: offset, window: 128,
+                ratio: ratio, scale: scale))
+            let b = try XCTUnwrap(DSV41IndexedAttentionNAX.attendSlab(
+                q: c.q, kv2d: c.kv, codes: seg.codes, scales: seg.scales, biases: seg.biases,
+                groupSize: seg.groupSize, poolRows: p, topk2d: c.topk, sinks: c.sinks, offset: offset, window: 128,
+                ratio: ratio, scale: scale))
+            XCTAssertFalse(isNaN(a.asType(.float32)).any().item(Bool.self))
+            XCTAssertEqual(bits16(a), bits16(b), "shape \(i): slab != dense")
+        }
+    }
+
     // MARK: routed experts
 
     private func projection(_ key: MLXArray, k: Double, experts: Int, outputs: Int, inputs: Int,
@@ -350,7 +375,15 @@ final class DeepseekV41PrefillKernelPerfTests: XCTestCase {
         let c = nax().asType(.float32)
         let relN = (MLX.abs(a - c).max() / MLX.abs(a).max()).item(Float.self)
         print(String(format: "DSV41_KERNEL_PERF nax vs heads16 max rel diff %.3e", relN))
-        interleaved([("heads16 kernel", h16), ("nax indexed", nax)])
+        let seg = DeepseekV4PoolStorage.quantize(pool.reshaped(p, 512), bits: 4, groupSize: 32)
+        eval(seg.codes, seg.scales, seg.biases)
+        let slab = {
+            DSV41IndexedAttentionNAX.attendSlab(
+                q: q, kv2d: kv.reshaped(r, 512), codes: seg.codes, scales: seg.scales, biases: seg.biases,
+                groupSize: seg.groupSize, poolRows: p, topk2d: topk.reshaped(s, k), sinks: sinks, offset: offset,
+                window: 128, ratio: 2, scale: scale)!
+        }
+        interleaved([("heads16 kernel", h16), ("nax indexed", nax), ("nax indexed, 4-bit slab", slab)])
     }
 
     func testRoutedPrefillTimingAtDSV41Shapes() throws {
