@@ -81,6 +81,29 @@ func runDSV41PrefillBench(modelPath: String) async throws {
         configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
     let loadConfiguration = settings.resolvedLoadConfiguration(
         configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
+    /// MLX allocator, process ledger and host wire counters at a named stage ("[PF_MEM]"): where the
+    /// bytes are, how much of the host is wired or compressed, and whether the kernel rejected wiring.
+    func memStage(_ stage: String, _ extra: [String: Any] = [:]) {
+        var r: [String: Any] = extra
+        for (k, v) in mem() { r[k] = v }
+        r["stage"] = stage
+        r["unix"] = Date().timeIntervalSince1970
+        r["memory_limit"] = MLX.Memory.memoryLimit
+        r["cache_limit"] = MLX.Memory.cacheLimit
+        if let os = ProcessMemoryObservation.read() {
+            r["footprint_gib"] = Double(os.footprintBytes) / gib
+            r["host_wired_gib"] = os.hostWiredBytes.map { Double($0) / gib } ?? -1
+            r["host_compressed_gib"] = os.hostCompressedBytes.map { Double($0) / gib } ?? -1
+        }
+        let wire = SystemWireBudget.snapshot()
+        r["wire_rejections"] = wire.wireLimitRejections ?? -1
+        if let report = ModelWireBudgetReport.lastLoad {
+            r["residency_target"] = report.residencyTargetBytes ?? 0
+            r["model_bytes"] = report.modelBytes
+        }
+        emit("PF_MEM", r)
+    }
+    memStage("before_load")
     let loadStart = CFAbsoluteTimeGetCurrent()
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: loadConfiguration)
@@ -89,9 +112,12 @@ func runDSV41PrefillBench(modelPath: String) async throws {
         MLX.Memory.cacheLimit = Int(gb * gib)
     }
     let model = context.model
+    memStage("loaded", ["load_s": loadSeconds])
     var headAttached = false
     if env["BENCH_PF_HEAD"] != "0", let target = model as? any DSparkSpeculativeModel {
+        let headStart = CFAbsoluteTimeGetCurrent()
         headAttached = try target.attachDSparkDraft(directory: modelDir.appendingPathComponent("dspark"))
+        memStage("head", ["head_s": CFAbsoluteTimeGetCurrent() - headStart])
     }
     emit("PF_LOAD", [
         "model": modelDir.lastPathComponent, "load_s": loadSeconds, "head": headAttached,
@@ -145,6 +171,7 @@ func runDSV41PrefillBench(modelPath: String) async throws {
                 ]
                 for (k, v) in mem() { r[k] = v }
                 emit("PF_SPEED", r)
+                memStage("after_probe", ["n": n])
             }
         }
     }
