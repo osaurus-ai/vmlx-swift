@@ -808,6 +808,13 @@ let package = Package(
         ),
 
         .testTarget(
+            name: "JinjaReferenceTests",
+            dependencies: ["VMLXJinja"],
+            path: "Tests/JinjaReferenceTests",
+            exclude: ["README.md"],
+            resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
             name: "MLXTests",
             dependencies: [
                 "MLX", "MLXNN", "MLXOptimizers",

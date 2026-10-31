@@ -112,7 +112,8 @@ final class LagunaChatTemplateFallbackTests: XCTestCase {
         ])
 
         XCTAssertTrue(rendered.contains("<available_tools>"), rendered.debugDescription)
-        XCTAssertTrue(rendered.contains("\"name\":\"line_count\""), rendered.debugDescription)
+        // `tojson` writes what HF transformers' filter writes (`json.dumps` separators), as the Python runtime renders.
+        XCTAssertTrue(rendered.contains("\"name\": \"line_count\""), rendered.debugDescription)
         XCTAssertFalse(rendered.contains("The current assistant response MUST be a function call."), rendered.debugDescription)
         XCTAssertFalse(rendered.contains("function-name"), rendered.debugDescription)
         XCTAssertTrue(rendered.hasSuffix("<assistant></think>"), rendered.debugDescription)

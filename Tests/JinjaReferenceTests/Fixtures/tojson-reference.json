@@ -1,0 +1,517 @@
+[
+  {
+    "id": "order-default",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson }}",
+    "expected": "{\"z\": 1, \"a\": 2, \"m\": {\"z\": false, \"a\": null}}"
+  },
+  {
+    "id": "order-ascii",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(ensure_ascii=true) }}",
+    "expected": "{\"z\": 1, \"a\": 2, \"m\": {\"z\": false, \"a\": null}}"
+  },
+  {
+    "id": "order-pretty2",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(indent=2) }}",
+    "expected": "{\n  \"z\": 1,\n  \"a\": 2,\n  \"m\": {\n    \"z\": false,\n    \"a\": null\n  }\n}"
+  },
+  {
+    "id": "order-pretty0",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(indent=0) }}",
+    "expected": "{\n\"z\": 1,\n\"a\": 2,\n\"m\": {\n\"z\": false,\n\"a\": null\n}\n}"
+  },
+  {
+    "id": "order-negative_indent",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(indent=-1) }}",
+    "expected": "{\n\"z\": 1,\n\"a\": 2,\n\"m\": {\n\"z\": false,\n\"a\": null\n}\n}"
+  },
+  {
+    "id": "order-string_indent",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(indent='x') }}",
+    "expected": "{\nx\"z\": 1,\nx\"a\": 2,\nx\"m\": {\nxx\"z\": false,\nxx\"a\": null\nx}\n}"
+  },
+  {
+    "id": "order-compact",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(separators=(',', ':')) }}",
+    "expected": "{\"z\":1,\"a\":2,\"m\":{\"z\":false,\"a\":null}}"
+  },
+  {
+    "id": "order-sorted",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(sort_keys=true) }}",
+    "expected": "{\"a\": 2, \"m\": {\"a\": null, \"z\": false}, \"z\": 1}"
+  },
+  {
+    "id": "order-sortedpretty",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "expected": "{\n  \"a\": 2,\n  \"m\": {\n    \"a\": null,\n    \"z\": false\n  },\n  \"z\": 1\n}"
+  },
+  {
+    "id": "order-custom",
+    "template": "{{ {'z':1,'a':2,'m':{'z':false,'a':none}} | tojson(separators=(' | ', ' = ')) }}",
+    "expected": "{\"z\" = 1 | \"a\" = 2 | \"m\" = {\"z\" = false | \"a\" = null}}"
+  },
+  {
+    "id": "unicode-default",
+    "template": "{{ input_text | tojson }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-ascii",
+    "template": "{{ input_text | tojson(ensure_ascii=true) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"caf\\u00e9 \\ud83e\\udd96 <>&' https://example.com/a/b \\u007f\\u0085\\u2028\""
+  },
+  {
+    "id": "unicode-pretty2",
+    "template": "{{ input_text | tojson(indent=2) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-pretty0",
+    "template": "{{ input_text | tojson(indent=0) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-negative_indent",
+    "template": "{{ input_text | tojson(indent=-1) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-string_indent",
+    "template": "{{ input_text | tojson(indent='x') }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-compact",
+    "template": "{{ input_text | tojson(separators=(',', ':')) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-sorted",
+    "template": "{{ input_text | tojson(sort_keys=true) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "unicode-sortedpretty",
+    "template": "{{ input_text | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"caf\\u00e9 \\ud83e\\udd96 <>&' https://example.com/a/b \\u007f\\u0085\\u2028\""
+  },
+  {
+    "id": "unicode-custom",
+    "template": "{{ input_text | tojson(separators=(' | ', ' = ')) }}",
+    "string_value": "café 🦖 <>&' https://example.com/a/b  ",
+    "expected": "\"café 🦖 <>&' https://example.com/a/b  \""
+  },
+  {
+    "id": "controls-default",
+    "template": "{{ input_text | tojson }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-ascii",
+    "template": "{{ input_text | tojson(ensure_ascii=true) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-pretty2",
+    "template": "{{ input_text | tojson(indent=2) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-pretty0",
+    "template": "{{ input_text | tojson(indent=0) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-negative_indent",
+    "template": "{{ input_text | tojson(indent=-1) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-string_indent",
+    "template": "{{ input_text | tojson(indent='x') }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-compact",
+    "template": "{{ input_text | tojson(separators=(',', ':')) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-sorted",
+    "template": "{{ input_text | tojson(sort_keys=true) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-sortedpretty",
+    "template": "{{ input_text | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "controls-custom",
+    "template": "{{ input_text | tojson(separators=(' | ', ' = ')) }}",
+    "string_value": "\"\\\b\f\n\r\t\u0000\u001f",
+    "expected": "\"\\\"\\\\\\b\\f\\n\\r\\t\\u0000\\u001f\""
+  },
+  {
+    "id": "arrays-default",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson }}",
+    "expected": "[{\"b\": [1, true, null, 0.1, -0.0, 1e-05, 0.0001, 1.5]}, [], {}]"
+  },
+  {
+    "id": "arrays-ascii",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(ensure_ascii=true) }}",
+    "expected": "[{\"b\": [1, true, null, 0.1, -0.0, 1e-05, 0.0001, 1.5]}, [], {}]"
+  },
+  {
+    "id": "arrays-pretty2",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(indent=2) }}",
+    "expected": "[\n  {\n    \"b\": [\n      1,\n      true,\n      null,\n      0.1,\n      -0.0,\n      1e-05,\n      0.0001,\n      1.5\n    ]\n  },\n  [],\n  {}\n]"
+  },
+  {
+    "id": "arrays-pretty0",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(indent=0) }}",
+    "expected": "[\n{\n\"b\": [\n1,\ntrue,\nnull,\n0.1,\n-0.0,\n1e-05,\n0.0001,\n1.5\n]\n},\n[],\n{}\n]"
+  },
+  {
+    "id": "arrays-negative_indent",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(indent=-1) }}",
+    "expected": "[\n{\n\"b\": [\n1,\ntrue,\nnull,\n0.1,\n-0.0,\n1e-05,\n0.0001,\n1.5\n]\n},\n[],\n{}\n]"
+  },
+  {
+    "id": "arrays-string_indent",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(indent='x') }}",
+    "expected": "[\nx{\nxx\"b\": [\nxxx1,\nxxxtrue,\nxxxnull,\nxxx0.1,\nxxx-0.0,\nxxx1e-05,\nxxx0.0001,\nxxx1.5\nxx]\nx},\nx[],\nx{}\n]"
+  },
+  {
+    "id": "arrays-compact",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(separators=(',', ':')) }}",
+    "expected": "[{\"b\":[1,true,null,0.1,-0.0,1e-05,0.0001,1.5]},[],{}]"
+  },
+  {
+    "id": "arrays-sorted",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(sort_keys=true) }}",
+    "expected": "[{\"b\": [1, true, null, 0.1, -0.0, 1e-05, 0.0001, 1.5]}, [], {}]"
+  },
+  {
+    "id": "arrays-sortedpretty",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "expected": "[\n  {\n    \"b\": [\n      1,\n      true,\n      null,\n      0.1,\n      -0.0,\n      1e-05,\n      0.0001,\n      1.5\n    ]\n  },\n  [],\n  {}\n]"
+  },
+  {
+    "id": "arrays-custom",
+    "template": "{{ [{'b':[1, true, none, 0.1, -0.0, 0.00001, 0.0001, 1.5]},[],{}] | tojson(separators=(' | ', ' = ')) }}",
+    "expected": "[{\"b\" = [1 | true | null | 0.1 | -0.0 | 1e-05 | 0.0001 | 1.5]} | [] | {}]"
+  },
+  {
+    "id": "numbers-default",
+    "template": "{{ input_numbers | tojson }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[0.0, -0.0, 0.1, 1e-05, 0.0001, 1000000000000000.0, 1e+16, 1e+23, 1.2345678901234567, 5e-324, 2.2250738585072014e-308, NaN, Infinity, -Infinity]"
+  },
+  {
+    "id": "numbers-ascii",
+    "template": "{{ input_numbers | tojson(ensure_ascii=true) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[0.0, -0.0, 0.1, 1e-05, 0.0001, 1000000000000000.0, 1e+16, 1e+23, 1.2345678901234567, 5e-324, 2.2250738585072014e-308, NaN, Infinity, -Infinity]"
+  },
+  {
+    "id": "numbers-pretty2",
+    "template": "{{ input_numbers | tojson(indent=2) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[\n  0.0,\n  -0.0,\n  0.1,\n  1e-05,\n  0.0001,\n  1000000000000000.0,\n  1e+16,\n  1e+23,\n  1.2345678901234567,\n  5e-324,\n  2.2250738585072014e-308,\n  NaN,\n  Infinity,\n  -Infinity\n]"
+  },
+  {
+    "id": "numbers-pretty0",
+    "template": "{{ input_numbers | tojson(indent=0) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[\n0.0,\n-0.0,\n0.1,\n1e-05,\n0.0001,\n1000000000000000.0,\n1e+16,\n1e+23,\n1.2345678901234567,\n5e-324,\n2.2250738585072014e-308,\nNaN,\nInfinity,\n-Infinity\n]"
+  },
+  {
+    "id": "numbers-negative_indent",
+    "template": "{{ input_numbers | tojson(indent=-1) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[\n0.0,\n-0.0,\n0.1,\n1e-05,\n0.0001,\n1000000000000000.0,\n1e+16,\n1e+23,\n1.2345678901234567,\n5e-324,\n2.2250738585072014e-308,\nNaN,\nInfinity,\n-Infinity\n]"
+  },
+  {
+    "id": "numbers-string_indent",
+    "template": "{{ input_numbers | tojson(indent='x') }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[\nx0.0,\nx-0.0,\nx0.1,\nx1e-05,\nx0.0001,\nx1000000000000000.0,\nx1e+16,\nx1e+23,\nx1.2345678901234567,\nx5e-324,\nx2.2250738585072014e-308,\nxNaN,\nxInfinity,\nx-Infinity\n]"
+  },
+  {
+    "id": "numbers-compact",
+    "template": "{{ input_numbers | tojson(separators=(',', ':')) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[0.0,-0.0,0.1,1e-05,0.0001,1000000000000000.0,1e+16,1e+23,1.2345678901234567,5e-324,2.2250738585072014e-308,NaN,Infinity,-Infinity]"
+  },
+  {
+    "id": "numbers-sorted",
+    "template": "{{ input_numbers | tojson(sort_keys=true) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[0.0, -0.0, 0.1, 1e-05, 0.0001, 1000000000000000.0, 1e+16, 1e+23, 1.2345678901234567, 5e-324, 2.2250738585072014e-308, NaN, Infinity, -Infinity]"
+  },
+  {
+    "id": "numbers-sortedpretty",
+    "template": "{{ input_numbers | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[\n  0.0,\n  -0.0,\n  0.1,\n  1e-05,\n  0.0001,\n  1000000000000000.0,\n  1e+16,\n  1e+23,\n  1.2345678901234567,\n  5e-324,\n  2.2250738585072014e-308,\n  NaN,\n  Infinity,\n  -Infinity\n]"
+  },
+  {
+    "id": "numbers-custom",
+    "template": "{{ input_numbers | tojson(separators=(' | ', ' = ')) }}",
+    "float_values": [
+      "0.0",
+      "-0.0",
+      "0.1",
+      "0.00001",
+      "0.0001",
+      "1e15",
+      "1e16",
+      "1e23",
+      "1.2345678901234567",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "NaN",
+      "Infinity",
+      "-Infinity"
+    ],
+    "expected": "[0.0 | -0.0 | 0.1 | 1e-05 | 0.0001 | 1000000000000000.0 | 1e+16 | 1e+23 | 1.2345678901234567 | 5e-324 | 2.2250738585072014e-308 | NaN | Infinity | -Infinity]"
+  },
+  {
+    "id": "schema-default",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson }}",
+    "expected": "{\"name\": \"invoke_skill\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": [\"string\", \"null\"], \"minLength\": 1, \"maxLength\": 80, \"const\": \"a/b\"}}, \"additionalProperties\": false, \"anyOf\": [{\"required\": [\"text\"]}, {\"type\": \"null\"}]}}"
+  },
+  {
+    "id": "schema-ascii",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(ensure_ascii=true) }}",
+    "expected": "{\"name\": \"invoke_skill\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": [\"string\", \"null\"], \"minLength\": 1, \"maxLength\": 80, \"const\": \"a/b\"}}, \"additionalProperties\": false, \"anyOf\": [{\"required\": [\"text\"]}, {\"type\": \"null\"}]}}"
+  },
+  {
+    "id": "schema-pretty2",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(indent=2) }}",
+    "expected": "{\n  \"name\": \"invoke_skill\",\n  \"parameters\": {\n    \"type\": \"object\",\n    \"properties\": {\n      \"text\": {\n        \"type\": [\n          \"string\",\n          \"null\"\n        ],\n        \"minLength\": 1,\n        \"maxLength\": 80,\n        \"const\": \"a/b\"\n      }\n    },\n    \"additionalProperties\": false,\n    \"anyOf\": [\n      {\n        \"required\": [\n          \"text\"\n        ]\n      },\n      {\n        \"type\": \"null\"\n      }\n    ]\n  }\n}"
+  },
+  {
+    "id": "schema-pretty0",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(indent=0) }}",
+    "expected": "{\n\"name\": \"invoke_skill\",\n\"parameters\": {\n\"type\": \"object\",\n\"properties\": {\n\"text\": {\n\"type\": [\n\"string\",\n\"null\"\n],\n\"minLength\": 1,\n\"maxLength\": 80,\n\"const\": \"a/b\"\n}\n},\n\"additionalProperties\": false,\n\"anyOf\": [\n{\n\"required\": [\n\"text\"\n]\n},\n{\n\"type\": \"null\"\n}\n]\n}\n}"
+  },
+  {
+    "id": "schema-negative_indent",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(indent=-1) }}",
+    "expected": "{\n\"name\": \"invoke_skill\",\n\"parameters\": {\n\"type\": \"object\",\n\"properties\": {\n\"text\": {\n\"type\": [\n\"string\",\n\"null\"\n],\n\"minLength\": 1,\n\"maxLength\": 80,\n\"const\": \"a/b\"\n}\n},\n\"additionalProperties\": false,\n\"anyOf\": [\n{\n\"required\": [\n\"text\"\n]\n},\n{\n\"type\": \"null\"\n}\n]\n}\n}"
+  },
+  {
+    "id": "schema-string_indent",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(indent='x') }}",
+    "expected": "{\nx\"name\": \"invoke_skill\",\nx\"parameters\": {\nxx\"type\": \"object\",\nxx\"properties\": {\nxxx\"text\": {\nxxxx\"type\": [\nxxxxx\"string\",\nxxxxx\"null\"\nxxxx],\nxxxx\"minLength\": 1,\nxxxx\"maxLength\": 80,\nxxxx\"const\": \"a/b\"\nxxx}\nxx},\nxx\"additionalProperties\": false,\nxx\"anyOf\": [\nxxx{\nxxxx\"required\": [\nxxxxx\"text\"\nxxxx]\nxxx},\nxxx{\nxxxx\"type\": \"null\"\nxxx}\nxx]\nx}\n}"
+  },
+  {
+    "id": "schema-compact",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(separators=(',', ':')) }}",
+    "expected": "{\"name\":\"invoke_skill\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":[\"string\",\"null\"],\"minLength\":1,\"maxLength\":80,\"const\":\"a/b\"}},\"additionalProperties\":false,\"anyOf\":[{\"required\":[\"text\"]},{\"type\":\"null\"}]}}"
+  },
+  {
+    "id": "schema-sorted",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(sort_keys=true) }}",
+    "expected": "{\"name\": \"invoke_skill\", \"parameters\": {\"additionalProperties\": false, \"anyOf\": [{\"required\": [\"text\"]}, {\"type\": \"null\"}], \"properties\": {\"text\": {\"const\": \"a/b\", \"maxLength\": 80, \"minLength\": 1, \"type\": [\"string\", \"null\"]}}, \"type\": \"object\"}}"
+  },
+  {
+    "id": "schema-sortedpretty",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(sort_keys=true,indent=2,ensure_ascii=true) }}",
+    "expected": "{\n  \"name\": \"invoke_skill\",\n  \"parameters\": {\n    \"additionalProperties\": false,\n    \"anyOf\": [\n      {\n        \"required\": [\n          \"text\"\n        ]\n      },\n      {\n        \"type\": \"null\"\n      }\n    ],\n    \"properties\": {\n      \"text\": {\n        \"const\": \"a/b\",\n        \"maxLength\": 80,\n        \"minLength\": 1,\n        \"type\": [\n          \"string\",\n          \"null\"\n        ]\n      }\n    },\n    \"type\": \"object\"\n  }\n}"
+  },
+  {
+    "id": "schema-custom",
+    "template": "{{ {'name':'invoke_skill','parameters':{'type':'object','properties':{'text':{'type':['string','null'],'minLength':1,'maxLength':80,'const':'a/b'}},'additionalProperties':false,'anyOf':[{'required':['text']},{'type':'null'}]}} | tojson(separators=(' | ', ' = ')) }}",
+    "expected": "{\"name\" = \"invoke_skill\" | \"parameters\" = {\"type\" = \"object\" | \"properties\" = {\"text\" = {\"type\" = [\"string\" | \"null\"] | \"minLength\" = 1 | \"maxLength\" = 80 | \"const\" = \"a/b\"}} | \"additionalProperties\" = false | \"anyOf\" = [{\"required\" = [\"text\"]} | {\"type\" = \"null\"}]}}"
+  },
+  {
+    "id": "undefined",
+    "template": "{{ missing | tojson }}",
+    "expected_error": "TypeError: Object of type Undefined is not JSON serializable"
+  },
+  {
+    "id": "function",
+    "template": "{{ range | tojson }}",
+    "expected_error": "TypeError: Object of type type is not JSON serializable"
+  },
+  {
+    "id": "macro",
+    "template": "{% macro f() %}x{% endmacro %}{{ f | tojson }}",
+    "expected_error": "TypeError: Object of type Macro is not JSON serializable"
+  },
+  {
+    "id": "namespace",
+    "template": "{% set ns=namespace(x=1) %}{{ ns | tojson }}",
+    "expected_error": "TypeError: Object of type Namespace is not JSON serializable"
+  },
+  {
+    "id": "bad_indent",
+    "template": "{{ {'x':1} | tojson(indent=1.5) }}",
+    "expected_error": "TypeError: can't multiply sequence by non-int of type 'float'"
+  },
+  {
+    "id": "boolean_indent",
+    "template": "{{ {'x':1} | tojson(indent=true) }}",
+    "expected": "{\n \"x\": 1\n}"
+  },
+  {
+    "id": "bad_separators",
+    "template": "{{ {'x':1} | tojson(separators=['only-one']) }}",
+    "expected_error": "ValueError: not enough values to unpack (expected 2, got 1)"
+  }
+]

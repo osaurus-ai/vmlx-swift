@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 @_exported import OrderedCollections
 
 /// Represents values in Jinja template expressions and variables.
@@ -37,6 +38,19 @@ public enum Value: Sendable {
     /// - Parameter value: The Swift value to convert
     /// - Throws: `JinjaError.runtime` if the value type cannot be converted
     public init(any value: Any?) throws {
+        // INVARIANT: Foundation JSON booleans are NSNumber instances that also
+        // bridge to Int. Inspect their real type before numeric casts so tool
+        // schemas never change false/true into 0/1. Preserve boxed doubles too.
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                self = .boolean(number.boolValue)
+                return
+            }
+            if ["f", "d"].contains(String(cString: number.objCType)) {
+                self = .double(number.doubleValue)
+                return
+            }
+        }
         switch value {
         case let value as Value:
             self = value
