@@ -309,6 +309,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
         switch self {
+        case .gemma4:
+            // Gemma's template closes the thought channel before tool transport.
+            // INVARIANT: quoted tool history inside thought is not executable.
+            // Feeding it to the shared processor both executes examples and
+            // contaminates its buffer before the real content-channel call.
+            return false
         case .dsml, .dsmlV41, .minicpm5, .k2Horizon:
             // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
