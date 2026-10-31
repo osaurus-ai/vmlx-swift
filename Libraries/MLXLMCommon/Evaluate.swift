@@ -1915,8 +1915,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             input.cacheRestorePolicy == .freshRequiredToolSelection
         self.disableDiskBackedRequiredToolRestore =
             disableDiskBackedRequiredToolRestore || requiresFreshToolSelection
+        // A model whose exact-prefix restore is suffix-independent restores a
+        // forced tool selection like any other turn (see the fetch below), so
+        // its prompt-minus-one seed is as reusable as any other turn's: keep
+        // storing it, or the turn after every forced tool call re-prefills.
+        let requiredToolTurnKeepsReuse = (model as? PrefixCacheInvariantModel)?
+            .exactPrefixRestoreIsSuffixIndependent == true
         self.skipDiskBackedToolPromptSeedBoundary =
-            skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection
+            (skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection)
+            && !requiredToolTurnKeepsReuse
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {

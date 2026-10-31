@@ -610,6 +610,10 @@ struct Bench {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DSV41_SPLIT_EXACT"] ?? "0") == "1" {
+            try await runDSV41SplitExactBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_CACHE_LOOP"] ?? "0") == "1" {
             try await runCacheReuseLoopBench(modelPath: modelPath)
             return
