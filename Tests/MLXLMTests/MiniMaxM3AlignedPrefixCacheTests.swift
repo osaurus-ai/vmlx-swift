@@ -439,7 +439,7 @@ struct MiniMaxM3AlignedPrefixCacheTests {
             // resident entries ("memory") or its files ("disk").
             #expect(coordinator.isPagedIncompatible)
             let details = Set(recorder.restores.map(\.detail))
-            #expect(!details.isEmpty && details.isSubset(of: ["disk", "memory"]), "restore tiers \(details)")
+            #expect(!details.isEmpty && details.isSubset(of: ["disk", "memory", "diskPending"]), "restore tiers \(details)")
 
             // The state a CACHED turn (turn 6) stored, restored from disk, equals a direct cold prefill row for row.
             _ = coordinator.waitForPendingDiskWrites()

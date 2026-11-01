@@ -1786,11 +1786,29 @@ public final class DiskCache: @unchecked Sendable {
             touchRecency: touchRecency, countHit: countHit)
     }
 
+    /// Where a fetched payload came from.
+    enum FetchSource {
+        /// Read from its file on the SSD.
+        case file
+        /// Kept resident in RAM (the opt-in RAM tier, ``residentByteBudget``).
+        case resident
+        /// Its file is still being written: the writer's payload, released once the file lands.
+        case inflight
+
+        /// The coordinator's tier label for a hit from this source.
+        var detail: CacheDetail {
+            switch self {
+            case .file: return .disk
+            case .resident: return .memory
+            case .inflight: return .diskPending
+            }
+        }
+    }
+
     /// What ``fetchCandidate(tokens:mediaSalt:)`` found.
     enum CandidateFetch {
-        /// `servedFromMemory`: the payload came from RAM (resident, or still being written), not
-        /// from its file.
-        case arrays([String: MLXArray], servedFromMemory: Bool)
+        /// `source`: the file, the resident set, or a payload still being written.
+        case arrays([String: MLXArray], source: FetchSource)
         case miss
         /// The entry is there, and an engine has already refused to restore
         /// this very payload. Nothing was read; not counted as a miss.
@@ -1820,7 +1838,7 @@ public final class DiskCache: @unchecked Sendable {
         let arrays = _fetchLocked(
             hash: hash, url: url, tokens: tokens, mediaSalt: mediaSalt,
             touchRecency: false, countHit: false)
-        let servedFromMemory = lastFetchServedFromMemory
+        let source = lastFetchSource
         // Remember what was served only when the file was the same one on
         // both sides of the read (`_fetchLocked` fingerprints what it loaded).
         servedCandidates.removeAll { $0.hash == hash }
@@ -1830,7 +1848,7 @@ public final class DiskCache: @unchecked Sendable {
                 servedCandidates.removeFirst(servedCandidates.count - Self.servedCandidateLimit)
             }
         }
-        return arrays.map { CandidateFetch.arrays($0, servedFromMemory: servedFromMemory) } ?? .miss
+        return arrays.map { CandidateFetch.arrays($0, source: source) } ?? .miss
     }
 
     /// An engine fetched this entry through the coordinator and could not
@@ -1879,21 +1897,21 @@ public final class DiskCache: @unchecked Sendable {
         rejectedRestores[hash] == current && !rewrittenAfterRejection.contains(hash)
     }
 
-    /// Whether the last `_fetchLocked` served RAM (resident or in-flight) arrays. Under `lock`.
-    private var lastFetchServedFromMemory = false
+    /// Where the last `_fetchLocked` read its arrays from. Under `lock`.
+    private var lastFetchSource: FetchSource = .file
 
     /// Caller holds ``MLXDiskCacheIOLock`` and `lock`.
     private func _fetchLocked(
         hash: String, url: URL, tokens: [Int], mediaSalt: String?,
         touchRecency: Bool, countHit: Bool
     ) -> [String: MLXArray]? {
-        lastFetchServedFromMemory = false
+        lastFetchSource = .file
         // Still being written: serve the payload the store validated and materialized. Same
         // content-addressed bytes the file will hold; no wait, no disk read.
         if let entry = inflight[hash], !entry.invalidated, entry.tokenCount == tokens.count,
             entry.awaitScreen().isEmpty
         {
-            lastFetchServedFromMemory = true
+            lastFetchSource = .inflight
             inflightFetches += 1
             if countHit { hits += 1 }
             if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
@@ -1904,7 +1922,7 @@ public final class DiskCache: @unchecked Sendable {
         }
         // Resident: the payload this process stored or read, still the file on disk.
         if let arrays = _residentPayloadLocked(hash: hash, url: url, tokenCount: tokens.count) {
-            lastFetchServedFromMemory = true
+            lastFetchSource = .resident
             residentHits += 1
             if touchRecency { _touchEntryLocked(hash: hash) }
             if countHit { hits += 1 }
