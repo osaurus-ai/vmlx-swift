@@ -84,5 +84,29 @@ struct HybridPoolHiddenTailLifetimeTests {
                 }
             }
         }
+        @Test(
+            "Forty asynchronous layer submissions per token release completed events through Swift")
+        func longLayeredSwiftHistory() throws {
+            try Device.withDefaultDevice(.gpu) {
+                try withError { error in
+                    var x = MLXArray(Float(0))
+                    for position in 1 ... 4096 {
+                        var h = x
+                        for _ in 0 ..< 40 {
+                            let next = h + 1
+                            let pre = h + 2
+                            asyncEval(next, pre)
+                            h = next + pre * 0
+                        }
+                        asyncEval(h)
+                        try error.check()
+                        let value = h.item(Float.self)
+                        try error.check()
+                        #expect(value == Float(position * 40))
+                        x = h
+                    }
+                }
+            }
+        }
     #endif
 }
