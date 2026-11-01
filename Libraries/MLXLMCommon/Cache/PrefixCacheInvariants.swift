@@ -53,6 +53,19 @@ public extension PrefixCacheInvariantModel {
     var maximumKVSizeIsCacheStateInvariant: Bool { false }
 }
 
+/// A model whose chunked prompt prefill runs its upper layers only over the rows that the prompt's last position and
+/// final windows depend on (DeepSeek-V4.1 prompt-suffix pruning). Prefilling a prompt as two prompts, as a cache
+/// boundary capture does, makes the first one run those layers over the rows ITS end depends on as well, which an
+/// uncut prefill never computes: for DeepSeek-V4.1 up to ~24k extra layer rows per cut, whatever the prompt length
+/// (two stable cuts made a 4.2k-token cold prefill 18-19 % slower). A cut close to the end costs only the rows between
+/// it and the end, which the uncut prefill runs through every layer anyway.
+public protocol PrunedPromptPrefillModel: AnyObject {
+    /// Rows at the end of a prompt that this model's prefill runs through every layer (its final, unpruned forward)
+    /// for the caller's prefill step. A cut at most this many rows before the end of the span being prefilled adds at
+    /// most those rows to the pruned layers. nil when the prefill prunes nothing, so a cut adds no rows.
+    func unprunedPromptTailRows(windowSize: Int?) -> Int?
+}
+
 /// A model whose prefill positions depend on the WHOLE prompt (M-RoPE: media placeholders occupy
 /// compressed positions), so a suffix prefilled after a cache restore must be positioned from the
 /// full request, not from the suffix alone. Both schedulers call this once per prefill, right before

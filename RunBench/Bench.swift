@@ -618,6 +618,10 @@ struct Bench {
             try await runDSV41SplitExactBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_COLD_CAPTURE"] ?? "0") == "1" {
+            try await runColdCaptureBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_CACHE_LOOP"] ?? "0") == "1" {
             try await runCacheReuseLoopBench(modelPath: modelPath)
             return

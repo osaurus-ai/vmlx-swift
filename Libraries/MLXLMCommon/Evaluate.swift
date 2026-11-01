@@ -1858,6 +1858,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prefill already passes through every one of these boundaries, so the
     /// state is free at that moment; keeping a copy costs one cache copy.
     var stableBoundarySnapshots: [Int: [KVCache]] = [:]
+    /// Pool-cache stable boundaries (store positions) this prefill deliberately did not cut at: too far from the end
+    /// of the span for a free cut (``poolCacheNearCutRows(windowSize:)``). Like every stable boundary a pool cache did
+    /// not capture in prefill, the store loop leaves them alone instead of replaying the prefix after the answer; a
+    /// later prompt that ends near them captures them.
+    var poolStableBoundariesLeftUncut: Set<Int> = []
     private var canonicalStablePrefillCapture: CanonicalStablePrefillCapture?
 
     /// Absolute `promptTokenIds.count - 1` boundary for text-only
@@ -3260,6 +3265,24 @@ public struct TokenIterator: TokenIteratorProtocol {
             && cacheRequiresPrefillCapturedDiskSeed(cache)
     }
 
+    /// How close to the end of the span being prefilled a pool cache's stable boundary must sit to be cut there
+    /// during prefill, or nil for every distance.
+    ///
+    /// A cut prefills the head as its own prompt. On a model whose prefill prunes its upper layers to the rows the
+    /// prompt end depends on (``PrunedPromptPrefillModel``, DeepSeek-V4.1), the head then runs those layers over the
+    /// rows ITS end depends on too: a cut far from the end costs a second pruned region, ~24k layer rows, which made
+    /// a 4.2k-token cold DSV4.1 prefill with its system and system+tools cuts 18-19 % slower than an uncut one. A
+    /// cut within the model's unpruned tail of the end costs at most that tail, which the uncut prefill runs through
+    /// every layer anyway. Boundaries further out are left to a later prompt that ends near them: a new chat or the
+    /// next turn on the same system + tools prefix, whose own cold prefill takes the near cut (the prompt-minus-one
+    /// seed of every request is stored as before). The answer stream never waits on a rebuild of them.
+    ///
+    /// `VMLX_POOL_BOUNDARY_CAPTURE=all` cuts at every stable boundary (the previous behaviour, for comparisons).
+    private func poolCacheNearCutRows(windowSize: Int?) -> Int? {
+        guard ProcessInfo.processInfo.environment["VMLX_POOL_BOUNDARY_CAPTURE"] != "all" else { return nil }
+        return (model as? any PrunedPromptPrefillModel)?.unprunedPromptTailRows(windowSize: windowSize)
+    }
+
     /// `VMLX_POOL_BOUNDARY_CAPTURE=history`: the published history boundaries
     /// too (the newest message boundary and the ladder rungs). Opt-in: a split
     /// far from the prompt end runs the pruned upper layers over the rows before
@@ -3311,7 +3334,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         captureStoreSeedsOnly: Bool = false
     ) throws -> LMInput? {
         let segmentEnd = alreadyConsumed + (input.text.tokenIds?.count ?? input.text.tokens.size)
-        let wanted: [Int]
+        var wanted: [Int]
         if captureStoreSeedsOnly {
             // The terminal store consumes only N-1 for disk-backed hybrid
             // topologies. Retaining N as well would duplicate a KV payload
@@ -3342,6 +3365,19 @@ public struct TokenIterator: TokenIteratorProtocol {
                             tokens: Array(promptTokenIds.prefix(boundary)),
                             mediaSalt: cacheSaltPlan.salt(forBoundary: boundary)) ?? false)
                 }.sorted()
+            if poolCacheCapturesBoundariesInPrefill, let nearRows = poolCacheNearCutRows(windowSize: windowSize) {
+                let stableStores = Set(stable.map { requiresDiskRestore && $0 > 1 ? $0 - 1 : $0 })
+                let far = wanted.filter { stableStores.contains($0) && segmentEnd - $0 > nearRows }
+                if !far.isEmpty {
+                    poolStableBoundariesLeftUncut.formUnion(far)
+                    wanted.removeAll { far.contains($0) }
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        RuntimeDiagnostics.write(Data(
+                            ("[vmlx][cache/stable-head-capture] far=\(far) segmentEnd=\(segmentEnd)"
+                                + " nearRows=\(nearRows) left to a later prompt\n").utf8))
+                    }
+                }
+            }
         } else {
             // Preserve the pre-existing final-suffix partition exactly.
             wanted = Set(originalInput.cacheStablePrefixTokenCounts
@@ -4189,6 +4225,23 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.debug(
                             "TokenIterator: skipped already-durable cache boundary at \(boundary, privacy: .public) tokens (stable=\(isStableBoundary, privacy: .public))"
                         )
+                        continue
+                    }
+                    // A pool cache that captures its stable boundaries in prefill gets them there or not at all:
+                    // cut near the end of this prompt, or left to a later prompt that ends near them (far from
+                    // this end, or inside the prefix this request restored). A replay here would hold the answer
+                    // stream open for a whole prefix prefill, and on every later turn of the chat as well, since a
+                    // boundary nobody cut never becomes durable.
+                    if isStableBoundary, poolCacheCapturesBoundariesInPrefill,
+                       stableBoundarySnapshots[storeBoundary] == nil
+                    {
+                        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                            RuntimeDiagnostics.write(Data(
+                                ("[vmlx][cache/store-boundary] boundary=\(boundary) store=\(storeBoundary)"
+                                    + " stable=true not captured in prefill, left to a later prompt"
+                                    + " (cut far from the end: \(poolStableBoundariesLeftUncut.contains(storeBoundary)))\n")
+                                    .utf8))
+                        }
                         continue
                     }
                     let allowRederive = shouldForceStableBoundaryRederive(
