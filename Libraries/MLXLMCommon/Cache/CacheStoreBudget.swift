@@ -157,6 +157,15 @@ public enum CacheStoreBudget {
         return max(0, mlxActiveBytes)
     }
 
+    /// A store of `cache`. A snapshot of views (``AppendOnlyRowsCache/prefixView(rows:)``) the store owns materializes
+    /// nothing: its rows are the finished cache's own buffers, written run by run without a copy
+    /// (`SafetensorsByteWriter` strided payloads) or served from memory while queued. Pricing it as a full copy refused
+    /// every long-context MiniMax-M3 store on a 128 GB Mac (4.5-4.6 GiB at 35k tokens) although it needs no new memory.
+    public static func canStore(_ cache: [KVCache], ownsSnapshot: Bool) -> Bool {
+        if ownsSnapshot, cacheIsPrefixViews(cache) { return true }
+        return canStore(cache)
+    }
+
     /// Testable core: no MLX state, just the arithmetic.
     ///
     /// `active + storeCost + margin <= budget`, where the margin is whatever share

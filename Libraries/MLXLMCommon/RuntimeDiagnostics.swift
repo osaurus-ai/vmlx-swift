@@ -23,6 +23,12 @@ public enum RuntimeDiagnostics {
         private static let logger = Logger(subsystem: "vmlx", category: "RuntimeDiagnostics")
     #endif
 
+    /// `VMLX_DIAGNOSTICS_STDERR=1`: also write every line to stderr with a plain
+    /// `write(2)` (benchmarks and terminal runs). Opt-in only: a host whose
+    /// stderr may be a disconnected pipe leaves it unset.
+    static let mirrorsToStandardError =
+        ProcessInfo.processInfo.environment["VMLX_DIAGNOSTICS_STDERR"] == "1"
+
     public static func write(_ data: Data) {
         guard !data.isEmpty else { return }
         #if canImport(os)
@@ -32,6 +38,11 @@ public enum RuntimeDiagnostics {
             // Some optional diagnostic payloads include paths or decoded
             // tokens. Do not make these public unified-log fields.
             logger.info("\(String(decoding: data, as: UTF8.self), privacy: .private)")
+            // Benchmarks and terminal runs read the same lines from stderr
+            // (`VMLX_DIAGNOSTICS_STDERR=1`); the private unified log stays.
+            if mirrorsToStandardError {
+                _ = data.withUnsafeBytes { Darwin.write(STDERR_FILENO, $0.baseAddress, $0.count) }
+            }
         #else
             observerForTesting?(data)
             FileHandle.standardError.write(data)

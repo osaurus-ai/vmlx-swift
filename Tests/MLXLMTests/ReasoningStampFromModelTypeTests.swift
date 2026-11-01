@@ -173,8 +173,15 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
     }
 
     func testMiniMaxGetsThinkXml() {
-        for modelType in ["minimax", "minimax_m2", "minimax_m3"] {
+        for modelType in ["minimax", "minimax_m2"] {
             XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
+        }
+    }
+
+    /// MiniMax-M3 / M3.1 reason in `<mm:think>`, not the M2 `<think>` rail.
+    func testMiniMaxM3GetsItsOwnStamp() {
+        for modelType in ["minimax_m3", "minimax_m3_vl", "MiniMax-M3"] {
+            XCTAssertEqual(reasoningStampFromModelType(modelType), "minimax_m3")
         }
     }
 

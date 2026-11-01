@@ -122,7 +122,17 @@ enum JANGHHeaderAdapter {
             !name.contains("\\"), !name.contains("\0")
         else { throw Failure.invalid("unsafe JANGH metadata filename") }
         let descriptor = openat(rootDescriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard descriptor >= 0 else { throw Failure.invalid("cannot open JANGH metadata file") }
+        guard descriptor >= 0 else {
+            // Name the file and the reason: a symlinked shard (refused by design, the bundle's files are read and
+            // identity-checked in place) used to surface only as the next factory's unrelated error.
+            let code = errno
+            let reason = String(cString: strerror(code))
+            let hint =
+                code == ELOOP
+                ? " (a symbolic link: JANGH bundles read their regular files in place; link the bundle directory, "
+                    + "not its files)" : ""
+            throw Failure.invalid("cannot open JANGH metadata file '\(name)': \(reason)\(hint)")
+        }
         let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         do {
             _ = try identity(file)

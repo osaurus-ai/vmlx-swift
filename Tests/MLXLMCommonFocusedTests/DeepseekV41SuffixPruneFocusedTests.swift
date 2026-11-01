@@ -278,6 +278,79 @@ struct DeepseekV41SuffixPruneFocusedTests {
         }
     }
 
+    // MARK: KV-source trim == untrimmed pruning, bit for bit
+
+    @Test("KV-source trim: every cache array and the logits bit-identical to the untrimmed pruned prefill")
+    func kvSourceTrimIsExact() throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Engram at 1 and 3: the last owner is layer 3, kv source + index-key owner + candidate source (as layer
+            // 20 of the release), so the trimmed layer runs the window, the compressor and the index keys.
+            let bundle = try Self.writeEngramBundle(layers: [1, 3], vocab: 128)
+            defer { try? FileManager.default.removeItem(at: bundle) }
+            var config = Self.config()
+            config.engramLayerIds = [1, 3]
+            let model = DeepseekV4Model(config)
+            try model.configureBundle(modelDirectory: bundle)
+            DeepseekV41VisionFocusedTests.randomize(model, seed: 4102)
+            model.model.dsparkTapLayers = [5, 6, 7]
+            model.model.dsparkTailCapacity = 16
+            #expect(model.model.suffixPruneFrom == 4)
+            let keep = DeepseekV4ModelInner.suffixPruneKeep(layer: 4, numLayers: 8, window: 16)
+            #expect(keep == 61)
+            let all = Self.tokens(400, seed: 11)
+            // Layer 4 keeps 61 rows: a forward ending at or before P - 61 is trimmed. Chunk plans with trimmed
+            // forwards, a forward ending exactly at P - 61, and none (every forward reaches the kept rows).
+            for (n, step) in [(161, 32), (161, 17), (161, 33), (115, 23), (250, 64), (47, 64), (300, 101), (162, 101)] {
+                let ids = Array(all[..<n])
+                let body = Array(ids.dropLast())
+                func run(_ trim: Bool) -> (cache: [KVCache], rows: [(start: Int, rows: [Int])], trimmed: Int) {
+                    model.model.kvSourceTrimEnabled = trim
+                    model.model.kvSourceTrimmedForwards = 0
+                    defer { model.model.kvSourceTrimEnabled = DeepseekV4Math.kvSourceTrimEnabled }
+                    let (cache, rows) = Self.prefillBody(model, body, step: step, prune: true)
+                    return (cache, rows, model.model.kvSourceTrimmedForwards)
+                }
+                let base = run(false)
+                let trimmed = run(true)
+                #expect(base.trimmed == 0)
+                // Forwards that end at or before P - keep(4) take the trim; the others are unchanged.
+                let P = body.count
+                let expected = stride(from: 0, to: P, by: step).filter { min(P, $0 + step) <= P - keep }.count
+                #expect(expected > 0 || n <= 115 || step > 100, "n=\(n) step=\(step): plan without a trimmed forward")
+                #expect(trimmed.trimmed == expected, "n=\(n) step=\(step): \(trimmed.trimmed) trimmed, expected \(expected)")
+                #expect(trimmed.rows.map(\.start) == base.rows.map(\.start))
+                for (a, b) in zip(base.rows, trimmed.rows) {
+                    // Layers before the KV-source layer and the KV-source layer itself report every row; a trimmed
+                    // forward skips the pruned layers, which the untrimmed forward also skipped.
+                    #expect(a.rows == b.rows, "n=\(n) step=\(step) start=\(a.start): \(a.rows) vs \(b.rows)")
+                }
+                for (i, (c0, c1)) in zip(base.cache, trimmed.cache).enumerated() {
+                    #expect(c0.offset == c1.offset)
+                    let s0 = c0.state, s1 = c1.state
+                    #expect(
+                        s0.count == s1.count && zip(s0, s1).allSatisfy { DeepseekV41DSparkFocusedTests.equal($0, $1) },
+                        "n=\(n) step=\(step): layer \(i) state differs")
+                    #expect(c0.metaState == c1.metaState, "n=\(n) step=\(step): layer \(i) meta differs")
+                }
+                let holder = { (c: [KVCache]) in
+                    c.first { ($0 as? DeepseekV4Cache)?.requiresAuxiliaryTokenHistory == true } as? DeepseekV4Cache
+                }
+                let t0 = holder(base.cache)?.auxiliaryHiddenTail?.joined()
+                let t1 = holder(trimmed.cache)?.auxiliaryHiddenTail?.joined()
+                #expect(t0?.start == t1?.start)
+                if let t0, let t1 { #expect(DeepseekV41DSparkFocusedTests.equal(t0.rows, t1.rows)) }
+                // The last prompt token and a continuation: identical logits.
+                for t in Array(all[(n - 1) ..< (n + 6)]) {
+                    let x = MLXArray([t]).reshaped(1, 1)
+                    let l0 = model(x, cache: base.cache)[0, 0]
+                    let l1 = model(x, cache: trimmed.cache)[0, 0]
+                    #expect(DeepseekV41DSparkFocusedTests.equal(l0, l1), "n=\(n) step=\(step): logits differ")
+                }
+            }
+            #expect(DeepseekV4Math.suffixPruneFlag("0") == false)
+        }
+    }
+
     // MARK: Off == unchanged
 
     @Test("pruning off (flag, no prompt end, forward past the prompt end, 0731) leaves the forward unchanged")

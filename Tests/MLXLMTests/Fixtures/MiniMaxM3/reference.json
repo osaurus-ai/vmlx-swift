@@ -1,0 +1,154 @@
+{
+  "generator": "scripts/minimax_m3_fixtures/generate_fixtures.py",
+  "generator_sha256": "4e49bffeb1d3ff56d66d075e50c1f96e60fe899cf1a74ed82d6ac52b36746d21",
+  "vmlx_commit": "98c526e9",
+  "reference_sha256": {
+    "minimax_m3.py": "4457e32d66ecc5d97c4c43a60156d6bb705c56fd1cc53e56d63041c3a5237e93",
+    "cache.py": "26545a5c845f3cdb3270f4a48022d16b74baf6b61a69f3221744bc612f6437ea",
+    "source_format.py": "3979a25804dbd1503dcde271cac88b86ce256e2dfc743cf3325130968afbf496"
+  },
+  "mlx": "0.32.3",
+  "mlx_lm": "0.31.3",
+  "numpy": "2.2.6",
+  "python": "3.13.13",
+  "machine": "arm64",
+  "float32_matmul": "MLX_ENABLE_TF32=0 (64x64 probe max abs error 8.1e-06)",
+  "checks": {
+    "attention": {
+      "python_vs_numpy_rel": 2.017429126132241e-07,
+      "group_disagreements": 12,
+      "seq": 23,
+      "block": 4,
+      "topk_blocks": 2
+    },
+    "m31-float": {
+      "seed": 26,
+      "seq": 23,
+      "prefix": 15,
+      "chunk": 7,
+      "sparse_attention_freq": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "moe_layer_freq": [
+        0,
+        0,
+        0,
+        1,
+        1
+      ],
+      "cache_layout": [
+        "sparse",
+        "sparse",
+        "sparse",
+        "sparse",
+        "sparse"
+      ],
+      "group_disagreements_per_sparse_layer": [
+        14,
+        7,
+        10,
+        8,
+        12
+      ],
+      "min_block_margin_per_sparse_layer": [
+        0.07319276142304165,
+        0.14012384616354545,
+        0.010153027162338457,
+        0.011354697010834691,
+        0.021802925455884914
+      ],
+      "min_expert_margin": 0.017244994640350342,
+      "decode_vs_prefill_rel": 5.702391945305862e-07,
+      "chunked_vs_prefill_rel": 0.0
+    },
+    "m3-float": {
+      "seed": 38,
+      "seq": 23,
+      "prefix": 15,
+      "chunk": 7,
+      "sparse_attention_freq": [
+        0,
+        0,
+        0,
+        1,
+        1
+      ],
+      "moe_layer_freq": [
+        0,
+        0,
+        0,
+        1,
+        1
+      ],
+      "cache_layout": [
+        "kv",
+        "kv",
+        "kv",
+        "sparse",
+        "sparse"
+      ],
+      "group_disagreements_per_sparse_layer": [
+        12,
+        11
+      ],
+      "min_block_margin_per_sparse_layer": [
+        0.09595789143548838,
+        0.04628935020439684
+      ],
+      "min_expert_margin": 0.0149497389793396,
+      "decode_vs_prefill_rel": 6.580190188287816e-07,
+      "chunked_vs_prefill_rel": 0.0
+    },
+    "m31-source": {
+      "seq": 13,
+      "prefix": 9,
+      "stored_dtypes": [
+        "BF16",
+        "F32",
+        "F8_E4M3",
+        "F8_E8M0",
+        "U8"
+      ],
+      "f32_vs_spec_dequant_rel": 3.7622780268975475e-07,
+      "bf16_vs_spec_dequant_rel": 0.008798280730843544,
+      "experts_zeroed_vs_spec_dequant_rel": 0.13350170850753784,
+      "group_disagreements_per_sparse_layer": [
+        2,
+        2
+      ],
+      "min_block_margin_per_sparse_layer_f32": [
+        0.11248041219881078,
+        0.29522307044158547
+      ],
+      "min_block_margin_per_sparse_layer_bf16": [
+        0.16635191440582275,
+        0.2907545566558838
+      ],
+      "min_expert_margin_f32": 0.04997456073760986,
+      "inv_global_scales": {
+        "gate_proj": [
+          0.005122242495417595,
+          0.014093170873820782,
+          0.005319623742252588,
+          0.006897018291056156
+        ],
+        "up_proj": [
+          0.008756988681852818,
+          0.007712102960795164,
+          0.008191056549549103,
+          0.0076357098296284676
+        ],
+        "down_proj": [
+          0.007614664733409882,
+          0.005371817387640476,
+          0.00945038627833128,
+          0.005801050923764706
+        ]
+      }
+    }
+  }
+}
