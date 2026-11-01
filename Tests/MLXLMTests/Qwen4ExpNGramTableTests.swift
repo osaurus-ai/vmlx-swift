@@ -255,7 +255,7 @@ struct Qwen4ExpNGramTableTests {
         }
     }
 
-    /// Writes the layout ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit ships: the whole table as
+    /// Writes the layout a mixed 4/8-bit converter bundle ships: the whole table as
     /// one safetensors file named by `config.ngram_table.file`, with no index entry and no layer name.
     private func writeSingleFileTable(
         rows: Int, dimensions: Int, metadata: DType, pleLayerIds: [Int]
@@ -270,7 +270,7 @@ struct Qwen4ExpNGramTableTests {
         let staged = directory.appendingPathComponent("ngram_table.safetensors")
         try save(
             arrays: ["weight": packed, "scales": storedScales, "biases": storedBiases],
-            metadata: ["format": "mlx-serve-ngram", "bits": "4", "group_size": "32"], url: staged)
+            metadata: ["format": "ngram-table", "bits": "4", "group_size": "32"], url: staged)
         try FileManager.default.moveItem(
             at: staged, to: directory.appendingPathComponent("ngram_table.bin"))
         let config: [String: Any] = [
@@ -334,16 +334,16 @@ struct Qwen4ExpNGramTableTests {
         }
     }
 
-    /// The numeric oracle for the MLX-Serve layout (T-246): the same trained table, quantized twice
+    /// The numeric oracle for the mixed 4/8-bit converter layout (T-246): the same trained table, quantized twice
     /// by different converters, read through the two reader paths. A shard-order or row-offset error
     /// pairs every row with an unrelated one, so each sampled row must agree better with its own JANG
     /// row than any wrong pairing does; that needs no threshold. Also pins the bundle's stored hash
     /// buffers to the ones vmlx computes, since sanitize drops them.
-    @Test("MLX-Serve and JANG tables hold the same rows in the same order")
-    func mlxServeTableMatchesJANG() throws {
+    @Test("Converter-layout and JANG tables hold the same rows in the same order")
+    func converterTableMatchesJANG() throws {
         try MLXMetalTestLock.withLock {
             let environment = ProcessInfo.processInfo.environment
-            guard let servePath = environment["QWEN4_MLX_SERVE_BUNDLE"],
+            guard let servePath = environment["QWEN4_CONVERTER_BUNDLE"],
                 let jangPath = environment["QWEN4_JANG_BUNDLE"]
             else { return }
             let serve = URL(fileURLWithPath: servePath, isDirectory: true)
@@ -396,7 +396,7 @@ struct Qwen4ExpNGramTableTests {
                 weakestOwn = min(weakestOwn, own)
                 strongestOther = max(strongestOther, others.max()!)
             }
-            print("[Qwen4ExpPLE] MLX-Serve vs JANG: \(rows.count) rows, weakest own-row correlation "
+            print("[Qwen4ExpPLE] converter layout vs JANG: \(rows.count) rows, weakest own-row correlation "
                 + "\(weakestOwn), strongest wrong pairing \(strongestOther)")
 
             // The stored hash buffers equal what the runtime computes.

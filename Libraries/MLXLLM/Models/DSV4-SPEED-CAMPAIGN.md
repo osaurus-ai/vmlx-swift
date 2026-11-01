@@ -31,7 +31,7 @@ Target: **35+ tok/s stable decode and ~400 pp/s prefill** for DSV4-Flash on M5 M
 | Pre-refault eviction | 2c5324a1f | avoids paging stalls |
 | Pool quant default ON | 949aab70c + .tmp-r20 (DSV4_POOL_QUANT_DEFAULT=True) | automatic cache quant pooling |
 
-## Newer DSV4 reference inventory (JANG / antirez-vMLX lane, 2026-08-07)
+## Newer DSV4 reference inventory (JANG / vMLX reference lane, 2026-08-07)
 These changes are reference designs, not Swift proof. Each port still requires a guarded A/B, greedy/coherence parity, physical-footprint measurement, and short/long/near-500k validation.
 
 | Reference change | Commit | Why it matters to the Swift collapse |

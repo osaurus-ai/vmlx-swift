@@ -15,7 +15,7 @@ global production claim, and it does not enable MTP automatically.
 | Instrument before optimizing. | Live logs include `acceptedByDepth`, `targetVerifySec`, `mtpDraftSec`, `samplingSec`, `cacheCommitSec`, `targetForwards`, `verifyInputTokens`, `repairForwards`, RSS, footprint, and cache stats where enabled. |
 | Explain why D3 was slower. | The old default hybrid path used `sequential_repair`, producing almost one target forward per generated token. Explicit `chunk_commit` verifies `[primary, d1, d2, d3]` in one target forward. |
 | Implement the real fast verifier path. | The chunk path commits accepted verifier prefixes through `MambaCache.recordPrefixCommitState` and `commitRecordedPrefix`; it remains a greedy-only hybrid speed path. Non-greedy exact-pq hybrid rows use sequential repair after the 35B MXFP4 residual-correction failure. |
-| Compare against Python vMLX / MTPLX concepts. | Swift now has recursive D1/D2/D3 drafting, one chunk verifier forward, accepted-prefix commit, and per-phase telemetry. Swift still lacks GraphBank/compiled small-M verifier shapes, dedicated draft-only sidecar heads, and a production self-test that promotes chunk mode per artifact. |
+| Compare against Python vMLX concepts. | Swift now has recursive D1/D2/D3 drafting, one chunk verifier forward, accepted-prefix commit, and per-phase telemetry. Swift still lacks GraphBank/compiled small-M verifier shapes, dedicated draft-only sidecar heads, and a production self-test that promotes chunk mode per artifact. |
 | Review autodetect/startup. | The census rows use `MTPBundleInspector` and real tensor evidence. The later policy artifact `docs/local/production-readiness/20260517T_real_mtp_auto_launch_policy/` plus the 2026-05-18 tuning-file update prove local Qwen MTP auto-launch now requires real tensor evidence and usable bundle-local `vmlx_mtp_tuning.json`; depth comes from that file, and JANG_2K remains blocked by its tuning row. |
 | Validate six artifacts. | Speed rows are under `docs/local/qwen36-mtp-opt/20260517T050311Z-six-artifact-chunk-speed/`. Cache rows are under `docs/local/qwen36-mtp-opt/20260517T050824Z-27b-mxfp4-d3-cache/` and `docs/local/qwen36-mtp-opt/20260517T050858Z-recommended-depth-cache-rows/`. |
 
@@ -124,9 +124,9 @@ defaults, coherent two-turn output, disk-prefix hits, and SSM hits. Greedy
 still reports `verifierMode=chunk_commit` and passes, so the speed path remains
 available where the sampler does not need target/draft probability ratios.
 
-## MTPLX Comparison
+## Native MTP speed shape
 
-Swift now has the core runtime shape needed for MTPLX-style speed:
+Swift now has the core runtime shape needed for fast native MTP:
 
 - recursive D1/D2/D3 drafting from MTP hidden state;
 - one target verifier pass over `[primary, d1, d2, d3]`;
@@ -134,7 +134,7 @@ Swift now has the core runtime shape needed for MTPLX-style speed:
 - accepted verifier prefix commit;
 - phase timing and acceptance telemetry.
 
-Swift still lacks several MTPLX-style speed pieces:
+Swift still lacks several speed pieces:
 
 - compiled/GraphBank small-M verifier shapes;
 - specialized small-M qmv/qmm tuning;

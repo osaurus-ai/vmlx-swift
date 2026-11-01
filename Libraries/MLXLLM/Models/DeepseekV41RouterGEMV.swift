@@ -12,7 +12,7 @@
 // k = 128 i + 4 l + {0..3} in that order into one fp32 accumulator per row, then a shuffle-down ladder
 // 16, 8, 4, 2, 1. Each logit is therefore bit-identical to the stock fp32 matmul (checked by
 // `DeepseekV41DecodeFusionFocusedTests`). Pattern: vMLX `vmlx_engine/metal/glm5_router_matvec.py`
-// (GLM 288 x 4096), donor idea mlx-serve `GATE_SOURCE` / ds4 `kernel_dsv41_router_one`.
+// (GLM 288 x 4096).
 //
 // Decode only (one row). dSpark verify rows (2-8) keep the stock fp32 matmul: MLX runs those as a GEMM
 // with a different reduction order, and this kernel must not change their bits.

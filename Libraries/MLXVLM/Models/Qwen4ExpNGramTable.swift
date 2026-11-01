@@ -390,7 +390,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         let spec: AffineSpec?
         let rows: Int
         let dimensions: Int
-        /// Affine scales/biases stored as BF16 (MLX-Serve) rather than F16 (JANG).
+        /// Affine scales/biases stored as BF16 (mixed 4/8-bit converter bundles) rather than F16 (JANG).
         var bfloat16Metadata = false
     }
 
@@ -412,7 +412,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         layerIndex: Int,
         shardCount: Int
     ) throws {
-        // MLX-Serve declares the whole table as ONE safetensors file (`config.ngram_table`) that the
+        // A mixed 4/8-bit converter bundle declares the whole table as ONE safetensors file (`config.ngram_table`) that the
         // index does not list, its tensors named plain `weight`/`scales`/`biases`. It is read as a
         // single row shard; the JANG layout splits the same rows into `shardCount` indexed shards.
         let declared = try Self.readDeclaredTable(modelDirectory: modelDirectory)
@@ -821,7 +821,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         return low
     }
 
-    /// `config.ngram_table = {file, bits, group_size}`, MLX-Serve's declaration of a table it keeps
+    /// `config.ngram_table = {file, bits, group_size}`, a converter bundle's declaration of a table it keeps
     /// outside the indexed safetensors; nil when the bundle declares none. The file names no layer,
     /// so a model with several PLE layers cannot be served by it and is refused rather than guessed.
     private static func readDeclaredTable(

@@ -3,8 +3,7 @@
 //
 // DeepSeek-V4.1 MoE at decode and dSpark-verify sizes (1-8 rows) in two Metal dispatches.
 //
-// Port of the mlx-serve fused MoE decode (`MOE_GU_SOURCE` / `MOE_DN_SOURCE`, src/deepseek_v41.zig
-// L1612-1693 at 191da71de32a; reference runtime `decode_moe.py` is the same idea): kernel 1 runs the six routed
+// Two-dispatch fused MoE decode (the reference runtime's `decode_moe.py` is the same idea): kernel 1 runs the six routed
 // experts' gate and up projections plus the shared expert's w1/w3 as slot 6 in one grid and applies the
 // clamped SwiGLU (times the route weight on the routed slots); kernel 2 runs the six routed down
 // projections, sums them in fp32 in slot order and adds the shared expert's down projection.
@@ -14,8 +13,7 @@
 // SwiGLU, a gather_qmv for down, a cast + column sum, three shared-expert qmv, the shared SwiGLU and the
 // fp32 add.
 //
-// Exactness. mlx-serve's own dot products are "every rounding where the composed path takes it" with a
-// different fp32 accumulation order. This port goes further and is bit-identical to the stock MLX path:
+// Exactness. Bit-identical to the stock MLX path:
 // each dot product is a VERBATIM transcription of the kernel MLX itself dispatches for that projection
 // (fork kernels/quantized.h, mlx 169ba206):
 //   - routed gate/up (`gather_qmv_fast`, K = 5120): `qmv_fast_impl` with `load_vector` / `qdot`;
