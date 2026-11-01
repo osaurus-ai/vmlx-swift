@@ -82,6 +82,30 @@ struct DiskCacheResidentEntryTests {
         }
     }
 
+    /// The serving default caches on the SSD only (no resident budget). A read while the entry's
+    /// file is still being written is served from the writer's payload and labelled
+    /// `diskPending`, never `memory` (the opt-in RAM tier). Once the file lands the same read is
+    /// `disk`, and nothing is resident at any point.
+    @Test func ssdOnlyReadDuringTheWriteIsDiskPendingNeverMemory() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("pending")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let prompt = Self.chain(263)
+            let ssd = Self.coordinator(root: root, residentBytes: 0, writeBehind: true)
+            ssd.diskCache?.writeDelayForTesting = 0.3
+            ssd.storePersistentBoundary(
+                tokens: Array(prompt.prefix(157)), diskArrays: Self.payload(61, value: 5), ssmStates: nil)
+            let during = try #require(Self.hit(ssd.fetch(tokens: prompt)))
+            #expect(during.matched == 157 && during.detail == .diskPending && during.detail.isDiskTierEntry)
+            #expect(ssd.waitForPendingDiskWrites())
+            let after = try #require(Self.hit(ssd.fetch(tokens: prompt)))
+            #expect(after.matched == 157 && after.detail == .disk)
+            #expect(ssd.diskCache?.residentStats.entries == 0)
+            let a = try #require(during.arrays["data"]), b = try #require(after.arrays["data"])
+            #expect(a.shape == b.shape && MLX.all(a .== b).item(Bool.self))
+        }
+    }
+
     @Test func budgetEvictsLeastRecentlyUsedAndNeverTheNewest() throws {
         try MLXMetalTestLock.withLock {
             let root = Self.makeRoot("lru")
