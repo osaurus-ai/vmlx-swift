@@ -11,6 +11,7 @@ import XCTest
 /// difference between prefilling a prompt once and prefilling it twice.
 private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     private(set) var forwarded: [Int] = []
+    private(set) var forwardChunkSizes: [Int] = []
     private(set) var prepareCalls = 0
     private(set) var prepareMediaFlags: [Bool] = []
     private(set) var prepareTokenSegments: [[Int]] = []
@@ -40,6 +41,7 @@ private class RecordingHybridModel: Module, LanguageModel, @unchecked Sendable {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let ids = inputs.reshaped([-1]).asArray(Int32.self).map(Int.init)
         forwarded.append(contentsOf: ids)
+        forwardChunkSizes.append(ids.count)
         if let mamba = cache?.first as? MambaCache {
             let runningSum = (mamba.state.first?.asArray(Float.self).first ?? 0)
                 + ids.reduce(Float(0)) { $0 + Float($1) }
@@ -364,6 +366,25 @@ final class HybridStripBoundaryPrefillTests: XCTestCase {
         XCTAssertEqual(matched, userTurn.count)
         XCTAssertEqual(remaining, genPromptSuffix + [77])
         XCTAssertEqual(detail, .disk)
+    }
+
+    func testTerminalSSMReplayHonorsRequestPrefillStep() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let model = RecordingHybridModel()
+        let coordinator = makeCoordinator()
+        let prompt = (0..<131).map { $0 % 31 + 1 }
+        let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count))
+        var iterator = try TokenIterator(input: input, model: model,
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 2),
+            cacheCoordinator: coordinator)
+        var generated: [Int] = []
+        for _ in 0..<3 { generated.append(try XCTUnwrap(iterator.next())) }
+        eval(iterator.cache)
+        let beforeStore = model.forwardChunkSizes.count
+        iterator.storeCacheAfterGeneration(generatedTokenIds: generated, includeGeneratedBoundary: true)
+        let replaySizes = Array(model.forwardChunkSizes.dropFirst(beforeStore))
+        XCTAssertFalse(replaySizes.isEmpty, "Fixture must exercise terminal replay")
+        XCTAssertTrue(replaySizes.allSatisfy { $0 <= 2 }, "Replay ignored request chunk size: \(replaySizes)")
     }
 
     func testCompletedHybridAnswerResumesWithRecurrentState() throws {
