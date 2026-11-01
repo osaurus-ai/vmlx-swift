@@ -442,7 +442,7 @@ enum MiniMaxM3DSparkLoader {
 
     /// `X.weight` (e4m3 bytes) + `X.weight_scale_inv` (e8m0) pairs become `X.weight` (viewed uint32) + `X.scales`
     /// (MLX's mxfp8 layout, same bytes), in place; returns the module paths X (Python `mxfp8_pairs_to_mlx`).
-    static func mxfp8PairsToMLX(_ weights: inout [String: MLXArray]) -> Set<String> {
+    static func decodeMXFP8Pairs(_ weights: inout [String: MLXArray]) -> Set<String> {
         var paths = Set<String>()
         for key in weights.keys.sorted() where key.hasSuffix(".weight_scale_inv") {
             let base = String(key.dropLast(".weight_scale_inv".count))
@@ -490,7 +490,7 @@ enum MiniMaxM3DSparkLoader {
             }
         }
         let drafter = MiniMaxM3DSparkDrafter(config)
-        let mxfp8 = mxfp8PairsToMLX(&weights)
+        let mxfp8 = decodeMXFP8Pairs(&weights)
         let quant = raw["quantization"] as? [String: Any]
         let top: (Int, Int, QuantizationMode)? = quant.flatMap { q in
             guard let g = (q["group_size"] as? NSNumber)?.intValue, let b = (q["bits"] as? NSNumber)?.intValue,
