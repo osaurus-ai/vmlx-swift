@@ -999,6 +999,7 @@ let package = Package(
                 "LFM25ChatTemplateRenderFocusedTests.swift",
                 "LogitProcessorIndependentCopyTests.swift",
                 "DSparkSpeculationFocusedTests.swift",
+                "HybridPoolHiddenTailLifetimeTests.swift",
                 "DeepseekV41DSparkFocusedTests.swift",
                 "DeepseekV41VisionFocusedTests.swift",
             ]
