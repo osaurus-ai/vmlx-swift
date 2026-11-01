@@ -1788,7 +1788,7 @@ public struct MTPRecursiveDraftContract: Codable, Sendable, Equatable {
         return Int(ceil(Double(outputTokens) / Double(maxCommittedTokensPerVerify)))
     }
 
-    public static let mtplxDepth3 = MTPRecursiveDraftContract(depth: 3)
+    public static let recursiveDepth3 = MTPRecursiveDraftContract(depth: 3)
 }
 
 /// No-load MTP/VL inspector. It reads JSON metadata and safetensors headers only;

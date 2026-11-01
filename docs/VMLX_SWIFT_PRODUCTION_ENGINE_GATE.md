@@ -180,8 +180,8 @@ These rows are now covered in this checkout with artifacts under
   reaches `prepared prompt=16318`, then `.err` terminates with Metal
   `kIOGPUCommandBufferCallbackErrorOutOfMemory`. The engine must fix this
   memory path before claiming B7-style long-context production readiness.
-- The ds4 official vector fixture used by the Python `dsv4_vector_probe.py`
-  was not present at `/tmp/ds4-read/tests/test-vectors/official.vec`; vector
+- The official DSV4 reference-vector fixture used by the Python `dsv4_vector_probe.py`
+  was not present at `tests/test-vectors/official.vec`; vector
   drift remains blocked, not inferred from the shorter recall rows.
 - Nemotron Omni video generation now follows the real source contract: the
   processor carries the post-EVS keep count through `LMInput.ProcessedVideo`,

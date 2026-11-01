@@ -193,7 +193,7 @@ struct Qwen4ExpConfigurationTests {
         array?.asType(.float32).asArray(Float.self) ?? []
     }
 
-    /// The layout an mlx-vlm-style converter writes (ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit):
+    /// The layout an mlx-vlm-style converter writes (a mixed 4/8-bit Qwen3.8 Flash-Next):
     /// the module tree's own names, with every value already through the reference's sanitize. On
     /// that bundle the shifted norms equal JANG_2L's `runtime_plus1_applied` values bit for bit, and
     /// the two MTP fusion norms equal JANG_2L's zero-centred values plus one.

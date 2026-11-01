@@ -110,8 +110,7 @@ tail rate of 75.3-75.4 tok/s therefore matches the relevant Python steady-state
 rate; Swift's lower headline includes an approximately one-second first-decode
 materialization cost.
 
-CoreML/ANE is not added by this change. The audited mlx-serve path disables ANE
-on M5 because it was slower and depends on private APIs. Any future TensorOps,
+CoreML/ANE is not added by this change (ANE access depends on private APIs). Any future TensorOps,
 NAX, NPP, CoreML or ANE path still requires its own real-bundle parity,
 footprint and wall-clock win before production use.
 

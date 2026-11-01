@@ -115,7 +115,7 @@ public struct DFlash2Configuration: Sendable {
     public let markovRank: Int
     /// DSpark checkpoints draft from EVERY block row, the anchor row emitting draft 0 (DFlash drops the anchor row).
     /// Their declared `block_size` counts drafts; `blockSize` here is normalized to the verify width (+1). Reading the
-    /// wrong mapping is a silent 0 %-acceptance drafter, not an error (mlx-serve `anchor_row_drafts`).
+    /// wrong mapping is a silent 0 %-acceptance drafter, not an error.
     public let anchorRowDrafts: Bool
     /// GPT-J interleaved rope (`rope_is_neox_style: false`). DFlash sidecars and MiniCPM-V 4.7's DSpark are neox.
     public let ropeTraditional: Bool
@@ -198,7 +198,7 @@ public struct DFlash2Configuration: Sendable {
         {
             inner = inner.replacingBlockSize(top)
         }
-        // DSpark splits its contract between the root and `dflash_config` (mlx-serve reads both, nested first).
+        // DSpark splits its contract between the root and `dflash_config` (both are read, nested first).
         let dflashObject = dflashRaw as? [String: Any] ?? [:]
         func any(_ key: String) -> Any? { dflashObject[key] ?? root[key] }
         let markovRank = (any("markov_rank") as? Int) ?? 0
