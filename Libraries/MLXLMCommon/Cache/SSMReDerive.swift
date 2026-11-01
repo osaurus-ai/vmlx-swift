@@ -315,7 +315,9 @@ public func reDeriveSSMStates(
     @unknown default:
         break
     }
-    MLX.eval(freshCache)
+    // Lazy materialization can fail after prepare/replayForward has returned.
+    // Do not return companion state after an evaluation error was merely logged.
+    try withError { MLX.eval(freshCache) }
 
     let states = extractSSMStates(from: freshCache)
     return states.isEmpty ? nil : states
@@ -389,7 +391,9 @@ public func reDeriveSSMStatesAtBoundaries(
                 // forward fails throws here, and the store publishes nothing.
                 _ = try model.replayForward(tokenArray, cache: freshCache)
             }
-            MLX.eval(freshCache)
+            // INVARIANT: an evaluation failure aborts this replay before the
+            // cursor advances or any later boundary can be published.
+            try withError { MLX.eval(freshCache) }
             cursor = end
             Memory.clearCache()
         }
@@ -407,7 +411,7 @@ public func reDeriveSSMStatesAtBoundaries(
         let live = extractSSMStates(from: freshCache)
         if !live.isEmpty {
             let owned = live.map { $0 * 1 }
-            MLX.eval(owned)
+            try withError { MLX.eval(owned) }
             out[boundary] = owned
         }
     }
