@@ -1000,6 +1000,7 @@ let package = Package(
                 "LogitProcessorIndependentCopyTests.swift",
                 "DSparkSpeculationFocusedTests.swift",
                 "HybridPoolHiddenTailLifetimeTests.swift",
+                "RotatingSharedKVCacheLifetimeTests.swift",
                 "DeepseekV41DSparkFocusedTests.swift",
                 "DeepseekV41VisionFocusedTests.swift",
             ]

@@ -368,6 +368,23 @@ class DeepseekV4Attention: Module {
         return kv
     }
 
+    /// The model has one latent KV head and reads only the returned K window.
+    /// Default rotating caches can share their companion V state rather than
+    /// retaining a separate lazy update chain through all previous forwards.
+    private func updateLatentKV(_ kv: MLXArray, cache: KVCache) -> MLXArray {
+        if let cache = cache as? DeepseekV4Cache {
+            return cache.updateSharedKV(kv)
+        }
+        if let cache = cache as? RotatingKVCache {
+            return cache.updateSharedKV(kv)
+        }
+        let result = cache.update(keys: kv, values: kv)
+        // Custom cache implementations still need their unused V branch
+        // scheduled. This preserves their representation without a host wait.
+        asyncEval(result.1)
+        return result.0
+    }
+
     /// DeepSeek-V4.1 prompt-suffix pruning (``DeepseekV4ModelInner``, KV-source trim): only this layer's cache writes
     /// for the rows `x` (one attention call's rows): the window rows, then the compressor (pool rows, the incomplete
     /// group's buffer) and, on an index-key owner, the index keys of every completed group. The same calls, on the
@@ -377,7 +394,7 @@ class DeepseekV4Attention: Module {
         let offset = cache.offset
         let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
         let kv = kvMath(x, cosT: cosT, sinT: sinT)
-        _ = cache.update(keys: kv, values: kv)
+        _ = updateLatentKV(kv, cache: cache)
         DeepseekV41PrefillProfile.mark("cache_append", cache.innerState())
         guard compressRatio > 0, let comp = compressor else { return }
         let v4Cache = cache as? DeepseekV4Cache
@@ -436,7 +453,7 @@ class DeepseekV4Attention: Module {
         // --- Cache update (sliding-window local) ---
         var keys = kv
         if let cache = cache {
-            (keys, _) = cache.update(keys: kv, values: kv)
+            keys = updateLatentKV(kv, cache: cache)
         }
         DeepseekV41PrefillProfile.mark("cache_append", [keys])
         var fullKV = keys
@@ -771,7 +788,7 @@ class DeepseekV4Attention: Module {
     /// same RoPE positions). The attention math itself is not rerun.
     func commitCapturedPrefix(_ record: DSV41VerifyCapture.Layer, keep: Int, cache: KVCache) {
         let rows = record.kv[0..., 0..., 0 ..< keep, 0...]
-        _ = cache.update(keys: rows, values: rows)
+        _ = updateLatentKV(rows, cache: cache)
         if compressRatio > 0, let comp = compressor, let x = record.x,
             let v4Cache = cache as? DeepseekV4Cache
         {

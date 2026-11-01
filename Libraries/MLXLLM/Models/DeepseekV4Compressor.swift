@@ -1277,6 +1277,16 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         return window
     }
 
+    /// DeepSeek's local attention consumes one shared latent as both K and V.
+    /// Preserve the companion state without an unused lazy V history.
+    public func updateSharedKV(_ kv: MLXArray) -> MLXArray {
+        let window = local.updateSharedKV(kv)
+        if compactLocalWindow, kv.dim(2) > 1 {
+            local.compactToWindow()
+        }
+        return window
+    }
+
     /// Round-trip layout (kept stable for `TQDiskSerializer`):
     ///   index 0..<localCount       — `local.state` (rotating window)
     ///   index localCount + 0       — compPooled (or empty zero-row tensor)

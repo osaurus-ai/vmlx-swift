@@ -1187,6 +1187,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         offset = position
     }
 
+    /// Update a cache whose complete history uses the same latent for K and V.
+    /// The caller consumes K only. Retaining the independent, unevaluated V
+    /// updates would keep every old row's forward graph and completion event.
+    /// Keep V aligned with the updated K using a fresh handle, so later writes
+    /// cannot mutate both Swift objects through one shared MLXArray instance.
+    public func updateSharedKV(_ kv: MLXArray) -> MLXArray {
+        let result = update(keys: kv, values: kv).0
+        values = keys.map { $0.reshaped($0.shape) }
+        return result
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result =
             if keys.dim(2) == 1 && canUpdateInPlace(keys.dim(2)) {
