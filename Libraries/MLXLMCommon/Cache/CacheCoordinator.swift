@@ -33,15 +33,19 @@ public enum CacheDetail: String, Sendable {
     case paged
     /// The on-disk L2 cache.
     case disk
-    /// An entry of the disk tier served from RAM: kept resident after its store or an earlier
-    /// read, or still being written (see ``DiskCache/residentByteBudget``). Restored exactly like
-    /// ``disk`` (the hit carries `diskArrays`); only the source of the bytes differs.
+    /// An entry of the disk tier kept resident in RAM after its store or an earlier read (the
+    /// opt-in RAM tier, see ``DiskCache/residentByteBudget``). Restored exactly like ``disk`` (the
+    /// hit carries `diskArrays`); only the source of the bytes differs.
     case memory
+    /// An entry of the disk tier whose file is still being written (write-behind): served from the
+    /// writer's payload, the same content-addressed bytes the file will hold. Not resident: it
+    /// occurs with the SSD-only default, and the payload is released once the file lands.
+    case diskPending
     /// No cache tier had a match.
     case miss
 
-    /// The hit carries a disk-tier payload (`diskArrays`): ``disk`` or ``memory``.
-    public var isDiskTierEntry: Bool { self == .disk || self == .memory }
+    /// The hit carries a disk-tier payload (`diskArrays`): ``disk``, ``memory`` or ``diskPending``.
+    public var isDiskTierEntry: Bool { self == .disk || self == .memory || self == .diskPending }
 }
 
 // MARK: - CacheFetchResult
@@ -993,11 +997,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // Do not make rejected hybrid candidates hot: no recency
                 // touch and no hit until one is accepted.
                 let arrays: [String: MLXArray]
-                let servedFromMemory: Bool
+                let source: DiskCache.FetchSource
                 switch diskCache.fetchCandidate(tokens: prefix, mediaSalt: probeSalt) {
-                case .arrays(let found, let fromMemory):
+                case .arrays(let found, let from):
                     arrays = found
-                    servedFromMemory = fromMemory
+                    source = from
                 case .miss:
                     // A miss here means the content-addressed key over this
                     // prefix found no row; a rejection below means the row
@@ -1026,11 +1030,11 @@ public final class CacheCoordinator: @unchecked Sendable {
                         matchedBoundary: boundary,
                         mediaSalt: probeSalt,
                         chainId: chainId)
-                    ftrace("HIT \(servedFromMemory ? "memory" : "disk") boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
+                    ftrace("HIT \(source.detail.rawValue) boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))\(saltTag)")
                     return .hit(
                         matchedTokens: boundary,
                         remainingTokens: Array(tokens.dropFirst(boundary)),
-                        detail: servedFromMemory ? .memory : .disk,
+                        detail: source.detail,
                         blocks: [],
                         ssmStates: ssmStates,
                         diskArrays: arrays
