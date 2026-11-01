@@ -2801,3 +2801,13 @@ extension DeepseekV4Model: PrefixCacheInvariantModel {
     /// DSV4-0731 is not claimed.
     public var exactPrefixRestoreIsSuffixIndependent: Bool { config.isDeepseekV41 }
 }
+
+extension DeepseekV4Model: PrunedPromptPrefillModel {
+    /// DeepSeek-V4.1 with prompt-suffix pruning: `prepare` prunes its chunks toward the start of the caller's final
+    /// forward, which runs every layer over at most `step` rows. DSV4-0731 (and V4.1 with pruning off) computes every
+    /// row of every layer, so a cut adds nothing.
+    public func unprunedPromptTailRows(windowSize: Int?) -> Int? {
+        guard suffixPruneEnabled, model.suffixPruneFrom != nil else { return nil }
+        return prefillChunking(windowSize).step
+    }
+}
