@@ -6,4 +6,4 @@ Current-main parser/template, byte-budget, error propagation and request-sized t
 
 Qualification is in progress on the local Max2 only. Strict Metal test artifacts must come from the pinned core, and every suite must execute nonzero tests. Historical runtime/UI measurements remain dated component evidence; they are not new final-source speed or physical M2 results. Model multi-turn, actual cache receipts, tool-stream drain and consumer UI/relaunch are outstanding. No release is authorized.
 
-The M2-only split-K core candidate is separate and is not included in this projection. Local M5 controls do not establish prevention on physical M2 hardware.
+The core pin now consumes merged MLX PR36 at3b39b5e7925fa8860ab8ccd79b054349872e24a5. Its M2 Max-only FP16/BF16 long-batched split-K route is limited to2–32 matrices, excluding the measured64-matrix slowdown. Retained clean-build,74focused and16async assertions and nativeM5 dispatch controls qualify this scoped integration; physical M2 crash prevention remains unconfirmed. The separate fused-attention issue remains open. No sampler, cache format or other-device dispatch policy changes are introduced.
