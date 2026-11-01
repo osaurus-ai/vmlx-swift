@@ -48,6 +48,7 @@ struct HybridPoolHiddenTailLifetimeTests {
         }
     }
 
+    #if canImport(Metal)
     @Test("Long GPU decoding keeps unread tap rows bounded without consuming the draft tail")
     func longGPUHistory() throws {
         try Device.withDefaultDevice(.gpu) {
@@ -75,4 +76,5 @@ struct HybridPoolHiddenTailLifetimeTests {
             }
         }
     }
+    #endif
 }
