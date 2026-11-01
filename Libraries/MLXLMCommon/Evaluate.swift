@@ -3740,7 +3740,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 promptTokenIds: promptTokenIds,
                                 mediaSalt: mediaSalt,
                                 additionalBoundaries: sharedPromptAdditionalBoundaries,
-                                persistCapturedStatesToDisk: false)
+                                persistCapturedStatesToDisk: false,
+                                prefillStepSize: cacheInitParameters?.prefillStepSize ?? 512)
                     }
                     if let shared = sharedPromptRederivedStates?[tokens.count] {
                         return shared
@@ -3751,7 +3752,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     model: model,
                     promptTokenIds: tokens,
                     mediaSalt: mediaSalt,
-                    persistCapturedStatesToDisk: false)
+                    persistCapturedStatesToDisk: false,
+                    prefillStepSize: cacheInitParameters?.prefillStepSize ?? 512)
             }()
             let diskStoreCache = makeDiskStoreCache(
                 fromPromptBoundary: snapshot,
