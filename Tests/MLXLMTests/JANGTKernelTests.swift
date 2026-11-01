@@ -163,7 +163,18 @@ final class JANGTKernelTests: XCTestCase {
         XCTAssertEqual(JANGTCode.laneBits(3), 48)
     }
 
-    private func runGateUpAndDown(k: Double, limit: Float, largeHidden: Bool) throws {
+    /// The CPU form of `JANGTActivation` (clamp, then SiLU or SwiGLU-OAI), in Double.
+    private func act(_ g: Float, _ u: Float, limit: Float, _ activation: JANGTActivation) -> Float {
+        var g = Double(g), u = Double(u)
+        if limit > 0 { g = min(g, Double(limit)); u = min(max(u, -Double(limit)), Double(limit)) }
+        switch activation {
+        case .silu: return Float(g / (1 + Foundation.exp(-g)) * u)
+        case .oai(let alpha): return Float(g / (1 + Foundation.exp(-Double(alpha) * g)) * (u + 1))
+        }
+    }
+
+    private func runGateUpAndDown(k: Double, limit: Float, largeHidden: Bool,
+                                  activation: JANGTActivation = .silu) throws {
         var rng = Rng(state: UInt64(k * 1000) + (largeHidden ? 7 : 3))
         let experts = 4, d = 1024, i = 512, tokens = 3, slots = 2
         // Gate/up outliers are layer-wide (same columns for every expert); down columns differ per expert.
@@ -192,8 +203,7 @@ final class JANGTKernelTests: XCTestCase {
                         g += xt[c] * gate.wout[(e * i + n) * gate.outliers + j]
                         u += xt[c] * up.wout[(e * i + n) * up.outliers + j]
                     }
-                    if limit > 0 { g = min(g, limit); u = min(max(u, -limit), limit) }
-                    hRef[(t * slots + s) * i + n] = g / (1 + exp(-g)) * u
+                    hRef[(t * slots + s) * i + n] = act(g, u, limit: limit, activation)
                 }
             }
         }
@@ -223,9 +233,18 @@ final class JANGTKernelTests: XCTestCase {
         let xm = MLXArray(x, [tokens, d]), ids = MLXArray(idx, [tokens, slots])
         let suGU = g.signs * JANGTRoutedExpertLayer.keepMask(width: d, columns: g.outlierColumnIndices[0 ..< 1])[0]
         let h = JANGTKernels.gateUp(xr: JANGTKernels.rotateRows(xm, signs: suGU), x: xm, indices: ids, gate: g, up: u,
-                                    limit: limit, outputDType: .float32)
-        let hErr = relL2(h.asArray(Float.self), largeHidden ? hRef.enumerated().map { [1, 4].contains($0.offset / i) ? $0.element / 100_000 : $0.element } : hRef)
-        XCTAssertLessThan(hErr, 1e-2, "gate/up K=\(k) limit=\(limit) rel-L2")
+                                    limit: limit, activation: activation, outputDType: .float32)
+        let hWant = largeHidden ? hRef.enumerated().map { [1, 4].contains($0.offset / i) ? $0.element / 100_000 : $0.element } : hRef
+        let hErr = relL2(h.asArray(Float.self), hWant)
+        XCTAssertLessThan(hErr, 1e-2, "gate/up K=\(k) limit=\(limit) \(activation) rel-L2")
+        if activation != .silu {
+            // Control: the SiLU kernel at the same limit must miss the reference by far more than the tolerance.
+            let silu = JANGTKernels.gateUp(xr: JANGTKernels.rotateRows(xm, signs: suGU), x: xm, indices: ids, gate: g,
+                                           up: u, limit: limit, activation: .silu, outputDType: .float32)
+            let control = relL2(silu.asArray(Float.self), hWant)
+            print("JANGT K=\(k) \(activation) control (SiLU kernel): rel-L2 \(control)")
+            XCTAssertGreaterThan(control, 10 * 1e-2, "SiLU control K=\(k)")
+        }
 
         let svDN = down.columnScales! * down.signs.expandedDimensions(axis: 0)
             * JANGTRoutedExpertLayer.keepMask(width: i, columns: down.outlierColumnIndices)
@@ -239,7 +258,7 @@ final class JANGTKernelTests: XCTestCase {
 
     /// Expert-sorted NAX prefill tiles (JANGTPrefillKernel) against the CPU decoder: single projection, fused
     /// gate+up with a clamp that bites, and the outlier term, for 96 sorted rows over a ragged expert split.
-    private func runPrefill(k: Double) throws {
+    private func runPrefill(k: Double, activation: JANGTActivation = .silu) throws {
         try XCTSkipUnless(JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
         var rng = Rng(state: UInt64(k * 100) + 11)
         let experts = 4, n = 256, kin = 1024, rows = 96
@@ -258,26 +277,25 @@ final class JANGTKernelTests: XCTestCase {
                 let g = dot(gate.row(e, c), xr) * gate.scale[e * n + c]
                 let u = dot(up.row(e, c), xr) * up.scale[e * n + c]
                 single.append(g)
-                let gc = min(g, limit), uc = min(max(u, -limit), limit)
-                fused.append(gc / (1 + exp(-gc)) * uc)
+                fused.append(act(g, u, limit: limit, activation))
                 var o: Float = 0, ou: Float = 0
                 for (j, col) in gate.columns(e).enumerated() {
                     o += raw[r * kin + col] * gate.wout[(e * n + c) * gate.outliers + j]
                     ou += raw[r * kin + col] * up.wout[(e * n + c) * up.outliers + j]
                 }
                 outl.append(o)
-                let go = min(g + o, limit), uo = min(max(u + ou, -limit), limit)
-                fusedOut.append(go / (1 + exp(-go)) * uo)
+                fusedOut.append(act(g + o, u + ou, limit: limit, activation))
             }
         }
         let g = try gate.mlx(), u = try up.mlx()
         let xm = MLXArray(x, [rows, kin]).asType(.bfloat16), idx = MLXArray(ids)
         let ySingle = JANGTPrefillKernel.project(xm, g, indices: idx).asType(.float32).asArray(Float.self)
-        let yFused = JANGTPrefillKernel.project(xm, g, up: u, indices: idx, limit: limit).asType(.float32).asArray(Float.self)
+        let yFused = JANGTPrefillKernel.project(xm, g, up: u, indices: idx, limit: limit, activation: activation)
+            .asType(.float32).asArray(Float.self)
         let yOut = try XCTUnwrap(JANGTPrefillKernel.outliers(MLXArray(raw, [rows, kin]), g, indices: idx)).asArray(Float.self)
         let yFusedOut = JANGTPrefillKernel.projectGateUpWithOutliers(
             xm, rawRows: MLXArray(raw, [rows, kin]), gate: g, up: u, columns: MLXArray([Int32(3), Int32(900)]),
-            indices: idx, limit: limit).asType(.float32).asArray(Float.self)
+            indices: idx, limit: limit, activation: activation).asType(.float32).asArray(Float.self)
         let e4 = relL2(yFusedOut, fusedOut)
         XCTAssertLessThan(e4, 2e-2, "fused gate/up with outlier epilogue")
         let e1 = relL2(ySingle, single), e2 = relL2(yFused, fused), e3 = relL2(yOut, outl)
@@ -285,6 +303,93 @@ final class JANGTKernelTests: XCTestCase {
         XCTAssertLessThan(e1, 1e-2)
         XCTAssertLessThan(e2, 2e-2)
         XCTAssertLessThan(e3, 1e-3)  // fp32 gather_mm runs in TF32 under MLX defaults (as in the reference)
+        if activation != .silu {
+            // Controls: the SiLU tiles at the same limit miss both fused references by far more than the tolerance.
+            let c2 = relL2(JANGTPrefillKernel.project(xm, g, up: u, indices: idx, limit: limit)
+                .asType(.float32).asArray(Float.self), fused)
+            let c4 = relL2(JANGTPrefillKernel.projectGateUpWithOutliers(
+                xm, rawRows: MLXArray(raw, [rows, kin]), gate: g, up: u, columns: MLXArray([Int32(3), Int32(900)]),
+                indices: idx, limit: limit).asType(.float32).asArray(Float.self), fusedOut)
+            print("JANGT prefill K=\(k) \(activation) controls (SiLU tiles): fused \(c2), fused+outliers \(c4)")
+            XCTAssertGreaterThan(c2, 10 * 2e-2)
+            XCTAssertGreaterThan(c4, 10 * 2e-2)
+        }
+    }
+
+    /// The expert-aligned schedule (`JANGTPrefillKernel.expertTilePlan`, vMLX Python edf7e36e8) returns the row-tiled
+    /// schedule's output BIT FOR BIT: every variant (single, fused SwiGLU / SwiGLU-OAI clamped, fused + outlier epilogue,
+    /// H32 output rotation), K 1.5 / 2 / 2.5 / 3, ragged segments (empty experts, segments of 1, of exactly 64, of more
+    /// than two tiles, row counts that are not multiples of 64), a call of < 8 rows, and rows whose id is not a valid
+    /// expert (NaN in both). Control: a deliberately wrong plan (tiles shifted by one row) changes the output.
+    func testExpertAlignedTilesEqualRowTiledBitForBit() throws {
+        try XCTSkipUnless(JANGTPrefillKernel.available, "NAX prefill tiles need an M5-class GPU")
+        func bits(_ a: MLXArray) -> [UInt16] { a.asType(.bfloat16).view(dtype: .uint16).asArray(UInt16.self) }
+        let layouts: [[Int]] = [
+            [7, 40, 0, 49],                // the runPrefill split (96 rows)
+            [64, 1, 0, 0, 130, 64, 3, 65], // exact tile, singletons, empty experts, > 2 tiles (327 rows)
+            [0, 5, 0, 0],                  // 5 rows: < 8 (padded ids) and one tile
+            [200, 0, 17, 39, 0, 1, 0, 2],  // 259 rows
+        ]
+        for (li, counts) in layouts.enumerated() {
+            for k in [1.5, 2, 2.5, 3] {
+                var rng = Rng(state: UInt64(k * 1000) + UInt64(li) * 7919 + 5)
+                let experts = counts.count, n = 128, kin = 512
+                let cols = (0 ..< experts).map { _ in [Int32(3), Int32(400)] }
+                let gate = try projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols,
+                                          columnScales: false).mlx()
+                let up = try projection(&rng, k: k, experts: experts, outputs: n, inputs: kin, columns: cols,
+                                        columnScales: false).mlx()
+                var ids: [UInt32] = []
+                for (e, c) in counts.enumerated() { ids += Array(repeating: UInt32(e), count: c) }
+                let rows = ids.count
+                let x = MLXArray((0 ..< rows * kin).map { _ in rng.normal() }, [rows, kin]).asType(.bfloat16)
+                let xo = MLXArray((0 ..< rows * 2).map { _ in rng.normal() }, [rows, 2])
+                let idx = MLXArray(ids)
+                let plan = JANGTPrefillKernel.expertTilePlan(sortedIndices: idx, experts: experts)
+                for act in [JANGTActivation.silu, .oai(alpha: 1.702)] {
+                    let cases: [(String, (JANGTPrefillKernel.ExpertTilePlan?) -> MLXArray)] = [
+                        ("single", { JANGTPrefillKernel.project(x, gate, indices: idx, plan: $0) }),
+                        ("fused", { JANGTPrefillKernel.project(x, gate, up: up, indices: idx, limit: 0.3,
+                                                               activation: act, plan: $0) }),
+                        ("fused_h32", { JANGTPrefillKernel.project(x, gate, up: up, indices: idx, activation: act,
+                                                                   rotateOutput: true, plan: $0) }),
+                        ("fused_outliers", { JANGTPrefillKernel.projectGateUpWithOutliers(
+                            x, outlierRows: xo, gate: gate, up: up, columns: 2, indices: idx, limit: 0.3,
+                            activation: act, plan: $0) }),
+                    ]
+                    for (name, f) in cases {
+                        let a = bits(f(nil)), b = bits(f(plan))
+                        XCTAssertEqual(a, b, "layout \(li) K=\(k) \(act) \(name): expert tiles != row tiles")
+                    }
+                }
+                if li == 1 && k == 2 {
+                    // Control: a plan whose second segment starts one row late misses that row (and computes the next
+                    // expert's first row with the wrong weights): the comparison above can fail.
+                    var s = plan.starts.asArray(Int32.self)  // 8 experts: 10 entries, no padding
+                    s[1] += 1
+                    let bad = JANGTPrefillKernel.ExpertTilePlan(
+                        starts: MLXArray(s), tiles: plan.tiles, segments: plan.segments, rows: plan.rows)
+                    let a = bits(JANGTPrefillKernel.project(x, gate, indices: idx))
+                    let b = bits(JANGTPrefillKernel.project(x, gate, indices: idx, plan: bad))
+                    XCTAssertNotEqual(a, b, "control: a wrong plan must change the output")
+                }
+            }
+        }
+        // Rows whose id is not a valid expert: NaN rows on both schedules (the last plan segment), others equal.
+        var rng = Rng(state: 99)
+        let gate = try projection(&rng, k: 2, experts: 3, outputs: 64, inputs: 512, columns: [[3], [4], [5]],
+                                  columnScales: false).mlx()
+        let ids: [UInt32] = Array(repeating: 0, count: 10) + Array(repeating: 2, count: 70) + [7, 9, 9]
+        let x = MLXArray((0 ..< ids.count * 512).map { _ in rng.normal() }, [ids.count, 512]).asType(.bfloat16)
+        let idx = MLXArray(ids)
+        let plan = JANGTPrefillKernel.expertTilePlan(sortedIndices: idx, experts: 3)
+        let a = JANGTPrefillKernel.project(x, gate, indices: idx).asType(.float32)
+        let b = JANGTPrefillKernel.project(x, gate, indices: idx, plan: plan).asType(.float32)
+        XCTAssertEqual(isNaN(a[80...]).all().item(Bool.self), true, "row tiles: invalid ids -> NaN")
+        XCTAssertEqual(isNaN(b[80...]).all().item(Bool.self), true, "expert tiles: invalid ids -> NaN")
+        XCTAssertEqual(bits(a[..<80]), bits(b[..<80]))
+        XCTAssertEqual(plan.starts.asArray(Int32.self), [0, 10, 10, 80, 83, 83, 83, 83])  // padded to 8 (device ptr)
+        XCTAssertEqual(plan.tiles.asArray(Int32.self), [0, 1, 1, 3, 4, 4, 4, 4])
     }
 
     func testPrefillTilesMatchCPUReferenceK2() throws { try runPrefill(k: 2) }
@@ -294,6 +399,29 @@ final class JANGTKernelTests: XCTestCase {
     func testKernelsMatchCPUReferenceK2() throws { try runGateUpAndDown(k: 2, limit: 0, largeHidden: false) }
     func testKernelsMatchCPUReferenceK25Clamped() throws { try runGateUpAndDown(k: 2.5, limit: 0.25, largeHidden: false) }
     func testKernelsMatchCPUReferenceK3LargeHidden() throws { try runGateUpAndDown(k: 3, limit: 0, largeHidden: true) }
+
+    // SwiGLU-OAI (MiniMax-M3 / M3.1): alpha 1.702; the limit is chosen so the clamp bites at these magnitudes.
+    func testKernelsMatchCPUReferenceK2OAIClamped() throws {
+        try runGateUpAndDown(k: 2, limit: 0.25, largeHidden: false, activation: .oai(alpha: 1.702))
+    }
+    func testKernelsMatchCPUReferenceK25OAIUnclamped() throws {
+        try runGateUpAndDown(k: 2.5, limit: 0, largeHidden: false, activation: .oai(alpha: 1.702))
+    }
+    func testPrefillTilesMatchCPUReferenceK2OAI() throws { try runPrefill(k: 2, activation: .oai(alpha: 1.702)) }
+    func testPrefillTilesMatchCPUReferenceK25OAI() throws { try runPrefill(k: 2.5, activation: .oai(alpha: 1.702)) }
+
+    /// `.silu` must generate exactly the kernel source the existing families compiled before the variants existed.
+    func testSiLUVariantKeepsTheKernelSource() {
+        let src = JANGTKernelSource.gateUp(kin: 1024, n: 512, k: 2, l: 12, outliers: 2, words: 66, xdt: "float",
+                                           odt: "float", limit: 0)
+        XCTAssertTrue(src.contains("out[(size_t)ts * 512u + row0 + r] = float((g / (1.0f + metal::fast::exp(-g))) * u);"))
+        XCTAssertEqual(JANGTPrefillKernel.naxSource(words: 66), JANGTPrefillKernel.naxSource(words: 66, activation: .silu))
+        XCTAssertTrue(JANGTPrefillKernel.naxSource(words: 66).contains("return (g / (1.0f + metal::fast::exp(-g))) * u;"))
+        let oai = JANGTPrefillKernel.naxSource(words: 66, activation: .oai(alpha: 1.702))
+        XCTAssertFalse(oai.contains("return (g / (1.0f + metal::fast::exp(-g))) * u;"))
+        XCTAssertTrue(oai.contains("as_type<float>(\(Float(1.702).bitPattern)u)"))
+        XCTAssertEqual(JANGTActivation.silu.nameTag, "")
+    }
 }
 
 /// Decode-kernel throughput at GLM-5.3-Flash JANGHT shapes (288 experts, top-8, one token). Diagnostic: runs only

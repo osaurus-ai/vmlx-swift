@@ -455,6 +455,13 @@ public enum DeepseekV4Math {
     public static let suffixPruneEnabled: Bool =
         suffixPruneFlag(ProcessInfo.processInfo.environment["VMLX_DSV41_SUFFIX_PRUNE"])
 
+    /// DeepSeek-V4.1 KV-source trim inside prompt-suffix pruning: a pruned prefill forward whose rows the prompt end
+    /// does not read past the last kv-source layer runs only that layer's cache writes (window, compressor, index
+    /// keys) and stops, instead of its whole attention and MoE. Bit-identical caches and logits.
+    /// `VMLX_DSV41_KV_SOURCE_TRIM=0` (or false/off/no) runs that layer in full, as before. Default on.
+    public static let kvSourceTrimEnabled: Bool =
+        suffixPruneFlag(ProcessInfo.processInfo.environment["VMLX_DSV41_KV_SOURCE_TRIM"])
+
     static func suffixPruneFlag(_ raw: String?) -> Bool {
         guard let raw else { return true }
         return !["0", "false", "off", "no"].contains(

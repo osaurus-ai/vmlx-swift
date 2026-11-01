@@ -610,6 +610,22 @@ struct Bench {
             try await runK2MultiturnBench(modelPath: modelPath)
             return
         }
+        if (env["BENCH_DSV41_MISS_PARITY"] ?? "0") == "1" {
+            try await runDSV41MissParityBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_SPLIT_EXACT"] ?? "0") == "1" {
+            try await runDSV41SplitExactBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_COLD_CAPTURE"] ?? "0") == "1" {
+            try await runColdCaptureBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_CACHE_LOOP"] ?? "0") == "1" {
+            try await runCacheReuseLoopBench(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_GLMCOST"] ?? "0") == "1" {
             try await runGlm5VerifyCostBench(modelPath: modelPath)
             return
@@ -644,6 +660,14 @@ struct Bench {
         }
         if (env["BENCH_DSV41_LONG"] ?? "0") == "1" {
             try await runDSV41LongContext(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_PREFILL"] ?? "0") == "1" {
+            try await runDSV41PrefillBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_DSV41_KL"] ?? "0") == "1" {
+            try await runDSV41KLBench(modelPath: modelPath)
             return
         }
         if (env["BENCH_DSPARK_DRAFTS"] ?? "0") == "1" {

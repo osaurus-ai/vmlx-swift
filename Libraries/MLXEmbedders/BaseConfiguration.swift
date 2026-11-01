@@ -59,6 +59,9 @@ public struct BaseConfiguration: Codable, Sendable {
         case skip
         /// Quantize this layer using the provided parameters.
         case quantize(Quantization)
+        /// A module in a weight format MLX's quantizer does not express (a `mode` that is not an MLX mode, no
+        /// `bits`, e.g. JANGT `{"mode": "jangt", "kbits": 1.5}`): no MLX quantization; that format's loader owns it.
+        case formatOwned(mode: String)
     }
 
     /// A container for per-layer quantization settings.
@@ -87,7 +90,7 @@ public struct BaseConfiguration: Codable, Sendable {
         public func quantization(layer: String) -> Quantization? {
             if let perLayer = perLayerQuantization[layer] {
                 switch perLayer {
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 case .quantize(let quantization):
                     return quantization
@@ -143,6 +146,12 @@ public struct BaseConfiguration: Codable, Sendable {
                         if !f {
                             perLayerQuantization[key.stringValue] = .skip
                         }
+                    } else if let entry = try? container.nestedContainer(
+                        keyedBy: Quantization.CodingKeys.self, forKey: key),
+                        !entry.contains(.bits), let rawMode = try? entry.decode(String.self, forKey: ._mode),
+                        QuantizationMode(rawValue: rawMode.lowercased()) == nil
+                    {
+                        perLayerQuantization[key.stringValue] = .formatOwned(mode: rawMode)
                     } else {
                         // Otherwise, try to decode a specific Quantization object for this layer
                         perLayerQuantization[key.stringValue] = .quantize(
@@ -164,6 +173,8 @@ public struct BaseConfiguration: Codable, Sendable {
                     try container.encode(false, forKey: .init(stringValue: key))
                 case .quantize(let q):
                     try container.encode(q, forKey: .init(stringValue: key))
+                case .formatOwned(let mode):
+                    try container.encode(["mode": mode], forKey: .init(stringValue: key))
                 }
             }
         }

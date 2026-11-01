@@ -896,7 +896,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         // model; restoring the native list is what lets the model emit <|tool_call_start|>.
         // These assertions used to require the summary, i.e. they pinned the regression.
         #expect(rendered.contains("List of tools:"))
-        #expect(rendered.contains("\"name\":\"line_count\""))
+        #expect(rendered.contains("\"name\": \"line_count\""))  // tojson = HF's json.dumps separators
         #expect(!rendered.contains("Available functions:"))
         #expect(!rendered.contains("required arguments: text"))
         #expect(!rendered.contains("<tools>"))
@@ -944,7 +944,7 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(!rendered.contains("..."))
         // Native JSON schemas are REQUIRED for LFM2 tool calling (see 46973d1 note above).
         #expect(rendered.contains("List of tools:"))
-        #expect(rendered.contains("\"name\":\"line_count\""))
+        #expect(rendered.contains("\"name\": \"line_count\""))  // tojson = HF's json.dumps separators
         #expect(!rendered.contains("<tools>"))
         #expect(rendered.contains("Do not write reasoning, XML-style tool tags, markdown, or prose."))
         #expect(rendered.contains("Copy the `text` value exactly from the current user request."))

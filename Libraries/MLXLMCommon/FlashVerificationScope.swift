@@ -4,6 +4,9 @@ import Foundation
 /// Ordinary prefill and other model families never establish this scope.
 public enum FlashVerificationScope {
     @TaskLocal private static var rows = 0
+    /// Verify windows checked row-exactly (every row bit-identical to the AR step): 2...8 rows, i.e. draft depth
+    /// 1...7. This is the native-MTP verifier's correctness window (`NativeMTPDepthPolicy.verifierTopRung`).
+    public static let rowExactVerifyRows: ClosedRange<Int> = 2 ... 8
     private static let diagnosticDisabled =
         ProcessInfo.processInfo.environment["VMLX_FLASH_ROW_EXACT"] == "0"
     /// Diagnostic only: VMLX_FLASH_ROW_EXACT_OFF=q8,hcjoin,hcdown,hcup,attn,early,router,gdn,moe turns single
@@ -30,7 +33,7 @@ public enum FlashVerificationScope {
             diagnosticDisabled
             ? 0
             : (inputShape.count == 2 && inputShape[0] == 1
-                && (2 ... 8).contains(inputShape[1]) ? inputShape[1] : 0)
+                && rowExactVerifyRows.contains(inputShape[1]) ? inputShape[1] : 0)
         return try $rows.withValue(admittedRows, operation: operation)
     }
 

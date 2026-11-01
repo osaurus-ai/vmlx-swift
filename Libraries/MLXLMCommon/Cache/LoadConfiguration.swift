@@ -292,7 +292,15 @@ public struct LoadBundleFacts: Sendable, Equatable {
 
     /// Inspect the bundle directory at `url`. All probes are best-effort —
     /// failures degrade silently to safe defaults (zero bytes, dense).
-    public static func inspect(bundleURL url: URL) -> LoadBundleFacts {
+    public static func inspect(bundleURL: URL) -> LoadBundleFacts {
+        // A bundle reached through a symlinked directory (models kept on another volume and
+        // linked into the models folder) must report the same facts as its target.
+        // `contentsOfDirectory(at:)` throws ENOTDIR on a URL naming a symlink to a directory, so
+        // the unresolved URL listed nothing: zero weight bytes, so no Metal residency budget, so
+        // the whole model stayed reclaimable. DeepSeek-V4.1 JANG_2K (197 GiB) on a 256 GiB Mac
+        // then had 69-80 GiB of its weights compressed right after load, and the first command
+        // buffer that had to bring them back hit the GPU timeout.
+        let url = bundleURL.resolvingSymlinksInPath()
         let fm = FileManager.default
         let physical = HostPhysicalMemory.bytes
 
@@ -688,7 +696,18 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// One property for both caps deliberately: they are the same decision about the same bundle,
     /// and a family added to one list and not the other is exactly how this reached production.
     public var requiresUncappedResidentPools: Bool {
-        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG || isDeepseekV41AffineJANG
+        isPlainDeepseekV4AffineJANG || isGlm5NextAffineJANG || isDeepseekV41AffineJANG || isMiniMaxM3Routed
+    }
+
+    /// MiniMax-M3 / M3.1 (any routed format: JANGHT banks, affine, the MXFP8 source). Same mechanism as the families
+    /// above, reached through context instead of weight size: Safe Auto's scheduling allowance is the resident
+    /// weights + 4 GiB, and the sparse-attention KV grows 138,240 B per token, so from ~26k tokens of context (M3.1
+    /// JANGHT1.9 + its drafter on a 128 GB Mac: 100.9 GB weights, 104.5 GB limit) every MLX eval waits for the queue
+    /// to drain. Measured in the Osaurus GUI proof (m5-max, 2026-10-29): a 35k-token turn prefilled at 284 pp/s and
+    /// decoded at 5.9 tok/s (AR 150 ms / token) against 36 tok/s at 33k on the same runtime without the limit.
+    public var isMiniMaxM3Routed: Bool {
+        let type = modelType?.lowercased() ?? ""
+        return (type == "minimax_m3" || type == "minimax_m3_vl") && isRouted
     }
 
     public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {

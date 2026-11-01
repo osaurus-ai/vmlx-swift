@@ -990,6 +990,22 @@ extension ReasoningParser {
                 stripStrayTags: false)
         }
 
+        // MiniMax-M3 / M3.1: `<mm:think>…</mm:think>`. M3.1's template is adaptive: the generation prompt carries no
+        // reasoning prefix and the first generated token is the decision, `<mm:think>` (reasoning follows, closed by
+        // `</mm:think>`) or `</mm:think>` (answer directly). So the parser starts in content: `<mm:think>` opens the
+        // rail, and a leading `</mm:think>` is consumed as the close of an empty rail. A prompt that does end inside
+        // the rail (M3's enabled thinking mode prefills `<mm:think>`) is resolved by `forPrompt`. Plain `<think>` /
+        // `</think>` are accepted as aliases (vMLX's `minimax_m3` parser; observed in live M3 output).
+        if normalized == "minimax_m3" || normalized.hasPrefix("minimax_m3_") {
+            return ReasoningParser(
+                startTag: "<mm:think>",
+                endTag: "</mm:think>",
+                startInReasoning: false,
+                stripStrayTags: true,
+                startTagAliases: ["<think>"],
+                endTagAliases: ["</think>"])
+        }
+
         // `glm_think_block` is the stamp GLM-5.3 bundles actually ship
         // (`jang_config.capabilities.reasoning_parser`, inside config.json).
         // It named nothing here, so resolution fell through to the terminal
@@ -1403,6 +1419,10 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
     let compact = normalized.replacingOccurrences(of: "_", with: "")
 
     if compact == "k2horizon" { return "k2_horizon" }
+
+    // MiniMax-M3 / M3.1 (`minimax_m3`, `minimax_m3_vl`): `<mm:think>` rail, not the M2 `<think>` one. Checked before
+    // the `minimax` think_xml prefix below.
+    if compact.hasPrefix("minimaxm3") { return "minimax_m3" }
 
     // Official Hunyuan v3 uses `:opensource`-suffixed think markers; the
     // dedicated stamp resolves to that parser (see `fromCapabilityName`).

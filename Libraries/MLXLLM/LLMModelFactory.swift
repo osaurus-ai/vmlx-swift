@@ -167,6 +167,9 @@ public enum LLMTypeRegistry {
                 let config = try JSONDecoder.json5().decode(MiniMaxConfiguration.self, from: data)
                 return MiniMaxModel(config)
             },
+            // MiniMax-M3 / M3.1: MSA attention, sigmoid-routed MoE, a separate architecture from M2.
+            "minimax_m3": dispatchMiniMaxM3,
+            "minimax_m3_vl": dispatchMiniMaxM3,
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -433,6 +436,19 @@ public enum LLMTypeRegistry {
             context = nil
         }
         return ZayaModel(config, moe: context)
+    }
+
+    /// MiniMax-M3 / M3.1. A `minimax_m3_vl` config with `vision_config` builds its vision stack unless the caller asks
+    /// for text only; a lane the config cannot build is refused instead of being served text-only.
+    private static func dispatchMiniMaxM3(data: Data, requesting: Set<ModelRuntimeRequestModality>? = nil)
+        throws -> any LanguageModel
+    {
+        let vision = try MiniMaxM3VisionConfiguration.decode(configuration: data)
+        let lanes = try Set.resolveForConstruction(
+            requested: requesting, constructible: vision == nil ? [.text] : [.text, .vision])
+        return MiniMaxM3Model(
+            try JSONDecoder.json5().decode(MiniMaxM3Configuration.self, from: data),
+            vision: lanes.contains(.vision) ? vision : nil)
     }
 
     /// `model_type = "bailing_hybrid"` covers two architectures that share the
@@ -1388,6 +1404,9 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// their own turn, expand to image spans, and ship their patches in `LMInput.image`. nil for
     /// every other model (images are ignored there, as before).
     let deepseekV41Vision: DeepseekV41VisionConfiguration?
+    /// MiniMax-M3 / M3.1 with its vision stack built: image items in their turn, expanded to image runs, patches in
+    /// `LMInput.image` (`MiniMaxM3Vision.swift`). nil for every other model.
+    let miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
@@ -1396,7 +1415,8 @@ struct LLMUserInputProcessor: UserInputProcessor {
         defaultAdditionalContext: [String: any Sendable]? = nil,
         templateReadsEnableThinking: Bool = false,
         k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil,
-        deepseekV41Vision: DeepseekV41VisionConfiguration? = nil
+        deepseekV41Vision: DeepseekV41VisionConfiguration? = nil,
+        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1406,18 +1426,22 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.templateReadsEnableThinking = templateReadsEnableThinking
         self.k2ReasoningDeclaration = k2ReasoningDeclaration
         self.deepseekV41Vision = deepseekV41Vision
+        self.miniMaxM3Vision = miniMaxM3Vision
     }
 
     func prepare(input: UserInput) throws -> LMInput {
         try K2HorizonTemplateContract.validateContext(
             input.additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
-        // Two per-family adapters, each translating the generic request
-        // surface into ITS template's contract. Both are no-ops for every
-        // other family (they gate on `modelType` first), so the order between
-        // them is irrelevant.
-        let additionalContext = MuseGlimmerReasoningTemplateContext.apply(
-            additionalContext: Hy3ReasoningTemplateContext.apply(
-                additionalContext: try mergedAdditionalContext(input.additionalContext),
+        // Per-family adapters, each translating the generic request surface
+        // into ITS template's contract. Each is a no-op for every other family
+        // (they gate on `modelType` first), so the order between them is
+        // irrelevant.
+        let additionalContext = MiniMaxM3ThinkingTemplateContext.apply(
+            additionalContext: MuseGlimmerReasoningTemplateContext.apply(
+                additionalContext: Hy3ReasoningTemplateContext.apply(
+                    additionalContext: try mergedAdditionalContext(input.additionalContext),
+                    modelType: modelType
+                ),
                 modelType: modelType
             ),
             modelType: modelType
@@ -1445,6 +1469,19 @@ struct LLMUserInputProcessor: UserInputProcessor {
                 chat: chat, looseImages: input.images, generated: messages)
             if !anchored.images.isEmpty {
                 return try deepseekV41ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
+        if let vision = miniMaxM3Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = MiniMaxM3VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try miniMaxM3ImageInput(
                     input: input, messages: anchored.messages, images: anchored.images,
                     additionalContext: additionalContext, vision: vision)
             }
@@ -1523,6 +1560,56 @@ struct LLMUserInputProcessor: UserInputProcessor {
             cachePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
                 boundaries.all, rawToExpanded: expansion.rawToExpanded),
             cacheStablePrefixTokenCounts: DeepseekV41VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
+    }
+
+    /// MiniMax-M3 / M3.1 image request (vMLX `preprocess_m3_vl_messages`): render the image items through the same
+    /// chat template path as text (an image turn and its text continuation share one prompt format and cache
+    /// boundaries), preprocess each image as the bundle's processor does, expand every image token into
+    /// `start, image x (t h w / 4), end`, and remap the cache boundaries into the expanded token space.
+    private func miniMaxM3ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: MiniMaxM3VisionPromptConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: input.tools,
+            additionalContext: additionalContext,
+            promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map {
+            try MiniMaxM3ImagePreprocessor.process(
+                try DeepseekV41ImagePreprocessor.decodeRGB($0), config: vision.processor)
+        }
+        let token = { (text: String) throws -> Int in
+            guard let id = tokenizer.convertTokenToId(text) else { throw MiniMaxM3VisionError.missingToken(text) }
+            return id
+        }
+        let merge = vision.processor.mergeSize * vision.processor.mergeSize
+        let expansion = try MiniMaxM3VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId,
+            startTokenId: try token(MiniMaxM3VisionPrompt.startToken),
+            endTokenId: try token(MiniMaxM3VisionPrompt.endToken),
+            counts: processed.map { $0.grid.t * $0.grid.h * $0.grid.w / merge })
+        let p = vision.processor
+        RuntimeReceipts.emit(
+            "m3vision stage=preprocess images=\(processed.count) grids="
+                + processed.map { "\($0.grid.t)x\($0.grid.h)x\($0.grid.w)" }.joined(separator: ",")
+                + " image_tokens=\(expansion.tokens.filter { $0 == vision.imageTokenId }.count)"
+                + " prompt_tokens=\(expansion.tokens.count)")
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: MiniMaxM3ImagePreprocessor.processedImage(
+                processed, rowWidth: 3 * p.temporalPatchSize * p.patchSize * p.patchSize),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: MiniMaxM3VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: MiniMaxM3VisionPrompt.remapBoundaries(
                 boundaries.stable, rawToExpanded: expansion.rawToExpanded),
             toolSchemas: input.tools)
     }
@@ -1701,6 +1788,10 @@ public final class LLMModelFactory: ModelFactory {
         let dsv41JANGHPreparation = try DeepseekV41JANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let dsv41JANGHPreparation { configData = dsv41JANGHPreparation.ordinaryConfiguration }
+        // MiniMax-M3 / M3.1 JANGHT (JANGT trellis routed experts; mxfp8 / affine trunk keyed by live module path).
+        let miniMaxM3JANGHPreparation = try MiniMaxM3JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let miniMaxM3JANGHPreparation { configData = miniMaxM3JANGHPreparation.ordinaryConfiguration }
 
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
@@ -1709,7 +1800,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1909,7 +2000,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil {
+        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -1989,6 +2080,8 @@ public final class LLMModelFactory: ModelFactory {
             } else if let dsv41JANGHPreparation {
                 model = try dsv41JANGHPreparation.construct(
                     configurationData: configData, requesting: configuration.requestedModalities)
+            } else if let miniMaxM3JANGHPreparation {
+                model = try miniMaxM3JANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: configData, modelType: baseConfig.modelType,
@@ -1996,7 +2089,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil { throw error }
+            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2138,7 +2231,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             } else if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
@@ -2151,7 +2244,7 @@ public final class LLMModelFactory: ModelFactory {
                     resolvedReasoning.parser == nil
                     ? "none"
                     : (resolvedReasoning.source == .chatTemplate
-                        ? (resolvedReasoning.parser?.preservesXMLFunctionPayloads == true ? "minicpm5" : "qwen3")
+                        ? ParserResolution.templateReasoningStampName(resolvedReasoning.parser)
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
@@ -2185,13 +2278,15 @@ public final class LLMModelFactory: ModelFactory {
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
+                || miniMaxM3JANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil ? jangConfig : nil,
+            jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil
+                && miniMaxM3JANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
@@ -2237,7 +2332,12 @@ public final class LLMModelFactory: ModelFactory {
                 metadata: K2HorizonTemplateContract.matches(baseConfig.modelType)
                     ? (try? Data(contentsOf: jangConfigURL)) : nil,
                 modelType: baseConfig.modelType),
-            deepseekV41Vision: (model as? DeepseekV4Model)?.v41Vision?.config)
+            deepseekV41Vision: (model as? DeepseekV4Model)?.v41Vision?.config,
+            miniMaxM3Vision: ((model as? MiniMaxM3Model)?.vision?.config).map {
+                MiniMaxM3VisionPromptConfiguration(
+                    processor: MiniMaxM3ImageProcessorConfiguration.load(directory: modelDirectory),
+                    imageTokenId: $0.imageTokenId)
+            })
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

@@ -2080,6 +2080,8 @@ public actor BatchEngine {
 
     /// Run one scheduling step: prefill pending slots, then batch-decode active slots.
     private func step() {
+        // Keep MLX's scheduling limit above the slots' resident working set (`SchedulingMemoryFloor`).
+        SchedulingMemoryFloor.observe()
         // Phase 1: Process one prefill chunk per slot that's still prefilling.
         // Prefill is done sequentially per slot (each chunk is large, batching
         // prefill chunks of different lengths wastes compute on padding).
@@ -2141,6 +2143,12 @@ public actor BatchEngine {
         // misses. RotatingKVCache is still skipped because its sliding-window
         // semantics are incompatible with partial restore.
         var inputForPrepare = slot.originalInput
+        // Aligned prefill: the same plan with or without a coordinator (see TokenIterator).
+        slot.alignedPrefillPlan = AlignedPrefill.plan(
+            model: context.model, cache: slot.cache, promptTokenIds: slot.cachePromptTokenIds,
+            cachePrefixTokenCounts: slot.originalInput.cachePrefixTokenCounts,
+            generationPromptSuffix: cacheCoordinator?.genPromptSuffixTokens ?? [],
+            prefillStepSize: slot.prefillStepSize)
         // SLIDING-1: legacy `!hasRotatingCache` guard removed — v2 schema
         // round-trips ring buffer + 5-tuple metaState via `.rotating`
         // LayerKind. Sliding-window models (Gemma3/Gemma4 SWA, Mistral4
@@ -2199,9 +2207,12 @@ public actor BatchEngine {
                     chainId: slot.parameters.cacheChainId,
                     mediaIndependentPrefix: saltPlan.mediaIndependentPrefix)
                 if case .hit(
-                    let matchedTokens, let remaining, let detail, let blocks,
+                    let fetchedMatchedTokens, let fetchedRemaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
                 {
+                    // An aligned-prefill restore may keep fewer rows than the entry held (below).
+                    var matchedTokens = fetchedMatchedTokens
+                    var remaining = fetchedRemaining
                     var restored = false
                     var retainedDiskRestore = false
                     var restoredTokenCount = 0
@@ -2308,7 +2319,7 @@ public actor BatchEngine {
                             Self.logger.info(
                                 "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
                             )
-                        } else if detail == .disk {
+                        } else if detail.isDiskTierEntry {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,
@@ -2325,7 +2336,7 @@ public actor BatchEngine {
                             slot.cache, matchedTokens: matchedTokens,
                             restoredTokens: restoredTokenCount, detail: detail.rawValue)
                     {
-                        if detail == .disk {
+                        if detail.isDiskTierEntry {
                             coordinator.reportDiskRestoreRejected(
                                 tokens: tokenIds, boundary: matchedTokens,
                                 mediaSalt: slot.mediaSalt,
@@ -2336,6 +2347,20 @@ public actor BatchEngine {
                         retainedDiskRestore = false
                         slot.cache = context.model.newCache(parameters: slot.parameters)
                         inputForPrepare = slot.originalInput
+                    }
+                    // Aligned prefill: keep only what a cold prefill of this request also ends a chunk at; none means
+                    // a whole-prompt prefill, exactly as a miss (see TokenIterator).
+                    if restored, let plan = slot.alignedPrefillPlan {
+                        let reuse = AlignedPrefill.alignRestoredPrefix(
+                            slot.cache, matchedTokens: matchedTokens, plan: plan, detail: detail.rawValue)
+                        if reuse > 0 {
+                            matchedTokens = reuse
+                            remaining = Array(tokenIds.dropFirst(reuse))
+                        } else {
+                            restored = false
+                            slot.cache = context.model.newCache(parameters: slot.parameters)
+                            inputForPrepare = slot.originalInput
+                        }
                     }
                     if restored {
                         if usesPostPrepareAlias {
@@ -2655,6 +2680,8 @@ public actor BatchEngine {
         error: ErrorBox
     ) throws {
         var slot = initialSlot ?? activeSlots[slotIndex]
+        // Aligned prefill: the model's prepare reads the plan from the caches it prefills (cold, restored or rebuilt).
+        AlignedPrefill.install(slot.alignedPrefillPlan, into: slot.cache)
 
         // Alignment after preparation does not prove that a warm restore used
         // the same partition as cold prefill. Only a genuinely cold start can

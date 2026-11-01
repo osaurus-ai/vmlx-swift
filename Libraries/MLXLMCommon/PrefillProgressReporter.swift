@@ -38,6 +38,9 @@ public enum PrefillProgressReporter {
     }
 
     public static func reportCompletedUnits(_ count: Int) {
+        // A prefill chunk just finished: the KV grew, keep MLX's scheduling limit above the live set
+        // (`SchedulingMemoryFloor`), so the next chunk's evals do not wait on a limit the context outgrew.
+        SchedulingMemoryFloor.observe()
         guard let box = Thread.current.threadDictionary[threadDictionaryKey] as? HandlerBox else {
             return
         }

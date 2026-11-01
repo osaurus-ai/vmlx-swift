@@ -105,7 +105,8 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `5`).
+    /// the iterator clamps to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`;
+    /// `VMLX_MTP_DEPTH_CAP` overrides it for diagnostics).
     /// This bound is separate from the request's adaptive policy.
     /// A host that asks past the cap sees the clamped
     /// value here — which is the point of surfacing it, since that gap is
@@ -169,6 +170,11 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     public let arSafetyTrips: Int
     public let arSafetyResumes: Int
 
+    /// The top rung of this generation's adaptive ladder (`NativeMTPDepthPolicy.runtimeTopRung`, or a lower
+    /// explicit limit / fixed depth): the real ceiling, so a host can show it instead of a guessed constant.
+    /// `nil` when built by a caller that does not know it.
+    public let adaptiveCeiling: Int?
+
     /// Verifier mode used for this generation (`verifierMode=`).
     public let verifierMode: String
 
@@ -191,7 +197,8 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         verifierMode: String,
         cacheMode: String,
         arSafetyTrips: Int = 0,
-        arSafetyResumes: Int = 0
+        arSafetyResumes: Int = 0,
+        adaptiveCeiling: Int? = nil
     ) {
         self.depth = depth
         self.activeDepth = activeDepth
@@ -209,6 +216,7 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
         self.cacheMode = cacheMode
         self.arSafetyTrips = arSafetyTrips
         self.arSafetyResumes = arSafetyResumes
+        self.adaptiveCeiling = adaptiveCeiling
     }
 }
 
@@ -429,9 +437,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// permanently. A changed regime can recover within the selected ceiling.
     private var adaptiveDemotedFromCount: [Int: Int] = [:]
     private var upperProbeNotBeforeCycle: [Int: Int] = [:]
-    /// Resolved promotion ceiling: fixed requests never exceed their chosen
-    /// depth; explicitly adaptive requests may explore to their bounded cap.
-    private let adaptiveDepthCeiling: Int
+    /// Resolved promotion ceiling: fixed requests never exceed their chosen depth; adaptive requests may
+    /// explore to the runtime's top rung (`NativeMTPDepthPolicy.runtimeTopRung`) or a lower explicit limit.
+    let adaptiveDepthCeiling: Int
     /// Cost-model depth owner for explicitly adaptive requests (NativeMTPDepthChooser.swift).
     private var depthChooser: NativeMTPDepthChooser?
     private var depthChooserLastStamp: (cycle: Int, time: TimeInterval)?
@@ -674,15 +682,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             topK: effectiveParameters.topK, minP: effectiveParameters.minP)
         self.hostRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
         self.maxTokens = effectiveParameters.maxTokens
-        // One resolved policy governs initialization, recovery and promotion.
-        // The environment bounds exploration but cannot raise a fixed request.
-        let depthCap =
-            ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) }
-            ?? (model as? any NativeMTPAdaptiveCeilingModel)?.nativeMTPAdaptiveDepthCeiling
-            ?? (model as? any NativeMTPBlockDraftModel).flatMap {
-                $0.nativeMTPUsesBlockDrafts ? $0.nativeMTPBlockDraftDepthLimit : nil
-            } ?? 5
+        // One resolved policy governs initialization, recovery and promotion. The runtime's top rung
+        // (`VMLX_MTP_DEPTH_CAP` diagnostic lever, else the model's verifier capability) bounds exploration;
+        // it cannot raise a fixed request.
+        let depthCap = NativeMTPDepthPolicy.runtimeTopRung(model: model)
         let resolvedDepth = try effectiveParameters.nativeMTPDepthPolicy.resolve(
             requestedDepth: requestedDepth, runtimeCap: depthCap)
         self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
@@ -849,7 +852,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if diskRestored > 0 {
                         restoredTokenCount = diskRestored
                         restored = true
-                    } else if detail == .disk {
+                    } else if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -866,7 +869,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "native-mtp")
                 {
-                    if detail == .disk {
+                    if detail.isDiskTierEntry {
                         coordinator.reportDiskRestoreRejected(
                             tokens: cacheLookupTokenIds, boundary: matchedTokens,
                             mediaSalt: mediaSalt,
@@ -1625,12 +1628,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             verifierMode: verifierMode,
             cacheMode: "private-mtp+verifier-prefix-commit",
             arSafetyTrips: arSafetyTrips,
-            arSafetyResumes: arSafetyResumes)
+            arSafetyResumes: arSafetyResumes,
+            adaptiveCeiling: adaptiveDepthCeiling)
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d] arLookahead=%d\n",
+                "[NativeMTP] depth=%d activeDepth=%d adaptiveCeiling=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit arSafety[trips=%d,resumes=%d,paused=%d] depthMoves[promotions=%d,wallclockDemotes=%d,acceptanceDemotes=%d] arLookahead=%d\n",
             depth,
             currentDepth,
+            adaptiveDepthCeiling,
             verifyCalls,
             generatedTokenIds.count,
             autoregressiveFallbackTokenCount,
@@ -1926,7 +1931,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             coordinator.requiresRecurrentSSMCompanion,
             !coordinator.requiresSeparateRecurrentPayload,
             let disk = coordinator.diskCache,
-            case .arrays(let arrays) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
+            case .arrays(let arrays, _) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
         else { return false }
         var scratch = model.newCache(parameters: cacheInitParameters)
         let restored = restoreFromDiskArrays(arrays, into: &scratch)

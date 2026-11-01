@@ -200,6 +200,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// MiniMax-M3 / M3.1: the namespace-token-prefixed `<tool_call>` envelope with tag-named arguments.
+    /// Example: `]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name="f">\n]<]minimax[>[<k>v]<]minimax[>[</k>…`
+    case minimaxM3 = "minimax_m3"
+
     /// MiniCPM5: `<function name="f"><param name="x">v</param></function>`.
     case minicpm5 = "minicpm5_xml_function"
 
@@ -280,6 +284,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minimaxM3:
+            return MiniMaxM3ToolCallParser()
         case .minicpm5:
             return MiniCPM5ToolCallParser()
         case .mistral:
@@ -440,6 +446,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
         if compact.hasPrefix("gemma3") || compact == "gemma" {
             return .gemma
+        }
+
+        // MiniMax-M3 / M3.1 (minimax_m3, minimax_m3_vl): their own envelope, checked before the M2 family.
+        if compact.hasPrefix("minimaxm3") {
+            return .minimaxM3
         }
 
         // MiniMax family (minimax, minimax_m2)
@@ -715,7 +726,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // MiniMax — JANG converter stamps `minimax`; older artifacts use
         // the canonical `minimax_m2`. Future M2.5 variants use
         // `minimax_m2_5` per the converter.
+        // A family-level `minimax` stamp on a MiniMax-M3 bundle names the M3 envelope.
         case "minimax", "minimax_m2_5":
+            if n == "minimax", let modelType, infer(from: modelType) == .minimaxM3 { return .minimaxM3 }
             return .minimaxM2
         case "minicpm5":
             return .minicpm5

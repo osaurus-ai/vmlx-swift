@@ -22,6 +22,25 @@ import MLX
 /// own path. `VMLX_ROW_EXACT_QMV_ROWS=0` disables (A/B tool).
 public enum RowExactAffineQMV {
     static let enabled = ProcessInfo.processInfo.environment["VMLX_ROW_EXACT_QMV_ROWS"] != "0"
+    /// Rows one launch serves (one weight walk; every row keeps qmv_fast's statements). 6 / 8 bits: up to 16, a DSpark
+    /// verify at the ladder top (15 rows) in one launch.
+    public static let maxRows = 16
+    /// 4 bits keep the earlier limit unless `VMLX_ROW_EXACT_QMV_Q4_ROWS` raises it (2...16): past 4 rows the 4-bit row
+    /// loop re-reads the weight words per 4-row chunk; measured per shape before changing the default (see the
+    /// MiniMax-M3.1 notes).
+    nonisolated(unsafe) public static var maxRows4Bit: Int = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_ROW_EXACT_QMV_Q4_ROWS"] ?? ""
+        return min(maxRows, max(2, Int(raw) ?? 4))
+    }()
+
+    /// Rows per launch the callers use at 6 / 8 bits (2...16; `VMLX_ROW_EXACT_QMV_WIDE_ROWS`).
+    nonisolated(unsafe) public static var launchRowsWide: Int = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_ROW_EXACT_QMV_WIDE_ROWS"] ?? ""
+        return min(maxRows, max(2, Int(raw) ?? maxRows))
+    }()
+
+    /// The widest launch the callers use for a projection of `bits` (they split wider row sets into blocks).
+    public static func launchRows(bits: Int) -> Int { bits == 4 ? maxRows4Bit : launchRowsWide }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var verdicts: [VerdictKey: Bool] = [:]
@@ -59,6 +78,26 @@ public enum RowExactAffineQMV {
               x_thread[i + 3] = x[i + 3] / 4096.0f;
             }
           }
+          else if (bits == 6 && WIDEN) {
+            // The fork's mixed BF16-input / F16-metadata q6 branch of qmv_fast_impl (widen, then sum).
+            for (int i = 0; i < values_per_thread; i += 4) {
+              U x0 = x[i], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
+              sum += x0 + x1 + x2 + x3;
+              x_thread[i] = x0;
+              x_thread[i + 1] = x1 / 64.0f;
+              x_thread[i + 2] = x2 / 16.0f;
+              x_thread[i + 3] = x3 / 4.0f;
+            }
+          }
+          else if (bits == 6) {
+            for (int i = 0; i < values_per_thread; i += 4) {
+              sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+              x_thread[i] = x[i];
+              x_thread[i + 1] = x[i + 1] / 64.0f;
+              x_thread[i + 2] = x[i + 2] / 16.0f;
+              x_thread[i + 3] = x[i + 3] / 4.0f;
+            }
+          }
           else if (bits == 8) {
             for (int i = 0; i < values_per_thread; i++) {
               sum += x[i];
@@ -84,6 +123,22 @@ public enum RowExactAffineQMV {
                    x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
                    x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
                    x_thread[4 * i + 3] * (ws[i] & 0xf000));
+            }
+          }
+          else if (bits == 6) {
+            for (int i = 0; i < (values_per_thread / 4); i++) {
+              x_thread += 4 * i;
+              w += 3 * i;
+
+              accum += (w[0] & 0x3f) * x_thread[0];
+
+              accum += (w[0] & 0xc0) * x_thread[1];
+              accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
+
+              accum += (w[1] & 0xf0) * x_thread[2];
+              accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
+
+              accum += (w[2] & 0xfc) * x_thread[3];
             }
           }
           else if (bits == 8) {
@@ -188,8 +243,9 @@ public enum RowExactAffineQMV {
           constexpr int packs_per_thread = 2;
           constexpr int num_simdgroups = 2;
           constexpr int results_per_simdgroup = 4;
-          constexpr int pack_factor = 32 / bits;
-          constexpr int bytes_per_pack = 4;
+          // get_pack_factor<bits, 32>() / get_bytes_per_pack<bits, 32>(): 6 bits pack 4 values in 3 bytes.
+          constexpr int pack_factor = bits == 6 ? 4 : 32 / bits;
+          constexpr int bytes_per_pack = bits == 6 ? 3 : 4;
           constexpr int values_per_thread = pack_factor * packs_per_thread;
           constexpr int block_size = values_per_thread * 32;
           constexpr int scale_step_per_thread = group_size / values_per_thread;
@@ -231,6 +287,17 @@ public enum RowExactAffineQMV {
                 for (int row = 0; row < results_per_simdgroup; row++) {
                   result[m][row] += rx_qdot_f<U, values_per_thread, bits>(
                       wf[row], x_thread, s_r[row], b_r[row], sum, values_per_thread);
+                }
+              }
+            } else if (bits == 6) {
+              // qmv_fast_impl's statements per row: load_vector, then rx_qdot straight from the weight bytes for
+              // each of the simdgroup's 4 outputs (the bytes stay in L1 across the rows of this k-block).
+              for (int m = 0; m < ROWS; m++) {
+                U sum = rx_load_vector<T, U, values_per_thread, bits, widen>(x + m * in_vec_size, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                  result[m][row] += rx_qdot<U, values_per_thread, bits>(
+                      ws + row * in_vec_size_w, x_thread, scales[row * in_vec_size_g], biases[row * in_vec_size_g],
+                      sum);
                 }
               }
             } else {
@@ -286,15 +353,33 @@ public enum RowExactAffineQMV {
         rows: Int, k: Int, n: Int, bits: Int, groupSize: Int, inputDType: DType, scalesDType: DType,
         hasBiases: Bool
     ) -> Bool {
-        // 4 bits above 4 rows: the batched per-row form measured faster (scalar dequant per row
-        // is compute-bound at 8 rows), so the caller keeps it.
-        guard enabled, (2 ... 8).contains(rows), bits == 8 || (bits == 4 && rows <= 4), hasBiases,
+        // 4 bits above `maxRows4Bit` rows: the caller splits the rows into blocks (or runs one-row calls).
+        guard enabled, (2 ... maxRows).contains(rows), [4, 6, 8].contains(bits), hasBiases,
+            bits != 4 || rows <= maxRows4Bit,
+            // Mixed BF16-x-F16 metadata at 6 bits: MLX's one-row call does not run the widened q6 branch here
+            // (measured: not admitted), so only matching dtypes.
+            bits != 6 || scalesDType == inputDType,
             [32, 64, 128].contains(groupSize),
             inputDType == .bfloat16 || inputDType == .float16,
             scalesDType == inputDType || (inputDType == .bfloat16 && scalesDType == .float16)
         else { return false }
-        let blockSize = (32 / bits) * 2 * 32
-        return k % blockSize == 0 && n % 8 == 0 && groupSize % ((32 / bits) * 2) == 0
+        let valuesPerThread = (bits == 6 ? 4 : 32 / bits) * 2
+        let blockSize = valuesPerThread * 32
+        return k % blockSize == 0 && n % 8 == 0 && groupSize % valuesPerThread == 0
+    }
+
+    /// The kernel's output with no admission check (tests and diagnosis only).
+    static func launchUnchecked(
+        _ input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int, bits: Int
+    ) -> MLXArray {
+        let (rows, n) = (input.dim(0), weight.dim(0))
+        return kernel(
+            [input, weight, scales, biases],
+            template: [
+                ("T", input.dtype), ("S", scales.dtype), ("BITS", bits), ("GROUP_SIZE", groupSize), ("ROWS", rows),
+            ],
+            grid: (32, (n / 8) * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n]], outputDTypes: [input.dtype])[0]
     }
 
     /// `input` [rows, K] against an affine-quantized [N, K] weight; nil when unsupported or not
@@ -305,7 +390,7 @@ public enum RowExactAffineQMV {
     ) -> MLXArray? {
         guard input.ndim == 2, weight.ndim == 2, weight.dtype == .uint32, let biases,
             scales.ndim == 2, biases.dtype == scales.dtype,
-            input.dim(1) == weight.dim(1) * (32 / max(bits, 1)), !CompiledDecodeTrace.isActive
+            input.dim(1) * max(bits, 1) == weight.dim(1) * 32, !CompiledDecodeTrace.isActive
         else { return nil }
         let rows = input.dim(0)
         let k = input.dim(1)

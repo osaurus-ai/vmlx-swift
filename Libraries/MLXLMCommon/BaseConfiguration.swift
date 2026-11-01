@@ -73,6 +73,11 @@ public struct BaseConfiguration: Codable, Sendable {
     public enum QuantizationOption: Sendable, Equatable {
         case skip
         case quantize(Quantization)
+        /// A module stored in a weight format MLX's quantizer does not express, named by its `mode` (e.g. JANGT
+        /// trellis experts: `{"mode": "jangt", "kbits": 1.5}`). Only that format's loader can build the module (a
+        /// factory's format preparation replaces these entries before construction); generic code treats it as no
+        /// MLX quantization, so an unprepared load fails loudly at weight binding instead of guessing a width.
+        case formatOwned(mode: String)
     }
 
     /// Per-layer ``Quantization`` values with optional default.
@@ -127,7 +132,7 @@ public struct BaseConfiguration: Codable, Sendable {
         public func quantization(layer: String) -> Quantization? {
             if let perLayer = explicitQuantizationOption(layer: layer) {
                 switch perLayer {
-                case .skip:
+                case .skip, .formatOwned:
                     return nil
                 case .quantize(let quantization):
                     return quantization
@@ -320,11 +325,10 @@ public struct BaseConfiguration: Codable, Sendable {
                     let nested = try container.nestedContainer(
                         keyedBy: _DictionaryCodingKey.self, forKey: key)
                     for layerKey in nested.allKeys {
-                        perLayerQuantization[layerKey.stringValue] = .quantize(
-                            try Self.decodeLayerQuantization(
-                                from: nested,
-                                key: layerKey,
-                                defaultGroupSize: quantization.groupSize))
+                        perLayerQuantization[layerKey.stringValue] = try Self.decodeLayerQuantization(
+                            from: nested,
+                            key: layerKey,
+                            defaultGroupSize: quantization.groupSize)
                     }
                     continue
 
@@ -341,11 +345,10 @@ public struct BaseConfiguration: Codable, Sendable {
                         // layer quantization.
                         continue
                     } else {
-                        perLayerQuantization[key.stringValue] = .quantize(
-                            try Self.decodeLayerQuantization(
-                                from: container,
-                                key: key,
-                                defaultGroupSize: quantization.groupSize))
+                        perLayerQuantization[key.stringValue] = try Self.decodeLayerQuantization(
+                            from: container,
+                            key: key,
+                            defaultGroupSize: quantization.groupSize)
                     }
                 }
             }
@@ -353,13 +356,39 @@ public struct BaseConfiguration: Codable, Sendable {
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
         }
 
+        /// One per-module entry. A `mode` that is not an MLX quantization mode and comes without `bits` names a
+        /// custom weight format (`.formatOwned`, e.g. JANGT); an MLX microscaling mode without `bits` / `group_size`
+        /// takes that mode's fixed geometry (mxfp8 8 / 32, mxfp4 4 / 32, nvfp4 4 / 16); an affine entry without
+        /// `group_size` takes the top-level one. Anything else still has to decode as a full ``Quantization``.
         private static func decodeLayerQuantization(
             from container: KeyedDecodingContainer<_DictionaryCodingKey>,
             key: _DictionaryCodingKey,
             defaultGroupSize: Int
-        ) throws -> Quantization {
+        ) throws -> QuantizationOption {
+            if let entry = try? container.nestedContainer(keyedBy: Quantization.CodingKeys.self, forKey: key),
+                !entry.contains(.bits), let rawMode = try? entry.decode(String.self, forKey: ._mode)
+            {
+                switch QuantizationMode(rawValue: rawMode.lowercased()) {
+                case nil:
+                    return .formatOwned(mode: rawMode)
+                case .mxfp8?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 32, bits: 8, mode: .mxfp8))
+                case .mxfp4?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 32, bits: 4, mode: .mxfp4))
+                case .nvfp4?:
+                    return .quantize(
+                        Quantization(
+                            groupSize: (try? entry.decode(Int.self, forKey: .groupSize)) ?? 16, bits: 4, mode: .nvfp4))
+                case .affine?:
+                    break  // affine has no fixed width: `bits` is required (the decode below reports it)
+                }
+            }
             do {
-                return try container.decode(Quantization.self, forKey: key)
+                return .quantize(try container.decode(Quantization.self, forKey: key))
             } catch DecodingError.keyNotFound(let missing, _)
                 where missing.stringValue == Quantization.CodingKeys.groupSize.rawValue
             {
@@ -368,7 +397,7 @@ public struct BaseConfiguration: Codable, Sendable {
                     forKey: key)
                 let bits = try nested.decode(Int.self, forKey: .bits)
                 let mode = try Quantization.decodeMode(from: nested) ?? .affine
-                return Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode)
+                return .quantize(Quantization(groupSize: defaultGroupSize, bits: bits, mode: mode))
             }
         }
 
@@ -393,6 +422,9 @@ public struct BaseConfiguration: Codable, Sendable {
                     try container.encode(false, forKey: .init(stringValue: key))
                 case .quantize(let q):
                     try container.encode(q, forKey: .init(stringValue: key))
+                case .formatOwned(let mode):
+                    // The format's own fields (e.g. JANGT `kbits`) belong to its loader; only the mode is kept.
+                    try container.encode(["mode": mode], forKey: .init(stringValue: key))
                 }
             }
         }
