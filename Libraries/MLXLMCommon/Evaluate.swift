@@ -2025,8 +2025,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 base: self.processor)
         }
         self.sampler = effectiveParameters.sampler()
-        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+        MetalLiveBufferGuard.reportProjectedBufferPressure(
             requested: effectiveParameters.maxTokens, cache: self.cache)
+        self.maxTokens = effectiveParameters.maxTokens
 
         self.kvBits = effectiveParameters.kvBits
         self.kvGroupSize = effectiveParameters.kvGroupSize

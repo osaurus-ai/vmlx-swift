@@ -13,21 +13,21 @@ import Foundation
 /// retention has not been measured must not be capped on a limit it provably
 /// cannot reach. DSV4's cumulative compressor/indexer pools are the measured
 /// exception (~one buffer per layer per decode token), and `clear_cache`
-/// frees none of that retained state, so the ceiling has to be projected
-/// rather than recovered from.
+/// frees none of that retained state. Such measurements can inform diagnostics;
+/// they cannot override caller or model output limits.
 public protocol MetalBufferRetainingCache {
     /// Live MLX buffers this cache layer retains per decoded token.
     var retainedBuffersPerDecodeToken: Double { get }
 }
 
-/// Projects the Metal live-buffer ceiling into a safe generated-token cap and
-/// clamps a request's `maxTokens` beneath it. Inert (returns the requested
-/// value unchanged) for cache topologies that retain no per-token buffers.
+/// Reports projected live-buffer pressure without changing a request's output limit.
+/// An estimate cannot replace the model or caller's generation contract. Resource
+/// exhaustion must surface as the actual runtime error, not a fabricated length stop.
 ///
 /// Env knobs (parity with Python vMLX 1.6.24 / R21-13):
-/// - `VMLX_METAL_BUFFER_COUNT_GUARD` — `0` disables the guard (default on).
+/// - `VMLX_METAL_BUFFER_COUNT_GUARD` — `0` disables reporting (default on).
 /// - `VMLX_METAL_BUFFER_GUARD_FRACTION` — safety fraction of the resource
-///   limit to budget (default 0.90).
+///   limit used by the diagnostic projection (default 0.90).
 /// - `VMLX_METAL_BUFFER_GUARD_BASELINE` — live buffers reserved for model
 ///   weights plus prompt-side state before decoding starts (default 16384).
 public enum MetalLiveBufferGuard {
@@ -37,17 +37,18 @@ public enum MetalLiveBufferGuard {
 
     /// Live-buffer ceiling reported by the OS, or `nil` when unavailable.
     ///
-    /// Mirrors mlx's Metal `device_info()`: reads `iogpu.rsrc_limit` and
-    /// falls back to 499000 when the sysctl reports nothing.
+    /// Reads `iogpu.rsrc_limit` when the OS exposes it. An unavailable value
+    /// stays unknown; a historical limit from another Mac is not evidence.
     public static func resourceLimit() -> Int? {
         #if canImport(Darwin)
-        var value: Int = 0
-        var length = MemoryLayout<Int>.size
-        sysctlbyname("iogpu.rsrc_limit", &value, &length, nil, 0)
-        if value <= 0 { value = 499_000 }
-        return value
+            var value: Int = 0
+            var length = MemoryLayout<Int>.size
+            guard sysctlbyname("iogpu.rsrc_limit", &value, &length, nil, 0) == 0,
+                value > 0
+            else { return nil }
+            return value
         #else
-        return nil
+            return nil
         #endif
     }
 
@@ -79,19 +80,16 @@ public enum MetalLiveBufferGuard {
         }
     }
 
-    /// Clamps a request's `maxTokens` to the projected buffer-count cap.
-    ///
-    /// An unlimited request (`nil`) against a retaining topology is clamped to
-    /// the cap — that is exactly the long-generation case that used to die at
-    /// the allocator wall. Non-retaining topologies pass through untouched.
-    public static func clampedMaxTokens(
+    /// Report a projection only when the OS limit and cache retention are known.
+    /// This never changes the caller's requested output-token limit.
+    public static func reportProjectedBufferPressure(
         requested: Int?,
         cache: [KVCache],
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Int? {
-        guard environment["VMLX_METAL_BUFFER_COUNT_GUARD"] != "0" else { return requested }
+    ) {
+        guard environment["VMLX_METAL_BUFFER_COUNT_GUARD"] != "0" else { return }
         let perToken = retainedBuffersPerDecodeToken(cache: cache)
-        guard perToken > 0, let limit = resourceLimit() else { return requested }
+        guard perToken > 0, let limit = resourceLimit() else { return }
         let fraction =
             environment["VMLX_METAL_BUFFER_GUARD_FRACTION"].flatMap(Double.init)
             ?? defaultSafetyFraction
@@ -104,13 +102,23 @@ public enum MetalLiveBufferGuard {
                 liveBaselineBuffers: baseline,
                 buffersPerToken: perToken,
                 safetyFraction: fraction)
-        else { return requested }
-        if let requested, requested <= cap { return requested }
+        else { return }
+        if let requested, requested <= cap { return }
         print(
-            "[MetalLiveBufferGuard] Metal live-buffer ceiling is the binding output limit: "
+            "[MetalLiveBufferGuard] Advisory only; requested output limit is unchanged: "
                 + "cap=\(cap) tokens (resource_limit=\(limit), "
                 + "\(perToken) buffers/token, requested=\(requested.map(String.init) ?? "unlimited"))"
         )
-        return cap
+    }
+
+    /// Historical API retained for source compatibility. Buffer projections are
+    /// diagnostic only; explicit and omitted output limits pass through unchanged.
+    public static func clampedMaxTokens(
+        requested: Int?,
+        cache: [KVCache],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int? {
+        reportProjectedBufferPressure(requested: requested, cache: cache, environment: environment)
+        return requested
     }
 }

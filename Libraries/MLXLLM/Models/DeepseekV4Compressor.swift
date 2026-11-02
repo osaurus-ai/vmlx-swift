@@ -2460,8 +2460,8 @@ public final class DeepseekV4Indexer: Module {
 }
 
 extension DeepseekV4Cache: MetalBufferRetainingCache {
-    /// Measured on DSV4-Flash (Python vMLX R21-13): the cumulative
-    /// compressor/indexer pool state retains ~one live Metal buffer per
-    /// layer per decode token, and `clear_cache` frees none of it.
-    public var retainedBuffersPerDecodeToken: Double { 1.0 }
+    /// The historical segmented DSV4 estimate is advisory. V4.1 uses a
+    /// bounded number of growable contiguous pool slabs, not one retained
+    /// Metal buffer per decoded token, so that estimate does not apply.
+    public var retainedBuffersPerDecodeToken: Double { contiguousPools ? 0.0 : 1.0 }
 }
