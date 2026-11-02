@@ -648,6 +648,116 @@ struct DSparkSpeculationFocusedTests {
         }
     }
 
+    /// The pipelined decode order `TokenIterator` uses: an AR step submits its forward and returns before its token is
+    /// read, so that forward's cost reaches the clock only when the next step reads the token. `readSeedFirst` uses
+    /// ``DSparkDecoder/begin(remaining:readSeed:)`` (the token is read before the previous step's clock closes);
+    /// otherwise the old order (`begin(remaining:)`, then the read) charges the pending AR forward to the speculative
+    /// step that read it.
+    static func pipelinedGovernorRun(readSeedFirst: Bool, accuracy: Double, count: Int = 400)
+        -> (seconds: Double, stats: DSparkGenerationStats, arPerToken: Double?)
+    {
+        Device.withDefaultDevice(.cpu) {
+            let V = 101
+            let base = 0.020
+            let perToken = 0.001
+            func nxt(_ t: Int, _ p: Int) -> Int { (t * 13 + p * 5 + 7) % V }
+            var now = 0.0
+            var pendingCost = 0.0  // an AR forward submitted but not yet read
+            let cache: [KVCache] = [KVCacheSimple()]
+            func run(_ ids: [Int]) -> MLXArray {
+                let start = cache[0].offset
+                let zeros = MLXArray.zeros([1, 1, ids.count, 1])
+                _ = cache[0].update(keys: zeros, values: zeros)
+                var rows = [Float](repeating: 0, count: ids.count * V)
+                for (i, t) in ids.enumerated() { rows[i * V + nxt(t, start + i)] = 1 }
+                return MLXArray(rows, [1, ids.count, V])
+            }
+            // A speculative forward is read inside the step (verify argmax), so it costs at once.
+            func forward(_ ids: [Int]) -> MLXArray {
+                now += pendingCost + base + perToken * Double(ids.count)
+                pendingCost = 0
+                return run(ids)
+            }
+            func argmaxLast(_ l: MLXArray) -> Int { argMax(l[0, -1], axis: -1).item(Int.self) }
+            let prompt = [3, 1, 4, 1, 5]
+            var reference: [Int: Int] = [:]
+            var t = nxt(prompt.last!, prompt.count - 1)
+            for p in prompt.count ..< prompt.count + count + 10 {
+                reference[p] = t
+                t = nxt(t, p)
+            }
+            let draft = DSparkScriptedDraft(
+                reference: reference, vocab: V, good: { _ in Int((accuracy * 5).rounded()) },
+                onDraft: { now += 0.006 })
+            var y = argmaxLast(forward(prompt))
+            let t0 = now
+            var decoder = DSparkDecoder(session: draft, blockSize: 5, stopTokenIDs: [], clock: { now })
+            var out: [Int] = []
+            var queue: [Int] = []
+            // Reading the pending token waits for the AR forward still in flight.
+            func readPending() -> Int {
+                now += pendingCost
+                pendingCost = 0
+                return y
+            }
+            while out.count < count {
+                if !queue.isEmpty { out.append(queue.removeFirst()); continue }
+                let remaining = count - out.count
+                let seed: Int?
+                if readSeedFirst {
+                    seed = decoder.begin(remaining: remaining, readSeed: readPending)
+                } else {
+                    seed = decoder.begin(remaining: remaining) ? readPending() : nil
+                }
+                guard let seed else {
+                    // Ordinary decode step: submit the next forward, then read the previous token.
+                    let token = y
+                    let logits = run([token])
+                    let previousCost = pendingCost
+                    pendingCost = base + perToken
+                    now += previousCost
+                    y = argmaxLast(logits)
+                    out.append(token)
+                    continue
+                }
+                switch decoder.speculate(seed: seed, cache: cache, remaining: remaining, forward: forward) {
+                case .autoregressive:
+                    y = argmaxLast(forward([seed]))
+                    out.append(seed)
+                case .committed(let tokens, let next):
+                    y = next.item(Int.self)
+                    queue = Array(tokens.dropFirst())
+                    out.append(tokens[0])
+                }
+            }
+            now += pendingCost
+            decoder.finish()
+            let expected = (0 ..< count).map { reference[prompt.count + $0]! }
+            #expect(out == expected)
+            return (now - t0, decoder.stats, decoder.governor.ar)
+        }
+    }
+
+    @Test("governor clock: a pipelined AR forward is charged to its AR step, not to the speculative step that reads its token")
+    func governorPipelinedClockAttribution() {
+        // 40 % acceptance (2 of 5 drafts, restore + commit forward): speculation costs ~0.018 s per token against AR's
+        // 0.021, so it wins, but only narrowly, as on DeepSeek-V4.1 sampled chats.
+        let fixed = Self.pipelinedGovernorRun(readSeedFirst: true, accuracy: 0.4)
+        let old = Self.pipelinedGovernorRun(readSeedFirst: false, accuracy: 0.4)
+        guard let ar = fixed.arPerToken, let oldAR = old.arPerToken else {
+            Issue.record("no AR estimate")
+            return
+        }
+        // The AR estimate is one AR forward per token.
+        #expect(abs(ar - 0.021) < 0.002, "AR estimate \(ar)")
+        // Control: the old clock order under-reads AR (its forward lands on the next speculative step) ...
+        #expect(oldAR < 0.019, "old AR estimate \(oldAR)")
+        // ... so it took AR steps that were slower than speculating, and the run took longer.
+        #expect(fixed.stats.arSteps < old.stats.arSteps, "AR steps \(fixed.stats.arSteps) vs \(old.stats.arSteps)")
+        #expect(fixed.seconds < old.seconds, "seconds \(fixed.seconds) vs \(old.seconds)")
+        #expect(fixed.stats.specSteps > fixed.stats.arSteps, "spec \(fixed.stats.specSteps) AR \(fixed.stats.arSteps)")
+    }
+
     @Test("governor: zero acceptance stays within a few percent of AR and keeps probing")
     func governorLowAcceptance() {
         let (ratio, stats) = Self.governorRun(accuracy: { _ in 0 })
