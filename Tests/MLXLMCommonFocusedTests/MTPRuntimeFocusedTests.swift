@@ -10,6 +10,38 @@ import Testing
 
 @Suite("MTP runtime metadata", .serialized)
 struct MTPRuntimeFocusedTests {
+    @Test("phase diagnostic flags retain live exact-one and legacy OR semantics")
+    func phaseDiagnosticFlagsRetainLiveSemantics() {
+        let current = "VMLX_NATIVE_MTP_PHASE_DIAG"
+        let legacy = "VMLINUX_NATIVE_MTP_PHASE_DIAG"
+        let saved = ProcessInfo.processInfo.environment
+        func assign(_ key: String, _ value: String?) {
+            if let value { setenv(key, value, 1) } else { unsetenv(key) }
+        }
+        defer {
+            assign(current, saved[current])
+            assign(legacy, saved[legacy])
+            NativeMTPPhaseDiagnostics.reset()
+        }
+        let values: [String?] = [nil, "", "0", "1", "true", "yes", "01"]
+        for primary in values {
+            for fallback in values {
+                assign(current, primary)
+                assign(legacy, fallback)
+                #expect(NativeMTPPhaseDiagnostics.enabled == (primary == "1" || fallback == "1"))
+            }
+        }
+        NativeMTPPhaseDiagnostics.reset()
+        assign(current, "1")
+        assign(legacy, nil)
+        NativeMTPPhaseDiagnostics.record("fixture", seconds: 0.25)
+        assign(current, "0")
+        NativeMTPPhaseDiagnostics.record("fixture", seconds: 9)
+        let snapshot = NativeMTPPhaseDiagnostics.snapshot()
+        #expect(snapshot.calls == ["fixture": 1])
+        #expect(snapshot.seconds == ["fixture": 0.25])
+    }
+
     @Test("native MTP greedy verifier rejects short logits before materialization")
     func nativeMTPGreedyVerifierRejectsShortLogitsBeforeMaterialization() {
         FocusedMLXTestSupport.withLock {
