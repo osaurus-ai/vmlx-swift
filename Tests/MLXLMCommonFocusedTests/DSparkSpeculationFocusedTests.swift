@@ -648,21 +648,21 @@ struct DSparkSpeculationFocusedTests {
         }
     }
 
-    /// The pipelined decode order `TokenIterator` uses: an AR step submits its forward and returns before its token is
-    /// read, so that forward's cost reaches the clock only when the next step reads the token. `readSeedFirst` uses
-    /// ``DSparkDecoder/begin(remaining:readSeed:)`` (the token is read before the previous step's clock closes);
-    /// otherwise the old order (`begin(remaining:)`, then the read) charges the pending AR forward to the speculative
-    /// step that read it.
+    /// The pipelined decode order `TokenIterator` uses, with the runtime's timing: a forward's graph build runs on the
+    /// host while the GPU works, and the GPU runs one forward at a time. An AR step submits its forward (`buildCost` on
+    /// the host) and reads the previous token, so when the next step begins that forward has `gpuCost - buildCost` left.
+    /// `readSeedFirst` uses ``DSparkDecoder/begin(remaining:readSeed:)``; otherwise the old order
+    /// (`begin(remaining:)`, then the read) has the speculative step pay that remainder.
     static func pipelinedGovernorRun(readSeedFirst: Bool, accuracy: Double, count: Int = 400)
-        -> (seconds: Double, stats: DSparkGenerationStats, arPerToken: Double?)
+        -> (seconds: Double, stats: DSparkGenerationStats, arEstimate: Double?, specEstimate: Double?)
     {
         Device.withDefaultDevice(.cpu) {
             let V = 101
-            let base = 0.020
-            let perToken = 0.001
+            let gpuCost = 0.021
+            let buildCost = 0.015
             func nxt(_ t: Int, _ p: Int) -> Int { (t * 13 + p * 5 + 7) % V }
             var now = 0.0
-            var pendingCost = 0.0  // an AR forward submitted but not yet read
+            var gpuEnd = 0.0  // when the forwards submitted so far finish
             let cache: [KVCache] = [KVCacheSimple()]
             func run(_ ids: [Int]) -> MLXArray {
                 let start = cache[0].offset
@@ -672,10 +672,10 @@ struct DSparkSpeculationFocusedTests {
                 for (i, t) in ids.enumerated() { rows[i * V + nxt(t, start + i)] = 1 }
                 return MLXArray(rows, [1, ids.count, V])
             }
-            // A speculative forward is read inside the step (verify argmax), so it costs at once.
+            // A speculative forward is read inside the step (verify argmax): the host waits for it.
             func forward(_ ids: [Int]) -> MLXArray {
-                now += pendingCost + base + perToken * Double(ids.count)
-                pendingCost = 0
+                now = Swift.max(now, gpuEnd) + 0.020 + 0.001 * Double(ids.count)
+                gpuEnd = now
                 return run(ids)
             }
             func argmaxLast(_ l: MLXArray) -> Int { argMax(l[0, -1], axis: -1).item(Int.self) }
@@ -688,16 +688,15 @@ struct DSparkSpeculationFocusedTests {
             }
             let draft = DSparkScriptedDraft(
                 reference: reference, vocab: V, good: { _ in Int((accuracy * 5).rounded()) },
-                onDraft: { now += 0.006 })
+                onDraft: { now += 0.020 })
             var y = argmaxLast(forward(prompt))
             let t0 = now
             var decoder = DSparkDecoder(session: draft, blockSize: 5, stopTokenIDs: [], clock: { now })
             var out: [Int] = []
             var queue: [Int] = []
-            // Reading the pending token waits for the AR forward still in flight.
+            // Reading the pending token waits for the forwards in flight.
             func readPending() -> Int {
-                now += pendingCost
-                pendingCost = 0
+                now = Swift.max(now, gpuEnd)
                 return y
             }
             while out.count < count {
@@ -710,12 +709,13 @@ struct DSparkSpeculationFocusedTests {
                     seed = decoder.begin(remaining: remaining) ? readPending() : nil
                 }
                 guard let seed else {
-                    // Ordinary decode step: submit the next forward, then read the previous token.
+                    // Ordinary decode step: submit the next forward (the build overlaps the GPU), then read the
+                    // previous token, whose forward ended at the old `gpuEnd`.
+                    let previousEnd = gpuEnd
                     let token = y
                     let logits = run([token])
-                    let previousCost = pendingCost
-                    pendingCost = base + perToken
-                    now += previousCost
+                    gpuEnd = Swift.max(gpuEnd, now) + gpuCost
+                    now = Swift.max(now + buildCost, previousEnd)
                     y = argmaxLast(logits)
                     out.append(token)
                     continue
@@ -730,30 +730,31 @@ struct DSparkSpeculationFocusedTests {
                     out.append(tokens[0])
                 }
             }
-            now += pendingCost
+            now = Swift.max(now, gpuEnd)
             decoder.finish()
             let expected = (0 ..< count).map { reference[prompt.count + $0]! }
             #expect(out == expected)
-            return (now - t0, decoder.stats, decoder.governor.ar)
+            return (now - t0, decoder.stats, decoder.governor.ar, decoder.governor.spec)
         }
     }
 
-    @Test("governor clock: a pipelined AR forward is charged to its AR step, not to the speculative step that reads its token")
+    @Test("governor clock: a pipelined AR forward's remainder is charged to its AR step, not to the speculative step that reads its token")
     func governorPipelinedClockAttribution() {
-        // 40 % acceptance (2 of 5 drafts, restore + commit forward): speculation costs ~0.018 s per token against AR's
-        // 0.021, so it wins, but only narrowly, as on DeepSeek-V4.1 sampled chats.
+        // 40 % acceptance with a costly draft: speculation costs ~0.018 s per token against AR's 0.021, so it wins, but
+        // only narrowly, as on DeepSeek-V4.1 sampled chats.
         let fixed = Self.pipelinedGovernorRun(readSeedFirst: true, accuracy: 0.4)
         let old = Self.pipelinedGovernorRun(readSeedFirst: false, accuracy: 0.4)
-        guard let ar = fixed.arPerToken, let oldAR = old.arPerToken else {
-            Issue.record("no AR estimate")
+        guard let ar = fixed.arEstimate, let spec = fixed.specEstimate, let oldSpec = old.specEstimate else {
+            Issue.record("no estimates")
             return
         }
-        // The AR estimate is one AR forward per token.
-        #expect(abs(ar - 0.021) < 0.002, "AR estimate \(ar)")
-        // Control: the old clock order under-reads AR (its forward lands on the next speculative step) ...
-        #expect(oldAR < 0.019, "old AR estimate \(oldAR)")
-        // ... so it took AR steps that were slower than speculating, and the run took longer.
-        #expect(fixed.stats.arSteps < old.stats.arSteps, "AR steps \(fixed.stats.arSteps) vs \(old.stats.arSteps)")
+        // The AR estimate must not under-read: a low one drops the governor into AR, the failure a seed-wait-only
+        // sample produced in the live app (16-23 ms against ~35).
+        #expect(ar > 0.019 && ar < 0.025, "AR estimate \(ar)")
+        // Control: the old order charges the remainder to speculation (live: 45-48 ms against 25-28 actual) ...
+        #expect(oldSpec > spec + 0.003, "speculative estimate old \(oldSpec) fixed \(spec)")
+        // ... and falls back to AR steps that are slower than speculating.
+        #expect(fixed.stats.arSteps * 10 < old.stats.arSteps, "AR steps \(fixed.stats.arSteps) vs \(old.stats.arSteps)")
         #expect(fixed.seconds < old.seconds, "seconds \(fixed.seconds) vs \(old.seconds)")
         #expect(fixed.stats.specSteps > fixed.stats.arSteps, "spec \(fixed.stats.specSteps) AR \(fixed.stats.arSteps)")
     }

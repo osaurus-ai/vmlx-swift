@@ -475,47 +475,42 @@ public struct DSparkDecoder {
         return true
     }
 
-    /// ``begin(remaining:)`` with each AR forward timed exactly once, keeping AR steps pipelined.
+    /// ``begin(remaining:)`` with a pending forward's wait charged to the step that submitted it.
     ///
-    /// An AR step returns before its token is read (the ordinary decode step submits the next forward first), so the
-    /// time between two consecutive `begin`s inside a run of AR steps is one AR forward, the previous one's. Two
-    /// boundaries were mis-charged by ``begin(remaining:)``:
-    /// - the last AR forward of a run is still running when a speculative step reads its token, and that wait was
-    ///   charged to the speculative step: speculation looked slower than it was, the governor fell back to AR and
-    ///   stayed there until its next probe (live, DeepSeek-V4.1 JANGHT1.4 sampled chats: 49-56 AR steps per reply
-    ///   against the reference runner's 1-2);
-    /// - the first AR step after a speculative one has no AR forward in flight before it, so its interval is a pipeline
-    ///   fill, not an AR token.
+    /// An AR step returns before its token is read (the ordinary decode step submits the next forward first). The
+    /// host's graph build overlaps the GPU, so when the next step begins most of that forward has been paid and a
+    /// remainder is still running. Inside a run of AR steps the remainder lands on the following AR step, and the run's
+    /// total is right. At an AR-to-speculative switch ``begin(remaining:)`` closed the AR step first, so the speculative
+    /// step's seed read paid the remainder: speculation read dearer and AR cheaper than they were, and the governor fell
+    /// back to AR until its next probe. Live on DeepSeek-V4.1 JANGHT1.4 sampled turns the governor's speculative
+    /// estimate was 45-48 ms per token against 25-28 actual, with 60-70 % of the steps AR.
     ///
-    /// Here the first AR step of a run is not timed, and at an AR-to-speculative switch the seed read's wait is
-    /// recorded as one more AR sample (the last forward of the run), then the speculative step starts after the read.
-    /// Every AR forward is then measured once, as the reference runner measures it, while AR steps still submit the
-    /// next forward before reading the token. The decision is taken as ``begin(remaining:)`` takes it.
-    /// Returns the seed for ``speculate(seed:cache:remaining:forward:)``, or nil for an ordinary decode step.
+    /// The decision is taken as ``begin(remaining:)`` takes it, on the governor with the previous step recorded now. An
+    /// AR choice closes that step at once and returns nil, so AR steps keep submitting the next forward before they read
+    /// the token. A speculative choice needs the token anyway: `readSeed` reads it first, and the previous step closes
+    /// after the read, so it carries its own remainder. Returns the seed for
+    /// ``speculate(seed:cache:remaining:forward:)``, or nil for an ordinary decode step.
     public mutating func begin(remaining: Int, readSeed: () -> Int) -> Int? {
         stats.steps += 1
-        let now = clock()
-        let previousMode = last?.mode
-        closeLastStep(now: now)
-        stepStart = now
+        let decideAt = clock()
+        var decision = governor
+        if let last, last.timed {
+            decision.record(last.mode, seconds: Swift.max(0, decideAt - last.start), emitted: last.emitted)
+        }
         // A block needs room for at least the seed plus one draft.
-        guard governor.choose() == .spec, remaining >= 2 else {
+        guard decision.choose() == .spec, remaining >= 2 else {
+            closeLastStep(now: decideAt)
+            _ = governor.choose()  // the same state as `decision`: applies the probe bookkeeping
+            stepStart = decideAt
             stats.arSteps += 1
-            // A run's first AR step has no AR forward in flight before it: a pipeline fill, not an AR token.
-            let timed = previousMode == .ar && !DSparkForwardWidths.firstUse(1)
-            last = (.ar, 1, now, timed, 0)
+            last = (.ar, 1, decideAt, !DSparkForwardWidths.firstUse(1), 0)
             return nil
         }
         let seed = readSeed()
-        if previousMode == .ar {
-            // The wait is the run's last AR forward: charge it to AR, not to this step.
-            let readAt = clock()
-            let wait = Swift.max(0, readAt - now)
-            governor.record(.ar, seconds: wait, emitted: 1)
-            stats.arSeconds += wait
-            stats.arSecondsPerToken = governor.ar
-            stepStart = readAt
-        }
+        let now = clock()
+        closeLastStep(now: now)
+        _ = governor.choose()  // applies the probe bookkeeping; this step speculates either way
+        stepStart = now
         plannedDrafts = planner?.plan(arStep: governor.ar)
         return seed
     }

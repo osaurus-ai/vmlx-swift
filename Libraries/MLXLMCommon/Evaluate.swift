@@ -2720,8 +2720,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         defer { dspark = decoder }
         let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
         // The governor chooses before the pending token is read: an AR step returns to the ordinary decode step,
-        // which submits the next forward before it waits for this token. A speculative step reads it (waiting for the
-        // previous step's last forward) before that step's clock is closed, so the wait is charged to it.
+        // which submits the next forward before it waits for this token. A speculative step reads it before the previous
+        // step's clock closes, so that step carries the wait for its own forward.
         let pending = y.tokens
         guard let seed = decoder.begin(remaining: remaining, readSeed: { pending.reshaped(-1)[0].item(Int.self) })
         else { return nil }
