@@ -378,6 +378,32 @@ public enum DeepseekV4Math {
         ).asType(blockOut.dtype)
     }
 
+    /// DeepSeek-V4.1 verify rows: the same post contraction kernel as `hcPost` at one token, over every row of
+    /// (1, R, ...). Each row runs the statements its 1-row decode runs, so it equals that decode's expand; the
+    /// batched path in `hcPost` is a GEMM, which sums (and on M5 rounds) differently.
+    static func hcPostRows(
+        blockOut: MLXArray,
+        residual: MLXArray,
+        post: MLXArray,
+        comb: MLXArray
+    ) -> MLXArray {
+        let hcMult = comb.dim(-1)
+        let hiddenSize = blockOut.dim(-1)
+        let x = contiguous(blockOut)
+        return hcPostDecodeKernel(
+            [x, contiguous(residual), contiguous(post), contiguous(comb)],
+            template: [
+                ("HC", hcMult),
+                ("D", hiddenSize),
+                ("outT", x.dtype),
+            ],
+            grid: (x.size * hcMult, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [Array(x.shape.dropLast()) + [hcMult, hiddenSize]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     /// Python `_DSV4_COMPILE_REGIONS` parity gate. Decode-only compiled
     /// regions collapse per-token host graph construction; prefill keeps the
     /// raw graph so trace count stays bounded.

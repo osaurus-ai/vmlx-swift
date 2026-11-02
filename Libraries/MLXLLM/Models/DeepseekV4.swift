@@ -975,9 +975,13 @@ class DeepseekV4MoEGate: Module {
 
     /// fp32 router logits `x.astype(f32) @ weight.astype(f32).T`. DeepSeek-V4.1 decode (one token)
     /// reads the bf16 rows directly in MLX's GEMV order (`DeepseekV41RouterGEMV`, bit-identical,
-    /// `VMLX_DSV41_ROUTER_KERNEL=0` restores the cast + matmul); everything else is the stock graph.
+    /// `VMLX_DSV41_ROUTER_KERNEL=0` restores the cast + matmul), and so does each row of a 2-8 row verify
+    /// (`rowLogits`, each row equal to its own 1-row logits); everything else is the stock graph.
     func routerLogits(_ x: MLXArray) -> MLXArray {
-        if config.isDeepseekV41, let logits = DeepseekV41RouterGEMV.logits(x, weight: weight) {
+        if config.isDeepseekV41,
+            let logits = DeepseekV41RouterGEMV.logits(x, weight: weight)
+                ?? DeepseekV41RouterGEMV.rowLogits(x, weight: weight)
+        {
             return logits
         }
         let xF32 = x.asType(.float32)
@@ -1036,6 +1040,16 @@ class DeepseekV4MoEGate: Module {
             }
             weights = weights * scalingFactorArray
             return (indices.asType(.uint32), weights)
+        }
+
+        // DeepSeek-V4.1 verify rows (2-8): the routing in one dispatch (`DeepseekV41RouteRows`, each row
+        // equal to the selector below run on that row, `VMLX_DSV41_ROUTE_TOPK=0` keeps the selector).
+        if config.isDeepseekV41,
+            let routed = DeepseekV41RouteRows.apply(
+                logits, bias: bias, topK: topK, normalize: normTopkProb, scale: scalingFactorArray,
+                stock: { compiledSelector([$0, bias, scalingFactorArray]) })
+        {
+            return (routed.indices, routed.weights)
         }
 
         // Non-hash: the same stateless compiled sqrtsoftplus + noaux-biased
@@ -1488,6 +1502,27 @@ class DeepseekV4DecoderLayer: Module {
             {
                 let ffnOut = mlp(f.normed, inputIds: inputIds, imageMask: nil)
                 let hF = ffnHC.expand(blockOut: ffnOut, residual: hA, post: f.post, comb: f.comb)
+                return (h: hF, ffnPre: f.pre)
+            }
+            let hA = attnHC.expand(blockOut: attnOut, residual: h, post: a.post, comb: a.comb)
+            let (fPre, fPost, fComb) = ffnHC.mixes(hA)
+            let normedF = postAttentionLayerNorm(DeepseekV4Math.hcCollapse(hA, pre: a.pre))
+            let ffnOut = mlp(normedF, inputIds: inputIds, imageMask: nil)
+            let hF = ffnHC.expand(blockOut: ffnOut, residual: hA, post: fPost, comb: fComb)
+            return (h: hF, ffnPre: fPre)
+        }
+        // Verify (2-8 rows): the rows kernels (`DeepseekV41HCRows`), each row computed as in its 1-row decode. A
+        // prefill chunk cut into attention pieces keeps the statements below.
+        if h.dim(1) > 1, imageMask == nil, (attnPieces?.count ?? 1) <= 1,
+            let a = DeepseekV41HCRows.apply(h: h, cpre: preMix, hc: attnHC, norm: inputLayerNorm)
+        {
+            let attnOut = selfAttn(a.normed, mask: mask, cache: cache, compressShare: compressShare)
+            if let f = DeepseekV41HCRows.apply(
+                h: h, y: attnOut, post: a.post, comb: a.comb, cpre: a.pre, hc: ffnHC,
+                norm: postAttentionLayerNorm), let hA = f.stream
+            {
+                let ffnOut = mlp(f.normed, inputIds: inputIds, imageMask: nil)
+                let hF = DeepseekV4Math.hcPostRows(blockOut: ffnOut, residual: hA, post: f.post, comb: f.comb)
                 return (h: hF, ffnPre: f.pre)
             }
             let hA = attnHC.expand(blockOut: attnOut, residual: h, post: a.post, comb: a.comb)
