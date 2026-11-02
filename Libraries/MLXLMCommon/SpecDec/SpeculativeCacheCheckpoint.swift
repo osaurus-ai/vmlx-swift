@@ -228,7 +228,14 @@ public struct HybridPoolHiddenTail {
         }
         if chunks.count > Self.maxChunks, let all = joined() {
             let lo = Swift.max(all.start, floor)
-            chunks = [Chunk(start: lo, rows: all.rows[(lo - all.start)...])]
+            let compacted = all.rows[(lo - all.start)...]
+            // A lazy slice still owns the concatenation's inputs, including the
+            // previous compacted tail. During plain decoding no drafter reads
+            // those rows, so repeated compaction otherwise retains old forward
+            // graphs and their Metal events indefinitely. Schedule the bounded
+            // rows now; this detaches that history without a host-side wait.
+            asyncEval(compacted)
+            chunks = [Chunk(start: lo, rows: compacted)]
         }
     }
 }
