@@ -32,7 +32,12 @@ enum DeepseekV41SplitAttention {
     /// cover 1-6), but each row reloads its keys, and in the osaurus app on JANG_2K a 6-row dSpark verify ran
     /// slower than the existing dense path (dSpark code 74.6 -> 69-71 tok/s) while a single row ran 11-12 % faster
     /// (plain decode 44 -> 49-51 tok/s, dSpark prose 41.9 -> 47). Verify rows keep the dense path.
-    static let maxRows = 1
+    /// `VMLX_DSV41_ATTN_SPLIT_MAX_ROWS` raises it (up to `kernelMaxRows`) to compare verify rows in the app on JANGHT,
+    /// where this was never measured.
+    static let maxRows: Int = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_DSV41_ATTN_SPLIT_MAX_ROWS"].flatMap(Int.init)
+        return min(kernelMaxRows, max(1, raw ?? 1))
+    }()
     static let kernelMaxRows = 8
     /// Key chunks of 16 per (row, head): the window (<= 128 + verify rows) and the indexer's picks (<= 512).
     static let maxChunks = 48
