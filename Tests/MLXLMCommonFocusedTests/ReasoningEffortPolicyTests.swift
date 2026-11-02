@@ -205,6 +205,24 @@ struct ReasoningCapabilityBundleTests {
         return dir
     }
 
+    @Test("bundle efforts coexist with independent think/no-think modes")
+    func declaredEffortsWithToggleModes() throws {
+        let dir = try bundle([
+            "config.json": #"{"model_type":"spark2_5"}"#,
+            "jang_config.json": #"{"chat":{"reasoning":{"supported":true,"modes":["think","no_think"],"efforts":["low","high"],"default_effort":"low"}}}"#,
+            "chat_template.jinja": "{{ enable_thinking }} {{ reasoning_effort }}",
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let c = ReasoningCapability.forModel(at: dir)
+        #expect(c.levels == [0, 1, 2])
+        #expect(c.defaultLevel == 1)
+        #expect(c.effort(for: 1) == "low")
+        #expect(c.effort(for: 2) == "high")
+        #expect(c.applying(level: 0)?["enable_thinking"] as? Bool == false)
+        #expect(c.applying(level: 2)?["reasoning_effort"] as? String == "high")
+        #expect(c.source == .declared)
+    }
+
     @Test("the template is found in EITHER location")
     func templateInEitherPlace() throws {
         // Across real bundles the chat template is split almost evenly between a standalone

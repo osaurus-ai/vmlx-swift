@@ -496,6 +496,7 @@ extension ReasoningCapability {
            let supported = reasoning?["supported_reasoning_efforts"] as? [String] {
             efforts = supported
         }
+        if efforts.count < 2, let declared = reasoning?["efforts"] as? [String] { efforts = declared }
         if efforts.count < 2, let values = chat?["reasoning_values"] as? [String] { efforts = values }
         if efforts.count < 2, let modes = reasoning?["modes"] as? [String],
            !modes.contains(where: { offModeNames.contains($0.lowercased()) }) {
