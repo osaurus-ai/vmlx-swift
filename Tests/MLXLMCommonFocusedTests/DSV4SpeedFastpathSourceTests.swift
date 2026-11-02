@@ -45,19 +45,21 @@ struct DSV4SpeedFastpathSourceTests {
         #expect(model.contains("nonisolated(unsafe) private static var tables:"))
     }
 
-    @Test("Metal live-buffer clamp is wired at both serving admission points")
+    @Test("Metal buffer diagnostics cannot replace either serving output limit")
     func bufferClampIsReached() throws {
         let scheduler = try source(
             "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift")
         let evaluate = try source("Libraries/MLXLMCommon/Evaluate.swift")
 
-        // BatchEngine slots (osaurus serving path) and the solo
-        // TokenIterator both admit generations; miss either and a
-        // DSV4 long generation dies at the 499000 allocator wall.
-        #expect(scheduler.contains("MetalLiveBufferGuard.clampedMaxTokens("))
-        #expect(evaluate.contains("MetalLiveBufferGuard.clampedMaxTokens("))
+        // Both serving paths keep the request's output limit. Buffer-pressure
+        // projections are advisory and cannot invent a length stop.
+        #expect(scheduler.contains("MetalLiveBufferGuard.reportProjectedBufferPressure("))
+        #expect(evaluate.contains("MetalLiveBufferGuard.reportProjectedBufferPressure("))
 
-        // DSV4's cache layer is the measured retaining topology.
+        #expect(scheduler.contains("self.maxTokens = request.parameters.maxTokens"))
+        #expect(evaluate.contains("self.maxTokens = effectiveParameters.maxTokens"))
+
+        // Historical DSV4 retention stays available for diagnostics.
         let compressor = try source(
             "Libraries/MLXLLM/Models/DeepseekV4Compressor.swift")
         #expect(
