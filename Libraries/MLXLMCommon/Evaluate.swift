@@ -1278,9 +1278,10 @@ public struct SuppressTokensProcessor: LogitProcessor {
         guard !valid.isEmpty else { return logits }
         // MLXArray is reference-typed: subscript assignment through a second
         // binding would also rewrite the caller's logits and any aliases.
-        let ids = MLXArray(Int32(0) ..< Int32(vocabSize))
-        let mask = valid.reduce(MLXArray(false)) { $0 .|| (ids .== MLXArray(Int32($1))) }
-        return MLX.where(mask, negInf, logits)
+        let indexShape = Array(repeating: 1, count: logits.ndim - 1) + [valid.count]
+        let indices = MLXArray(valid.map(Int32.init)).reshaped(indexShape)
+        return MLX.putAlong(
+            logits, indices, values: negInf.asType(logits.dtype), axis: -1)
     }
 
     mutating public func didSample(token: MLXArray) {}

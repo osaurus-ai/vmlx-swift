@@ -70,6 +70,34 @@ struct NativeReasoningLogitsFocusedTests {
         }
     }
 
+    @Test("explicit suppression preserves rank, dtype, every row, and input aliases")
+    func suppressionShapeDTypeAndAliasing() {
+        Device.withDefaultDevice(.cpu) {
+            let processor = SuppressTokensProcessor(tokens: [-1, 1, 1, 3, 4, 200])
+            for shape in [[4], [2, 4], [2, 3, 4]] {
+                for dtype in [DType.float32, .bfloat16] {
+                    let count = shape.reduce(1, *)
+                    let source = (0 ..< count).map { Float($0) + 0.25 }
+                    let logits = MLXArray(source).reshaped(shape).asType(dtype)
+                    let alias = logits
+                    let before = logits.asType(.float32).asArray(Float.self)
+                    let processed = processor.process(logits: logits)
+                    #expect(processed.shape == shape)
+                    #expect(processed.dtype == dtype)
+                    let output = processed.asType(.float32).asArray(Float.self)
+                    for index in 0 ..< count {
+                        let expected = [1, 3].contains(index % 4) ? -Float.infinity : before[index]
+                        #expect(output[index] == expected, "shape=\(shape) dtype=\(dtype) index=\(index)")
+                    }
+                    #expect(logits.shape == shape)
+                    #expect(logits.dtype == dtype)
+                    #expect(logits.asType(.float32).asArray(Float.self) == before)
+                    #expect(alias.asType(.float32).asArray(Float.self) == before)
+                }
+            }
+        }
+    }
+
     @Test("legacy explicit leading suppression has only its requested mask and window")
     func compatibilityWindowHasNoHiddenSampler() throws {
         try Device.withDefaultDevice(.cpu) {

@@ -39,9 +39,11 @@ model quality failure must be reported rather than masked.
   removed. No model family, prompt, or effort setting enables these controls.
 - Preserve bundle/user `suppress_tokens` semantics while constructing the mask
   out of place so caller-owned logits and aliases are unchanged. Invalid token
-  IDs are ignored as before. This allocates mask expressions proportional to
-  vocabulary size and explicit token count; the performance impact has not been
-  measured and this patch makes no speedup claim.
+  IDs are ignored as before. Functional `MLX.putAlong` broadcasts the requested
+  indices across leading logit dimensions and preserves the input dtype. It
+  avoids building a full-vocabulary comparison for every suppressed token, but
+  output materialization and scatter costs depend on the backend; no performance
+  measurement or speedup claim is made here.
 - Diffusion categorical sampling, argmax, entropy, and self-conditioning use the
   same unmasked native temperature-scheduled logits. Native EOS truncation,
   prompt/cache commit, output limits, and denoising schedule remain intact.
@@ -50,8 +52,9 @@ model quality failure must be reported rather than masked.
 
 `NativeReasoningLogitsFocusedTests` covers unchanged default logits, immediate
 closer eligibility, exact explicit suppression with unchanged survivor
-probabilities, invalid IDs, caller aliases, leading-window expiration, and both
-engine entry points' absence of automatic injection.
+probabilities, invalid IDs, caller aliases, leading-window expiration, rank1/2/3
+and float32/bfloat16 preservation, and both engine entry points' absence of
+automatic injection.
 
 `BlockDiffusionEOSContractFocusedTests` uses a tiny constant-logit CPU fixture
 through the real `BlockDiffusionTokenIterator`. It covers native EOS in the first
@@ -65,9 +68,9 @@ Pending: coordinated focused-test build/run, review and normal PR/CI/merge flow,
 then consumer-pin and real-model/UI qualification where appropriate. Source
 checks and synthetic fixtures cannot qualify every model family's behavior.
 
-Separate source finding: `DeepseekV4ChatEncoder.swift` describes its DSV4-0731
-Low/High/Max effort prefaces as enforcement prose, including a deliberate
-deviation from the official Low rail. Those prefaces are unchanged in this
-bounded decode-mask patch and require their own native-template contract audit.
-Removing the floor does not establish that the remaining DSV4 prompt policy is
-fully compliant.
+Separate source finding, subsequently verified against the official0731 encoder:
+Low's native prefix is empty; the runtime deliberately adds Low enforcement
+prose. High/Max prose is part of the native model contract and must be preserved.
+The Low deviation is unchanged in this bounded decode-mask patch and requires
+a separate correction; removing the floor does not establish that the remaining
+DSV4 prompt policy is fully compliant.
