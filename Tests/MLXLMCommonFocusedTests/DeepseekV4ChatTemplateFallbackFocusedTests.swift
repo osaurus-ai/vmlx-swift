@@ -1083,8 +1083,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
-    @Test("Gemma4 fallback grounds preserving-newlines required tool value")
-    func gemma4FallbackGroundsPreservingNewlinesRequiredToolValue() throws {
+    @Test("Gemma4 fallback preserves the native required-tool prompt and exact newlines")
+    func gemma4FallbackPreservesNativeRequiredToolPromptAndNewlines() throws {
         let context: [String: any Sendable] = [
             "messages": [
                 [
@@ -1107,19 +1107,22 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ] {
             let rendered = try Template(templateSource).renderDSV4(context)
 
-            #expect(rendered.contains("Required call shape for the current request:"))
-            // `a87d3012` ("Fix Gemma4 required tool multiline prompt") removed the
-            // `replace("\n", "\\n")` from `exact_escaped` AND the paired "Do not replace \n with a
-            // physical newline…" instruction: the grounded value is now carried through with REAL
-            // newlines rather than escape sequences the model then had to un-escape. Backslashes
-            // and tabs are still escaped. Assert the shipped shape.
-            #expect(
-                rendered.contains(
-                    "<|tool_call>call:line_count{text:<|\"|>alpha\nbeta\ngamma<|\"|>}<tool_call|>"))
-            #expect(!rendered.contains(#"Do not replace \n with a physical newline"#))
-            // The grounded value must still be exact — no stray space after a line break.
-            #expect(!rendered.contains("alpha\nbeta\n gamma"))
-            #expect(rendered.hasSuffix("<|turn>model\n"))
+            // Commit2beb053c6 removed synthetic tool/history hints. The old
+            // test still required those deleted instructions. Pin the complete
+            // native prompt instead of restoring a behavior-forcing directive.
+            let expected = #"""
+                <bos><|turn>system
+                <|tool>declaration:line_count{description:<|"|>Count newline-separated text lines.<|"|>,parameters:{text:{type:<|"|>string<|"|>}},required:["text"]}<tool|><turn|>
+                <|turn>user
+                Use the line_count tool on exactly this text, preserving newlines:
+                alpha
+                beta
+                gamma<turn|>
+                <|turn>model
+                """# + "\n"
+            #expect(rendered == expected)
+            #expect(!rendered.contains("Required call shape for the current request:"))
+            #expect(!rendered.contains("<|tool_call>call:line_count"))
         }
     }
 
