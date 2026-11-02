@@ -719,6 +719,10 @@ extension MiniMaxM3Model: DSparkSpeculativeModel {
 
     public var dsparkLadderTop: Int? { attachedHead.map { MiniMaxM3DSpark.ladderTop(block: $0.config.blockSize) } }
 
+    public var dsparkWidthCostPerRow: Double? {
+        attachedHead != nil && DSparkPricedWidth.enabledByEnvironment ? DSparkPricedWidth.defaultCostPerRow : nil
+    }
+
     public var dsparkPinnedWidth: Int? {
         guard attachedHead != nil, let width = MiniMaxM3DSpark.pinnedWidth else { return nil }
         NSLog("[MiniMax-M3 DSpark] VMLX_DSPARK_WIDTH=\(width) pins every step's width (diagnostic lever)")

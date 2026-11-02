@@ -2694,7 +2694,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             dspark = DSparkDecoder(
                 session: session, blockSize: blockSize, stopTokenIDs: stopTokenIDs,
                 sampling: DSparkSampling(parameters: parameters),
-                ladderTop: target.dsparkLadderTop, pinnedWidth: target.dsparkPinnedWidth)
+                ladderTop: target.dsparkLadderTop, pinnedWidth: target.dsparkPinnedWidth,
+                widthCostPerRow: target.dsparkWidthCostPerRow)
             dsparkStartOffset = cache.map(\.offset).max() ?? 0
             return nil
         }()
