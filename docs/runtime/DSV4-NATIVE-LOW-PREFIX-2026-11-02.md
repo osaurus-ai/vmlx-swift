@@ -1,6 +1,6 @@
 # Restore the native DSV4-0731 Low effort prefix
 
-Status: source prepared; syntax/diff checks passed; focused execution pending.
+Status: root-reviewed; syntax/diff checks and the combined98-test/eight-suite run pass.
 This follows the automatic reasoning-floor/diffusion-mask correction. No real
 model inference, consumer deployment, release, or speed claim is included.
 
@@ -36,7 +36,8 @@ this patch. The separately recorded fallback risk must not be confused with the
 current Osaurus JANG path, which reads the bundle's declared High default and
 passes High75 through the LLM/VLM context. No capability ladder is removed.
 
-Remaining: focused encoder/policy/fallback/agent-loop tests, root review and
-normal PR/CI/merge, consumer pin/build checks, and app composer/agent-editor
+Completed: encoder/policy/fallback/agent-loop tests, including full byte-equality
+fixtures and growing tool transcripts. Remaining: normal PR/CI/merge, consumer
+pin/build checks, and app composer/agent-editor
 multi-turn/tool qualification. Source and synthetic template tests do not prove
 real-model quality, speed, or cache behavior.
