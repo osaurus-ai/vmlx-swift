@@ -481,9 +481,8 @@ struct DeepseekV4AgentLoopBoundaryTests {
         let low = try render("low")
         let high = try render("high")
 
-        // Every effort rail (including the enforced low preface) injects at
-        // position 0, so low vs high diverges immediately after the shared
-        // BOS + "Reasoning Effort: " stem (39 characters).
+        // Low adds no effort prefix; native High prepends its text immediately
+        // after BOS, so changing effort invalidates the transcript from there.
         #expect(low != high, "reasoning effort had no effect on the prompt at all")
         let shared = zip(low, high).prefix { $0 == $1 }.count
         #expect(

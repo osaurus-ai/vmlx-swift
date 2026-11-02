@@ -79,9 +79,10 @@ location before running tests; no production shader or precision was changed.
 Pending: normal PR/CI/merge, consumer pin and appropriate real-model/UI checks.
 Source checks and synthetic fixtures cannot qualify every model family's behavior.
 
-Separate source finding, subsequently verified against the official0731 encoder:
+Separate source finding, subsequently verified against the official 0731 encoder:
 Low's native prefix is empty; the runtime deliberately adds Low enforcement
 prose. High/Max prose is part of the native model contract and must be preserved.
-The Low deviation is unchanged in this bounded decode-mask patch and requires
-a separate correction; removing the floor does not establish that the remaining
-DSV4 prompt policy is fully compliant.
+The separate Low-prefix follow-up restores the native empty string in the Swift
+encoder and embedded Jinja fallback; see
+`DSV4-NATIVE-LOW-PREFIX-2026-11-02.md`. Neither source correction alone establishes
+full model-family runtime qualification.

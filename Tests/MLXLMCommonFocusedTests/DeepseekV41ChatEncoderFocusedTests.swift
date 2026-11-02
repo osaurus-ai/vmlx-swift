@@ -118,14 +118,13 @@ struct DeepseekV41ChatEncoderFocusedTests {
 
     // MARK: - DSV4-0731 isolation
 
-    @Test("default encoder keeps the 0731 text prefaces and never emits the System token")
+    @Test("default encoder keeps native 0731 Low empty and High/Max text without the System token")
     func default0731Unchanged() throws {
         let enc = DeepseekV4ChatEncoder()
         #expect(enc.family == .deepseekV4)
         let msgs = [Msg(role: .system, content: "You are helpful."), Msg(role: .user, content: "Hi")]
         let low = enc.encode(messages: msgs)
-        #expect(low == DeepseekV4Tokens.bos + DeepseekV4ChatEncoder.reasoningEffortLowPreface
-            + "You are helpful." + DeepseekV4Tokens.user + "Hi"
+        #expect(low == DeepseekV4Tokens.bos + "You are helpful." + DeepseekV4Tokens.user + "Hi"
             + DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart)
         #expect(enc.encode(messages: msgs, reasoningEffort: .high)
             .contains(DeepseekV4ChatEncoder.reasoningEffortHighPreface))
@@ -137,7 +136,8 @@ struct DeepseekV41ChatEncoderFocusedTests {
             messages: [["role": "system", "content": "S"], ["role": "user", "content": "Hi"]],
             tools: nil, additionalContext: ["reasoning_effort": "xhigh"], addGenerationPrompt: true)
         #expect(!adapted.contains("\u{FF5C}System\u{FF5C}"))
-        #expect(adapted.contains(DeepseekV4ChatEncoder.reasoningEffortLowPreface))
+        #expect(adapted == DeepseekV4Tokens.bos + "S" + DeepseekV4Tokens.user + "Hi"
+            + DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart)
         let tools = DeepseekV4ChatEncoder.renderTools([Self.weatherTool])
         #expect(tools.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
         #expect(!tools.contains("\u{FF5C}DSML\u{FF5C} calls"))

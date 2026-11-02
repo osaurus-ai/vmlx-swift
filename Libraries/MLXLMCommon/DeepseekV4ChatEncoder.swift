@@ -189,24 +189,10 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// explicit effort (or numeric budget) to get the reference default.
     public static let deepseekV41DefaultReasoningBudget = 50
 
-    // `high`/`max` are verbatim 0731 `REASONING_EFFORT_PROMPTS` values —
-    // part of the model's prompt contract; never reword or interchange them.
-    //
-    // The official contract defines `low` as the EMPTY STRING: no directive
-    // is injected and the model self-modulates think depth, so hard first
-    // prompts still produce long reasoning on the "Low" rail. That is
-    // unacceptable for surfaces whose default promises low reasoning, so
-    // vmlx deliberately deviates: `.low` (and absent effort, which the
-    // official DEFAULT_REASONING_EFFORT maps to low) injects a style-matched
-    // enforcement preface. nil ≡ .low by construction so warmup and send
-    // renders can never diverge.
-    static let reasoningEffortLowPreface = """
-        Reasoning Effort: Low — minimal thinking only.
-        Begin with a very short thinking block: one or two sentences confirming your approach, never more.
-        Then close your thinking and give only the final answer — clean and direct, without restating your reasoning.
-
-
-        """
+    // Official 0731 REASONING_EFFORT_PROMPTS, revision
+    // b9f75fec23eda3cdf0b102611d841d06c37ef1f3. Low is the empty
+    // native baseline; High/Max are model-owned prompt contract text.
+    static let reasoningEffortLowPreface = ""
 
     static let reasoningEffortHighPreface = """
         Reasoning Effort: Absolute maximum with no shortcuts permitted.
@@ -231,9 +217,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
     ///   - messages: conversation history, OpenAI-style roles + fields.
     ///   - thinkingMode: `.chat` or `.thinking` (DSV4 has these two).
     ///   - reasoningEffort: nil ≡ `.low` / `.high` / `.max`. Only applies
-    ///     in `.thinking` mode; every rail injects its preface at index 0
-    ///     (low is a deliberate vmlx enforcement extension — official
-    ///     contract leaves it empty).
+    ///     in `.thinking` mode at index 0. Low adds no prefix; High/Max
+    ///     render the model's native effort text.
     ///   - dropEarlierReasoning: strip `reasoning_content` from prior
     ///     assistant turns. Forced `false` whenever any message still
     ///     carries `tools` (mid-trajectory agent turns need full CoT).
@@ -370,7 +355,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let explicitlyEnabled = additionalContext?["enable_thinking"] as? Bool
         // DSV4's bundle contract (jang_config chat.reasoning) declares
         // default_mode="thinking" with default_effort="low". Absent controls
-        // therefore mean the thinking rail on the low preface (nil ≡ .low
+        // therefore mean the thinking rail with no effort prefix (nil ≡ .low
         // in the encoder) — the same default `encode(thinkingMode:)` uses.
         // Only an explicit enable_thinking=false selects the chat rail;
         // defaulting the absent case to chat rendered a closed </think>
@@ -649,9 +634,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
             out += effortPrefix
         } else if index == 0 && thinkingMode == .thinking {
             // DSV4-0731: reasoning-effort preface only at index 0 in thinking
-            // mode. Every rail injects its preface — including low (nil ≡
-            // .low), which the official contract leaves empty; see
-            // reasoningEffortLowPreface.
+            // mode. Low (including absent effort) adds no prefix, matching
+            // the native empty-string baseline; High/Max keep native text.
             switch reasoningEffort ?? .low {
             case .low:
                 out += Self.reasoningEffortLowPreface
