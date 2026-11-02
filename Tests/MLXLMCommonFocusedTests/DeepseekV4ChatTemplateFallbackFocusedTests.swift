@@ -77,7 +77,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let high = try template.renderDSV4(highContext)
         let max = try template.renderDSV4(maxContext)
 
-        #expect(low.contains("Reasoning Effort: Low — minimal thinking only."))
+        #expect(low == DeepseekV4Tokens.bos + DeepseekV4Tokens.user
+            + "Prove max reasoning reaches the template."
+            + DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart)
         #expect(!low.contains("Reasoning Effort: Absolute"))
         #expect(!low.contains("Reasoning Effort: Beyond"))
         #expect(high.contains("Reasoning Effort: Absolute maximum with no shortcuts permitted."))
@@ -87,6 +89,82 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect([low, high, max].allSatisfy {
             $0.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think>")
         })
+    }
+
+    // Independent fixture from the official 0731 encoder, pinned revision
+    // b9f75fec23eda3cdf0b102611d841d06c37ef1f3, lines59–75,250–255:
+    // https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/b9f75fec23eda3cdf0b102611d841d06c37ef1f3/encoding/encoding_dsv4.py
+    @Test("Swift and both Jinja fallbacks match the native 0731 effort bytes")
+    func native0731EffortFixtureAcrossEncoders() throws {
+        let high = """
+            Reasoning Effort: Absolute maximum with no shortcuts permitted.
+            You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
+            Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.
+
+
+            """
+        let max = """
+            Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.
+            You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.
+            Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.
+
+
+            """
+        let cases: [(String?, DeepseekV4ReasoningEffort?, String)] = [
+            (nil, nil, ""), ("low", .low, ""), ("high", .high, high), ("max", .max, max),
+        ]
+        let templates = try [
+            Template(ChatTemplateFallbacks.dsv4Minimal),
+            Template(repositoryFile("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")),
+        ]
+        for (rawEffort, effort, nativePrefix) in cases {
+            for thinking in [true, false] {
+                let mode: DeepseekV4ThinkingMode = thinking ? .thinking : .chat
+                let expected = DeepseekV4Tokens.bos + (thinking ? nativePrefix : "")
+                    + DeepseekV4Tokens.user + "Hi" + DeepseekV4Tokens.assistant
+                    + (thinking ? DeepseekV4Tokens.thinkStart : DeepseekV4Tokens.thinkEnd)
+                let swift = DeepseekV4ChatEncoder().encode(
+                    messages: [.init(role: .user, content: "Hi")],
+                    thinkingMode: mode, reasoningEffort: effort)
+                #expect(swift == expected)
+                var context: [String: any Sendable] = [
+                    "messages": [["role": "user", "content": "Hi"]],
+                    "add_generation_prompt": true,
+                    "enable_thinking": thinking,
+                ]
+                if let rawEffort { context["reasoning_effort"] = rawEffort }
+                for template in templates {
+                    #expect(try template.renderDSV4(context) == expected)
+                }
+            }
+        }
+
+        // Tool history keeps its native reasoning and DSML envelope. Changing
+        // effort may prepend the native first-message text, never rewrite it
+        // onto every subsequent user/tool turn.
+        let messages: [DeepseekV4ChatEncoder.Message] = [
+            .init(role: .system, content: "Use tools.", tools: [[
+                "type": "function",
+                "function": ["name": "lookup", "parameters": ["type": "object"]] as [String: any Sendable],
+            ]]),
+            .init(role: .user, content: "Look it up."),
+            .init(role: .assistant, content: "", reasoningContent: "Plan lookup.",
+                toolCalls: [.init(id: "c1", name: "lookup", arguments: "{}")]),
+            .init(role: .tool, content: "result42", toolCallId: "c1"),
+            .init(role: .user, content: "Explain the result."),
+        ]
+        let encoder = DeepseekV4ChatEncoder()
+        let low = encoder.encode(messages: messages, reasoningEffort: .low)
+        #expect(low == encoder.encode(messages: messages))
+        #expect(!low.contains("Reasoning Effort:"))
+        #expect(low.contains("Plan lookup."))
+        #expect(low.contains("result42"))
+        #expect(low.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
+        let body = String(low.dropFirst(DeepseekV4Tokens.bos.count))
+        for (_, effort, nativePrefix) in cases where !nativePrefix.isEmpty {
+            #expect(encoder.encode(messages: messages, reasoningEffort: effort)
+                == DeepseekV4Tokens.bos + nativePrefix + body)
+        }
     }
 
     @Test("top-level OpenAI tools render in DSV4 DSML schema block")
@@ -1005,8 +1083,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         #expect(rendered.hasSuffix("<|im_start|>assistant\n"))
     }
 
-    @Test("Gemma4 fallback grounds preserving-newlines required tool value")
-    func gemma4FallbackGroundsPreservingNewlinesRequiredToolValue() throws {
+    @Test("Gemma4 fallback preserves the native required-tool prompt and exact newlines")
+    func gemma4FallbackPreservesNativeRequiredToolPromptAndNewlines() throws {
         let context: [String: any Sendable] = [
             "messages": [
                 [
@@ -1029,19 +1107,22 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         ] {
             let rendered = try Template(templateSource).renderDSV4(context)
 
-            #expect(rendered.contains("Required call shape for the current request:"))
-            // `a87d3012` ("Fix Gemma4 required tool multiline prompt") removed the
-            // `replace("\n", "\\n")` from `exact_escaped` AND the paired "Do not replace \n with a
-            // physical newline…" instruction: the grounded value is now carried through with REAL
-            // newlines rather than escape sequences the model then had to un-escape. Backslashes
-            // and tabs are still escaped. Assert the shipped shape.
-            #expect(
-                rendered.contains(
-                    "<|tool_call>call:line_count{text:<|\"|>alpha\nbeta\ngamma<|\"|>}<tool_call|>"))
-            #expect(!rendered.contains(#"Do not replace \n with a physical newline"#))
-            // The grounded value must still be exact — no stray space after a line break.
-            #expect(!rendered.contains("alpha\nbeta\n gamma"))
-            #expect(rendered.hasSuffix("<|turn>model\n"))
+            // Commit2beb053c6 removed synthetic tool/history hints. The old
+            // test still required those deleted instructions. Pin the complete
+            // native prompt instead of restoring a behavior-forcing directive.
+            let expected = #"""
+                <bos><|turn>system
+                <|tool>declaration:line_count{description:<|"|>Count newline-separated text lines.<|"|>,parameters:{text:{type:<|"|>string<|"|>}},required:["text"]}<tool|><turn|>
+                <|turn>user
+                Use the line_count tool on exactly this text, preserving newlines:
+                alpha
+                beta
+                gamma<turn|>
+                <|turn>model
+                """# + "\n"
+            #expect(rendered == expected)
+            #expect(!rendered.contains("Required call shape for the current request:"))
+            #expect(!rendered.contains("<|tool_call>call:line_count"))
         }
     }
 

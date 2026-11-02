@@ -56,7 +56,7 @@ struct DeepseekV4ChatEncoderTests {
         #expect(!prompt.contains("Reasoning Effort: Absolute maximum"))
     }
 
-    @Test("reasoning_effort=high uses its distinct prefix; low and nil enforce the low preface")
+    @Test("reasoning_effort=high uses native text; low and nil use the empty native prefix")
     func reasoningEffortHighLowAndDefaultPrefixes() {
         let encoder = DeepseekV4ChatEncoder()
         let promptHigh = encoder.encode(
@@ -73,23 +73,23 @@ struct DeepseekV4ChatEncoderTests {
         #expect(promptHigh.contains("Reasoning Effort: Absolute maximum"))
         #expect(!promptHigh.contains("Reasoning Effort: Beyond maximum"))
         #expect(!promptHigh.contains("Reasoning Effort: Low"))
-        #expect(promptLow.contains("Reasoning Effort: Low"),
-            "low must inject the enforcement preface — official empty-string low left think depth to the model")
+        #expect(promptLow == DeepseekV4Tokens.bos + DeepseekV4Tokens.user + "hi"
+            + DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart)
         #expect(promptNil == promptLow,
             "absent effort is the official low default and must render byte-identically to explicit low")
         #expect(!promptLow.contains("Reasoning Effort: Absolute"))
         #expect(!promptLow.contains("Reasoning Effort: Beyond"))
     }
 
-    @Test("low preface sits at prompt index 0 (right after BOS) and never on the chat rail")
-    func lowPrefacePlacementAndChatRailClean() {
+    @Test("native low adds no preface in thinking or chat mode")
+    func lowHasNoPrefaceAndChatRailStaysClosed() {
         let encoder = DeepseekV4ChatEncoder()
         let thinking = encoder.encode(
             messages: [Msg(role: .user, content: "hi")],
             thinkingMode: .thinking,
             reasoningEffort: .low)
-        #expect(thinking.hasPrefix(DeepseekV4Tokens.bos + "Reasoning Effort: Low"),
-            "low preface must be the first bytes after <｜begin▁of▁sentence｜>")
+        #expect(thinking == DeepseekV4Tokens.bos + DeepseekV4Tokens.user + "hi"
+            + DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart)
         let chat = encoder.encode(
             messages: [Msg(role: .user, content: "hi")],
             thinkingMode: .chat,

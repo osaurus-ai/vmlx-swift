@@ -555,12 +555,6 @@ public actor BatchEngine {
             tokenizer: context.tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.submit")
-        if let floor = MinimumReasoningFloor.armIfNeeded(
-            input: input, tokenizer: context.tokenizer, promptTail: promptTail)
-        {
-            parameters.initialSuppressTokens = [floor.closeTokenID]
-            parameters.initialSuppressCount = floor.tokenCount
-        }
         // Upper bound. Armed by the process-global VMLX_REASONING_BUDGET env
         // (which wins) or a caller's per-request
         // `requestedReasoningBudgetTokens`; inert when neither asks, so this
@@ -696,12 +690,6 @@ public actor BatchEngine {
             tokenizer: tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.generate")
-        if let floor = MinimumReasoningFloor.armIfNeeded(
-            input: input, tokenizer: tokenizer, promptTail: promptTail)
-        {
-            parameters.initialSuppressTokens = [floor.closeTokenID]
-            parameters.initialSuppressCount = floor.tokenCount
-        }
         // `generate` is the path the app's single-request chat actually takes
         // (via `startSoloFastPath`), so arming only in `submit` left the
         // ceiling inert for every GUI turn — verified live: env set on the
