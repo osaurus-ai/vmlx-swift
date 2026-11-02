@@ -226,17 +226,15 @@ public struct GenerateParameters: Sendable {
     /// `generation_config.json`'s `suppress_tokens` field.
     public var suppressTokens: [Int]
 
-    /// Token ids masked only while the first ``initialSuppressCount`` sampled
-    /// tokens are produced; the ban lifts afterward. Engine-internal: armed by
-    /// `MinimumReasoningFloor` on the DSV4 enforced-low thinking rail so the
-    /// think block cannot close before a short visible reasoning floor lands.
-    /// Unlike ``suppressTokens`` this is a leading window, not a
-    /// whole-generation ban, and it can only ever DELAY a token — it never
-    /// forces or biases toward one.
+    /// Explicit caller-only token suppression during a leading sampling window.
+    /// The engine never enables this from a model family, prompt, or reasoning effort.
+    /// Retained for source compatibility; prefer the bundle's native generation controls.
+    @available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
     public var initialSuppressTokens: [Int] = []
 
-    /// Number of leading sampled tokens for which ``initialSuppressTokens``
-    /// stay masked. Zero disables the window.
+    /// Number of leading sampled tokens for the explicit suppression window.
+    /// Zero (the default) leaves logits untouched.
+    @available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
     public var initialSuppressCount: Int = 0
 
     /// Explicit ceiling on reasoning-block length, in sampled tokens. `nil`
@@ -550,10 +548,8 @@ public struct GenerateParameters: Sendable {
         (repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1)
             && (presencePenalty == nil || presencePenalty == 0)
             && (frequencyPenalty == nil || frequencyPenalty == 0)
-            // The minimum reasoning floor masks logits per sampled token;
-            // drafted MTP tokens would bypass it, so fall back to AR. A
-            // reasoning budget is the same story: a drafted token could sail
-            // past the ceiling unchecked.
+            // Explicit leading suppression and reasoning budgets require
+            // per-token processing that drafted MTP tokens would bypass.
             && initialSuppressTokens.isEmpty
             && reasoningBudgetTokens == nil
             // The requested form resolves into `reasoningBudgetTokens` only
@@ -1280,43 +1276,26 @@ public struct SuppressTokensProcessor: LogitProcessor {
         let vocabSize = logits.dim(-1)
         let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
         guard !valid.isEmpty else { return logits }
-        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        return logits
+        // MLXArray is reference-typed: subscript assignment through a second
+        // binding would also rewrite the caller's logits and any aliases.
+        let ids = MLXArray(Int32(0) ..< Int32(vocabSize))
+        let mask = valid.reduce(MLXArray(false)) { $0 .|| (ids .== MLXArray(Int32($1))) }
+        return MLX.where(mask, negInf, logits)
     }
 
     mutating public func didSample(token: MLXArray) {}
 }
 
-/// Masks a fixed token set for only the first N sampled tokens, then
-/// releases the ban. Powers the DSV4 enforced-low minimum reasoning floor
-/// (see `MinimumReasoningFloor`): the enforced-low thinking rail must open
-/// with a short visible think block, so `</think>` is unavailable for the
-/// first few sampled tokens and the model closes naturally afterward.
-///
-/// This is the inverse of the removed hidden "reasoning close bias" (which
-/// capped thinking by forcing the close after a budget): a leading-window
-/// mask can only DELAY a token. It never forces, biases toward, or injects
-/// one — see `NoHiddenReasoningCloseBiasFocusedTests`.
-///
-/// Logit processors run before the sampler's `top_p`, so banning a token that
-/// holds nearly all the probability mass renormalizes a nearly flat residual
-/// and nucleus sampling then admits the whole vocabulary tail — live DSV4 runs
-/// turned into token soup from the first reasoning token. The window therefore
-/// also drops survivors that fall below ``survivorRelativeFloor`` of the best
-/// remaining token, which keeps the nucleus as narrow as it was before the ban.
+/// Explicit caller-requested suppression for the first N sampled tokens.
+/// Retained for source compatibility. No model family or prompt enables it
+/// automatically, and it applies no probability cutoff or other sampler change.
+@available(*, deprecated, message: "Explicit caller-only leading suppression; never enabled automatically")
 public struct InitialSuppressTokensProcessor: LogitProcessor {
-    /// Minimum probability a survivor may hold relative to the best remaining
-    /// token while the ban is active. Standard `min_p` territory.
-    static let survivorRelativeFloor: Float = 0.05
-
-    private let tokens: [Int]
+    private let suppression: SuppressTokensProcessor
     private var remaining: Int
-    private let negInf = MLXArray(-Float.infinity)
-    private let trace = ProcessInfo.processInfo.environment[
-        "VMLX_REASONING_FLOOR_TRACE"] == "1"
 
     public init(tokens: [Int], count: Int) {
-        self.tokens = Array(Set(tokens)).sorted()
+        self.suppression = SuppressTokensProcessor(tokens: tokens)
         self.remaining = max(0, count)
     }
 
@@ -1324,33 +1303,11 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
 
     public func process(logits: MLXArray) -> MLXArray {
         guard remaining > 0 else { return logits }
-        let vocabSize = logits.dim(-1)
-        let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
-        guard !valid.isEmpty else { return logits }
-        if trace {
-            let flat = logits.reshaped(-1)
-            let top = argMax(flat).item(Int.self)
-            let probs = softmax(flat.asType(.float32), axis: -1)
-            let bannedMass = valid.map { probs[$0].item(Float.self) }.reduce(0, +)
-            let line =
-                "[vmlx][reasoning-floor] step remaining=\(remaining) preMaskTop=\(top) "
-                + "bannedMass=\(bannedMass) topMass=\(probs[top].item(Float.self))\n"
-            RuntimeDiagnostics.write(Data(line.utf8))
-        }
-        logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        let bestSurvivor = MLX.max(logits, axis: -1, keepDims: true)
-        let cutoff = bestSurvivor + Float(log(Self.survivorRelativeFloor))
-        return MLX.where(logits .< cutoff, negInf, logits)
+        return suppression.process(logits: logits)
     }
 
     mutating public func didSample(token: MLXArray) {
-        guard remaining > 0 else { return }
-        if trace {
-            let line =
-                "[vmlx][reasoning-floor] sampled=\(token.reshaped(-1)[0].item(Int.self))\n"
-            RuntimeDiagnostics.write(Data(line.utf8))
-        }
-        remaining -= 1
+        remaining = max(0, remaining - 1)
     }
 }
 

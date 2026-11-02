@@ -142,13 +142,4 @@ struct DeepseekV41ChatEncoderFocusedTests {
         #expect(tools.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"))
         #expect(!tools.contains("\u{FF5C}DSML\u{FF5C} calls"))
     }
-
-    @Test("reasoning floor arms on 0731 prefaces and never on the V4.1 numeric head")
-    func floorGating() {
-        let tail = DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart
-        let v4Head = DeepseekV4Tokens.bos + DeepseekV4ChatEncoder.reasoningEffortLowPreface
-        #expect(MinimumReasoningFloor.railRequiresFloor(promptHead: v4Head, promptTail: tail))
-        let v41Head = Self.v41.encode(messages: [Msg(role: .user, content: "Hi")])
-        #expect(!MinimumReasoningFloor.railRequiresFloor(promptHead: v41Head, promptTail: tail))
-    }
 }
