@@ -912,11 +912,17 @@ struct DeepseekV41VerifyRowBundleTests {
                 case .logits(let out):
                     eval(out.logits)
                 }
-                let checkpoint = try #require(SpeculativeCacheListCheckpoint(cache))
+                // A restore hands the checkpoint's arrays back to the cache, and the next forward can rebind them, so
+                // a checkpoint serves one restore (as in the dSpark step): take a fresh one after each.
+                var checkpoint = try #require(SpeculativeCacheListCheckpoint(cache))
+                func restore() {
+                    checkpoint.restore()
+                    checkpoint = SpeculativeCacheListCheckpoint(cache)!
+                }
                 func forward(_ x: MLXArray) -> MLXArray {
                     let l = model(LMInput.Text(tokens: x), cache: cache, state: nil).logits
                     eval(l)
-                    checkpoint.restore()
+                    restore()
                     return l
                 }
                 func ar(_ x: MLXArray) -> MLXArray {
@@ -925,7 +931,7 @@ struct DeepseekV41VerifyRowBundleTests {
                         eval(l)
                         return l
                     }
-                    checkpoint.restore()
+                    restore()
                     return concatenated(rows, axis: 1)
                 }
                 /// (top-1 agreement count, mean KL(reference || row), max |logit difference|).

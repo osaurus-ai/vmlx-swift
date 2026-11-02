@@ -74,12 +74,14 @@ func runDSV41RowParts(modelPath: String) async throws {
 
     for rows in rowsList {
         let ids = MLXArray((0 ..< rows).map { Int32(100 + 37 * $0) }).reshaped(1, rows)
-        guard let checkpoint = SpeculativeCacheListCheckpoint(cache) else { break }
+        // A restore hands the checkpoint's arrays back to the cache, so each repetition takes a fresh one.
+        guard var checkpoint = SpeculativeCacheListCheckpoint(cache) else { break }
         report("forward", rows, median {
             let capturing = session?.beginVerifyCapture(cache: cache) ?? false
             eval(model(LMInput.Text(tokens: ids), cache: cache, state: nil).logits)
             if capturing { session?.endVerifyCapture(cache: cache) }
             checkpoint.restore()
+            checkpoint = SpeculativeCacheListCheckpoint(cache)!
         })
         for name in ["wq_a", "wq_b", "wkv", "wo_b"] {
             let mods = (0 ..< layers).compactMap { modules["model.layers.\($0).self_attn.\(name)"] as? UnaryLayer }
