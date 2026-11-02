@@ -622,15 +622,22 @@ struct DeepseekV41DecodeFusionFocusedTests {
         }
     }
 
+    /// The verify-row kernels stay off here: each of their rows equals its own 1-row result, which the batched
+    /// stock matmuls (the "off" side at 4 and 7 rows) do not. `DeepseekV41VerifyRowLayerTests` covers them.
     @Test("decode and verify through synthetic V4.1 layers: all kernels on == all kernels off, bitwise")
     func layerStackParity() throws {
         guard let c = DSV41Synth.config else { return }
         try Device.withDefaultDevice(.gpu) {
             let flags = (DeepseekV41RouterGEMV.enabled, DeepseekV41FusedMoE.enabled, DeepseekV41HCStage.enabled)
+            let rowFlags = (DeepseekV41HCRows.enabled, DeepseekV41RouterGEMV.rowsEnabled, DeepseekV41RouteRows.enabled)
             defer {
                 DeepseekV41RouterGEMV.enabled = flags.0; DeepseekV41FusedMoE.enabled = flags.1
                 DeepseekV41HCStage.enabled = flags.2
+                DeepseekV41HCRows.enabled = rowFlags.0; DeepseekV41RouterGEMV.rowsEnabled = rowFlags.1
+                DeepseekV41RouteRows.enabled = rowFlags.2
             }
+            DeepseekV41HCRows.enabled = false; DeepseekV41RouterGEMV.rowsEnabled = false
+            DeepseekV41RouteRows.enabled = false
             func set(_ on: Bool) {
                 DeepseekV41RouterGEMV.enabled = on; DeepseekV41FusedMoE.enabled = on; DeepseekV41HCStage.enabled = on
             }

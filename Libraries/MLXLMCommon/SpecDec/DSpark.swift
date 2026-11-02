@@ -49,6 +49,9 @@ public protocol DSparkSpeculativeModel: AnyObject {
     var dsparkLadderTop: Int? { get }
     /// A width pinned for every step by a diagnostic env lever; nil (the default) lets the controller choose.
     var dsparkPinnedWidth: Int? { get }
+    /// What one more verify row costs, in decode steps, when this model's Adaptive width is priced
+    /// (`DSparkPricedWidth`); nil (the default) keeps the acceptance rule.
+    var dsparkWidthCostPerRow: Double? { get }
     /// Load the head from `directory` once (later calls are no-ops). Returns false when this model
     /// cannot use a dSpark head (for example DSV4-0731).
     func attachDSparkDraft(directory: URL) throws -> Bool
@@ -61,6 +64,7 @@ public protocol DSparkSpeculativeModel: AnyObject {
 extension DSparkSpeculativeModel {
     public var dsparkLadderTop: Int? { dsparkBlockSize }
     public var dsparkPinnedWidth: Int? { nil }
+    public var dsparkWidthCostPerRow: Double? { nil }
 }
 
 /// Per-request drafter state (the per-stage attention windows). Not shared between requests.
@@ -405,6 +409,8 @@ public struct DSparkDecoder {
     public private(set) var planner: DSparkWidthPlanner?
     /// The planner's drafts for the step ``begin(remaining:)`` opened (nil until the planner has a measured round).
     private var plannedDrafts: Int?
+    /// Priced Adaptive width (`DSparkPricedWidth`); nil = the acceptance rule. The measured planner takes precedence.
+    public private(set) var pricedWidth: DSparkPricedWidth?
     let clock: () -> Double
     /// The step in flight; `timed` is false when it ran a forward width this process had not run yet.
     private var last: (mode: DSparkGovernor.Mode, emitted: Int, start: Double, timed: Bool, drafts: Int)?
@@ -417,6 +423,7 @@ public struct DSparkDecoder {
         governor: DSparkGovernor = DSparkGovernor(),
         ladderTop: Int? = nil, pinnedWidth: Int? = nil,
         measuredWidth: Bool = DSparkWidthPlanner.enabledByEnvironment,
+        widthCostPerRow: Double? = nil,
         clock: @escaping () -> Double = { Date.timeIntervalSinceReferenceDate }
     ) {
         precondition(blockSize >= 1, "dSpark block size must be at least 1")
@@ -431,12 +438,16 @@ public struct DSparkDecoder {
         self.governor = governor
         self.clock = clock
         planner = measuredWidth ? DSparkWidthPlanner(ladderTop: self.ladderTop) : nil
+        if !measuredWidth, let widthCostPerRow {
+            pricedWidth = DSparkPricedWidth(ladderTop: self.ladderTop, costPerRow: widthCostPerRow)
+        }
     }
 
     /// Current draft width.
     public var width: Int {
         if let pinnedWidth { return Swift.min(pinnedWidth, ladderTop) }
         if planner != nil, let plannedDrafts { return Swift.max(1, Swift.min(ladderTop, plannedDrafts)) }
+        if let pricedWidth { return pricedWidth.width }
         return Swift.max(1, Swift.min(ladderTop, Int((Double(ladderTop) * acceptEMA).rounded())))
     }
 
@@ -538,6 +549,7 @@ public struct DSparkDecoder {
         stats.accepted += k
         acceptEMA = 0.7 * acceptEMA + 0.3 * (Double(k) / Double(Swift.max(1, proposed.count)))
         planner?.observe(drafts: proposed.count, accepted: k)
+        pricedWidth?.observe(drafts: proposed.count, accepted: k)
 
         let fullAccept = k == proposed.count
         // Never commit past a stop token or the budget: the cache must end exactly where ordinary

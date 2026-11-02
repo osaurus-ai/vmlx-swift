@@ -133,3 +133,68 @@ public struct DSparkWidthPlanner: Sendable, Equatable {
 extension Int {
     fileprivate func clamped(_ lo: Int, _ hi: Int) -> Int { Swift.max(lo, Swift.min(hi, self)) }
 }
+
+/// Adaptive width priced per verify row: vMLX Python's default rule for a laddered drafter (`dspark/generate.py`
+/// `ARFallback.planned_width` + `choose_width`).
+///
+/// The acceptance rule, W = round(ladderTop x acceptance EMA), charges nothing for a verify row, so a ladder of 14 at
+/// 0.5 acceptance drafts 7. In the Osaurus app on MiniMax-M3.1 that drafted 6.8-8.65 at 0.40-0.59 acceptance, where
+/// MLX Studio on the same machine and sampling drafted 3.9-5.7 at 0.52-0.78.
+///
+/// Here each position keeps a conditional acceptance EMA (prior 0.7, alpha 0.3; a position is observed when every
+/// earlier draft was accepted) and a round drafts the k maximizing E[tokens | k] / (1 + costPerRow x k), with
+/// E[tokens | k] = 1 + sum over j <= k of p_1 ... p_j. Every width up to the ladder top stays reachable, none is capped
+/// or pinned, and the output doesn't depend on it. `VMLX_DSPARK_PRICED_WIDTH=0` keeps the acceptance rule.
+public struct DSparkPricedWidth: Sendable, Equatable {
+    public static let environmentKey = "VMLX_DSPARK_PRICED_WIDTH"
+    /// Python's default when a bundle stamps no `cost_per_row`.
+    public static let defaultCostPerRow = 0.12
+
+    public static var enabledByEnvironment: Bool {
+        let raw = (ProcessInfo.processInfo.environment[environmentKey] ?? "1").trimmingCharacters(in: .whitespaces)
+            .lowercased()
+        return !["0", "false", "off", "no"].contains(raw)
+    }
+
+    public let ladderTop: Int
+    public let costPerRow: Double
+    public let alpha: Double
+    /// p_j for j = 1 ... ladderTop (index j - 1).
+    public private(set) var acceptance: [Double]
+
+    public init(ladderTop: Int, costPerRow: Double = defaultCostPerRow, alpha: Double = 0.3, prior: Double = 0.7) {
+        self.ladderTop = Swift.max(1, ladderTop)
+        self.costPerRow = costPerRow
+        self.alpha = alpha
+        acceptance = Array(repeating: prior, count: Swift.max(1, ladderTop))
+    }
+
+    /// A round drafted `drafts` tokens and `accepted` of them matched: positions 1 ... accepted were accepted, position
+    /// accepted + 1 (when drafted) was rejected, and later positions were not observed.
+    public mutating func observe(drafts: Int, accepted: Int) {
+        guard drafts > 0 else { return }
+        let k = Swift.min(Swift.max(0, accepted), drafts)
+        for j in 0 ..< Swift.min(k + 1, Swift.min(drafts, ladderTop)) {
+            let hit = j < k ? 1.0 : 0.0
+            acceptance[j] += alpha * (hit - acceptance[j])
+        }
+    }
+
+    /// The next round's drafts.
+    public var width: Int { Self.choose(acceptance, ladderTop: ladderTop, costPerRow: costPerRow) }
+
+    /// The first k with the most expected tokens per priced round.
+    public static func choose(_ acceptance: [Double], ladderTop: Int, costPerRow: Double) -> Int {
+        var best = 0.0, bestK = 1, run = 1.0, expected = 1.0
+        for k in stride(from: 1, through: Swift.min(ladderTop, acceptance.count), by: 1) {
+            run *= acceptance[k - 1]
+            expected += run
+            let value = expected / (1 + costPerRow * Double(k))
+            if value > best {
+                best = value
+                bestK = k
+            }
+        }
+        return bestK
+    }
+}

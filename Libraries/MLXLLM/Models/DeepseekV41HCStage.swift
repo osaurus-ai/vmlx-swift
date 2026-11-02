@@ -22,8 +22,8 @@
 // is `col_reduce_small` over the 4 copies; the norm is `rms_looped` at 1024 threads; the expand and the
 // Sinkhorn split are the existing `deepseek_v4_hc_post_decode` / `deepseek_v4_hc_split_sinkhorn` bodies.
 // Every shape is still admitted once per process only after a live bitwise comparison against the stock
-// graph (the first decode step), so a compiler or MLX change can only fall back. Verify rows (2-8) keep the
-// stock graph: MLX runs their mix projection as a GEMM. `VMLX_DSV41_HC_STAGE=0` disables.
+// graph (the first decode step), so a compiler or MLX change can only fall back. Verify rows (2-8) run
+// `DeepseekV41HCRows`, each row computed as it is here. `VMLX_DSV41_HC_STAGE=0` disables both.
 
 import Foundation
 import MLX
@@ -239,7 +239,11 @@ enum DeepseekV41HCStage {
             auto pre_out = pre;
             auto post_out = post;
             auto comb_out = comb;
+            """ + splitBody)
 
+    /// The split after the mixes (`mix`, `epsv` and the output pointers in scope), the statements of
+    /// `deepseek_v4_hc_split_sinkhorn`. Shared with `DeepseekV41HCRows`.
+    static let splitBody = """
             float pre_scale = static_cast<float>(scale[0]);
             float post_scale = static_cast<float>(scale[1]);
             float comb_scale = static_cast<float>(scale[2]);
@@ -318,7 +322,7 @@ enum DeepseekV41HCStage {
             for (int i = 0; i < HC * HC; ++i) {
                 comb_out[i] = c[i];
             }
-            """)
+            """
 
     /// One sublayer's stage outputs: the normed sublayer input, this sublayer's (pre, post, comb), and on
     /// the FFN side the expanded stream it collapsed (`hA`).
@@ -344,7 +348,7 @@ enum DeepseekV41HCStage {
 
     private static let scalarLock = NSLock()
     nonisolated(unsafe) private static var scalars: [Float: MLXArray] = [:]
-    private static func scalar(_ v: Float) -> MLXArray {
+    static func scalar(_ v: Float) -> MLXArray {
         scalarLock.lock(); defer { scalarLock.unlock() }
         if let a = scalars[v] { return a }
         let a = MLXArray([v]); a.eval(); scalars[v] = a

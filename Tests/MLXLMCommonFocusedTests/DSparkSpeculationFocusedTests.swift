@@ -278,6 +278,60 @@ final class DSparkToyLanguageModel: Module, LanguageModel, DSparkSpeculativeMode
     }
 }
 
+/// Expected widths come from running vMLX Python's `choose_width` and `record_acceptance` on these inputs.
+@Suite("dSpark priced width")
+struct DSparkPricedWidthFocusedTests {
+    @Test("the width maximizes expected tokens per priced round, as the Python rule does")
+    func choosesAsPython() {
+        for (p, expected) in [(0.3, 1), (0.5, 2), (0.7, 4), (0.85, 7), (0.95, 14), (1.0, 14)] {
+            let width = DSparkPricedWidth.choose(Array(repeating: p, count: 14), ladderTop: 14, costPerRow: 0.12)
+            #expect(width == expected, "acceptance \(p)")
+        }
+        let tail = Array(repeating: 0.7, count: 10)
+        #expect(DSparkPricedWidth.choose([0.9, 0.8, 0.5, 0.3] + tail, ladderTop: 14, costPerRow: 0.12) == 3)
+        let late = [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.2] + Array(repeating: 0.7, count: 7)
+        #expect(DSparkPricedWidth.choose(late, ladderTop: 14, costPerRow: 0.12) == 6)
+    }
+
+    @Test("a position is observed only when every earlier draft was accepted")
+    func observesAsPython() {
+        var priced = DSparkPricedWidth(ladderTop: 14)
+        priced.observe(drafts: 4, accepted: 4)
+        priced.observe(drafts: 4, accepted: 1)
+        priced.observe(drafts: 4, accepted: 0)
+        let expected = [0.5971, 0.553, 0.79, 0.79, 0.7]
+        for (j, value) in expected.enumerated() {
+            #expect(abs(priced.acceptance[j] - value) < 1e-9, "position \(j + 1)")
+        }
+        #expect(priced.width == 4)
+    }
+
+    @Test("every width stays reachable, and high acceptance reaches the ladder top")
+    func noWidthIsCapped() {
+        var priced = DSparkPricedWidth(ladderTop: 14)
+        #expect(priced.width == 4)
+        for _ in 0 ..< 200 { priced.observe(drafts: priced.width, accepted: priced.width) }
+        #expect(priced.width == 14)
+        for _ in 0 ..< 200 { priced.observe(drafts: priced.width, accepted: 0) }
+        #expect(priced.width == 1)
+    }
+
+    @Test("the decoder uses it only when the model asks; the default stays the acceptance rule")
+    func decoderScope() {
+        func decoder(cost: Double?, measured: Bool = false) -> DSparkDecoder {
+            DSparkDecoder(
+                session: DSparkScriptedDraft(reference: [:], blockSize: 7, vocab: 16, good: { _ in 0 }),
+                blockSize: 7, stopTokenIDs: [], ladderTop: 14, measuredWidth: measured, widthCostPerRow: cost)
+        }
+        // Control: no price keeps the trained block, so DeepSeek-V4.1 and other models are unchanged.
+        #expect(decoder(cost: nil).width == 7)
+        #expect(decoder(cost: nil).pricedWidth == nil)
+        #expect(decoder(cost: 0.12).width == 4)
+        // The measured planner is the explicit lever, so it takes precedence.
+        #expect(decoder(cost: 0.12, measured: true).pricedWidth == nil)
+    }
+}
+
 @Suite("dSpark speculative decode", .serialized)
 struct DSparkSpeculationFocusedTests {
 
