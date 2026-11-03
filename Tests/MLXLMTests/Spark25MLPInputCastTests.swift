@@ -239,11 +239,13 @@ final class Spark25MLPInputCastTests: XCTestCase {
                 let mlp = Spark25MLP(
                     try JSONDecoder().decode(Spark25Configuration.self, from: data))
                 let (g, u) = Spark25InputCastFixture.layers()
-                mlp.gate = g
-                mlp.up = u
-                mlp.down = QuantizedLinear(
+                let down = QuantizedLinear(
                     weight: (MLXRandom.normal([2560, 10240], key: MLXRandom.key(109)) * 0.02)
                         .asType(.bfloat16), bias: nil, groupSize: 64, bits: 6)
+                mlp.update(modules: ModuleChildren.unflattened([
+                    ("gate_proj", g), ("up_proj", u), ("down_proj", down),
+                ]))
+                XCTAssertTrue(mlp.gate === g && mlp.up === u && mlp.down === down)
                 eval(mlp.parameters())
                 for shape in [[1, 1, 2560], [1, 2, 2560]] {
                     let x = MLXRandom.normal(shape, key: MLXRandom.key(113))
