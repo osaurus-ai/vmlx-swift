@@ -150,6 +150,9 @@ final class K2GroupedRMSNorm: Module, UnaryLayer {
         self.eps = eps
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let fused = K2GroupedNormFusion.apply(x, weight: weight, groups: groups, eps: eps) {
+            return fused
+        }
         if groups == 1 { return MLXFast.rmsNorm(x, weight: weight, eps: eps) }
         var shape = x.shape
         let d = shape.removeLast()
