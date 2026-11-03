@@ -292,7 +292,8 @@ final class PublishedBundleForwardReplayTests: XCTestCase {
             try self.withSynchronousGPU {
                 let stream = MLX.Stream()
                 let warmPrefill = env["VMLX_BUNDLE_REPLAY_WARM_PREFILL"] == "1"
-                receipt["prefill_timing_protocol"] = warmPrefill
+                receipt["prefill_timing_protocol"] =
+                    warmPrefill
                     ? "two untimed same-shape forwards with separate fresh KV caches; timed KV remains fresh"
                     : "first same-shape forward in this process; loaded weights, no shader warmup"
                 for length in [128, 512, 2048] {
