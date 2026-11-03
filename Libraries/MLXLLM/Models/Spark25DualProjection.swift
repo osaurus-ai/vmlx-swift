@@ -122,7 +122,7 @@ enum Spark25DualProjection {
         """, header: projectionHeader + Spark25Activation.geluMetalHeader,
         ensureRowContiguous: true)
 
-    private static let inputCastKernel = MLXFast.metalKernel(
+        private static let inputCastKernel = MLXFast.metalKernel(
             name: "spark25_dual_q6_gelu_fp32_input_cast",
             inputNames: ["x", "gw", "gs", "gb", "uw", "us", "ub"],
             outputNames: ["out"],
