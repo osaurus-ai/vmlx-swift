@@ -1,5 +1,6 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
+import Cmlx
 import CmlxGraphShim
 import Foundation
 import MLX
@@ -33,6 +34,50 @@ enum Spark25DualProjection {
         #else
             return nil
         #endif
+    }
+
+    /// Accept the native FP32 norm result only when its original projection
+    /// input cast is explicitly BF16. No normalization math is reproduced here.
+    static func applyNormalizedFP32(_ x: MLXArray, inputDType: DType, gate: Linear, up: Linear)
+        -> MLXArray?
+    {
+        #if canImport(Metal)
+            guard !inputCastReferenceOverride, !referenceOverride, inputDType == .bfloat16,
+                x.shape == [1, 1, 2560], x.dtype == .float32,
+                Spark25Activation.usesMetalStream,
+                type(of: gate) == QuantizedLinear.self, type(of: up) == QuantizedLinear.self,
+                let g = gate as? QuantizedLinear, let u = up as? QuantizedLinear,
+                g.bits == 6, u.bits == 6, g.groupSize == 64, u.groupSize == 64,
+                g.mode == .affine, u.mode == .affine, g.bias == nil, u.bias == nil,
+                let gb = g.biases, let ub = u.biases,
+                g.weight.shape == [10240, 480], u.weight.shape == [10240, 480],
+                g.weight.dtype == .uint32, u.weight.dtype == .uint32,
+                g.scales.shape == [10240, 40], u.scales.shape == [10240, 40],
+                gb.shape == [10240, 40], ub.shape == [10240, 40],
+                g.scales.dtype == .bfloat16, u.scales.dtype == .bfloat16,
+                gb.dtype == .bfloat16, ub.dtype == .bfloat16
+            else { return nil }
+            let inputs = [x, g.weight, g.scales, gb, u.weight, u.scales, ub]
+            guard
+                inputs.allSatisfy({
+                    vmlx_graph_array_is_tracer($0.ctx.ctx) == 0 && hasRowContiguousMetadata($0)
+                })
+            else { return nil }
+            return inputCastKernel(
+                inputs, template: [("T", DType.bfloat16), ("K", 2560), ("N", 10240)],
+                grid: (32, 2560, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[1, 1, 10240]], outputDTypes: [.bfloat16])[0]
+        #else
+            return nil
+        #endif
+    }
+
+    private static let inputCastReferenceOverride =
+        ProcessInfo.processInfo.environment["VMLX_SPARK_MLP_INPUT_CAST_REFERENCE"] == "1"
+
+    private static func hasRowContiguousMetadata(_ array: MLXArray) -> Bool {
+        var contiguous = false
+        return _mlx_array_is_row_contiguous(&contiguous, array.ctx) == 0 && contiguous
     }
 
     private static let referenceOverride =
@@ -77,7 +122,69 @@ enum Spark25DualProjection {
         """, header: projectionHeader + Spark25Activation.geluMetalHeader,
         ensureRowContiguous: true)
 
-    private static let projectionHeader = """
+        private static let inputCastKernel = MLXFast.metalKernel(
+            name: "spark25_dual_q6_gelu_fp32_input_cast",
+            inputNames: ["x", "gw", "gs", "gb", "uw", "us", "ub"],
+            outputNames: ["out"],
+            source: """
+                uint lane = thread_index_in_simdgroup;
+                uint sg = simdgroup_index_in_threadgroup;
+                uint row0 = threadgroup_position_in_grid.y * 8 + sg * 4;
+                const device uint8_t* w0 = (const device uint8_t*)gw + row0*(K*3/4) + lane*6;
+                const device uint8_t* w1 = (const device uint8_t*)uw + row0*(K*3/4) + lane*6;
+                const device T* s0 = gs+row0*(K/64)+lane/8;
+                const device T* b0 = gb+row0*(K/64)+lane/8;
+                const device T* s1 = us+row0*(K/64)+lane/8;
+                const device T* b1 = ub+row0*(K/64)+lane/8;
+                const device float* xp = x+lane*8;
+                float r0[4]={0}, r1[4]={0};
+                float xt[8];
+                for(int k=0;k<K;k+=256) {
+                 float sum=load_vector_q6_input_cast<T>(xp,xt);
+                 for(int row=0;row<4;row++) {
+                  r0[row]+=qdot<float,8,6>(w0+row*(K*3/4),xt,float(s0[row*(K/64)]),float(b0[row*(K/64)]),sum);
+                  r1[row]+=qdot<float,8,6>(w1+row*(K*3/4),xt,float(s1[row*(K/64)]),float(b1[row*(K/64)]),sum);
+                 }
+                 w0+=192;w1+=192;s0+=4;b0+=4;s1+=4;b1+=4;xp+=256;
+                }
+                for(int row=0;row<4;row++) {
+                 float vg=simd_sum(r0[row]),vu=simd_sum(r1[row]);
+                 if(lane==0) {
+                  T g=T(vg), u=T(vu);
+                  T scaled=g/T(1.4142135623730951f);
+                  T e=T(spark_erf(float(scaled)));
+                  T plus=T(1)+e;
+                  T product=g*plus;
+                  T activation=product/T(2);
+                  out[row0+row]=activation*u;
+                 }
+                }
+                """,
+            header: projectionHeader + inputCastLoadHeader + Spark25Activation.geluMetalHeader,
+            ensureRowContiguous: true)
+
+        // Preserve the types and association of the original q6 load_vector
+        // expression, including BF16 partial additions before adding to float sum.
+        private static let inputCastLoadHeader = """
+            template <typename T>
+            inline float load_vector_q6_input_cast(const device float* x, thread float* x_thread) {
+              float sum = 0;
+              for (int i = 0; i < 8; i += 4) {
+                T x0 = static_cast<T>(x[i]);
+                T x1 = static_cast<T>(x[i + 1]);
+                T x2 = static_cast<T>(x[i + 2]);
+                T x3 = static_cast<T>(x[i + 3]);
+                sum += x0 + x1 + x2 + x3;
+                x_thread[i] = x0;
+                x_thread[i + 1] = x1 / 64.0f;
+                x_thread[i + 2] = x2 / 16.0f;
+                x_thread[i + 3] = x3 / 4.0f;
+              }
+              return sum;
+            }
+            """ + "\n"
+
+        private static let projectionHeader = """
         // Copyright © 2023-2026 Apple Inc.
         template <int bits, int wsize = 8>
         inline constexpr short get_pack_factor() {
