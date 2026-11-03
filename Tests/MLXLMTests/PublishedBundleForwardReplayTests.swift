@@ -251,7 +251,7 @@ final class PublishedBundleForwardReplayTests: XCTestCase {
             else { throw Failure.invalid("Only exact K2/Spark published bundles supported") }
             let switchName =
                 family == "k2_horizon"
-                ? "VMLX_K2_GROUPED_NORM_REFERENCE" : "VMLX_SPARK_NORM_REFERENCE"
+                ? "VMLX_K2_GROUPED_NORM_REFERENCE" : "VMLX_SPARK_MLP_INPUT_CAST_REFERENCE"
             guard (env[switchName] == "1") == (arm == "reference") else {
                 throw Failure.invalid("Separate process arm must agree with \(switchName)")
             }

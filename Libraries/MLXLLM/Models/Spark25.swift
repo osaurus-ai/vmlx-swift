@@ -176,6 +176,15 @@ final class Spark25MLP: Module, UnaryLayer {
         _up.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: c.mlpBias)
         _down.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: c.mlpBias)
     }
+    func callWithNormalizedInput(_ x: MLXArray, inputDType: DType) -> MLXArray {
+        if let activation = Spark25DualProjection.applyNormalizedFP32(
+            x, inputDType: inputDType, gate: gate, up: up)
+        {
+            return down(activation)
+        }
+        return callAsFunction(x.asType(inputDType))
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let activation = Spark25DualProjection.apply(x, gate: gate, up: up) {
             return down(activation)
@@ -206,7 +215,7 @@ final class Spark25DecoderLayer: Module {
         // Residuals accumulate in fp32; projection input dtype comes from a
         // floating norm, never the packed uint32 weight of a quantized Linear.
         let h = x + attention(inputNorm(x).asType(inputNorm.weight.dtype), mask: mask, cache: cache)
-        return h + mlp(postNorm(h).asType(postNorm.weight.dtype))
+        return h + mlp.callWithNormalizedInput(postNorm(h), inputDType: postNorm.weight.dtype)
     }
 }
 
