@@ -236,8 +236,72 @@ and request-duration intervals and are not a speed comparison.
 The exact controls and failures are bound by
 `BUILD25-CODEC-MEDIA-RECEIPT.json` and
 `BUILD25-E2B-JANG-MEMORY-CONTROL-RECEIPT.json` in the same private evidence root.
+E4B MXFP4 has also completed the same current-consumer native control with
+Memory and Thinking explicitly Off. Its calculator passes (3953), the real
+image task fails by inventing `Fictional Audit Slip.png`, and the restart
+continuation correctly calls 3953 * 2 = 7906 after disk restores of 4987 and
+5279 tokens. That last workflow remains partial: the post-tool request emits
+103 reasoning deltas and the expanded native steps show "Thought for 1.5s
+393 chars" despite the actual Off selection. Thus one pass, one partial and
+one failure, with UI rates 74.2/74.4/73.5 tok/s. All six requests have positive
+output and no injected Memory. Thirty-nine BF16 payloads validate four full
+and twenty rotating layers; the prior fifteen E2B MXFP4 payload hashes remain
+unchanged. Observed peak physical footprint is 7,782,766,832 bytes, without a
+low-RAM or controlled-speed claim. Exact UI, request, cache and process evidence
+is bound by `BUILD25-E4B-MXFP4-NATIVE-RECEIPT.json`.
+
+The existing scored CacheProof suite has now run on actual E4B MXFP4 with the
+same q6/BF16 identity, disk-L2 and paged RAM Off: ten pass, one fails and two
+error across thirteen cases. The separate sustained-speed case is deferred.
+Per-tool-call boundary restores, tool-loop write volume, ordinary prefix reuse,
+identical replay, partial cross-session SSD restore and settings-revision
+invalidation pass. Hybrid-specific gates skip this non-hybrid topology; those
+rows do not qualify SSM companions. The longest-prefix row restores 292 tokens
+on its second fresh chat and 701 on its third, but the last tier is honestly
+`diskPending`, so its strict completed-SSD-read requirement fails. The
+five-turn and thinking-toggle rows stop as errors on authored 192/256-token
+limits; neither a capped answer nor its counters are accepted as completion.
+The process and collector exit 1/0. Observed external peak physical footprint
+is 7,186,502,960 bytes across 59 samples. Original results and typed turn-level
+progress/rates are retained in `CURRENT-MAIN-E4B-MXFP4-CACHEPROOF-RECEIPT.json`.
+Separate larger-budget diagnostics do not replace this original score.
+Three repeats retain the original longest-prefix failure on all three: its
+final restore remains `diskPending`. Two separate, clearly identified
+2048-token-budget cases keep every completion, memory and cache criterion
+unchanged. Thinking Off/On/Off/On completes naturally and passes three of
+three. Five ordinary turns complete naturally in all three trials, but pass
+only once: first-to-last physical growth of 1157 and 1248 MB exceeds the
+unchanged 1024 MB ceiling in two trials. These are actual measured failures,
+not evidence that memory is stable. The original 192/256-token errors remain.
+The diagnostic process and collector exit 1/0, with observed external peak
+7,248,892,968 bytes across 390 samples. The nine individual transcripts and
+separate aggregate results are bound by
+`CURRENT-MAIN-E4B-MXFP4-CACHEPROOF-DIAGNOSTICS-RECEIPT.json`.
+
+There is no idle-payload-purge trace in the solo text diagnostic. Source review
+finds that `finishSoloFastPath` purges the allocator for media, while the
+scheduler's idle payload purge is reached for finished media/large batched
+slots. This is a hypothesis to investigate with controlled writer/allocator
+measurements, not a demonstrated leak or grounds to add a disk-write wait to
+every product tool continuation. A genuine completed-SSD-read test must also
+distinguish its durability setup from an ordinary fast new-chat boundary;
+`diskPending` must not be relabelled as a completed disk read.
+
+Six unchanged AgentLoop/Frontier cases also pass on the actual q6 E4B MXFP4
+consumer runtime with explicit Thinking Off: exact calculator digits, additive
+file preservation, processed-call cancellation, multi-file reads/combining
+write, CSV aggregate validation and byte-exact ordered backup/edit. Seventeen
+model steps complete with zero recovery retries. Each generation step records
+measured throughput. Both process and collector exit zero; exact report,
+tool/file assertions and resource samples are bound by
+`CURRENT-MAIN-E4B-MXFP4-AGENTLOOP-Q6-RECEIPT.json`. This is a selected six-case
+row, not the full suites. The cancellation case injects after a processed call,
+not during concurrent prefill, and the multi-read outcome is not a concurrency
+schedule assertion. These case scorers do not assert absence of reasoning, so
+their pass does not clear the separate native Thinking Off violation.
+
 The complete affected ten-bundle settings and scored harness matrix remain
-required; seven bundle variants still need current-consumer controls. The earlier ten-bundle native matrix
+required; six bundle variants still need current-consumer controls. The earlier ten-bundle native matrix
 contains OCR, tool compliance, reasoning and RAM failures; those remain open.
 The empty-response handling and stale-memory grounding require separate root
 diagnosis and affected native/multi-turn/harness proof before any loop change.
