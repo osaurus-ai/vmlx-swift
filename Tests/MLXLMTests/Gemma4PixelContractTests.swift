@@ -10,8 +10,8 @@ import Testing
 
 @testable import MLXVLM
 
-@Suite("Gemma unified stored RGB contract", .serialized)
-struct Gemma4UnifiedPixelContractTests {
+@Suite("Gemma stored RGB contract", .serialized)
+struct Gemma4PixelContractTests {
     private struct ImageTokenizer: Tokenizer {
         func encode(text: String, addSpecialTokens: Bool) -> [Int] { [258880] }
         func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
@@ -31,6 +31,22 @@ struct Gemma4UnifiedPixelContractTests {
             "kCGColorSpaceSRGB", "kCGColorSpaceDisplayP3", "kCGColorSpaceITUR_2020_sRGBGamma",
         ], [UInt8(255), UInt8(128), UInt8(0)])
     func productionProcessorStoredRGB(colorSpace: String, alpha: UInt8) async throws {
+        try await checkStoredRGB(
+            processorClass: "Gemma4UnifiedProcessor", colorSpace: colorSpace, alpha: alpha)
+    }
+
+    @Test(
+        arguments: [
+            "kCGColorSpaceSRGB", "kCGColorSpaceDisplayP3", "kCGColorSpaceITUR_2020_sRGBGamma",
+        ], [UInt8(255), UInt8(128), UInt8(0)])
+    func ordinaryProcessorStoredRGB(colorSpace: String, alpha: UInt8) async throws {
+        try await checkStoredRGB(
+            processorClass: "Gemma4Processor", colorSpace: colorSpace, alpha: alpha)
+    }
+
+    private func checkStoredRGB(
+        processorClass: String, colorSpace: String, alpha: UInt8
+    ) async throws {
         try await MLXMetalTestLock.withLock {
             // 5 x 14 pooled patches: the real processor chooses the same dimensions,
             // isolating colour from resize interpolation and patch grouping.
@@ -61,12 +77,15 @@ struct Gemma4UnifiedPixelContractTests {
             CGImageDestinationAddImage(dest, image, nil)
             #expect(CGImageDestinationFinalize(dest))
             let ci = try #require(CIImage(data: data as Data))
+            let imageProcessorClass =
+                processorClass == "Gemma4UnifiedProcessor"
+                ? "Gemma4UnifiedImageProcessor" : "Gemma4ImageProcessor"
             let config = try JSONDecoder().decode(
                 Gemma4ProcessorConfiguration.self,
                 from: Data(
                     """
-                    {"processor_class":"Gemma4UnifiedProcessor","image_processor":{
-                    "image_processor_type":"Gemma4UnifiedImageProcessor","max_soft_tokens":70,
+                    {"processor_class":"\(processorClass)","image_processor":{
+                    "image_processor_type":"\(imageProcessorClass)","max_soft_tokens":70,
                     "patch_size":16,"pooling_kernel_size":3},"image_seq_length":70}
                     """.utf8))
             let processor = Gemma4Processor(config, tokenizer: ImageTokenizer())
@@ -95,7 +114,7 @@ struct Gemma4UnifiedPixelContractTests {
             }
             #expect(
                 maxError < 2e-3,
-                "production Gemma processor stored RGB error \(maxError), \(colorSpace), alpha \(alpha)"
+                "production \(processorClass) stored RGB error \(maxError), \(colorSpace), alpha \(alpha)"
             )
         }
     }
