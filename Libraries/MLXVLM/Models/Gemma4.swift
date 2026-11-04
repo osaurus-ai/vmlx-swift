@@ -1705,28 +1705,17 @@ public struct Gemma4Processor: UserInputProcessor {
                 } else {
                     softTokenCounts.append(config.imageSeqLength)
                 }
-                let colorInput: CIImage
-                if config.processorClass == "Gemma4UnifiedProcessor" {
-                    // Reference RGB conversion composites alpha onto white
-                    // before resize, in the stored sample domain.
-                    let white = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
-                        .cropped(to: ci.extent)
-                    colorInput = ci.composited(over: white)
-                } else {
-                    colorInput = ci
-                }
-                let resized = MediaProcessing.resampleBicubic(colorInput, to: CGSize(width: tW, height: tH))
-                if config.processorClass == "Gemma4UnifiedProcessor" {
-                    // The reference rescales stored RGB samples by 1/255; it
-                    // does not convert an embedded ICC profile into a linear
-                    // working gamut. Preserve those samples through resizing.
-                    return MediaProcessing.asMLXArrayUnmanaged(resized)
-                }
-                // Convert to sRGB tone curve — CIImage may be in linear space, but the
-                // vision tower was trained on sRGB images (PIL/Python default).
-                let srgb = MediaProcessing.inSRGBToneCurveSpace(resized)
-                // asMLXArray returns [1, C, H, W] (NCHW) with float values in [0, 1]
-                return MediaProcessing.asMLXArray(srgb)
+                // Both Gemma 4 reference processors convert stored samples to
+                // RGB and composite transparency onto white before resizing.
+                let white = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
+                    .cropped(to: ci.extent)
+                let colorInput = ci.composited(over: white)
+                let resized = MediaProcessing.resampleBicubic(
+                    colorInput, to: CGSize(width: tW, height: tH))
+                // Preserve the stored RGB domain through resize and rescale.
+                // ICC gamut conversion and an extra tone curve change the
+                // pixels relative to the reference's plain RGB conversion.
+                return MediaProcessing.asMLXArrayUnmanaged(resized)
             }
             // Store per-image dimensions in frames so prepare() can extract each
             // image at its original size (before padding for batch storage).
