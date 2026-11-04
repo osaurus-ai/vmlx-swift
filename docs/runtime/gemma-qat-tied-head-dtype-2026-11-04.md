@@ -121,6 +121,61 @@ stale automatically discovered shader and failed before forwards; the successful
 runs explicitly select the native app's byte-identical full metallib. These
 diagnostic failures are retained separately from product runtime findings.
 
+## Exact media-history cache trajectory control
+
+The current consumer's E2B MXFP4 q6 native run stores BF16 KV, with three full
+layers and twelve rotating layers. Fifteen payloads validate tensor types,
+token offsets, circular write-index bounds and file ranges. Fifty-seven
+payload hashes listed by the two preceding controls remain unchanged. This is
+the actual storage dtype; the admin API's `effective_kv_mode=fp16` is an engine
+category, not a claim that these tensors contain F16. Paged RAM is off and
+TurboQuant layer count is zero.
+
+With Memory and Thinking explicitly Off, the three native workflows score one
+pass and two failures: calculator 59 * 67 correctly returns 3953; the actual
+image turn invents a nonexistent PDF path; after restart, the next tool call
+uses 5953 * 2 instead of 3953 * 2. All six model requests emit output and rates.
+UI rates are 99.4, 95.9 and 95.9 tok/s for these respective workflows, not a
+controlled speed comparison. Observed peak physical footprint is
+5,280,879,248 bytes. These results neither qualify the model nor establish
+that Memory injection explains every earlier failure.
+
+A separate real-bundle numerical control reconstructs the failed media request
+through the production tokenizer, image preprocessing and Gemma processor.
+Before loading weights it verifies 5290 prompt tokens, the 5002-token prefix,
+5349 post-tool tokens, their exact native cache hashes, the decoded prompt,
+actual persisted image bytes and media salt. It teacher-forces the exact
+18-token native `calculate` call, including its wrong operand, comparing all
+262144 logits at each step across cold, repeated cold, fresh split, fresh SSD
+restore and original native SSD restore paths.
+
+| Comparison across all 18 steps | Equal values / total | Worst absolute difference | Worst full-distribution TVD |
+| --- | --- | --- | --- |
+| Repeated cold / cold | 4718592 / 4718592 | 0 | 0 |
+| Fresh SSD / same in-memory split | 4718592 / 4718592 | 0 | 0 |
+| Fresh split / cold | 434982 / 4718592 | 0.613259882 | 0.033485396 |
+| Original native SSD / cold | 530753 / 4718592 | 0.609848976 | 0.010827719 |
+
+All paths have the same top-ranked token at every tested step. At the first
+operand digit, cold prefers the correct `3` with probability 0.9100968 while
+wrong `5` retains probability 0.0376182; native restore gives 0.9030914 and
+0.0404297 respectively under the actual bundle sampler (T=1, p=.95, k=64).
+Thus restore is not necessary for the wrong digit to remain sampleable. This
+does not identify the original random draw, erase the cold/split differences,
+or convert the failed native task into a pass. No prompt, sampler, EOS,
+reasoning or harness behavior was changed. There are no sampled generation
+tokens in this diagnostic, so generation tok/s is not applicable.
+
+The numerical collector was invoked with an extra argument and exited 64;
+that run has no physical-footprint measurement. The native workflows have
+their own valid collectors. Source snapshots, commands, exact inputs and
+results are bound by `REAL-MEDIA-TEACHER-CACHE-FIDELITY-RECEIPT.json`;
+`BUILD25-E2B-MXFP4-NATIVE-RECEIPT.json` binds the separate UI evidence. Both
+are under the same private evidence root. The earlier diagnostic package
+manifest changed when this second executable was added; its original exact
+bytes remain in `real-cache-logits-diagnostic/source-snapshot/Package.swift`.
+The original receipt is retained unedited.
+
 ## Remaining acceptance work
 
 Release 25 now has actual localization/menu and q6/passthrough change/save/reload
@@ -182,7 +237,7 @@ The exact controls and failures are bound by
 `BUILD25-CODEC-MEDIA-RECEIPT.json` and
 `BUILD25-E2B-JANG-MEMORY-CONTROL-RECEIPT.json` in the same private evidence root.
 The complete affected ten-bundle settings and scored harness matrix remain
-required; eight bundle variants still need current-consumer controls. The earlier ten-bundle native matrix
+required; seven bundle variants still need current-consumer controls. The earlier ten-bundle native matrix
 contains OCR, tool compliance, reasoning and RAM failures; those remain open.
 The empty-response handling and stale-memory grounding require separate root
 diagnosis and affected native/multi-turn/harness proof before any loop change.
