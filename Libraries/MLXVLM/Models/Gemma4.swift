@@ -1705,7 +1705,17 @@ public struct Gemma4Processor: UserInputProcessor {
                 } else {
                     softTokenCounts.append(config.imageSeqLength)
                 }
-                let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
+                let colorInput: CIImage
+                if config.processorClass == "Gemma4UnifiedProcessor" {
+                    // Reference RGB conversion composites alpha onto white
+                    // before resize, in the stored sample domain.
+                    let white = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
+                        .cropped(to: ci.extent)
+                    colorInput = ci.composited(over: white)
+                } else {
+                    colorInput = ci
+                }
+                let resized = MediaProcessing.resampleBicubic(colorInput, to: CGSize(width: tW, height: tH))
                 if config.processorClass == "Gemma4UnifiedProcessor" {
                     // The reference rescales stored RGB samples by 1/255; it
                     // does not convert an embedded ICC profile into a linear

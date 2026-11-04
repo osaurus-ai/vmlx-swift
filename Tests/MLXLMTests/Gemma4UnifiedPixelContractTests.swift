@@ -26,10 +26,11 @@ struct Gemma4UnifiedPixelContractTests {
         ) throws -> [Int] { [258880] }
     }
 
-    @Test(arguments: [
-        "kCGColorSpaceSRGB", "kCGColorSpaceDisplayP3", "kCGColorSpaceITUR_2020_sRGBGamma",
-    ])
-    func productionProcessorStoredRGB(colorSpace: String) async throws {
+    @Test(
+        arguments: [
+            "kCGColorSpaceSRGB", "kCGColorSpaceDisplayP3", "kCGColorSpaceITUR_2020_sRGBGamma",
+        ], [UInt8(255), UInt8(128), UInt8(0)])
+    func productionProcessorStoredRGB(colorSpace: String, alpha: UInt8) async throws {
         try await MLXMetalTestLock.withLock {
             // 5 x 14 pooled patches: the real processor chooses the same dimensions,
             // isolating colour from resize interpolation and patch grouping.
@@ -43,6 +44,7 @@ struct Gemma4UnifiedPixelContractTests {
                     raw[i] = UInt8((x / 48 * 37 + 20) % 256)
                     raw[i + 1] = UInt8((y / 48 * 71 + 50) % 256)
                     raw[i + 2] = UInt8((x / 48 * 13 + y / 48 * 29 + 90) % 256)
+                    raw[i + 3] = alpha
                 }
             }
             let provider = try #require(CGDataProvider(data: Data(raw) as CFData))
@@ -50,7 +52,7 @@ struct Gemma4UnifiedPixelContractTests {
                 CGImage(
                     width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
                     space: space,
-                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
                     provider: provider, decode: nil, shouldInterpolate: false,
                     intent: .defaultIntent))
             let data = NSMutableData()
@@ -84,14 +86,17 @@ struct Gemma4UnifiedPixelContractTests {
             for y in stride(from: 24, to: h, by: 48) {
                 for x in stride(from: 24, to: w, by: 48) {
                     for c in 0 ..< 3 {
-                        let expected = Float(raw[(y * w + x) * 4 + c]) / 255
+                        let stored = Float(raw[(y * w + x) * 4 + c])
+                        let a = Float(alpha) / 255
+                        let expected = (stored * a + 255 * (1 - a)).rounded() / 255
                         maxError = max(maxError, abs(values[c * h * w + y * w + x] - expected))
                     }
                 }
             }
             #expect(
                 maxError < 2e-3,
-                "production Gemma processor stored RGB error \(maxError), \(colorSpace)")
+                "production Gemma processor stored RGB error \(maxError), \(colorSpace), alpha \(alpha)"
+            )
         }
     }
 }
