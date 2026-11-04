@@ -1706,6 +1706,12 @@ public struct Gemma4Processor: UserInputProcessor {
                     softTokenCounts.append(config.imageSeqLength)
                 }
                 let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
+                if config.processorClass == "Gemma4UnifiedProcessor" {
+                    // The reference rescales stored RGB samples by 1/255; it
+                    // does not convert an embedded ICC profile into a linear
+                    // working gamut. Preserve those samples through resizing.
+                    return MediaProcessing.asMLXArrayUnmanaged(resized)
+                }
                 // Convert to sRGB tone curve — CIImage may be in linear space, but the
                 // vision tower was trained on sRGB images (PIL/Python default).
                 let srgb = MediaProcessing.inSRGBToneCurveSpace(resized)

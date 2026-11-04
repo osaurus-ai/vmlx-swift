@@ -1,0 +1,17 @@
+# Gemma unified stored RGB preprocessing — 2026-11-04
+
+Status: separate source candidate after merged norm PR723. Numeric production-processor tests pass; native candidate qualification, CI and consumer landing remain pending. No release tags or publishing.
+
+The unified image processor reference rescales stored RGB samples by 1/255 without ICC gamut conversion. The current Gemma processor renders through CoreImage's managed working gamut with a tone-curve filter. That preserves the test's sRGB pixels but changes Display P3 and Rec.2020 pixels. A new test exercises the actual `Gemma4Processor.prepare` method with real encoded PNGs and a deterministic image-placeholder tokenizer. Dimensions exactly fill 70 pooled patches, avoiding interpolation differences so the test isolates color processing. Independent CPU raw-byte values provide the expected pixels.
+
+Baseline runtime `4a76ab058da9c515b4c71e5b236f1977a7217869` passes the sRGB case but fails Display P3 (maximum error 0.6705315) and Rec.2020 (1.0248828). The framework reports four issues for those two failing parameter cases. The proposed correction uses the existing unmanaged rendering helper after the existing resize, only for `Gemma4UnifiedProcessor`. Ordinary Gemma processor behavior is unchanged. No model weights are loaded by this test.
+
+The corrected selection passes 27 SwiftTesting tests in four suites, including all three production-processor color cases, unmanaged media parity, media determinism, VLM cache scope and Gemma VLM tests; 2 XCTest tests also pass. A follow-up passes 14 XCTest tests and one SwiftTesting test with three color cases, checking repeated production media salts and the existing media-cache/dtype contracts. Pixel bytes already participate in `computeMediaSalt`, so changed prepared pixels isolate cache state; no cache deletion is needed. Resizing parity beyond the no-resize fixture and causal improvement in model OCR are not established by the numeric test.
+
+Primary reference is the pinned Transformers commit `3eb8e27a4f50da05e362ad19c0f3ab4a4eb17ead`, [Gemma unified image processor](https://github.com/huggingface/transformers/blob/3eb8e27a4f50da05e362ad19c0f3ab4a4eb17ead/src/transformers/models/gemma4_unified/image_processing_gemma4_unified.py): `do_convert_rgb=True`, `do_rescale=True`, `do_normalize=False`, followed by resize and rescale. Original reference bytes and identity are retained locally.
+
+SOURCE EVIDENCE: the unified-only branch in `Libraries/MLXVLM/Models/Gemma4.swift`, `Tests/MLXLMTests/Gemma4UnifiedPixelContractTests.swift` and `Libraries/MLXLMCommon/Cache/MediaSalt.swift`.
+
+LIVE EVIDENCE: currently the production-processor red/green test logs and `GEMMA-UNIFIED-PIXEL-CONTRACT-BASELINE-RECEIPT.json` / `GEMMA-UNIFIED-PIXEL-CONTRACT-CORRECTED-RECEIPT.json` in `/Users/eric/vmlx-private-evidence/osaurus-cache-wiring-20261103/`. These are numeric runtime tests, not native-app model proof. A fresh candidate app must exercise the unchanged real ICC-profiled audit-slip images, tool continuation, changed media and same-media/fresh-process cache reuse with measured rates and physical footprint before a scoped merge claim.
+
+The merged normalization candidate still failed OCR (3/6 fields) and the low-RAM physical-footprint gate. Those failures remain retained. This patch does not change prompts, samplers, thinking tags, weights, owned loading, ordinary Gemma towers, audio or raw speed settings. Other QAT/MXFP4, cancellation/eviction and scored evaluation rows remain partial.
