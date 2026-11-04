@@ -123,9 +123,66 @@ diagnostic failures are retained separately from product runtime findings.
 
 ## Remaining acceptance work
 
-Current-app localization/menu proof, actual head-codec change/save/reload,
-JANG media/restart controls, and the complete affected ten-bundle settings and
-scored harness matrix remain required. The earlier ten-bundle native matrix
+Release 25 now has actual localization/menu and q6/passthrough change/save/reload
+proof on consumer 5be949779. Both selections survive normal process restart and
+produce different effective runtime cache keys. No production code changed for
+these controls. The E4B JANG native results are:
+
+| Workflow | Result |
+| --- | --- |
+| Passthrough calculator, history-dependent double, restart continuation | Three passes: 1333, 2666, 7998 |
+| q6 new image and calculator | Partial: amount/color/5408 correct; code loses its final digit |
+| q6 media-history follow-up | Fail: uses stored-memory 1577 and G918-NZ37 instead of this chat's 5408 and attached code |
+| q6 media after process restart | Partial: real SSD restore and correct 5408/color; code remains truncated |
+
+There are fifteen actual requests, including three direct API controls. All
+have positive output/rates and none contains the empty-turn notice. The original
+empty row remains a failure. In the new fixed media request, cache On/Off/On
+restores 5460/0/5460 tokens out of 5463 and always selects the same wrong operand
+1577. Four decoded prompt dumps, original plus replays, are byte-identical.
+The exported image is intentionally redacted; replays restore the actual
+content-addressed persisted image blob with its matching history reference,
+not a guessed replacement. This proves cache reuse is not necessary for that
+failure; it does not establish numerical media parity or the full root cause.
+Twenty-nine new F16 snapshots validate all layer kinds, offsets and bounds;
+the previous 53 payload hashes remain unchanged. The three owned app processes
+and their collectors exit normally. Peak observed physical footprint is
+14,576,364,512 bytes; no low-RAM pass is claimed.
+
+E2B JANG has a separate matched native Memory setting control. The normal
+per-agent switch is saved through the editor and survives relaunch. Old memory
+and failing chats remain intact; Off uses a separate fresh chat so the previous
+injected blocks do not remain in history. Thinking is explicitly Off in both
+conditions; bundle temperature 1/top-p .95/top-k 64 and all other controls stay
+the same.
+
+| E2B JANG workflow | Memory On | Explicit Memory Off |
+| --- | --- | --- |
+| Calculator 59 * 67 | Pass: 3953 | Pass: 3953 |
+| Actual image and amount + 3 | Fail: invents a file path and reports its read error | Partial: all three image fields and 7268 correct, but emits a visible reasoning pass despite Thinking Off |
+| Restart, double first-turn multiplication | Fail: selects old 89 * 23 = 2047, then 4094 | Pass: actual 3953 * 2 = 7906 |
+
+The twelve requests have positive output/rates. Captured raw input contains
+`[Memory]` in all six On requests and none of the six Off requests. E2B stores
+F16 with three full KV and twelve rotating layers. Twenty-eight typed snapshots
+validate; the previous 82 payload hashes remain unchanged. The observed peak
+physical footprint is 10,140,802,800 bytes. The Off control has three correct
+semantic results, but only two complete passes because the media row violates
+the selected reasoning behavior. These stochastic, separately rendered inputs
+do not prove numerical causality, fix Memory On, or qualify all settings.
+
+Actual stored-memory UI also exposes a misstated episode: it describes
+7998 * 3 = 23994 although the corresponding executed tool was 2666 * 3 = 7998.
+Together with the retained stale pinned facts, this is a concrete host-input
+quality concern. No memory store, prompt, sampler, reasoning output or agent
+loop has been patched to hide it. Rate observations span different UI, runtime
+and request-duration intervals and are not a speed comparison.
+
+The exact controls and failures are bound by
+`BUILD25-CODEC-MEDIA-RECEIPT.json` and
+`BUILD25-E2B-JANG-MEMORY-CONTROL-RECEIPT.json` in the same private evidence root.
+The complete affected ten-bundle settings and scored harness matrix remain
+required; eight bundle variants still need current-consumer controls. The earlier ten-bundle native matrix
 contains OCR, tool compliance, reasoning and RAM failures; those remain open.
 The empty-response handling and stale-memory grounding require separate root
 diagnosis and affected native/multi-turn/harness proof before any loop change.
