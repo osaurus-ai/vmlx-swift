@@ -30,12 +30,14 @@ struct Gemma4TiedHeadLoadDTypeTests {
              "layer_types":["sliding_attention","full_attention"]}
             """
         if vlm {
-            return Gemma4(try JSONDecoder().decode(
-                Gemma4Configuration.self,
-                from: Data("{\"model_type\":\"gemma4\",\"text_config\":\(text)}".utf8)))
+            return Gemma4(
+                try JSONDecoder().decode(
+                    Gemma4Configuration.self,
+                    from: Data("{\"model_type\":\"gemma4\",\"text_config\":\(text)}".utf8)))
         }
-        return Gemma4TextModel(try JSONDecoder().decode(
-            Gemma4TextConfiguration.self, from: Data(text.utf8)))
+        return Gemma4TextModel(
+            try JSONDecoder().decode(
+                Gemma4TextConfiguration.self, from: Data(text.utf8)))
     }
 
     @Test(arguments: Gemma4TiedHeadLoadDTypeTests.cases)
@@ -48,7 +50,8 @@ struct Gemma4TiedHeadLoadDTypeTests {
             try #require(ProcessInfo.processInfo.environment["VMLX_QUANT_TIED_HEAD_BITS"] == nil)
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("gemma-tied-head-load-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
 
             let original = try makeModel(vlm: vlm, perLayerInput: perLayerInput)
@@ -60,16 +63,19 @@ struct Gemma4TiedHeadLoadDTypeTests {
             let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4, mode: mode)
             var overrides = [String: BaseConfiguration.QuantizationOption]()
             for (path, module) in original.leafModules().flattened() {
-                if module is Linear || (mode == .mxfp4 && path.hasSuffix("embed_tokens_per_layer")) {
+                if module is Linear || (mode == .mxfp4 && path.hasSuffix("embed_tokens_per_layer"))
+                {
                     overrides[path] = .quantize(quantization)
                 } else if module is Embedding {
                     overrides[path] = .skip
                 }
             }
-            MLXNN.quantize(model: original, filter: { path, _ in
-                if case .quantize(let q) = overrides[path] { return q.asTuple }
-                return nil
-            })
+            MLXNN.quantize(
+                model: original,
+                filter: { path, _ in
+                    if case .quantize(let q) = overrides[path] { return q.asTuple }
+                    return nil
+                })
             try MLX.save(
                 arrays: Dictionary(uniqueKeysWithValues: original.parameters().flattened()),
                 url: directory.appendingPathComponent("model.safetensors"))
@@ -88,7 +94,8 @@ struct Gemma4TiedHeadLoadDTypeTests {
             let converted = try load(head: .init(bits: bits, groupSize: 64))
             let tokens = MLXArray([Int32(1), 2, 3, 4, 5, 6]).reshaped(1, 6)
             func embedding(_ model: any LanguageModel) throws -> Embedding {
-                try #require(model.namedModules().first { $0.0.hasSuffix("embed_tokens") }?.1 as? Embedding)
+                try #require(
+                    model.namedModules().first { $0.0.hasSuffix("embed_tokens") }?.1 as? Embedding)
             }
             let ordinaryRows = try embedding(passthrough)(tokens)
             let convertedRows = try embedding(converted)(tokens)
@@ -96,9 +103,10 @@ struct Gemma4TiedHeadLoadDTypeTests {
 
             func container(_ model: any LanguageModel) -> ModelContainer {
                 let processor = TestInputProcessor()
-                return ModelContainer(context: ModelContext(
-                    configuration: ModelConfiguration(id: "same-fixture-weights"), model: model,
-                    processor: processor, tokenizer: processor.tokenizer))
+                return ModelContainer(
+                    context: ModelContext(
+                        configuration: ModelConfiguration(id: "same-fixture-weights"), model: model,
+                        processor: processor, tokenizer: processor.tokenizer))
             }
             let ordinaryContainer = container(passthrough)
             let convertedContainer = container(converted)
@@ -118,7 +126,9 @@ struct Gemma4TiedHeadLoadDTypeTests {
             #expect(ordinaryTopology.cacheComputationIdentity == nil)
             let identity = try #require(convertedTopology.cacheComputationIdentity)
             #expect(convertedKey.split(separator: "|").contains(Substring("compute=\(identity)")))
-            #expect(ordinaryTopology.diskCacheStateIdentifiers == convertedTopology.diskCacheStateIdentifiers)
+            #expect(
+                ordinaryTopology.diskCacheStateIdentifiers
+                    == convertedTopology.diskCacheStateIdentifiers)
             await convertedContainer.enableCachingAsync(config: cacheConfiguration)
             #expect(convertedContainer.cacheCoordinator?.config.modelKey == convertedKey)
             // Hosts already supply the topology's computation tag. Both paths
@@ -134,8 +144,9 @@ struct Gemma4TiedHeadLoadDTypeTests {
             #expect(hostKey.split(separator: "|").filter { $0 == "compute=\(identity)" }.count == 1)
             await convertedContainer.enableCachingAsync(config: hostConfiguration)
             #expect(convertedContainer.cacheCoordinator?.config.modelKey == hostKey)
-            #expect(DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: ordinaryKey)
-                != DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: convertedKey))
+            #expect(
+                DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: ordinaryKey)
+                    != DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: convertedKey))
             // Loading another model's policy must not rewrite this model's key.
             TiedHeadQuantizationPolicy.current = nil
             convertedContainer.enableCaching(config: cacheConfiguration)
@@ -150,7 +161,8 @@ struct Gemma4TiedHeadLoadDTypeTests {
                 #expect(convertedLogits.dtype == ordinaryLogits.dtype)
                 #expect(ordinaryCache.map(\.offset) == convertedCache.map(\.offset))
                 for (ordinary, converted) in zip(ordinaryCache, convertedCache) {
-                    try #require(!ordinary.state.isEmpty && ordinary.state.count == converted.state.count)
+                    try #require(
+                        !ordinary.state.isEmpty && ordinary.state.count == converted.state.count)
                     for (a, b) in zip(ordinary.state, converted.state) {
                         #expect(a.dtype == b.dtype)
                     }
