@@ -8,6 +8,18 @@ import Testing
 
 @Suite("Gemma QAT tied-head precision through the production loader", .serialized)
 struct Gemma4TiedHeadLoadDTypeTests {
+    private static var cases: [(Bool, Int, QuantizationMode, Int)] {
+        var result = [(Bool, Int, QuantizationMode, Int)]()
+        for vlm in [false, true] {
+            for perLayerInput in [0, 32] {
+                for mode in [QuantizationMode.mxfp4, .affine] {
+                    for bits in [4, 6, 8] { result.append((vlm, perLayerInput, mode, bits)) }
+                }
+            }
+        }
+        return result
+    }
+
     private func makeModel(vlm: Bool, perLayerInput: Int) throws -> any LanguageModel {
         let text = """
             {"model_type":"gemma4_text","hidden_size":64,"intermediate_size":64,
@@ -26,16 +38,11 @@ struct Gemma4TiedHeadLoadDTypeTests {
             Gemma4TextConfiguration.self, from: Data(text.utf8)))
     }
 
-    @Test(arguments: [
-        (false, 0, QuantizationMode.mxfp4), (true, 0, QuantizationMode.mxfp4),
-        (false, 32, QuantizationMode.mxfp4), (true, 32, QuantizationMode.mxfp4),
-        (false, 0, QuantizationMode.affine), (true, 0, QuantizationMode.affine),
-        (false, 32, QuantizationMode.affine), (true, 32, QuantizationMode.affine),
-    ])
+    @Test(arguments: Gemma4TiedHeadLoadDTypeTests.cases)
     func headCodecPreservesLoadedActivationAndKVPrecision(
-        vlm: Bool, perLayerInput: Int, mode: QuantizationMode
-    ) throws {
-        try MLXMetalTestLock.withLock {
+        vlm: Bool, perLayerInput: Int, mode: QuantizationMode, bits: Int
+    ) async throws {
+        try await MLXMetalTestLock.withLock {
             let savedPolicy = TiedHeadQuantizationPolicy.current
             defer { TiedHeadQuantizationPolicy.current = savedPolicy }
             try #require(ProcessInfo.processInfo.environment["VMLX_QUANT_TIED_HEAD_BITS"] == nil)
@@ -78,7 +85,7 @@ struct Gemma4TiedHeadLoadDTypeTests {
                 return model
             }
             let passthrough = try load(head: nil)
-            let converted = try load(head: .init(bits: 6, groupSize: 64))
+            let converted = try load(head: .init(bits: bits, groupSize: 64))
             let tokens = MLXArray([Int32(1), 2, 3, 4, 5, 6]).reshaped(1, 6)
             func embedding(_ model: any LanguageModel) throws -> Embedding {
                 try #require(model.namedModules().first { $0.0.hasSuffix("embed_tokens") }?.1 as? Embedding)
@@ -86,6 +93,53 @@ struct Gemma4TiedHeadLoadDTypeTests {
             let ordinaryRows = try embedding(passthrough)(tokens)
             let convertedRows = try embedding(converted)(tokens)
             #expect(convertedRows.dtype == ordinaryRows.dtype)
+
+            func container(_ model: any LanguageModel) -> ModelContainer {
+                let processor = TestInputProcessor()
+                return ModelContainer(context: ModelContext(
+                    configuration: ModelConfiguration(id: "same-fixture-weights"), model: model,
+                    processor: processor, tokenizer: processor.tokenizer))
+            }
+            let ordinaryContainer = container(passthrough)
+            let convertedContainer = container(converted)
+            defer {
+                ordinaryContainer.disableCaching()
+                convertedContainer.disableCaching()
+            }
+            let cacheConfiguration = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: false, modelKey: "same-fixture-weights")
+            ordinaryContainer.enableCaching(config: cacheConfiguration)
+            convertedContainer.enableCaching(config: cacheConfiguration)
+            let ordinaryKey = try #require(ordinaryContainer.cacheCoordinator?.config.modelKey)
+            let convertedKey = try #require(convertedContainer.cacheCoordinator?.config.modelKey)
+            #expect(ordinaryKey != convertedKey)
+            let ordinaryTopology = await ordinaryContainer.cacheTopologySnapshot()
+            let convertedTopology = await convertedContainer.cacheTopologySnapshot()
+            #expect(ordinaryTopology.cacheComputationIdentity == nil)
+            let identity = try #require(convertedTopology.cacheComputationIdentity)
+            #expect(convertedKey.split(separator: "|").contains(Substring("compute=\(identity)")))
+            #expect(ordinaryTopology.diskCacheStateIdentifiers == convertedTopology.diskCacheStateIdentifiers)
+            await convertedContainer.enableCachingAsync(config: cacheConfiguration)
+            #expect(convertedContainer.cacheCoordinator?.config.modelKey == convertedKey)
+            // Hosts already supply the topology's computation tag. Both paths
+            // must use the same namespace without adding a duplicate identity.
+            let hostConfiguration = CacheCoordinatorConfig(
+                usePagedCache: false, enableDiskCache: false,
+                modelKey: "same-fixture-weights|compute=\(identity)")
+            convertedContainer.enableCaching(config: hostConfiguration)
+            let hostKey = try #require(convertedContainer.cacheCoordinator?.config.modelKey)
+            // Host input tags retain their order, so compare the components,
+            // then require exact sync/async equality for that same host input.
+            #expect(Set(hostKey.split(separator: "|")) == Set(convertedKey.split(separator: "|")))
+            #expect(hostKey.split(separator: "|").filter { $0 == "compute=\(identity)" }.count == 1)
+            await convertedContainer.enableCachingAsync(config: hostConfiguration)
+            #expect(convertedContainer.cacheCoordinator?.config.modelKey == hostKey)
+            #expect(DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: ordinaryKey)
+                != DiskCache.hashTokens([1, 2, 3, 4, 5, 6], modelKey: convertedKey))
+            // Loading another model's policy must not rewrite this model's key.
+            TiedHeadQuantizationPolicy.current = nil
+            convertedContainer.enableCaching(config: cacheConfiguration)
+            #expect(convertedContainer.cacheCoordinator?.config.modelKey == convertedKey)
 
             let ordinaryCache = passthrough.newCache(parameters: nil)
             let convertedCache = converted.newCache(parameters: nil)
