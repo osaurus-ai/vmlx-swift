@@ -637,10 +637,12 @@ private class UnifiedVisionEmbedder: Module {
         self.cfg = cfg
         let patchDims = 3 * cfg.modelPatchSize * cfg.modelPatchSize
         _patchDense.wrappedValue = Linear(patchDims, cfg.outputProjectionDimensions, bias: true)
-        _patchNorm1.wrappedValue = LayerNorm(dimensions: patchDims, eps: cfg.rmsNormEps)
-        _patchNorm2.wrappedValue = LayerNorm(dimensions: cfg.outputProjectionDimensions, eps: cfg.rmsNormEps)
+        // Unified vision uses LayerNorm's 1e-5 epsilon, independently of
+        // Gemma's 1e-6 RMSNorm epsilon (HF Gemma4UnifiedVisionEmbedder).
+        _patchNorm1.wrappedValue = LayerNorm(dimensions: patchDims, eps: 1e-5)
+        _patchNorm2.wrappedValue = LayerNorm(dimensions: cfg.outputProjectionDimensions, eps: 1e-5)
         _posEmbedding.wrappedValue = MLXArray.ones([cfg.positionEmbeddingSize, 2, cfg.outputProjectionDimensions])
-        _posNorm.wrappedValue = LayerNorm(dimensions: cfg.outputProjectionDimensions, eps: cfg.rmsNormEps)
+        _posNorm.wrappedValue = LayerNorm(dimensions: cfg.outputProjectionDimensions, eps: 1e-5)
         super.init()
     }
 
@@ -1165,7 +1167,13 @@ func gemma4MaskedScatter(
 public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing,
     ModelComponentMapping
 {
-    public var cacheStorageDTypeIdentity: String? { "gemma4-native-kv-dtype-v1" }
+    public var cacheStorageDTypeIdentity: String? {
+        let native = "gemma4-native-kv-dtype-v1"
+        // Image-conditioned KV made with the old LayerNorm epsilon cannot
+        // be restored after correcting the unified vision embedding math.
+        guard config.visionConfig?.usesUnifiedVisionEmbedder == true else { return native }
+        return native + "|unified-vision-ln-1e-5-v1"
+    }
 
     @ModuleInfo(key: "vision_tower") private var visionTower: VisionTower?
     @ModuleInfo(key: "vision_embedder") private var unifiedVisionEmbedder: UnifiedVisionEmbedder?
