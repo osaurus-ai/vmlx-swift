@@ -22,8 +22,10 @@ cache suite now passes30functions with no failures/skips. A final formatting
 pass changes only whitespace; quoted literals and non-whitespace bytes match
 the passing source exactly, with no new changed-line style diagnostics.
 
-The wider target still has independent registered failures; full candidate
-refresh pending. These are component controls, not model-family, batched
+The full same-target candidate refresh records1250total/1204passed/9failed/
+37skipped (1004SwiftTesting functions/13issues). No new failing method IDs
+against the sampler baseline; four benchmark/cache source-contract failures
+are cleared. The remaining nine independent failures stay registered and red. These are component controls, not model-family, batched
 inference, speed, physical-RAM or multimodal qualification. Existing actual
 app39 evidence remains valid for unchanged production; no new app behavior is
 claimed from source guards. Canonical models remain read-only. No release/tag.
