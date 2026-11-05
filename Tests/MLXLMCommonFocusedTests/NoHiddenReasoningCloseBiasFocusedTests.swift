@@ -182,7 +182,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("live model matrix exits nonzero when rows fail")
     func liveModelMatrixExitsNonzeroWhenRowsFail() throws {
         let source = try String(
-            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            contentsOf: FocusedMLXTestSupport.sourceURL("scripts/vmlx-live-model-matrix.sh"),
             encoding: .utf8)
 
         #expect(source.contains("grep -q $'\\tfail:'"))
@@ -681,7 +681,7 @@ struct HarmonyParserFocusedTests {
     @Test("Qwen multi-turn tool matrix uses production token budget")
     func qwenMultiturnToolMatrixUsesProductionTokenBudget() throws {
         let script = try String(
-            contentsOfFile: "scripts/vmlx-live-model-matrix.sh",
+            contentsOf: FocusedMLXTestSupport.sourceURL("scripts/vmlx-live-model-matrix.sh"),
             encoding: .utf8)
         guard let row = script.range(of: "\"${name}.qwen_multiturn_tool\""),
               let nextRow = script.range(
@@ -2084,7 +2084,7 @@ struct Gemma4VLMFocusedSourceContractsTests {
     }
 
     private func focusedRepositoryFile(_ relativePath: String) throws -> String {
-        let url = URL(fileURLWithPath: relativePath)
+        let url = FocusedMLXTestSupport.sourceURL(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
     }
 }
