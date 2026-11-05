@@ -23,20 +23,21 @@ struct NativeDiskDurabilityTests {
         return result
     }
 
-    private func sourceCache(nested: Bool = false) -> [any KVCache] {
+    private func sourceCache(nested: Bool = false, tokenCount: Int? = nil) -> [any KVCache] {
+        let count = tokenCount ?? tokens.count
         let kv = KVCacheSimple()
         _ = kv.update(
-            keys: MLXArray.ones([1, 1, tokens.count, 4]),
-            values: MLXArray.ones([1, 1, tokens.count, 4]) * 2)
+            keys: MLXArray.ones([1, 1, count, 4]),
+            values: MLXArray.ones([1, 1, count, 4]) * 2)
         let state = MambaCache(slots: 6, persistentSlotCount: 4)
         state[0] = MLXArray([Int32(11)])
         state[2] = MLXArray([Int32(13)])
         state[3] = MLXArray([Int32(14)])
         state[4] = MLXArray([Int32(999)])  // scratch must not be persisted
-        state.offset = tokens.count
+        state.offset = count
         if nested {
             let list = CacheList(state)
-            list.offset = tokens.count
+            list.offset = count
             return [kv, list]
         }
         return [kv, state]
@@ -148,19 +149,79 @@ struct NativeDiskDurabilityTests {
         }
     }
 
-    @Test("native ownership does not bypass the store's offset/key mismatch guard")
-    func refusesMismatchedBoundary() throws {
+    @Test(
+        "native ownership does not bypass the store's offset/key mismatch guard",
+        arguments: [7, 9], [false, true])
+    func refusesMismatchedBoundary(tokenCount: Int, nested: Bool) throws {
+        // Neither length divides the four-token page size. Exercise both
+        // attention and recurrent leaves, including a hidden nested child.
+        for damagedLayer in 0 ... 1 {
+            try withRoot { root in
+                let key = Array(71 ..< 71 + tokenCount)
+                let coordinator = nativeCoordinator(root)
+                let source = sourceCache(nested: nested, tokenCount: tokenCount)
+                #expect(cacheBoundaryLeafOffsets(source) == [tokenCount, tokenCount])
+                let damagedLeaf =
+                    if damagedLayer == 1, let list = source[1] as? CacheList {
+                        list[0]
+                    } else {
+                        source[damagedLayer]
+                    }
+                let damaged = try #require(damagedLeaf as? BaseKVCache)
+                damaged.offset = tokenCount - 1
+                #expect(Set(cacheBoundaryLeafOffsets(source)) == Set([tokenCount - 1, tokenCount]))
+                if let list = source[1] as? CacheList {
+                    #expect(list.offset == tokenCount)
+                }
+                coordinator.storeAfterGeneration(
+                    promptTokens: key, perLayerData: [], ssmStates: nil, cache: source)
+                #expect(!coordinator.hasDurableDiskEntry(tokens: key))
+                #expect(!coordinator.hasValidatedDiskEntry(tokens: key))
+                #expect(coordinator.diskCache?.snapshotStats().stores == 0)
+                #expect(!nativeCoordinator(root).hasDurableDiskEntry(tokens: key))
+
+                // The same topology becomes durable after repairing only the
+                // leaf offset: refusal must not be a serializer-unsupported pass.
+                damaged.offset = tokenCount
+                coordinator.storeAfterGeneration(
+                    promptTokens: key, perLayerData: [], ssmStates: nil, cache: source)
+                #expect(coordinator.hasDurableDiskEntry(tokens: key))
+                #expect(coordinator.hasValidatedDiskEntry(tokens: key))
+                #expect(coordinator.diskCache?.snapshotStats().stores == 1)
+                #expect(nativeCoordinator(root).hasDurableDiskEntry(tokens: key))
+            }
+        }
+    }
+
+    @Test("unused wrapper offset does not reject valid native leaves", arguments: [7, 9])
+    func wrapperOffsetIsNotABoundary(tokenCount: Int) throws {
         try withRoot { root in
-            let coordinator = nativeCoordinator(root)
-            let source = sourceCache(nested: true)
-            let container = try #require(source[1] as? CacheList)
-            container.offset = 0
-            coordinator.storeAfterGeneration(
-                promptTokens: tokens, perLayerData: [],
-                ssmStates: nil, cache: source)
-            #expect(!coordinator.hasDurableDiskEntry(tokens: tokens))
-            #expect(!coordinator.hasValidatedDiskEntry(tokens: tokens))
-            #expect(coordinator.diskCache?.snapshotStats().stores == 0)
+            let key = Array(71 ..< 71 + tokenCount)
+            let writer = nativeCoordinator(root)
+            let source = sourceCache(nested: true, tokenCount: tokenCount)
+            let wrapper = try #require(source[1] as? CacheList)
+            wrapper.offset = 0
+            #expect(cacheBoundaryLeafOffsets(source) == [tokenCount, tokenCount])
+            writer.storeAfterGeneration(
+                promptTokens: key, perLayerData: [], ssmStates: nil, cache: source)
+            #expect(writer.hasDurableDiskEntry(tokens: key))
+            #expect(writer.diskCache?.snapshotStats().stores == 1)
+            let reader = nativeCoordinator(root)
+            guard
+                case .hit(let matched, _, let detail, _, _, let payload) = reader.fetch(
+                    tokens: key + [79])
+            else {
+                Issue.record("Valid native leaves must survive disk reopen")
+                return
+            }
+            #expect(matched == tokenCount && detail == .disk)
+            let arrays = try #require(payload)
+            let recurrent = MambaCache(slots: 6, persistentSlotCount: 4)
+            var restored: [any KVCache] = [KVCacheSimple(), CacheList(recurrent)]
+            #expect(restoreFromDiskArrays(arrays, into: &restored) == tokenCount)
+            #expect(cacheBoundaryLeafOffsets(restored) == [tokenCount, tokenCount])
+            #expect(recurrent[0]?.item(Int32.self) == 11)
+            #expect(recurrent[4] == nil)
         }
     }
 
