@@ -268,16 +268,24 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
 
     @Test("RunBench gates do not count reasoning-only output as visible")
     func runBenchGatesDoNotCountReasoningOnlyOutputAsVisible() throws {
-        let files = [
-            "RunBench/Bench.swift",
-            "RunBench/StabilityBench.swift",
-            "RunBench/VLBench.swift",
-            "RunBench/OmniBench.swift",
-            "RunBench/JangPressRegressionBench.swift",
-        ]
+        // The retired cold-tier regression driver was removed with its APIs.
+        // RunBench now builds the directory's current Swift sources: inventory
+        // them all instead of pinning this guard to a deleted driver.
+        let root = FocusedMLXTestSupport.sourceURL("RunBench")
+        let enumerator = try #require(
+            FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]))
+        let files = enumerator.compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "swift" }
+            .sorted { $0.path < $1.path }
+        #expect(!files.isEmpty)
+        #expect(
+            Set(files.map(\.lastPathComponent)).isSuperset(of: [
+                "Bench.swift", "StabilityBench.swift", "VLBench.swift", "OmniBench.swift",
+            ]))
         for file in files {
-            let source = try String(
-                contentsOf: FocusedMLXTestSupport.sourceURL(file), encoding: .utf8)
+            let source = try String(contentsOf: file, encoding: .utf8)
+            #expect(!source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             #expect(!source.contains("text.isEmpty ? reasoning : text"))
             #expect(!source.contains("visible.isEmpty ? reasoning : visible"))
             #expect(!source.contains("visible.isEmpty ? r.reasoning : visible"))
@@ -291,6 +299,9 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             #expect(!source.contains("let combined = text + reasoning"))
             #expect(!source.contains("(text + reasoning).count"))
             #expect(!source.contains("(text + reasoning).isEmpty"))
+            #expect(
+                !source.contains(
+                    "var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
         }
 
         let bench = try String(
@@ -300,10 +311,6 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/StabilityBench.swift"),
             encoding: .utf8)
         #expect(stability.contains("empty visible output"))
-        let jangPress = try String(
-            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/JangPressRegressionBench.swift"),
-            encoding: .utf8)
-        #expect(!jangPress.contains("var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
     }
 
     @Test("VL media-salt proof reports token rate and peak memory gate")
