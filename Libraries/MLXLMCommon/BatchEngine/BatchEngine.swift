@@ -2774,11 +2774,16 @@ public actor BatchEngine {
                     // was decomposed. Splitting the prefill at the boundary and
                     // capturing the live state makes the turn's own forward pass
                     // the only forward pass.
+                    // A validated media restore leaves the historical payload in
+                    // originalInput while the prepared suffix can be text-only.
+                    // Only split that suffix; post-prepare cache keys still need
+                    // their existing model-specific preparation path.
                     let hybridBoundarySplit: Int? = {
                         guard cacheCoordinator?.isHybrid == true,
                             cacheCoordinator?.canPersistBoundaries == true,
                             slot.originalInput.cachePromptIntent != .auxiliary,
-                            !slot.originalInput.hasMediaContent,
+                            !inputForPrepare.hasMediaContent,
+                            !slot.originalInput.requiresPostPrepareCacheKey,
                             slot.diskSeedSnapshot == nil
                         else { return nil }
                         let fullLen = slot.cachePromptTokenIds.count
