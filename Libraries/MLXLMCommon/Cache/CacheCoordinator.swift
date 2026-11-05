@@ -1439,6 +1439,26 @@ public final class CacheCoordinator: @unchecked Sendable {
         isResumeBoundary: Bool = false,
         isPostAnswer: Bool = false
     ) {
+        storeAfterGeneration(
+            promptTokens: promptTokens, perLayerData: perLayerData, ssmStates: ssmStates,
+            cache: cache, mediaSalt: mediaSalt, chainId: chainId,
+            isStableRoot: isStableRoot, isResumeBoundary: isResumeBoundary,
+            isPostAnswer: isPostAnswer, dflash2Context: nil)
+    }
+
+    /// Optional conditioning shares the target payload's lifetime and quota.
+    func storeAfterGeneration(
+        promptTokens: [Int],
+        perLayerData: [(keys: MLXArray, values: MLXArray)?],
+        ssmStates: [MLXArray]?,
+        cache: [any KVCache]? = nil,
+        mediaSalt: String? = nil,
+        chainId: String? = nil,
+        isStableRoot: Bool = false,
+        isResumeBoundary: Bool = false,
+        isPostAnswer: Bool = false,
+        dflash2Context: DFlash2PrefixContext?
+    ) {
         var trace = CacheFinalizationTrace("coordinator-store", tokens: promptTokens.count)
         defer { trace.mark("return") }
         let totalTokens = promptTokens.count
@@ -1599,6 +1619,23 @@ public final class CacheCoordinator: @unchecked Sendable {
                 if !arrays.isEmpty {
                     diskArrays = arrays
                 }
+            }
+        }
+
+        if let context = dflash2Context, var arrays = diskArrays, let diskCache {
+            let baseBytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
+            let companionBytes =
+                persistSeparateRecurrentPayload
+                ? IndexedBytes.total((ssmStates ?? []).map { Int64($0.nbytes) }) : 0
+            let cap = Int64(max(1, diskCache.maxSizeBytes))
+            let reserved = IndexedBytes.sum(IndexedBytes.sum(baseBytes, companionBytes), 131_072)
+            let available = cap - min(cap, reserved)
+            // Optional acceleration must never turn an otherwise valid KV store into a miss.
+            if let extra = context.diskArrays(at: promptTokens.count, byteBudget: available),
+                extra.keys.allSatisfy({ arrays[$0] == nil })
+            {
+                arrays.merge(extra) { existing, _ in existing }
+                diskArrays = arrays
             }
         }
 

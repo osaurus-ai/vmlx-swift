@@ -52,6 +52,95 @@ suppression, reasoning budgets and `min_p` all need per-step logits that
 a pre-drafted block does not have. Those requests fall back to ordinary
 decoding.
 
+## Conditioning at an SSD prefix boundary
+
+Restoring target KV alone does not restore the target hidden features read by
+the drafter. A warm prompt can consequently condition proposals on only the
+uncached generation suffix, although target KV covers the whole prefix.
+
+The SSD payload may now include two optional arrays:
+`__dflash2_context_descriptor__` and `__dflash2_context_hidden__`. The descriptor
+records format version, absolute start/end positions, feature width, and ordered
+capture-layer IDs. Features are captured at the **same canonical boundary** as
+the target snapshot, before processing the generation suffix. Image prompts use
+the existing media-salted key. Both early boundary stores and terminal stores
+carry this data; images are eligible for early stores, while video whose final
+key is resolved after preparation follows the existing deferred-store policy.
+
+Restore requires matching positions, capture order, width, supported floating
+dtype, shape, and finite values. Only contiguous compatible suffix features are
+appended. The retained window comes from the drafter's declared sliding window;
+no new draft-width, sampling, reasoning, or output-token override is introduced.
+Missing, old, or malformed auxiliary arrays fall back to suffix-only
+conditioning without invalidating usable target KV. Existing entries are not
+rewritten just to add optional features. An incompatible feature join also falls
+back to authentic suffix features rather than synthesizing missing rows.
+
+The arrays share the primary payload's lifetime and disk accounting. If optional
+features cannot fit the configured disk quota together with target and companion
+state, they are omitted and the base cache can still be stored. There is no
+separate persistent feature cache.
+
+### Qualification checkpoint, 2026-11-05
+
+`DFlash2PrefixContextTests` covers disk round trips, absolute windows, invalid
+metadata/data, contiguous joins, target-KV compatibility, coordinator reopen,
+and oversized optional payloads. Thirteen tests passed against a fresh Common
+build. An added actual-disk-reader regression first exposed a fallback bug:
+the reader's general finite-value screen discarded valid target KV when optional
+features contained NaN. The reader now keeps the required-target screen intact
+and leaves validation of these two reserved auxiliary arrays to their consumer.
+Tests cover both optional-array failures and rejection of corrupt target state
+alongside corrupt optional data. Store-side finite checks remain unchanged.
+
+Six real Qwen3.8-27B image generations exercised cold, warm, and growing turns
+through the public generation entry point. Warm conditioning included all 560
+prompt rows instead of only seven new rows. Persisted boundary features matched
+an independently captured prefix byte for byte; all 338 original target-cache
+tensors also remained byte-identical. All six generations stopped naturally
+with visible output and positive measured rates (3.92–34.01 tokens/s in that
+test artifact). **One follow-up incorrectly answered `3 + 2 = 6` and fails the
+quality gate.** These rates are unpaired measurements, not a speedup claim.
+
+The Release dev app on `5c3e0025` restored 4,932 Qwen prompt tokens after a full
+restart and retained the declared 2,047 feature rows. GLM-5.3-Flash cold/growing
+turns used its distinct five-tap, 20,480-wide capture layout; the growing turn
+restored 143 tokens and conditioned on all 379 prompt rows. Both models returned
+correct arithmetic answers in these scoped GUI checks, with separated GLM
+reasoning. A real Stop ended a Qwen stream after 255 tokens; the next turn
+restored the 7,588-token canonical boundary and answered correctly. Rates and
+typed payload/window observations were retained. A 2,306-token code run stopped
+naturally, but its generated program was not executed or fully reviewed.
+
+An AR request also restored a DFlash-produced entry and answered correctly.
+It exposed a separate 9,642.513 ms, 8,043-token finalization re-derive in the
+unchanged batched AR cache path; SSD writes took 66 and 60 ms. That delay remains
+separate from the conditioning change. A stacked boundary-capture follow-up
+subsequently exercised three warm image-history AR turns without that full
+re-derive; it does not remove cold-media or stable-system-seed rebuilds.
+
+The stacked dev app also completed a real foreground `sleep 45` command,
+returned both actual stdout markers with exit code zero, and restored 12,175
+prompt tokens for the post-tool answer. That answer correctly reported the
+marker and the original invoice subtotal (123 generated tokens, 93.14 tokens/s
+in the native receipt). Initial private-archive runs failed before execution
+because the test build lacked sandbox entitlements and its socket path exceeded
+104 bytes; both failures were preserved and only test packaging was repaired.
+Permission time is included in the tool's 81.073-second receipt, so it is not a
+45-second latency benchmark.
+
+The next DFlash answer incorrectly computed `271828 + 2 = 271827`; a warm
+regeneration repeated it, while an edit/resend answered correctly. These remain
+quality failures. Selecting AR and regenerating replayed frozen DFlash controls
+and therefore did not constitute AR proof. A fresh AR submission answered
+correctly but had a different effective request/cache path, so it does not
+establish token-level numerical parity. Its cold stable-system-seed rebuild
+also remains open. Shared-entry AR read overhead, paired performance and broader
+family/media coverage remain incomplete.
+Full-model physical memory usage fails the low-memory gate; owned loading is
+retained. The cache change does not establish numerical parity for every
+speculative verify shape or resolve the earlier long-answer/quality failures.
+
 ## Rollback on a hybrid target
 
 Qwen3.8-27B is 48 GatedDeltaNet layers plus 16 full-attention layers.

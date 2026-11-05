@@ -68,7 +68,8 @@ func storeCapturedHybridBoundary(
     kvBits: Int? = nil,
     kvMode: KVQuantizationMode,
     kvGroupSize: Int,
-    quantizedKVStart: Int
+    quantizedKVStart: Int,
+    dflash2Context: DFlash2PrefixContext? = nil
 ) -> Bool {
     guard ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_EARLY_SPILL"] != "0",
           !Task.isCancelled,
@@ -93,7 +94,8 @@ func storeCapturedHybridBoundary(
         kvMode: kvMode)
     coordinator.storeAfterGeneration(
         promptTokens: tokens, perLayerData: [], ssmStates: states, cache: diskCache,
-        mediaSalt: mediaSalt, chainId: chainId, isResumeBoundary: true)
+        mediaSalt: mediaSalt, chainId: chainId, isResumeBoundary: true,
+        dflash2Context: dflash2Context)
     return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
 }
 
