@@ -90,7 +90,7 @@ final class BatchWarmMediaBoundaryTests: XCTestCase {
         #endif
     }
 
-    private func input(pixel: Float = 1) -> LMInput {
+    private func input(pixel: Float = 1) -> sending LMInput {
         LMInput(
             text: .init(
                 tokens: MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), tokenIds: ids),
@@ -130,7 +130,7 @@ final class BatchWarmMediaBoundaryTests: XCTestCase {
         }
         model.clearObservations()
         let processor = BoundaryProcessor()
-        nonisolated(unsafe) let context = ModelContext(
+        let context = ModelContext(
             configuration: processor.configuration, model: model,
             processor: processor, tokenizer: processor.tokenizer)
         let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
