@@ -78,10 +78,10 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testJANGTQ1WeightFormatSourceRoutesNemotronToOneBitJANGTQ() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/NemotronH.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLLM/Models/NemotronH.swift"),
             encoding: .utf8)
         let factorySource = try String(
-            contentsOfFile: "Libraries/MLXLLM/LLMModelFactory.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLLM/LLMModelFactory.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(source.contains("JANGTQStreamingExperts.isEnabled"))
@@ -94,7 +94,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testMissingJANGTQSignalsKeepsNemotronAffineSwitchMLPSourcePath() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/NemotronH.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLLM/Models/NemotronH.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(source.contains("self._switchMLP.wrappedValue = NemotronHSwitchMLP("))
@@ -103,10 +103,12 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testUltraOneBitJANGTQStreamingStaysExplicitUntilLiveFastPathIsProven() throws {
         let streamingSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift"),
             encoding: .utf8)
         let linearSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/TurboQuantSwitchLinear.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/TurboQuantSwitchLinear.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(streamingSource.contains("shouldAutoEnableNemotronUltra("))
@@ -119,16 +121,18 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testUltraRuntimeFastPathControlsAreSourceWired() throws {
         let modelSource = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/NemotronH.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLLM/Models/NemotronH.swift"),
             encoding: .utf8)
         let jangtqSource = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/NemotronHJANGTQ.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLLM/Models/NemotronHJANGTQ.swift"),
             encoding: .utf8)
         let streamingSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift"),
             encoding: .utf8)
         let benchSource = try String(
-            contentsOfFile: "RunBench/Bench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(modelSource.contains("JANGTQ_DISABLE_NEMOTRON_ACTIVATION_BF16"))
@@ -176,7 +180,8 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testStackedNemotronWeightedDecodeUsesScoredDownProjectionKernel() throws {
         let kernelSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/JANGTQKernels.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/JANGTQKernels.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(kernelSource.contains("kGatherTQScoredSource"))
@@ -236,7 +241,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
         XCTAssertEqual(pattern.filter { $0 == "attention" }.count, 12)
 
         let source = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/NemotronH.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLLM/Models/NemotronH.swift"),
             encoding: .utf8)
         XCTAssertTrue(source.contains("return MambaCache()"))
         XCTAssertTrue(source.contains("return KVCacheSimple()"))
@@ -298,7 +303,8 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
 
     func testExplicitStreamingOffOverridesUltraAutoStreamingSourceContract() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/JANGTQStreamingExperts.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(source.contains("if let explicit = explicitStreamingEnabled"))
@@ -307,7 +313,7 @@ final class NemotronHJANGTQDispatchFocusedTests: XCTestCase {
     }
 
     func testNemotronStreamingFastPathRequiresOnlyUpDownProjectionCoverage() throws {
-        let sourceURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let sourceURL = FocusedMLXTestSupport.sourceURL("")
             .appendingPathComponent("Libraries/MLXLMCommon/JANGTQStreamingExperts.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
 

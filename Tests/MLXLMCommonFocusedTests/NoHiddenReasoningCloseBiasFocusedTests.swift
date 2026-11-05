@@ -13,10 +13,11 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("decode does not bias or force reasoning close tokens")
     func decodeDoesNotBiasOrForceReasoningCloseTokens() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(!evaluate.contains("ReasoningCloseBiasConfig"))
@@ -34,7 +35,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         // These assertions are what keep `ReasoningBudget` on the right side
         // of the rule above: it may exist, but it may never arm itself.
         let budget = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/ReasoningBudget.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/ReasoningBudget.swift"),
             encoding: .utf8)
         #expect(evaluate.contains("public var reasoningBudgetTokens: Int? = nil"))
         #expect(evaluate.contains("public var reasoningBudgetCloseTokenID: Int? = nil"))
@@ -54,7 +56,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("sampling applies temperature before probability filters")
     func samplingAppliesTemperatureBeforeProbabilityFilters() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(evaluate.contains("Temperature is applied before probability filters"))
@@ -69,10 +71,12 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("Nemotron Omni image preprocessing uses dynamic source grid")
     func nemotronOmniImagePreprocessingUsesDynamicSourceGrid() throws {
         let model = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift"),
             encoding: .utf8)
         let preprocessors = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/NemotronHOmni/Preprocessors.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXVLM/Models/NemotronHOmni/Preprocessors.swift"),
             encoding: .utf8)
 
         #expect(model.contains("let gridH = pixelValues.dim(2) / config.visionPatchSize"))
@@ -118,7 +122,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             "RunBench/JangPressRegressionBench.swift",
         ]
         for file in files {
-            let source = try String(contentsOfFile: file, encoding: .utf8)
+            let source = try String(
+                contentsOf: FocusedMLXTestSupport.sourceURL(file), encoding: .utf8)
             #expect(!source.contains("text.isEmpty ? reasoning : text"))
             #expect(!source.contains("visible.isEmpty ? reasoning : visible"))
             #expect(!source.contains("visible.isEmpty ? r.reasoning : visible"))
@@ -134,21 +139,23 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
             #expect(!source.contains("(text + reasoning).isEmpty"))
         }
 
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         #expect(bench.contains("Reasoning-only output is a"))
         let stability = try String(
-            contentsOfFile: "RunBench/StabilityBench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/StabilityBench.swift"),
             encoding: .utf8)
         #expect(stability.contains("empty visible output"))
         let jangPress = try String(
-            contentsOfFile: "RunBench/JangPressRegressionBench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/JangPressRegressionBench.swift"),
             encoding: .utf8)
         #expect(!jangPress.contains("var p = GenerateParameters(maxTokens: maxNewTokens, temperature: 0)"))
     }
 
     @Test("VL media-salt proof reports token rate and peak memory gate")
     func vlMediaSaltProofReportsTokenRateAndPeakMemoryGate() throws {
-        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+        let source = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/VLBench.swift"), encoding: .utf8)
 
         #expect(source.contains("mediaSalt memory pre-load"))
         #expect(source.contains("mediaSalt memory post-load"))
@@ -161,7 +168,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
 
     @Test("VL batch chat reports peak memory gate")
     func vlBatchChatReportsPeakMemoryGate() throws {
-        let source = try String(contentsOfFile: "RunBench/VLBench.swift", encoding: .utf8)
+        let source = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/VLBench.swift"), encoding: .utf8)
 
         #expect(source.contains("VL batch memory pre-load"))
         #expect(source.contains("VL batch memory post-load"))
@@ -211,7 +219,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("terminal info snapshots unclosed reasoning between the two flushes")
     func terminalInfoSnapshotsUnclosedReasoningBetweenTheTwoFlushes() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         guard
@@ -254,22 +262,25 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("growing chat cache probe distinguishes unsafe template divergence")
     func growingChatCacheProbeDistinguishesUnsafeTemplateDivergence() throws {
         let bench = try String(
-            contentsOfFile: "RunBench/Bench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"),
             encoding: .utf8)
         let tokenizer = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Tokenizer.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Tokenizer.swift"),
             encoding: .utf8)
         let input = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/LanguageModel.swift"),
             encoding: .utf8)
         let processor = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/ModelContainer.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/ModelContainer.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(bench.contains("Native turn-2 common prefix"))
@@ -293,7 +304,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("growing chat verifier failures exit instead of crashing async main")
     func growingChatVerifierFailuresExitInsteadOfCrashingAsyncMain() throws {
         let bench = try String(
-            contentsOfFile: "RunBench/Bench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"),
             encoding: .utf8)
         guard let envCheck = bench.range(
             of: "if (env[\"BENCH_GROWING_CHAT_CACHE\"] ?? \"0\") == \"1\""),
@@ -313,7 +324,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("history-boundary rederive feeds remaining tokens batch-first")
     func historyBoundaryRederiveUsesBatchFirstRemainingTokens() throws {
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         guard let start = engine.range(of: "func boundarySnapshot(tokens: [Int]"),
               let end = engine.range(
@@ -337,7 +349,7 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
     @Test("TokenIterator history-boundary rederive feeds remaining tokens batch-first")
     func tokenIteratorHistoryBoundaryRederiveUsesBatchFirstRemainingTokens() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         guard let start = evaluate.range(of: "private func cacheSnapshotForBoundary("),
               let end = evaluate.range(
@@ -583,7 +595,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("BatchEngine tool-call live probe supplies tools and rejects empty rows")
     func batchEngineToolCallProbeRequiresBehavioralEvidence() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runBatchEngineToolCall", from: bench),
             "runBatchEngineToolCall not found"
@@ -609,7 +622,7 @@ struct HarmonyParserFocusedTests {
     @Test("Gemma4 VLM processor renders normalized tools and preserves raw schemas")
     func gemma4VLMProcessorRendersNormalizedToolsAndPreservesRawSchemas() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXVLM/Models/Gemma4.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXVLM/Models/Gemma4.swift"),
             encoding: .utf8)
 
         #expect(source.contains("normalizedToolsForChatTemplate(input.tools)"))
@@ -619,7 +632,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Harmony live reasoning probe honors generation defaults")
     func harmonyLiveReasoningProbeHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runHarmonyReasoningCheck", from: bench),
             "runHarmonyReasoningCheck not found"
@@ -631,7 +645,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Qwen multi-turn tool probe honors generation defaults")
     func qwenMultiturnToolProbeHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
             "runQwenMultiturnToolCheck not found"
@@ -650,7 +665,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("Qwen multi-turn tool probe keeps prepared tool schemas")
     func qwenMultiturnToolProbeKeepsPreparedToolSchemas() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runQwenMultiturnToolCheck", from: bench),
             "runQwenMultiturnToolCheck not found"
@@ -684,7 +700,8 @@ struct HarmonyParserFocusedTests {
 
     @Test("DSV4 coherence gate honors bundle defaults")
     func dsv4CoherenceGateHonorsGenerationDefaults() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let function = try #require(
             Self.extractFunction(named: "runDSV4CoherenceGate", from: bench),
             "runDSV4CoherenceGate not found"
@@ -2062,7 +2079,7 @@ struct Gemma4VLMFocusedSourceContractsTests {
     }
 
     private func gemma4VLMSource() throws -> String {
-        let url = URL(fileURLWithPath: "Libraries/MLXVLM/Models/Gemma4.swift")
+        let url = FocusedMLXTestSupport.sourceURL("Libraries/MLXVLM/Models/Gemma4.swift")
         return try String(contentsOf: url, encoding: .utf8)
     }
 

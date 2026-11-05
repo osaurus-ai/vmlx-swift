@@ -55,16 +55,19 @@ struct MediaCachePlaceholderTests {
     @Test("post-prepare cache-key paths use effective prompt tokens")
     func postPrepareCacheKeyPathsUseEffectivePromptTokens() throws {
         let scheduler = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift"),
             encoding: .utf8)
         let batch = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let nativeMTP = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
         #expect(scheduler.contains("var cachePromptTokenIds: [Int]"))
@@ -89,7 +92,7 @@ struct MediaCachePlaceholderTests {
     @Test("OmniBench carries live repeated-video post-prepare alias proof")
     func omniBenchCarriesRepeatedVideoAliasProof() throws {
         let omniBench = try String(
-            contentsOfFile: "RunBench/OmniBench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/OmniBench.swift"),
             encoding: .utf8)
 
         #expect(omniBench.contains("5d. video repeated cache alias"))

@@ -24,10 +24,13 @@ struct RuntimeEnvironmentSourceCoverageTests {
 
     private func swiftSources(under root: String) -> [(String, String)] {
         let fm = FileManager.default
-        guard let e = fm.enumerator(atPath: root) else { return [] }
+        let directory = FocusedMLXTestSupport.sourceURL(root)
+        guard let e = fm.enumerator(atPath: directory.path) else { return [] }
         var out: [(String, String)] = []
         for case let p as String in e where p.hasSuffix(".swift") {
-            if let text = try? String(contentsOfFile: root + "/" + p, encoding: .utf8) {
+            if let text = try? String(
+                contentsOf: directory.appendingPathComponent(p), encoding: .utf8)
+            {
                 out.append((p, text))
             }
         }

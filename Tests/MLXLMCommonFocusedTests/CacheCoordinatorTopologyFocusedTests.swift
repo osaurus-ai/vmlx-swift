@@ -619,7 +619,8 @@ struct CacheCoordinatorTopologyFocusedTests {
     @Test("ZAYA CCA state is not duplicated into SSM companion cache")
     func zayaCCADoesNotUseSSMCompanionExtraction() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/CacheHelpers.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/CacheHelpers.swift"),
             encoding: .utf8)
 
         #expect(source.contains("} else if layer is ZayaCCACache {"))
@@ -1243,10 +1244,11 @@ struct CacheCoordinatorTopologyFocusedTests {
     @Test("caller policy bypasses only disk-backed forced-tool restore")
     func callerPolicyBypassesOnlyDiskBackedForcedToolRestore() throws {
         let batchSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluateSource = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(batchSource.contains("shouldSkipDiskBackedToolPromptSeedBoundary"))
@@ -1544,7 +1546,7 @@ struct Gemma4CacheTopologyFocusedTests {
     @Test("TokenIterator compiled decode promotes all-rotating SWA caches")
     func tokenIteratorCompiledDecodePromotesAllRotatingCaches() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         guard let start = source.range(of: "mutating func setupCompiledDecode("),
               let end = source.range(

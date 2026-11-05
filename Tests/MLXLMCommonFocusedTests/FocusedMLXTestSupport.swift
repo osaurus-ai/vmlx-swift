@@ -6,6 +6,12 @@ import Darwin
 import os
 
 enum FocusedMLXTestSupport {
+    /// Source contracts read the package under test, independently of the
+    /// runner's working directory. Missing files still fail their assertions.
+    static func sourceURL(_ relativePath: String) -> URL {
+        repoRoot.appendingPathComponent(relativePath)
+    }
+
     private static let queue = DispatchQueue(label: "ai.osaurus.vmlx.focused-mlx-tests")
     private static let lock = ProcessWideMLXTestLock()
 

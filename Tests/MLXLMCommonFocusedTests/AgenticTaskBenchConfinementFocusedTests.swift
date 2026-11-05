@@ -8,7 +8,7 @@ import Testing
 struct AgenticTaskBenchConfinementFocusedTests {
     private func source() throws -> String {
         try String(
-            contentsOfFile: "RunBench/AgenticTaskBench.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/AgenticTaskBench.swift"),
             encoding: .utf8)
     }
 
@@ -45,7 +45,8 @@ struct AgenticTaskBenchConfinementFocusedTests {
 
     @Test("agentic mode dispatches before the legacy model load")
     func agenticModeOwnsExactlyOneModelContext() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
         let dispatch = try #require(bench.range(of: #"env["BENCH_AGENTIC_TASKS"]"#))
         let legacyLoad = try #require(bench.range(of: #"print("Loading...")"#))
         #expect(dispatch.lowerBound < legacyLoad.lowerBound)

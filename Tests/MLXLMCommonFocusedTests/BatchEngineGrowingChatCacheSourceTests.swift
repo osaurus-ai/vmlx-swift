@@ -11,7 +11,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("DFlash and DSpark stores retain the requesting chat owner at both boundaries")
     func draftCacheStoresRetainChatOwner() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift"),
             encoding: .utf8)
         let store = try #require(source.components(separatedBy: "mutating func storeCacheAfterGeneration(").last)
         let calls = store.components(separatedBy: "coordinator.storeAfterGeneration(").dropFirst()
@@ -24,7 +25,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("reusable-prefix warmup intent survives input copies and forbids hybrid stripping")
     func reusablePrefixWarmupIntentIsPreserved() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/LanguageModel.swift"),
             encoding: .utf8)
 
         #expect(source.contains("public enum CachePromptIntent: Sendable, Equatable"))
@@ -56,13 +58,15 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("all generation paths reject unsafe exact recurrent warmups and throwaway boundaries")
     func cacheWarmupPersistenceContractCoversAllGenerationPaths() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let batch = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let mtp = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
         // The solo N-1 disk-seed boundary is published for reusable-prefix
@@ -146,10 +150,12 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("batch engine stores post-answer cache boundaries and keeps hybrid full-hit guard")
     func batchEngineStoresPostAnswerBoundaryForGrowingChat() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let scheduler = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift"),
             encoding: .utf8)
 
         #expect(scheduler.contains("var generatedTokenIds: [Int] = []"))
@@ -195,7 +201,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("token iterator mirrors post-answer cache boundary policy")
     func tokenIteratorStoresPostAnswerBoundaryForGrowingChat() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(source.contains("mutating func storeCacheAfterGeneration"))
@@ -254,7 +260,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("native MTP iterator skips disk-backed history boundary rederive")
     func nativeMTPIteratorSkipsDiskBackedHistoryBoundaryReDerive() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
@@ -293,7 +300,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("token iterator publishes info early but finishes only after cache store drain")
     func tokenIteratorFinishesOnlyAfterCacheStoreDrain() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let taskRange = try #require(source.range(of: "private func generateLoopTask"))
         let task = String(source[taskRange.lowerBound...])
@@ -319,7 +326,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("token iterator materializes disk cache restores before prefill")
     func tokenIteratorMaterializesDiskRestoreBeforePrefill() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         let serializedRestore = try #require(source.range(
@@ -335,13 +342,15 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("solo and batched DSV4 paths capture prompt-minus-one disk seeds during prefill")
     func generationPathsCaptureTypedDiskSeedDuringPrefill() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let batch = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let scheduler = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift"),
             encoding: .utf8)
 
         #expect(source.contains("static func diskSeedBoundaryIndex("))
@@ -417,7 +426,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("batch warm DSV4 replay skips storage without bypassing terminal drain")
     func batchWarmDSV4ReplayPreservesTerminalDrain() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let finishStart = try #require(source.range(of: "private func finishSlot("))
         let finishEnd = try #require(source.range(
@@ -455,7 +465,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("batch DSV4 persists its N-1 seed before decode and releases the duplicate")
     func dsv4DiskSeedDoesNotRemainResidentThroughDecode() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(source.contains("private func storePrefillCapturedDiskSeed("))
@@ -478,16 +489,19 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("history-boundary rederive skips disk-backed cache topologies after trim miss")
     func historyBoundaryRederiveSkipsDiskBackedTopologiesAfterTrimMiss() throws {
         let helpers = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/CacheHelpers.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/CacheHelpers.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let batch = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let nativeMTP = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
         #expect(helpers.contains("func shouldSkipHistoryBoundaryRederiveAfterTrimMiss"))
@@ -525,16 +539,19 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("standalone rotating/SWA caches share the generation-suffix-stripped boundary policy")
     func standaloneRotatingSharesStrippedBoundaryPolicy() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let batch = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let mtp = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
         let dflash2 = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift"),
             encoding: .utf8)
 
         // The shared helper admits the proven standalone rotating/SWA
@@ -605,7 +622,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("token iterator does not blanket-eval disk-backed cache snapshots before store")
     func tokenIteratorDoesNotBlanketEvalDiskBackedSnapshotsBeforeStore() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let storeRange = try #require(source.range(of: "func store(\n            tokens: [Int],"))
         let store = String(source[storeRange.lowerBound...])
@@ -622,10 +639,12 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("disk cache serializes MLX safetensors IO across model cache instances")
     func diskCacheSerializesMLXSafetensorsIOAcrossInstances() throws {
         let disk = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/DiskCache.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/DiskCache.swift"),
             encoding: .utf8)
         let ssm = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMCompanionDiskStore.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/SSMCompanionDiskStore.swift"),
             encoding: .utf8)
 
         #expect(disk.contains("enum MLXDiskCacheIOLock"))
@@ -661,7 +680,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("load-time stack materialization serializes with cache IO")
     func loadTimeStackMaterializationSerializesWithCacheIO() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/LoadTimeStacking.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/LoadTimeStacking.swift"),
             encoding: .utf8)
         let helper = try #require(source.range(of: "public func loadTimeMaterializedStacked"))
         let helperSource = String(source[helper.lowerBound...])
@@ -675,10 +695,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("SSM companion cache serializes in-memory MLX materialization")
     func ssmCompanionCacheSerializesInMemoryMLXMaterialization() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMStateCache.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Cache/SSMStateCache.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let store = try #require(source.range(of: "public func store("))
         let storeSource = String(source[store.lowerBound...])
@@ -703,7 +724,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("token iterator trims full cache hits before one-token seed prefill")
     func tokenIteratorTrimsFullCacheHitBeforeSeedPrefill() throws {
         let source = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(source.contains("let trimNeeded = cacheOffset - (promptLen - 1)"))
@@ -715,10 +736,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("reasoning close-token forcing is not a decode feature")
     func reasoningCloseTokenForcingIsAbsent() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(!evaluate.contains("ReasoningCloseBiasConfig"))
@@ -738,7 +760,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("batch engine has env-gated reasoning prompt-tail diagnostics")
     func batchEngineHasReasoningPromptTailDiagnostics() throws {
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         // The legacy `VMLINUX_` spelling is no longer a literal at the call site: it is derived
@@ -755,7 +778,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("batch text forwarding does not inherit cache-store actor isolation")
     func batchTextForwardingRunsOutsideEngineActor() throws {
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(engine.contains("Task.detached {\n            var detokenizer"))
@@ -774,10 +798,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("MiniMax stays off compiled decode until parity is proven")
     func minimaxCompiledDecodeIsDenied() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(evaluate.contains("typeName.contains(\"minimax\")"))
@@ -788,10 +813,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("MiMo V2 cache topology keeps TurboQuant limited to full-attention KV layers")
     func mimoV2CacheTopologyLimitsTurboQuantToFullAttentionKVLayers() throws {
         let model = try String(
-            contentsOfFile: "Libraries/MLXLLM/Models/MiMoV2Flash.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLLM/Models/MiMoV2Flash.swift"),
             encoding: .utf8)
         let kvCache = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/KVCache.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/KVCache.swift"),
             encoding: .utf8)
 
         #expect(model.contains("modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? \"mimo_v2_flash\""))
@@ -811,10 +837,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
     @Test("Laguna stays off compiled decode until parity is proven")
     func lagunaCompiledDecodeIsDenied() throws {
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
 
         #expect(evaluate.contains("typeName.contains(\"laguna\")"))

@@ -8,7 +8,8 @@ import Testing
 struct DSV4AgenticToolSourceTests {
     @Test("agentic row enforces DSML, exact args, native interleaving, defaults, and disk-only L2")
     func agenticRowEnforcesDSMLThinkParserExactArgsDefaultsAndDiskOnlyL2() throws {
-        let bench = try String(contentsOfFile: "RunBench/Bench.swift", encoding: .utf8)
+        let bench = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("RunBench/Bench.swift"), encoding: .utf8)
 
         #expect(bench.contains("BENCH_DSV4_AGENTIC_TOOL"))
         #expect(bench.contains("func runDSV4AgenticToolCheck("))
