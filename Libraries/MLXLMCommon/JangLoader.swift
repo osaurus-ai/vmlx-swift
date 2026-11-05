@@ -2588,16 +2588,16 @@ public struct JangLoader: Sendable {
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
-            let declaredForLayer = declaredQuantization(for: basePath)
+            let skipsDeclaredAliases = declaredPerLayerQuantization?
+                .declaresSkipForAnyAlias(of: basePath) ?? false
+            let declaredForLayer = skipsDeclaredAliases ? nil : declaredQuantization(for: basePath)
             let explicitForLayer: BaseConfiguration.Quantization? = {
                 guard let declaredPerLayerQuantization else { return nil }
                 // Contradictory aliases (one spelling `.quantize`, another
                 // `.skip`) make the declaration a coin flip decided by candidate
                 // order. Set it aside so the packed width is resolved from the
                 // tensors instead — see `declaresSkipForAnyAlias`.
-                guard !declaredPerLayerQuantization
-                    .declaresSkipForAnyAlias(of: basePath)
-                else { return nil }
+                guard !skipsDeclaredAliases else { return nil }
                 guard let explicit = declaredPerLayerQuantization
                     .explicitQuantizationOption(layer: basePath)
                 else { return nil }
@@ -2775,8 +2775,27 @@ public struct JangLoader: Sendable {
                 return (d.bits, d.groupSize)
             }()
 
+            // A packed row can realize two different widths. For language
+            // anchors and hidden-input projections, the graph's exact hidden
+            // width disambiguates stale per-module metadata. Other towers have
+            // their own widths and retain their declarations.
+            let semanticHiddenOverride: (bits: Int, groupSize: Int)? = {
+                guard let declared = declaredIfConsistent,
+                    isLanguageHiddenAnchor || isHiddenInputProjection,
+                    let hiddenSize = hiddenSizeHint,
+                    let exact = inferExactQuantization(expectedInDim: hiddenSize),
+                    exact.bits != declared.bits || exact.groupSize != declared.groupSize
+                else { return nil }
+                let hasOtherTower = basePath.lowercased().split(separator: ".").contains { component in
+                    ["visual", "vision", "audio", "speech"].contains { component.hasPrefix($0) }
+                }
+                return hasOtherTower ? nil : exact
+            }()
+
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
+            } else if let exact = semanticHiddenOverride {
+                (bits, inferredGroupSize) = exact
             } else if let declared = declaredIfConsistent {
                 (bits, inferredGroupSize) = declared
             } else if isLanguageHiddenAnchor,

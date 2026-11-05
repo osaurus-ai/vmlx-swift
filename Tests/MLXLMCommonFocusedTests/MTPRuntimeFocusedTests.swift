@@ -1928,17 +1928,45 @@ struct MTPRuntimeFocusedTests {
                 "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
             encoding: .utf8)
 
-        #expect(source.contains(
-            "try Task.checkCancellation()\n        let prepared = try prepareCapturingCacheBoundaries("))
+        let prefillStart = try #require(source.range(of: "let start = NativeMTPClock.now()"))
+        let prepareCall = try #require(source.range(of: "let prepared = try NativeMTPPromptPrimer.$current.withValue(primer)"))
+        #expect(prefillStart.lowerBound < prepareCall.lowerBound)
+        #expect(source[prefillStart.lowerBound..<prepareCall.lowerBound].contains("try Task.checkCancellation()"))
+        #expect(source.contains("try prepareCapturingCacheBoundaries("))
         // The boundary-capturing prefill checks between every chunk and before the tail.
         #expect(source.contains(
             "for boundary in wanted.sorted() {\n            try Task.checkCancellation()"))
         #expect(source.contains(
-            "try Task.checkCancellation()\n        return try model.prepare(segment(consumed, size)"))
+            "try Task.checkCancellation()\n        return try prepareReporting(segment(consumed, size)"))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let bridge = model.nativeBackboneForward"))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let draftBatch = Self.makeDrafts("))
+    }
+
+    @Test("already-cancelled native MTP initialization performs no model work")
+    func nativeMTPAlreadyCancelledInitializationDoesNotPrepare() async throws {
+        try await FocusedMLXTestSupport.withLock {
+            let model = FocusedNativeMTPProbeTarget()
+            let input = LMInput(tokens: MLXArray([3, 5, 7]))
+            let task = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                do {
+                    _ = try NativeMTPTokenIterator(
+                        input: input, model: model,
+                        parameters: GenerateParameters(maxTokens: 4, temperature: 0), depth: 3)
+                    Issue.record("Cancelled initialization unexpectedly succeeded")
+                } catch is CancellationError {
+                    // The cancellation must escape before prepare or either forward path.
+                } catch {
+                    Issue.record("Expected CancellationError, received \(error)")
+                }
+            }
+            await task.value
+            #expect(model.prepareCalls == 0)
+            #expect(model.backboneCalls == 0)
+            #expect(model.draftCalls == 0)
+        }
     }
 
     @Test("BatchEngine.submit rejects native MTP instead of silently batching AR")
@@ -2275,6 +2303,49 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("JANG semantic metadata loads a nonzero three-bit projection")
+    func jangSemanticMetadataLoadsNonzeroThreeBitProjection() throws {
+        try FocusedMLXTestSupport.withLock {
+            let base = "model.layers.0.self_attn.q_proj"
+            let source = MLXArray((0 ..< 16 * 3_072).map { Float(($0 % 37) - 18) / 19 })
+                .reshaped(16, 3_072)
+            let (weight, scales, optionalBiases) = MLX.quantized(source, groupSize: 128, bits: 3)
+            let biases = try #require(optionalBiases)
+            eval(weight, scales, biases)
+            let stale = BaseConfiguration.Quantization(groupSize: 64, bits: 6, mode: .affine)
+            let inferred = JangLoader.inferPerLayerQuantization(
+                weights: ["\(base).weight": weight, "\(base).scales": scales, "\(base).biases": biases],
+                jangConfig: JangConfig(quantization: JangQuantization(
+                    blockSize: 128, bitWidthsUsed: [3, 6])),
+                hiddenSizeHint: 3_072,
+                validInDims: [1_536, 3_072],
+                declaredDefaultQuantization: stale,
+                declaredPerLayerQuantization: .init(
+                    quantization: stale, perLayerQuantization: [base: .quantize(stale)]))
+            guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                Issue.record("Expected a realizable language projection")
+                return
+            }
+            #expect(actual.bits == 3)
+            #expect(actual.groupSize == 128)
+            // A wrong pair has the wrong input width; preserve the assertion
+            // failure instead of invoking a backend shape precondition.
+            guard actual.bits == 3, actual.groupSize == 128 else { return }
+            let input = MLXArray((0 ..< 3_072).map { Float(($0 % 11) - 5) / 7 }).reshaped(1, 3_072)
+            let loaded = QuantizedLinear(
+                weight: weight, scales: scales, biases: biases,
+                groupSize: actual.groupSize, bits: actual.bits)
+            let result = loaded(input)
+            let dense = MLX.dequantized(weight, scales: scales, biases: biases, groupSize: 128, bits: 3)
+            let reference = matmul(input, dense.T)
+            eval(result, reference)
+            #expect(result.shape == [1, 16])
+            let magnitude = MLX.max(abs(reference)).item(Float.self)
+            #expect(magnitude > 0.001)
+            #expect(MLX.max(abs(result - reference)).item(Float.self) < max(0.001, magnitude * 0.0001))
+        }
+    }
+
     @Test("JANG vision position embedding does not inherit language hidden width")
     func jangVisionPositionEmbeddingDoesNotInheritLanguageHiddenWidth() {
         FocusedMLXTestSupport.withLock {
@@ -2303,6 +2374,34 @@ struct MTPRuntimeFocusedTests {
             }
             #expect(actual.bits == 8)
             #expect(actual.groupSize == 64)
+        }
+    }
+
+    @Test(arguments: ["visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder", "speech_encoder"])
+    func jangNonLanguageTowerKeepsConsistentDeclaration(prefix: String) {
+        FocusedMLXTestSupport.withLock {
+            for suffix in ["embed_tokens", "layers.0.self_attn.q_proj"] {
+                let base = "\(prefix).\(suffix)"
+                let weights: [String: MLXArray] = [
+                    "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
+                    "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
+                ]
+                let declared = BaseConfiguration.Quantization(groupSize: 64, bits: 8, mode: .affine)
+                let inferred = JangLoader.inferPerLayerQuantization(
+                    weights: weights,
+                    jangConfig: JangConfig(quantization: JangQuantization(
+                        blockSize: 128, bitWidthsUsed: [4, 8])),
+                    hiddenSizeHint: 3_072,
+                    validInDims: [1_536, 3_072],
+                    declaredDefaultQuantization: declared,
+                    declaredPerLayerQuantization: .init(
+                        quantization: declared, perLayerQuantization: [base: .quantize(declared)]))
+                guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
+                    Issue.record("Expected declared non-language quantization for \(base)")
+                    continue
+                }
+                #expect(actual == declared)
+            }
         }
     }
 
@@ -3286,9 +3385,13 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
 {
     var kvHeads: [Int] { [1] }
     var nativeMTPAvailable: Bool { true }
+    private(set) var prepareCalls = 0
+    private(set) var backboneCalls = 0
+    private(set) var draftCalls = 0
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        .tokens(input.text)
+        prepareCalls += 1
+        return .tokens(input.text)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -3300,7 +3403,8 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
     }
 
     func nativeBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
-        NativeMTPForwardResult(
+        backboneCalls += 1
+        return NativeMTPForwardResult(
             logits: logits(for: inputs),
             hiddenStates: hiddenStates(for: inputs))
     }
@@ -3310,7 +3414,8 @@ private final class FocusedNativeMTPProbeTarget: Module, LanguageModel, NativeMT
         nextTokenIds: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        NativeMTPForwardResult(
+        draftCalls += 1
+        return NativeMTPForwardResult(
             logits: logits(for: nextTokenIds),
             hiddenStates: self.hiddenStates(for: nextTokenIds))
     }
