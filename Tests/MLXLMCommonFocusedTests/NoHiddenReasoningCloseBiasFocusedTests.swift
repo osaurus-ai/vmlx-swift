@@ -61,11 +61,165 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
 
         #expect(evaluate.contains("Temperature is applied before probability filters"))
         #expect(evaluate.contains("var logprobs = logSoftmax(logits * (1 / temp))"))
-        #expect(evaluate.contains("return categorical(logprobs)"))
+        // The draw lives inside the request-owned RNG wrapper; a bare return
+        // spelling is not part of the temperature/filter-order contract.
+        #expect(evaluate.contains("categorical(logprobs)"))
         #expect(!evaluate.contains("return categorical(logprobs * (1 / temp))"))
         #expect(evaluate.contains("var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))"))
         #expect(evaluate.contains("return softmax(logprobs, axis: -1, precise: true)"))
         #expect(!evaluate.contains("return softmax(logprobs * (1 / MLXArray(temperature))"))
+    }
+
+    @Test(
+        "ordinary and speculative sampling scale before nucleus filtering",
+        arguments: [[3], [1, 3], [1, 1, 3]], [0, 2])
+    func temperatureFilterDistributionsAndDraws(shape: [Int], topK: Int) throws {
+        try FocusedMLXTestSupport.withLock {
+            for dtype in [DType.float32, DType.bfloat16] {
+                let logits = MLX.log(MLXArray([Float(0.5), 0.3, 0.2]))
+                    .asType(dtype).reshaped(shape)
+                // Exercise the public speculative API with the same ranks as
+                // the ordinary sampler; retain singleton axes through filtering.
+                let nativeLogits = logits
+                let parameters = GenerateParameters(
+                    temperature: 0.5, topP: 0.6, topK: topK, randomSeed: 42)
+                let ordinary = parameters.sampler()
+                let speculative = SpeculativeSamplingController(parameters: parameters)
+                let oneHot = MLXArray([Float(1), 0, 0])
+                let filtered = TopPSampler(
+                    temperature: 0.5, topP: 0.6, topK: topK, randomSeed: 42
+                )
+                .filteredLogprobs(logits)
+                let ordinaryProbabilities = softmax(filtered, axis: -1, precise: true).reshaped(-1)
+                let speculativeProbabilities = speculative.probabilities(logits: nativeLogits)
+                    .reshaped(
+                        -1)
+                #expect(MLX.max(abs(ordinaryProbabilities - oneHot)).item(Float.self) < 0.00001)
+                #expect(MLX.max(abs(speculativeProbabilities - oneHot)).item(Float.self) < 0.00001)
+                for _ in 0 ..< 64 {
+                    #expect(ordinary.sample(logits: logits).item(Int.self) == 0)
+                    #expect(speculative.sample(logits: nativeLogits).token.item(Int.self) == 0)
+                }
+
+                // At T=1 the same nucleus retains two tokens. Filtering before
+                // scaling at T=0.5 would incorrectly retain these two as well.
+                let host = logits.asType(.float32).reshaped(-1).asArray(Float.self)
+                let first = Foundation.exp(Double(host[0]))
+                let second = Foundation.exp(Double(host[1]))
+                let neutralExpected = MLXArray([
+                    Float(first / (first + second)), Float(second / (first + second)), 0,
+                ])
+                let neutralParameters = GenerateParameters(
+                    temperature: 1, topP: 0.6, topK: topK, randomSeed: 42)
+                let neutral = neutralParameters.sampler()
+                let neutralSpeculative = SpeculativeSamplingController(
+                    parameters: neutralParameters)
+                let neutralProbabilities = neutralSpeculative.probabilities(logits: nativeLogits)
+                    .reshaped(-1)
+                #expect(
+                    MLX.max(abs(neutralProbabilities - neutralExpected)).item(Float.self) < 0.00001)
+                var neutralTokens = Set<Int>()
+                for _ in 0 ..< 64 {
+                    neutralTokens.insert(neutral.sample(logits: logits).item(Int.self))
+                }
+                #expect(neutralTokens == Set([0, 1]))
+
+                // Independent host calculation verifies the temperature itself
+                // without a nucleus or top-k filter to collapse the distribution.
+                let weights = host.map { Foundation.exp(Double($0) / 0.5) }
+                let total = weights.reduce(0, +)
+                let expected = MLXArray(weights.map { Float($0 / total) })
+                let unfiltered = SpeculativeSamplingController(
+                    parameters: GenerateParameters(
+                        temperature: 0.5, randomSeed: 42)
+                ).probabilities(logits: logits).reshaped(-1)
+                #expect(MLX.max(abs(unfiltered - expected)).item(Float.self) < 0.00001)
+            }
+        }
+    }
+
+    @Test(
+        "speculative filters preserve distinct rows and last-axis masks",
+        arguments: [[3, 5], [1, 3, 5], [3, 1, 5]])
+    func speculativeFiltersPreserveDistinctRows(shape: [Int]) {
+        FocusedMLXTestSupport.withLock {
+            let weights: [Float] = [
+                0.8, 0.15, 0.03, 0.01, 0.01,
+                0.1, 0.6, 0.2, 0.08, 0.02,
+                0.4, 0.35, 0.1, 0.09, 0.06,
+            ]
+            for dtype in [DType.float32, DType.bfloat16] {
+                let logits = MLX.log(MLXArray(weights)).asType(dtype).reshaped(shape)
+                let host = logits.asType(.float32).reshaped(-1).asArray(Float.self)
+                var expected: [Float] = []
+                for row in 0 ..< 3 {
+                    let scaled = host[(row * 5) ..< ((row + 1) * 5)].map { Double($0) / 0.75 }
+                    let maximum = scaled.max()!
+                    let mass = scaled.map { Foundation.exp($0 - maximum) }
+                    let total = mass.reduce(0, +)
+                    let probabilities = mass.map { $0 / total }
+                    let ordered = probabilities.indices.sorted {
+                        probabilities[$0] > probabilities[$1]
+                    }
+                    var kept = [Double](repeating: 0, count: 5)
+                    var prefixMass: Double = 0
+                    for (rank, id) in ordered.enumerated() {
+                        let inNucleus = prefixMass < 0.9
+                        prefixMass += probabilities[id]
+                        if inNucleus, rank < 2,
+                            probabilities[id] >= probabilities[ordered[0]] * 0.75
+                        {
+                            kept[id] = probabilities[id]
+                        }
+                    }
+                    let keptMass = kept.reduce(0, +)
+                    #expect(keptMass > 0)
+                    expected += kept.map { Float($0 / keptMass) }
+                }
+                let controller = SpeculativeSamplingController(
+                    parameters: GenerateParameters(
+                        temperature: 0.75, topP: 0.9, topK: 2, minP: 0.75, randomSeed: 7))
+                let actual = controller.probabilities(logits: logits)
+                #expect(actual.shape == shape)
+                #expect(
+                    MLX.max(abs(actual.reshaped(-1) - MLXArray(expected))).item(Float.self)
+                        < 0.00001)
+                let sampled = controller.sample(logits: logits).token
+                #expect(sampled.shape == Array(shape.dropLast()))
+                let ids = sampled.asType(.int32).reshaped(-1).asArray(Int32.self)
+                #expect(ids.count == 3)
+                for (row, id) in ids.enumerated() {
+                    #expect(id >= 0 && id < 5)
+                    if id >= 0, id < 5 { #expect(expected[row * 5 + Int(id)] > 0) }
+                }
+            }
+        }
+    }
+
+    @Test(
+        "speculative acceptance and residual correction accept singleton row ranks",
+        arguments: [[3], [1, 3], [1, 1, 3]])
+    func speculativeAcceptancePreservesSingletonRows(shape: [Int]) throws {
+        try FocusedMLXTestSupport.withLock {
+            let controller = SpeculativeSamplingController(
+                parameters: GenerateParameters(
+                    temperature: 1, randomSeed: 7))
+            let same = MLXArray([Float(0.1), 0.7, 0.2]).reshaped(shape)
+            let accepted = controller.acceptOrCorrect(
+                draftToken: MLXArray([Int32(1)]), targetProbabilities: same,
+                draftProbabilities: same, acceptanceRoll: { 0.99 })
+            #expect(accepted.accepted && accepted.acceptanceProbability == 1)
+            #expect(accepted.correction == nil)
+            let target = MLXArray([Float(0.1), 0.2, 0.7]).reshaped(shape)
+            let draft = MLXArray([Float(0.7), 0.2, 0.1]).reshaped(shape)
+            let rejected = controller.acceptOrCorrect(
+                draftToken: MLXArray([Int32(0)]), targetProbabilities: target,
+                draftProbabilities: draft, acceptanceRoll: { 0.99 })
+            #expect(!rejected.accepted)
+            #expect(abs(rejected.acceptanceProbability - Float(1.0 / 7.0)) < 0.000001)
+            let correction = try #require(rejected.correction)
+            #expect(correction.size == 1 && correction.item(Int.self) == 2)
+        }
     }
 
     @Test("Nemotron Omni image preprocessing uses dynamic source grid")
