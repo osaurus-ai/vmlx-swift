@@ -125,6 +125,9 @@ final class ModelResidencyTests: XCTestCase {
                 where key.hasPrefix("XCTest") || key.hasPrefix("XCInject") {
                     environment.removeValue(forKey: key)
                 }
+                // Xcode redirects unified logs into stderr in debugger mode.
+                // Exercise the production logger, not that debugger pipe.
+                environment.removeValue(forKey: "OS_ACTIVITY_DT_MODE")
                 environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"] = mode
                 child.environment = environment
                 child.standardOutput = FileHandle.nullDevice

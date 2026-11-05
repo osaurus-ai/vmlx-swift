@@ -21,14 +21,23 @@ The broader focused run also found two test-harness problems: a source-contract
 check opened Module.swift relative to Xcode's temporary working directory, and
 a standalone child xctest inherited the parent IDE session and hung before
 executing its test. Source-relative lookup preserves the exact assertion;
-stripping only inherited XCTest/XCInject controller environment lets the child
-use its explicit test filter. Raw failure and child stack sample remain.
+stripping inherited XCTest/XCInject controller environment lets the child use
+its explicit test filter. A controlled child run additionally reproduced
+SIGPIPE only with Xcode OS_ACTIVITY_DT_MODE log redirection; the identical
+production-default logger run passed. The child now removes that debugger
+override too. Raw failures, control logs and child stack sample remain.
 
 The fresh 287-source Common build passed. The identical strengthened regression
 failed 124 acceleration assertions against the old build and passed all 64
 lifetimes against the candidate, including weak-owner release checks. No
 throughput conclusion follows from this small installation test.
 
-Status: full focused test retry and actual dev-app load/unload proof are pending.
+The normal full focused run completed: 246 XCTest cases (8 skipped) and
+995 Swift Testing cases. Lane lifetime tests pass. The run remains failed due
+to other working-directory-sensitive source checks and existing parser/config
+contracts; all original failures are retained. The debugger-log child repair
+needs its focused Xcode rerun.
+
+Status: actual dev-app load/unload proof and focused child rerun are pending.
 No merged-fix, family-quality, RAM or speed claim. Original DFlash arithmetic,
 long-answer and numerical-parity failures remain separate open items.
