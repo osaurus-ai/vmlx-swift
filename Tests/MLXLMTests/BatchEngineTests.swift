@@ -607,18 +607,35 @@ class BatchEngineIntegrationTests: XCTestCase {
 
         let (requestID, stream) = await engine.submit(input: input, parameters: params)
 
-        // Cancel after receiving a couple tokens
+        // Keep consuming after cancellation: breaking here only proves that
+        // tokens arrived, not that the engine closes with accurate metrics.
         var tokenCount = 0
+        var requestedCancellation = false
+        var completionInfo: GenerateCompletionInfo?
         for await event in stream {
-            if case .token = event {
+            switch event {
+            case .prefillProgress:
+                break
+            case .token:
                 tokenCount += 1
-                if tokenCount >= 2 {
+                if !requestedCancellation, tokenCount >= 2 {
+                    requestedCancellation = true
                     await engine.cancel(requestID)
-                    break
                 }
+            case .info(let info):
+                completionInfo = info
             }
         }
+        await engine.shutdown()
+
         XCTAssertGreaterThanOrEqual(tokenCount, 2)
+        let info = try XCTUnwrap(completionInfo, "Cancellation must close with completion info")
+        XCTAssertEqual(info.stopReason, .cancelled)
+        XCTAssertEqual(info.promptTokenCount, 3)
+        XCTAssertEqual(info.generationTokenCount, tokenCount)
+        XCTAssertGreaterThan(info.generateTime, 0)
+        XCTAssertTrue(info.tokensPerSecond.isFinite)
+        XCTAssertGreaterThan(info.tokensPerSecond, 0)
     }
 
     /// Test: more requests than maxBatchSize — queuing works
