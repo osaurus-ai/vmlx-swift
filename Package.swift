@@ -876,6 +876,7 @@ let package = Package(
                 "LaneQMMTargetClassificationTests.swift",
                 "DFlash2WidthChooserTests.swift",
                 "DFlash2PrefixContextTests.swift",
+                "BatchWarmMediaBoundaryTests.swift",
                 "DSparkDrafterTests.swift",
                 "ChunkedVectorAttentionTests.swift",
                 "SpeculativeAcceptanceBoundaryTests.swift",
