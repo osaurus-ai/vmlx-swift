@@ -118,6 +118,13 @@ final class ModelResidencyTests: XCTestCase {
                     Bundle(for: Self.self).bundleURL.path,
                 ]
                 var environment = ProcessInfo.processInfo.environment
+                // This is a standalone, explicitly filtered child runner. An
+                // inherited Xcode session makes it wait for the parent's IDE
+                // controller before it can execute the diagnostic test.
+                for key in environment.keys
+                where key.hasPrefix("XCTest") || key.hasPrefix("XCInject") {
+                    environment.removeValue(forKey: key)
+                }
                 environment["VMLX_RESIDENCY_DIAGNOSTIC_TEST"] = mode
                 child.environment = environment
                 child.standardOutput = FileHandle.nullDevice

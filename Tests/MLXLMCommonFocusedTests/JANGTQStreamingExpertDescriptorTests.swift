@@ -85,8 +85,12 @@ final class JANGTQStreamingExpertDescriptorTests: XCTestCase {
     }
 
     func testModuleUpdateArrayRecursionSkipsSparseNilEntries() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
         let moduleSource = try String(
-            contentsOfFile: "Source/MLXNN/Module.swift",
+            contentsOf: packageRoot.appendingPathComponent("Source/MLXNN/Module.swift"),
             encoding: .utf8)
 
         XCTAssertTrue(moduleSource.contains("case (_, .none):\n                            continue"))
