@@ -586,7 +586,7 @@ struct NemotronHOmniPreEncodedAudioTests {
 
     @Test("audio latency bench uses bundle generation defaults")
     func audioLatencyBenchUsesGenerationConfig() throws {
-        let path = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let path = FocusedMLXTestSupport.sourceURL("")
             .appending(path: "tools/OmniAudioLatencyBench/main.swift")
         let source = try String(contentsOf: path)
         #expect(source.contains(

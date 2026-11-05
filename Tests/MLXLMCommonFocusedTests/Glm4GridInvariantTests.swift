@@ -59,7 +59,8 @@ struct Glm4GridInvariantTests {
     func bothTowersGuard() throws {
         for file in ["Libraries/MLXVLM/Models/Glm4v.swift", "Libraries/MLXVLM/Models/Glm4vMoe.swift"] {
             let source = try #require(
-                try? String(contentsOfFile: file, encoding: .utf8), "missing \(file)")
+                try? String(contentsOf: FocusedMLXTestSupport.sourceURL(file), encoding: .utf8),
+                "missing \(file)")
             #expect(
                 source.contains("Glm4SharedVision.validateGrid("),
                 "\(file) does not establish the grid invariant")

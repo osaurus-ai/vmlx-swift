@@ -9,7 +9,8 @@ struct TokenizerAddedTokenRegexFocusedTests {
     @Test("indexed placeholder added tokens are excluded from regex construction")
     func unusedPlaceholderAddedTokensAreExcludedFromRegexConstruction() throws {
         let source = try String(
-            contentsOfFile: "Vendors/swift-transformers/Sources/Tokenizers/Tokenizer.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Vendors/swift-transformers/Sources/Tokenizers/Tokenizer.swift"),
             encoding: .utf8)
 
         #expect(source.contains("private static func isUnusedPlaceholderAddedToken"))

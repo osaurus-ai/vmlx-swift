@@ -17,7 +17,7 @@ import Testing
 struct DSV4SpeedFastpathSourceTests {
 
     private func source(_ path: String) throws -> String {
-        try String(contentsOfFile: path, encoding: .utf8)
+        try String(contentsOf: FocusedMLXTestSupport.sourceURL(path), encoding: .utf8)
     }
 
     @Test("lm_head defaults to fused quantized matmul with an exact opt-out")

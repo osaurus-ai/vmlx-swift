@@ -19,7 +19,8 @@ struct Apertus1p5PrefixNormalisationTests {
 
     private static let source: String = {
         (try? String(
-            contentsOfFile: "Libraries/MLXVLM/Models/Apertus1p5.swift", encoding: .utf8)) ?? ""
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXVLM/Models/Apertus1p5.swift"),
+            encoding: .utf8)) ?? ""
     }()
 
     @Test("sanitize delegates to the shared helper")

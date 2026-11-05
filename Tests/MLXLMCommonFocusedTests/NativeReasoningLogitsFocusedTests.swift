@@ -123,11 +123,14 @@ struct NativeReasoningLogitsFocusedTests {
     @Test("both application entry points leave native reasoning output unmasked")
     func defaultEngineReachability() throws {
         let engine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift", encoding: .utf8)
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"), encoding: .utf8)
         #expect(!engine.contains("MinimumReasoningFloor"))
         #expect(!engine.contains("initialSuppressTokens ="))
         #expect(!engine.contains("initialSuppressCount ="))
-        let evaluate = try String(contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift", encoding: .utf8)
+        let evaluate = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
+            encoding: .utf8)
         #expect(!evaluate.contains("survivorRelativeFloor"))
         #expect(!evaluate.contains("VMLX_REASONING_FLOOR_TRACE"))
         // The separate caller-requested ceiling remains explicit on both routes.

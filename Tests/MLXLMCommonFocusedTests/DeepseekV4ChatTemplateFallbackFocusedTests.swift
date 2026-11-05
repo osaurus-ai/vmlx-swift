@@ -1102,7 +1102,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         for templateSource in [
             ChatTemplateFallbacks.gemma4WithTools,
             try String(
-                contentsOf: URL(fileURLWithPath: "Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja"),
+                contentsOf: FocusedMLXTestSupport.sourceURL(
+                    "Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja"),
                 encoding: .utf8),
         ] {
             let rendered = try Template(templateSource).renderDSV4(context)
@@ -1290,7 +1291,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
     @Test("LFM2 tool fallback is tried before native bundled tool JSON template")
     func lfm2ToolFallbackIsTriedBeforeNativeBundledToolJSONTemplate() throws {
         let source = try String(
-            contentsOf: URL(fileURLWithPath: "Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift"),
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift"),
             encoding: .utf8)
 
         #expect(source.contains(#"upstream.bosToken == "<|startoftext|>""#))

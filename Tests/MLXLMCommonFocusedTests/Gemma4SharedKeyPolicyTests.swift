@@ -142,7 +142,8 @@ struct Gemma4SharedKeyPolicyTests {
         // The three relations are now distinct branches, not one `!=`.
         let source = try #require(
             try? String(
-                contentsOfFile: "Libraries/MLXLLM/Models/Gemma4Text.swift", encoding: .utf8))
+                contentsOf: FocusedMLXTestSupport.sourceURL(
+                    "Libraries/MLXLLM/Models/Gemma4Text.swift"), encoding: .utf8))
         #expect(
             source.contains("height > vocabSize") && source.contains("height < vocabSize"),
             "the undersized case must be its own branch, not folded into `!=`")

@@ -104,7 +104,7 @@ struct DeepseekV4Step37RuntimeContractsTests {
     }
 
     private static func source(_ relativePath: String) throws -> String {
-        try String(contentsOfFile: relativePath, encoding: .utf8)
+        try String(contentsOf: FocusedMLXTestSupport.sourceURL(relativePath), encoding: .utf8)
     }
 
     private static func lineCountToolSpec() -> [String: any Sendable] {

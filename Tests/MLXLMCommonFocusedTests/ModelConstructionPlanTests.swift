@@ -289,7 +289,10 @@ struct ModelConstructionPlanTests {
         ]
         var offenders: [String] = []
         for file in families {
-            guard let src = try? String(contentsOfFile: file, encoding: .utf8) else {
+            guard
+                let src = try? String(
+                    contentsOf: FocusedMLXTestSupport.sourceURL(file), encoding: .utf8)
+            else {
                 Issue.record("missing \(file)"); continue
             }
             let lines = src.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)

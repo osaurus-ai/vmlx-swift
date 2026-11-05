@@ -3192,7 +3192,7 @@ struct MTPRuntimeFocusedTests {
     }
 
     private static func source(_ relativePath: String) throws -> String {
-        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let root = FocusedMLXTestSupport.sourceURL("")
         let url = root.appendingPathComponent(relativePath)
         return try String(contentsOf: url, encoding: .utf8)
     }

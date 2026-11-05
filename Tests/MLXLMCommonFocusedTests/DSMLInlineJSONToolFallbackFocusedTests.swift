@@ -10,13 +10,15 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
     @Test("decode loop receives prepared tool schemas")
     func decodeLoopReceivesPreparedToolSchemas() throws {
         let lmInput = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/LanguageModel.swift"),
             encoding: .utf8)
         let batchEngine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
 
         #expect(lmInput.contains("public let toolSchemas: [ToolSpec]?"))
@@ -37,16 +39,19 @@ struct DSMLInlineJSONToolFallbackFocusedTests {
     @Test("decode loop disables tool parser without active schemas")
     func decodeLoopDisablesToolParserWithoutActiveSchemas() throws {
         let routing = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/GenerationStreamRouting.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/GenerationStreamRouting.swift"),
             encoding: .utf8)
         let batchEngine = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
             encoding: .utf8)
         let evaluate = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
             encoding: .utf8)
         let specDec = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/SpecDecStream.swift",
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/SpecDec/SpecDecStream.swift"),
             encoding: .utf8)
 
         #expect(routing.contains("through toolCallProcessor: ToolCallProcessor?"))

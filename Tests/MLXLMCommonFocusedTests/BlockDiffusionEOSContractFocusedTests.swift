@@ -60,11 +60,15 @@ struct BlockDiffusionEOSContractFocusedTests {
 
     @Test("ordinary generation routes block diffusion to the unmasked native iterator")
     func defaultDispatchReachability() throws {
-        let evaluate = try String(contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift", encoding: .utf8)
+        let evaluate = try String(
+            contentsOf: FocusedMLXTestSupport.sourceURL("Libraries/MLXLMCommon/Evaluate.swift"),
+            encoding: .utf8)
         #expect(evaluate.contains("if let diffusionModel = context.model as? any BlockDiffusionModel"))
         #expect(evaluate.contains("let iterator = try BlockDiffusionTokenIterator("))
         let iterator = try String(
-            contentsOfFile: "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift", encoding: .utf8)
+            contentsOf: FocusedMLXTestSupport.sourceURL(
+                "Libraries/MLXLMCommon/Diffusion/BlockDiffusionTokenIterator.swift"),
+            encoding: .utf8)
         #expect(iterator.contains("MLX.categorical(processed, key: denoiserKey)"))
         #expect(iterator.contains("argMax(processed, axis: -1)"))
         #expect(iterator.contains("selfConditioning = processed"))
