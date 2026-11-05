@@ -1266,6 +1266,44 @@ public func loadWeights(
     weights.removeAll(keepingCapacity: false)
     MLX.Memory.clearCache()
 
+    // Convert float16/float32 parameters to bfloat16 to prevent AsType cascades.
+    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
+    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
+    //
+    // JANGTQ caveat: TurboQuant Metal kernels infer their signature from
+    // `tq_norms`, and casting those norms to bf16 breaks routed projections
+    // (verified on MiniMax M2.7 JANGTQ_2L). Keep the JANGTQ tensors raw.
+    //
+    // Storage ownership must not change the model's numerical contract. Keep
+    // the established exact F16 affine metadata for these families, even though
+    // its bytes now live in owned buffers. The model controls activation dtype.
+    // JANGTQ kernels keep raw packed/norm tensors; only the families with an
+    // established BF16 affine requirement convert their remaining parameters.
+    let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
+    // SPEED-CRITICAL: keep exact affine metadata and GDN fused-row replacement.
+    // The Oct 14 Allosaurus/Flash-Next regression disabled fusion when metadata
+    // was counted as a nonreplaceable bank. Storage changes need matched app
+    // adaptive-MTP code/prose timings; a loader test alone is insufficient.
+    let preserveJANGAffineDtypes = !isJANGTQNative
+        && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(modelDirectory: modelDirectory))
+    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
+    // state projections and signs. Preserve that contract independent of
+    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
+    let materialiseBFloat16 =
+        hadamardContract == nil
+        && !model.preservesCheckpointParameterDTypes
+        && !preserveJANGAffineDtypes
+        && (!isJANGTQNative || autoJANGTQMmapBFloat16)
+    if materialiseBFloat16 {
+        convertToBFloat16(
+            model: model,
+            shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+    // Run the optional head codec after normal dtype materialisation. Its
+    // embedding output must match the effective unconverted-head path, not
+    // the earlier checkpoint dtype, or mixed F16/BF16 norms promote KV to F32.
     // Tied-head load-time quantization: quantize a plain fp16/bf16
     // `embed_tokens` at load. Tied-embedding families (Gemma4 QAT) ship
     // the decoder quantized but the 262k-vocab embedding unquantized;
@@ -1309,41 +1347,6 @@ public func loadWeights(
         }
     }
 
-    // Convert float16/float32 parameters to bfloat16 to prevent AsType cascades.
-    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
-    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
-    //
-    // JANGTQ caveat: TurboQuant Metal kernels infer their signature from
-    // `tq_norms`, and casting those norms to bf16 breaks routed projections
-    // (verified on MiniMax M2.7 JANGTQ_2L). Keep the JANGTQ tensors raw.
-    //
-    // Storage ownership must not change the model's numerical contract. Keep
-    // the established exact F16 affine metadata for these families, even though
-    // its bytes now live in owned buffers. The model controls activation dtype.
-    // JANGTQ kernels keep raw packed/norm tensors; only the families with an
-    // established BF16 affine requirement convert their remaining parameters.
-    let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
-    // SPEED-CRITICAL: keep exact affine metadata and GDN fused-row replacement.
-    // The Oct 14 Allosaurus/Flash-Next regression disabled fusion when metadata
-    // was counted as a nonreplaceable bank. Storage changes need matched app
-    // adaptive-MTP code/prose timings; a loader test alone is insufficient.
-    let preserveJANGAffineDtypes = !isJANGTQNative
-        && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
-            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory)
-            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(modelDirectory: modelDirectory))
-    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
-    // state projections and signs. Preserve that contract independent of
-    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
-    let materialiseBFloat16 =
-        hadamardContract == nil
-        && !model.preservesCheckpointParameterDTypes
-        && !preserveJANGAffineDtypes
-        && (!isJANGTQNative || autoJANGTQMmapBFloat16)
-    if materialiseBFloat16 {
-        convertToBFloat16(
-            model: model,
-            shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
-    }
     if let hadamardContract {
         try hadamardContract.verifyLoaded(model: model)
         LoadDiagnostics.write(Data(

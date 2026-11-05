@@ -7,6 +7,22 @@ import MLXNN
     import os
 #endif
 
+/// The optional loaded head codec changes input embeddings and persisted KV.
+/// Capture its actual precision per model rather than the mutable host policy.
+private func loadedCacheComputationIdentity(_ model: any LanguageModel) -> String? {
+    let heads = model.namedModules().compactMap { path, module -> String? in
+        guard path.hasSuffix("embed_tokens"),
+            let head = module as? QuantizedEmbedding, let dtype = head.outputDType
+        else { return nil }
+        return "\(path):\(head.mode.rawValue)-q\(head.bits)-gs\(head.groupSize)-\(dtype)"
+    }.sorted()
+    var identities = [model.cacheComputationIdentity].compactMap { $0 }
+    if !heads.isEmpty {
+        identities.append("tied-head-after-materialization-v2[\(heads.joined(separator: ","))]")
+    }
+    return identities.isEmpty ? nil : identities.joined(separator: ";")
+}
+
 /// Source-backed cache topology reported by a loaded model.
 ///
 /// This is intentionally derived from `LanguageModel.newCache(parameters:)`
@@ -420,7 +436,7 @@ public final class ModelContainer: Sendable {
         await context.read { ctx in
             ModelCacheTopologySnapshot(
                 cache: ctx.model.newCache(parameters: parameters),
-                cacheComputationIdentity: ctx.model.cacheComputationIdentity)
+                cacheComputationIdentity: loadedCacheComputationIdentity(ctx.model))
         }
     }
 
@@ -498,7 +514,7 @@ public final class ModelContainer: Sendable {
         ].compactMap { $0 }
         self.attentionCacheKeyComponent =
             cachePolicies.isEmpty ? nil : cachePolicies.joined(separator: "|")
-        self.cacheComputationIdentity = context.model.cacheComputationIdentity
+        self.cacheComputationIdentity = loadedCacheComputationIdentity(context.model)
         self.context = .init(context)
     }
 
