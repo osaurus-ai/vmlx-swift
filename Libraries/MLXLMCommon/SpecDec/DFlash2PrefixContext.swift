@@ -67,7 +67,8 @@ struct DFlash2PrefixContext {
         guard end == boundary, Int64(exactly: end) != nil,
             Int64(exactly: start) != nil
         else { return nil }
-        let descriptor = [Self.version, Int64(start), Int64(end), Int64(hidden.dim(2))]
+        let descriptor =
+            [Self.version, Int64(start), Int64(end), Int64(hidden.dim(2))]
             + layerIDs.map(Int64.init)
         let descriptorBytes = descriptor.count.multipliedReportingOverflow(by: 8)
         guard !descriptorBytes.overflow,

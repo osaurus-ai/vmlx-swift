@@ -2059,7 +2059,15 @@ public final class DiskCache: @unchecked Sendable {
             // computed NaN) must never be restored: it is removed on first touch
             // so an installed user recovers on the next prefill without clearing
             // anything by hand.
-            let nonFinite = Self.nonFiniteTensorNames(in: arrays)
+            // Optional drafter conditioning is screened by its consumer before
+            // use. Corruption there must not discard independently valid target
+            // state. Required tensors retain the same finite-value gate; stores
+            // still screen the entire payload before publishing it.
+            let targetArrays = arrays.filter {
+                $0.key != DFlash2PrefixContext.hiddenKey
+                    && $0.key != DFlash2PrefixContext.metadataKey
+            }
+            let nonFinite = Self.nonFiniteTensorNames(in: targetArrays)
             if !nonFinite.isEmpty {
                 refusedNonFiniteFetches += 1
                 throw DiskCacheIntegrityError.nonFinitePayload(nonFinite.joined(separator: ","))

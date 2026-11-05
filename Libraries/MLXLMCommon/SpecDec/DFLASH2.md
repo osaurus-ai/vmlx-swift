@@ -85,7 +85,13 @@ separate persistent feature cache.
 
 `DFlash2PrefixContextTests` covers disk round trips, absolute windows, invalid
 metadata/data, contiguous joins, target-KV compatibility, coordinator reopen,
-and oversized optional payloads: 11 tests passed against a fresh Common build.
+and oversized optional payloads. Thirteen tests passed against a fresh Common
+build. An added actual-disk-reader regression first exposed a fallback bug:
+the reader's general finite-value screen discarded valid target KV when optional
+features contained NaN. The reader now keeps the required-target screen intact
+and leaves validation of these two reserved auxiliary arrays to their consumer.
+Tests cover both optional-array failures and rejection of corrupt target state
+alongside corrupt optional data. Store-side finite checks remain unchanged.
 
 Six real Qwen3.8-27B image generations exercised cold, warm, and growing turns
 through the public generation entry point. Warm conditioning included all 560
