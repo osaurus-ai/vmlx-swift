@@ -71,6 +71,39 @@ final class LaneQMMTargetClassificationTests: XCTestCase {
         }
     }
 
+    func testInstallersDoNotSkipNewModelLifetimes() throws {
+        try FocusedMLXTestSupport.withLock {
+            guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
+            for iteration in 0 ..< 64 {
+                weak var releasedTarget: Module?
+                weak var releasedDrafter: Module?
+                autoreleasepool {
+                    func model() -> DenseLaneTarget {
+                        let values = MLXArray.ones([256, 1024], dtype: .bfloat16)
+                        let (w, s, b) = MLX.quantized(values, groupSize: 64, bits: 4)
+                        eval(w, s, b!)
+                        return DenseLaneTarget(
+                            QuantizedLinear(
+                                weight: w, scales: s, biases: b!, groupSize: 64, bits: 4))
+                    }
+                    let target = model()
+                    let drafter = model()
+                    releasedTarget = target
+                    releasedDrafter = drafter
+                    LaneQMM.installForDFlash2Target(target)
+                    LaneQMM.installForDFlash2Drafter(drafter)
+                    XCTAssertTrue(
+                        target.proj is LaneQuantizedLinear, "target lifetime \(iteration)")
+                    XCTAssertTrue(
+                        drafter.proj is LaneQuantizedLinear, "drafter lifetime \(iteration)")
+                    XCTAssertTrue(LaneQMM.isLaneFlat(target), "target policy lifetime \(iteration)")
+                }
+                XCTAssertNil(releasedTarget, "installer must not retain target weights")
+                XCTAssertNil(releasedDrafter, "installer must not retain drafter weights")
+            }
+        }
+    }
+
     func testOpaqueRoutedBankKeepsNarrowAdaptiveCandidate() throws {
         try FocusedMLXTestSupport.withLock {
             guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }

@@ -258,12 +258,21 @@ extension LaneQMM {
         return k % 64 == 0 && q.weight.dim(0) % 4 == 0
     }
 
-    nonisolated(unsafe) private static var installedTargets: Set<ObjectIdentifier> = []
-    nonisolated(unsafe) private static var laneFlatTargets: [ObjectIdentifier: Bool] = [:]
+    /// Object identifiers can be reused after a model unload. Keep a weak owner
+    /// so a later model at the same address receives its own installation.
+    private final class InstalledModule {
+        weak var owner: Module?
+        var laneFlat = false
 
-    nonisolated(unsafe) private static var installedDrafters: Set<ObjectIdentifier> = []
+        init(_ owner: Module) { self.owner = owner }
+    }
 
-    /// Install on a DFlash2 drafter once per process (`VMLX_LANE_QMM_DRAFTER=0` keeps MLX: A/B control).
+    nonisolated(unsafe) private static var installedTargets: [ObjectIdentifier: InstalledModule] =
+        [:]
+    nonisolated(unsafe) private static var installedDrafters: [ObjectIdentifier: InstalledModule] =
+        [:]
+
+    /// Install once per live DFlash2 drafter (`VMLX_LANE_QMM_DRAFTER=0` keeps MLX: A/B control).
     ///
     /// Every draft forward is an 8-16-row block, where MLX's quantized matmul leaves its 1-row bandwidth
     /// behind (27B MLP shape, 4-bit g64, 925 MHz: 1 row 0.10 ms, 8 rows 0.27 ms, 16 rows 0.18-0.46 ms;
@@ -275,7 +284,10 @@ extension LaneQMM {
             let module = drafter as? Module
         else { return }
         lock.lock()
-        let fresh = installedDrafters.insert(ObjectIdentifier(module)).inserted
+        installedDrafters = installedDrafters.filter { $0.value.owner != nil }
+        let id = ObjectIdentifier(module)
+        let fresh = installedDrafters[id]?.owner !== module
+        if fresh { installedDrafters[id] = InstalledModule(module) }
         lock.unlock()
         guard fresh else { return }
         let report = install(model: module, tile: true, untiledMinRows: minRows)
@@ -288,11 +300,14 @@ extension LaneQMM {
         guard let module = target as? Module else { return false }
         lock.lock()
         defer { lock.unlock() }
-        return laneFlatTargets[ObjectIdentifier(module)] ?? false
+        guard let installed = installedTargets[ObjectIdentifier(module)],
+            installed.owner === module
+        else { return false }
+        return installed.laneFlat
     }
     nonisolated(unsafe) public private(set) static var lastInstallReport: InstallReport?
 
-    /// Install on a DFlash2 target once per process (VMLX_LANE_QMM=0 opts out). A target conforming
+    /// Install once per live DFlash2 target (VMLX_LANE_QMM=0 opts out). A target conforming
     /// to ``LaneQMMTargetPolicy`` chooses tiling and the untiled row threshold from its own measured
     /// row costs; other targets keep the defaults below.
     public static func installForDFlash2Target(_ target: Any) {
@@ -302,7 +317,9 @@ extension LaneQMM {
         else { return }
         let id = ObjectIdentifier(module)
         lock.lock()
-        let fresh = installedTargets.insert(id).inserted
+        installedTargets = installedTargets.filter { $0.value.owner != nil }
+        let fresh = installedTargets[id]?.owner !== module
+        if fresh { installedTargets[id] = InstalledModule(module) }
         lock.unlock()
         guard fresh else { return }
         let start = Date()
@@ -355,7 +372,7 @@ extension LaneQMM {
             }
         }
         lock.lock()
-        laneFlatTargets[id] = flat
+        installedTargets[id]?.laneFlat = flat
         lock.unlock()
         if ProcessInfo.processInfo.environment["VMLX_LANE_QMM_LOG"] == "1" {
             RuntimeDiagnostics.write(
