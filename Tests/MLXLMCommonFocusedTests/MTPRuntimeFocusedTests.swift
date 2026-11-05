@@ -2386,19 +2386,25 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
-    @Test(arguments: [
-        "visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder",
-        "speech_encoder",
-    ])
-    func jangNonLanguageTowerKeepsConsistentDeclaration(prefix: String) {
+    @Test(
+        arguments: [
+            "visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder",
+            "speech_encoder",
+        ], [false, true])
+    func jangNonLanguageTowerKeepsConsistentDeclaration(prefix: String, skipAlias: Bool) {
         FocusedMLXTestSupport.withLock {
             for suffix in ["embed_tokens", "layers.0.self_attn.q_proj"] {
-                let base = "\(prefix).\(suffix)"
+                let alias = "\(prefix).\(suffix)"
+                let base = skipAlias ? "language_model.\(alias)" : alias
                 let weights: [String: MLXArray] = [
                     "\(base).weight": MLXArray.zeros([16, 384], dtype: .uint32),
                     "\(base).scales": MLXArray.zeros([16, 24], dtype: .float16),
                 ]
                 let declared = BaseConfiguration.Quantization(groupSize: 64, bits: 8, mode: .affine)
+                var declarations: [String: BaseConfiguration.QuantizationOption] = [
+                    base: .quantize(declared)
+                ]
+                if skipAlias { declarations[alias] = .skip }
                 let inferred = JangLoader.inferPerLayerQuantization(
                     weights: weights,
                     jangConfig: JangConfig(
@@ -2408,7 +2414,7 @@ struct MTPRuntimeFocusedTests {
                     validInDims: [1_536, 3_072],
                     declaredDefaultQuantization: declared,
                     declaredPerLayerQuantization: .init(
-                        quantization: declared, perLayerQuantization: [base: .quantize(declared)]))
+                        quantization: declared, perLayerQuantization: declarations))
                 guard case .quantize(let actual)? = inferred.perLayerQuantization[base] else {
                     Issue.record("Expected declared non-language quantization for \(base)")
                     continue

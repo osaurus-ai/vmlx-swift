@@ -5,7 +5,7 @@ per-module declaration previously won before an exact known language input
 width was consulted. Contradictory quantize/skip aliases could also select
 metadata according to alias order.
 
-The candidate checks skip aliases consistently and uses an exact realizable
+The candidate checks language skip aliases consistently and uses an exact realizable
 hidden width for existing language anchors and hidden-input projection roles.
 Exact per-tensor manifests remain first. Consistent vision/audio/speech tower
 declarations, missing or unrealizable hints and other projection roles retain
@@ -41,3 +41,32 @@ LIVE EVIDENCE: local `goal-storage-cache-resume-20261104/` artifacts
 `full-focused-xcode/jang-metadata-candidate-v2/Focused.xcresult`, and
 `jang-semantic-metadata-regression/CANDIDATE-UNIT-RECEIPT.json` bind exact
 source hashes and commands. These are real MLX leaf tests, not app proof.
+
+
+## Crossed tower/alias regression control
+
+The initial draft cleared each isolated control but failed their combination:
+a consistent non-language tower declaration plus a contradictory skip alias
+could fall through to the language width. The added test crosses six tower
+prefixes, alias presence/absence and embedding/projection roles. Main's loader
+passes all 12 parameter cases; the initial draft failed 12 assertions there.
+The candidate now preserves the other tower's existing consistent declaration
+when language geometry cannot disambiguate it. Exact manifests remain first.
+This avoids a new non-language regression while retaining the language fixes.
+
+The failed candidate, main control and narrowed positive run are retained in
+`full-focused-xcode/jang-metadata-crossed-tower-negative`,
+`full-focused-xcode/jang-crossed-tower-main-control` and
+`full-focused-xcode/jang-metadata-crossed-tower-fixed`. The main control still
+fails the original 16 metadata assertions; its crossed tower cases pass. The
+narrowed candidate passes all 110 selected tests. This does not qualify every
+possible contradictory metadata layout or non-language architecture.
+
+Prior Release35 baseline controls ran canonical external-drive Raptor0.7 and
+Diplodocus preview4 through the actual GUI: 4/4 short growing turns naturally
+completed with correct invoice totals and separate reasoning. Disk restores
+were 443 and 243 tokens; UI decode rates were 98.8/99.0 and 59.0/68.7 tokens/s.
+These are unpaired observations with a concurrent CPU build. Physical peak
+8,120,475,472 bytes fails low-RAM under retained owned loading. The obsolete
+initial-candidate app build was stopped after the crossed control failed;
+the corrected head still requires its isolated Release app proof.

@@ -2588,10 +2588,19 @@ public struct JangLoader: Sendable {
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
+            let hasOtherTower = basePath.lowercased().split(separator: ".").contains {
+                component in
+                ["visual", "vision", "audio", "speech"].contains { component.hasPrefix($0) }
+            }
             let skipsDeclaredAliases =
                 declaredPerLayerQuantization?
                 .declaresSkipForAnyAlias(of: basePath) ?? false
-            let declaredForLayer = skipsDeclaredAliases ? nil : declaredQuantization(for: basePath)
+            // Language geometry can resolve conflicting aliases. It cannot
+            // resolve another tower's width: preserve that tower's existing
+            // consistent declaration rather than applying a language hint.
+            let declaredForLayer =
+                skipsDeclaredAliases && !hasOtherTower
+                ? nil : declaredQuantization(for: basePath)
             let explicitForLayer: BaseConfiguration.Quantization? = {
                 guard let declaredPerLayerQuantization else { return nil }
                 // Contradictory aliases (one spelling `.quantize`, another
@@ -2787,10 +2796,6 @@ public struct JangLoader: Sendable {
                     let exact = inferExactQuantization(expectedInDim: hiddenSize),
                     exact.bits != declared.bits || exact.groupSize != declared.groupSize
                 else { return nil }
-                let hasOtherTower = basePath.lowercased().split(separator: ".").contains {
-                    component in
-                    ["visual", "vision", "audio", "speech"].contains { component.hasPrefix($0) }
-                }
                 return hasOtherTower ? nil : exact
             }()
 
