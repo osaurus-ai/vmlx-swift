@@ -28,9 +28,24 @@ reuse. All three tests pass after the change; the baseline warm test fails two
 assertions. The recorder generates one token with an expected length stop; it
 does not qualify a real language model.
 
-This is a source/unit checkpoint. A dev app on this change must still exercise
-real media history, growing turns, cache restore, and finalization before merge
-readiness. The single measured baseline row is not a paired performance result.
-Cold media and post-prepare-key media retain their existing paths; this change
-does not claim to remove their finalization costs or establish numerical parity
-for every model family.
+A normal Release dev app on implementation `0927979f` subsequently exercised
+three growing AR turns over the same real image history. Answers were correct;
+restored prefixes were 8,043, 8,205 and 8,322 tokens. Canonical inline store
+boundaries were 8,205, 8,322 and 8,492 tokens, with finalization return times
+2.315, 2.107 and 1.985 ms and no boundary re-derive in that run. UI decode rates
+were 22.6, 23.9 and 24.0 tokens/s. Different turn lengths and the app's idle-load
+policy mean these rows are cache-behavior proof, not a paired speed benchmark.
+
+The same production implementation completed an actual 45-second foreground
+sandbox command and restored 12,175 tokens for the correct post-tool answer.
+Test-only signing and socket-path repairs were needed before execution; no
+sandbox, tool or orchestration implementation was changed. The subsequent
+DFlash arithmetic failure and invalid frozen-control AR replay were retained
+separately; this boundary guard does not qualify general model quality.
+
+Cold media and post-prepare-key media retain their existing paths. A later cold
+AR request still rebuilt a 6,833-token stable-system seed in 9.196 seconds;
+this distinct finalization path remains open. The change does not remove those
+costs or establish numerical parity for every model family. Selected Swift 6
+adjacent tests passed (77 passed, one inventory skip); the full focused suite
+and normal review/CI remain separate gates.
