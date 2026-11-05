@@ -58,8 +58,8 @@ struct Gemma4ZyphraToolParserFocusedTests {
         #expect(processor.toolCalls.first?.function.arguments["text"] == .string("red\ngreen\nblue"))
     }
 
-    @Test("Gemma4 routes Zyphra tool calls inside reasoning wrapper without reasoning leak")
-    func gemma4RoutesZyphraToolCallsInsideReasoningWrapperWithoutLeak() {
+    @Test("Gemma4 keeps quoted Zyphra transport on the reasoning rail")
+    func gemma4KeepsQuotedZyphraTransportOnReasoningRail() {
         let output = """
         thought<|channel>```
         <zyphra_tool_call>
@@ -90,10 +90,69 @@ struct Gemma4ZyphraToolParserFocusedTests {
         }
 
         #expect(visible.isEmpty)
-        #expect(reasoning.isEmpty)
-        #expect(calls.count == 1)
-        #expect(calls.first?.function.name == "line_count")
-        #expect(calls.first?.function.arguments["text"] == .string("red\ngreen\nblue"))
+        #expect(reasoning == output)
+        #expect(calls.isEmpty)
+        #expect(processor.collectingToolCallText == nil)
+    }
+
+    @Test(arguments: [1, 2, 3, 7, 16, 64, 4096])
+    func quotedZyphraHistoryCannotContaminateLaterContentCall(chunkSize: Int) {
+        let quotes = [
+            "Earlier example: <zyphra_tool_call><function=line_count><parameter=text>old</parameter></function></zyphra_tool_call>",
+            "An unfinished example: <zyphra_tool_call><function=line_count><parameter=text>old",
+        ]
+        let actual = """
+            <zyphra_tool_call>
+            <function=line_count>
+            <parameter=text>
+            orange
+            purple
+            </parameter>
+            </function>
+            </zyphra_tool_call>
+            """
+        for quote in quotes {
+            let processor = ToolCallProcessor(format: .gemma4, tools: [lineCountToolSpec()])
+            var reasoning = ""
+            var content = ""
+            var calls: [ToolCall] = []
+            func receive(_ events: [Generation]) {
+                for event in events {
+                    switch event {
+                    case .reasoning(let text): reasoning += text
+                    case .chunk(let text): content += text
+                    case .toolCall(let call): calls.append(call)
+                    default: break
+                    }
+                }
+            }
+            func feed(_ text: String, channel: GenerationTextChannel) {
+                var start = text.startIndex
+                while start < text.endIndex {
+                    let end =
+                        text.index(start, offsetBy: chunkSize, limitedBy: text.endIndex)
+                        ?? text.endIndex
+                    receive(
+                        routeGenerationText(
+                            String(text[start ..< end]), channel: channel, through: processor))
+                    start = end
+                }
+            }
+            feed(quote, channel: .reasoning)
+            receive(flushGenerationText(channel: .reasoning, through: processor))
+            #expect(reasoning == quote)
+            #expect(content.isEmpty)
+            #expect(calls.isEmpty)
+            #expect(processor.collectingToolCallText == nil)
+
+            feed(actual, channel: .content)
+            receive(flushGenerationText(channel: .content, through: processor))
+            #expect(reasoning == quote)
+            #expect(content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            #expect(calls.count == 1)
+            #expect(calls.first?.function.name == "line_count")
+            #expect(calls.first?.function.arguments["text"] == .string("orange\npurple"))
+        }
     }
 
     @Test("Gemma4 parser still accepts native Gemma4 tool-call envelope")

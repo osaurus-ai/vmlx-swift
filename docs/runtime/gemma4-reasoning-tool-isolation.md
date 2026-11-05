@@ -33,3 +33,19 @@ bundle sampling defaults and natural stops; its results remain distinct from
 parser replay. This change does not establish the cause of a GPU error or prove
 all model output correct. No sampler, template, model math, cache policy or UI
 behavior is changed.
+
+## Focused-contract alignment, 2026-11-05
+
+A second focused suite still expected a quoted Zyphra XML call supplied on the
+reasoning rail to execute. That expectation contradicted this established
+contract and failed against the intentional routing guard from513379e14.
+The fixture now requires the quotation to remain verbatim reasoning, with no
+executable event or processor buffer. A later real content-channel XML call
+must execute once with its own exact arguments.
+
+The new sequential check crosses seven chunk sizes, from one character to a
+whole envelope, and both complete and unfinished quoted history. Normal Xcode
+runs passed the corrected suite and the original independent isolation suite:
+12 test functions in two suites, including their parameterized cases. No
+production parser, template, sampler, AgentLoop or in-app tool implementation
+changed; this is a corrected regression contract, not new model qualification.
