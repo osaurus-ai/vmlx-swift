@@ -2588,7 +2588,8 @@ public struct JangLoader: Sendable {
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
-            let skipsDeclaredAliases = declaredPerLayerQuantization?
+            let skipsDeclaredAliases =
+                declaredPerLayerQuantization?
                 .declaresSkipForAnyAlias(of: basePath) ?? false
             let declaredForLayer = skipsDeclaredAliases ? nil : declaredQuantization(for: basePath)
             let explicitForLayer: BaseConfiguration.Quantization? = {
@@ -2786,7 +2787,8 @@ public struct JangLoader: Sendable {
                     let exact = inferExactQuantization(expectedInDim: hiddenSize),
                     exact.bits != declared.bits || exact.groupSize != declared.groupSize
                 else { return nil }
-                let hasOtherTower = basePath.lowercased().split(separator: ".").contains { component in
+                let hasOtherTower = basePath.lowercased().split(separator: ".").contains {
+                    component in
                     ["visual", "vision", "audio", "speech"].contains { component.hasPrefix($0) }
                 }
                 return hasOtherTower ? nil : exact

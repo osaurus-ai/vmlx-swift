@@ -1929,15 +1929,19 @@ struct MTPRuntimeFocusedTests {
             encoding: .utf8)
 
         let prefillStart = try #require(source.range(of: "let start = NativeMTPClock.now()"))
-        let prepareCall = try #require(source.range(of: "let prepared = try NativeMTPPromptPrimer.$current.withValue(primer)"))
+        let prepareCall = try #require(
+            source.range(of: "let prepared = try NativeMTPPromptPrimer.$current.withValue(primer)"))
         #expect(prefillStart.lowerBound < prepareCall.lowerBound)
-        #expect(source[prefillStart.lowerBound..<prepareCall.lowerBound].contains("try Task.checkCancellation()"))
+        #expect(
+            source[prefillStart.lowerBound ..< prepareCall.lowerBound].contains(
+                "try Task.checkCancellation()"))
         #expect(source.contains("try prepareCapturingCacheBoundaries("))
         // The boundary-capturing prefill checks between every chunk and before the tail.
         #expect(source.contains(
             "for boundary in wanted.sorted() {\n            try Task.checkCancellation()"))
         #expect(source.contains(
-            "try Task.checkCancellation()\n        return try prepareReporting(segment(consumed, size)"))
+                "try Task.checkCancellation()\n        return try prepareReporting(segment(consumed, size)"
+            ))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let bridge = model.nativeBackboneForward"))
         #expect(source.contains(
@@ -2314,9 +2318,12 @@ struct MTPRuntimeFocusedTests {
             eval(weight, scales, biases)
             let stale = BaseConfiguration.Quantization(groupSize: 64, bits: 6, mode: .affine)
             let inferred = JangLoader.inferPerLayerQuantization(
-                weights: ["\(base).weight": weight, "\(base).scales": scales, "\(base).biases": biases],
-                jangConfig: JangConfig(quantization: JangQuantization(
-                    blockSize: 128, bitWidthsUsed: [3, 6])),
+                weights: [
+                    "\(base).weight": weight, "\(base).scales": scales, "\(base).biases": biases,
+                ],
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        blockSize: 128, bitWidthsUsed: [3, 6])),
                 hiddenSizeHint: 3_072,
                 validInDims: [1_536, 3_072],
                 declaredDefaultQuantization: stale,
@@ -2336,13 +2343,15 @@ struct MTPRuntimeFocusedTests {
                 weight: weight, scales: scales, biases: biases,
                 groupSize: actual.groupSize, bits: actual.bits)
             let result = loaded(input)
-            let dense = MLX.dequantized(weight, scales: scales, biases: biases, groupSize: 128, bits: 3)
+            let dense = MLX.dequantized(
+                weight, scales: scales, biases: biases, groupSize: 128, bits: 3)
             let reference = matmul(input, dense.T)
             eval(result, reference)
             #expect(result.shape == [1, 16])
             let magnitude = MLX.max(abs(reference)).item(Float.self)
             #expect(magnitude > 0.001)
-            #expect(MLX.max(abs(result - reference)).item(Float.self) < max(0.001, magnitude * 0.0001))
+            #expect(
+                MLX.max(abs(result - reference)).item(Float.self) < max(0.001, magnitude * 0.0001))
         }
     }
 
@@ -2377,7 +2386,10 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
-    @Test(arguments: ["visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder", "speech_encoder"])
+    @Test(arguments: [
+        "visual", "vision_tower", "model.vision_model", "audio_tower", "model.audio_encoder",
+        "speech_encoder",
+    ])
     func jangNonLanguageTowerKeepsConsistentDeclaration(prefix: String) {
         FocusedMLXTestSupport.withLock {
             for suffix in ["embed_tokens", "layers.0.self_attn.q_proj"] {
@@ -2389,8 +2401,9 @@ struct MTPRuntimeFocusedTests {
                 let declared = BaseConfiguration.Quantization(groupSize: 64, bits: 8, mode: .affine)
                 let inferred = JangLoader.inferPerLayerQuantization(
                     weights: weights,
-                    jangConfig: JangConfig(quantization: JangQuantization(
-                        blockSize: 128, bitWidthsUsed: [4, 8])),
+                    jangConfig: JangConfig(
+                        quantization: JangQuantization(
+                            blockSize: 128, bitWidthsUsed: [4, 8])),
                     hiddenSizeHint: 3_072,
                     validInDims: [1_536, 3_072],
                     declaredDefaultQuantization: declared,
