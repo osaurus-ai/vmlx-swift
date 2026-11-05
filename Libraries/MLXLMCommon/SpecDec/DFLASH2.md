@@ -52,6 +52,56 @@ suppression, reasoning budgets and `min_p` all need per-step logits that
 a pre-drafted block does not have. Those requests fall back to ordinary
 decoding.
 
+## Conditioning at an SSD prefix boundary
+
+Restoring target KV alone does not restore the target hidden features read by
+the drafter. A warm prompt can consequently condition proposals on only the
+uncached generation suffix, although target KV covers the whole prefix.
+
+The SSD payload may now include two optional arrays:
+`__dflash2_context_descriptor__` and `__dflash2_context_hidden__`. The descriptor
+records format version, absolute start/end positions, feature width, and ordered
+capture-layer IDs. Features are captured at the **same canonical boundary** as
+the target snapshot, before processing the generation suffix. Image prompts use
+the existing media-salted key. Both early boundary stores and terminal stores
+carry this data; images are eligible for early stores, while video whose final
+key is resolved after preparation follows the existing deferred-store policy.
+
+Restore requires matching positions, capture order, width, supported floating
+dtype, shape, and finite values. Only contiguous compatible suffix features are
+appended. The retained window comes from the drafter's declared sliding window;
+no new draft-width, sampling, reasoning, or output-token override is introduced.
+Missing, old, or malformed auxiliary arrays fall back to suffix-only
+conditioning without invalidating usable target KV. Existing entries are not
+rewritten just to add optional features. An incompatible feature join also falls
+back to authentic suffix features rather than synthesizing missing rows.
+
+The arrays share the primary payload's lifetime and disk accounting. If optional
+features cannot fit the configured disk quota together with target and companion
+state, they are omitted and the base cache can still be stored. There is no
+separate persistent feature cache.
+
+### Qualification checkpoint, 2026-11-05
+
+`DFlash2PrefixContextTests` covers disk round trips, absolute windows, invalid
+metadata/data, contiguous joins, target-KV compatibility, coordinator reopen,
+and oversized optional payloads: 11 tests passed against a fresh Common build.
+
+Six real Qwen3.8-27B image generations exercised cold, warm, and growing turns
+through the public generation entry point. Warm conditioning included all 560
+prompt rows instead of only seven new rows. Persisted boundary features matched
+an independently captured prefix byte for byte; all 338 original target-cache
+tensors also remained byte-identical. All six generations stopped naturally
+with visible output and positive measured rates (3.92–34.01 tokens/s in that
+test artifact). **One follow-up incorrectly answered `3 + 2 = 6` and fails the
+quality gate.** These rates are unpaired measurements, not a speedup claim.
+
+This checkpoint is incomplete. Candidate dev-app UI/restart proof, long prompts
+crossing the declared conditioning window, cancellation/finalization checks,
+and a second drafter family remain required. Full-model physical memory usage
+fails the low-memory gate. The cache change does not establish numerical parity
+for every speculative verify shape or resolve earlier long-answer failures.
+
 ## Rollback on a hybrid target
 
 Qwen3.8-27B is 48 GatedDeltaNet layers plus 16 full-attention layers.

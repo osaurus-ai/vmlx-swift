@@ -155,6 +155,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// it passes the boundary — one cache copy instead of a second full
     /// prefill after the answer. Released once stored.
     private var hybridStripSnapshot: [KVCache]?
+    private var hybridStripConditioningContext: DFlash2PrefixContext?
+    private var promptConditioningContext: DFlash2PrefixContext?
 
     /// Target hidden states for the positions the drafter has not yet
     /// consumed — `(1, rows, len(target_layer_ids) * hidden)`. After
@@ -401,6 +403,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
 
         let config = drafter.config
+        let hiddenLimit = config.layerTypes.allSatisfy { $0 == "sliding_attention" }
+            ? config.slidingWindow.map { $0 - 1 } : nil
+        var restoredConditioningContext: DFlash2PrefixContext?
         // The bundle's trained block width is the only output-neutral
         // default: a narrower runtime width (the Python engine's width-5
         // contract) measured ~2% faster here but DIVERGED from plain decode
@@ -672,6 +677,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         }
                     } else {
                         tokensToPrefill = remainingTokens
+                        if let diskArrays {
+                            restoredConditioningContext = DFlash2PrefixContext.restore(
+                                from: diskArrays, boundary: matchedTokens,
+                                layerIDs: config.targetLayerIds,
+                                featureWidth: config.targetLayerIds.count * config.hiddenSize,
+                                limit: hiddenLimit)
+                        }
                     }
                 }
             } else if populatedCacheRequiresResetAfterCoordinatorMiss(self.cache) {
@@ -684,10 +696,6 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let prefillStart = Date.timeIntervalSinceReferenceDate
         // The drafter's context window is bounded by its own sliding
         // cache, so retaining more prompt hidden than that is pure waste.
-        let hiddenLimit: Int? =
-            config.layerTypes.allSatisfy { $0 == "sliding_attention" }
-            ? (config.slidingWindow.map { $0 - 1 })
-            : nil
         self.drafterContextLimit = hiddenLimit
         // Same boundary rule as TokenIterator, so both iterators agree on
         // what the canonical cross-turn checkpoint is (hybrid SSM and
@@ -735,9 +743,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         try Task.checkCancellation()
         let prefill: PrefillResult
         if mediaPrefill, let mediaTarget {
-            var retained: MLXArray?
+            var conditioning = restoredConditioningContext
+            var retained = conditioning?.hidden
             var completedMediaRows = 0
             var boundarySnapshot: [KVCache]?
+            var boundaryContext: DFlash2PrefixContext?
             let ordered = self.orderedLayerIDs
             let restored = self.promptTokenIds.count - tokensToPrefill.count
             let cacheRef = self.cache
@@ -746,23 +756,28 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 stepSize: effectiveParameters.prefillStepSize,
                 restoredPrefix: restored,
                 boundary: captureAt.map { $0 + restored },
-                onBoundary: { boundarySnapshot = cacheRef.map { $0.copy() } }
+                onBoundary: {
+                    boundarySnapshot = cacheRef.map { $0.copy() }
+                    boundaryContext = conditioning
+                }
             ) { captured in
                 let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
-                let combined = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-                if let limit = hiddenLimit, combined.dim(1) > limit {
-                    retained = combined[0..., (combined.dim(1) - limit)..., 0...]
-                } else {
-                    retained = combined
-                }
-                if let retained { MLX.eval(retained) }
                 completedMediaRows += chunkHidden.dim(1)
+                let end = restored + completedMediaRows
+                conditioning = DFlash2PrefixContext.appending(
+                    chunkHidden, endingAt: end, layerIDs: ordered,
+                    to: conditioning, limit: hiddenLimit)
+                    ?? DFlash2PrefixContext.appending(
+                        chunkHidden, endingAt: end, layerIDs: ordered, to: nil, limit: hiddenLimit)
+                retained = conditioning?.hidden
+                if let retained { MLX.eval(retained) }
                 reportPrefill(completedMediaRows)
             }
             guard let retained else { throw DFlash2RuntimeError.emptyPrompt }
             MLX.eval(lastLogits, retained)
             prefill = PrefillResult(
-                lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
+                lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot,
+                boundaryContext: boundaryContext)
         } else {
             prefill = try Self.prefill(
                 tokens: tokensToPrefill,
@@ -773,7 +788,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 hiddenLimit: hiddenLimit,
                 stepSize: effectiveParameters.prefillStepSize,
                 captureBoundaryAt: captureAt,
-                progressHandler: reportPrefill)
+                progressHandler: reportPrefill,
+                initialContext: restoredConditioningContext)
         }
         prefillProgressHandler?(PrefillProgress(
             stage: .complete, completedUnitCount: totalPromptCount,
@@ -785,6 +801,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             RuntimeDiagnostics.write(Data(line.utf8))
         }
         self.hybridStripSnapshot = prefill.boundarySnapshot
+        self.hybridStripConditioningContext = prefill.boundaryContext
+        self.promptConditioningContext = hybridStripBoundary == nil
+            ? DFlash2PrefixContext(
+                hidden: prefill.hidden, end: promptTokenIds.count, layerIDs: orderedLayerIDs) : nil
         // Vocabulary agreement, checked against the first real logits row.
         // The drafter borrows the target's LM head, so a mismatch here
         // would not throw — it would silently index a different token
@@ -886,6 +906,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         /// Cache state exactly at `captureBoundaryAt` tokens, or `nil`
         /// when no capture was requested or the boundary was never crossed.
         let boundarySnapshot: [KVCache]?
+        let boundaryContext: DFlash2PrefixContext?
     }
 
     /// Chunked prefill that also collects the target hidden states the
@@ -903,15 +924,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         hiddenLimit: Int?,
         stepSize: Int,
         captureBoundaryAt: Int? = nil,
-        progressHandler: ((Int) -> Void)? = nil
+        progressHandler: ((Int) -> Void)? = nil,
+        initialContext: DFlash2PrefixContext? = nil
     ) throws -> PrefillResult {
         guard !tokens.isEmpty else {
             throw DFlash2RuntimeError.emptyPrompt
         }
         let step = Swift.max(1, stepSize)
         var logits: MLXArray?
-        var retained: MLXArray?
+        var conditioning = initialContext
+        var retained = conditioning?.hidden
         var boundarySnapshot: [KVCache]?
+        var boundaryContext: DFlash2PrefixContext?
+        let initialOffset = cache.first?.offset ?? 0
         var start = 0
         while start < tokens.count {
             try Task.checkCancellation()
@@ -937,19 +962,18 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             logits = chunkLogits
             let chunkHidden = extractContextFeature(
                 captured: captured, targetLayerIDs: orderedLayerIDs)
-            if let limit = hiddenLimit {
-                let combined =
-                    retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-                let rows = combined.dim(1)
-                retained =
-                    rows > limit ? combined[0..., (rows - limit)..., 0...] : combined
-            } else {
-                retained = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
-            }
+            conditioning = DFlash2PrefixContext.appending(
+                chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
+                to: conditioning, limit: hiddenLimit)
+                ?? DFlash2PrefixContext.appending(
+                    chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
+                    to: nil, limit: hiddenLimit)
+            retained = conditioning?.hidden
             if end == captureBoundaryAt {
                 try Task.checkCancellation()
                 MLX.eval(cache)
                 boundarySnapshot = cache.map { $0.copy() }
+                boundaryContext = conditioning
             }
             if end < tokens.count {
                 try Task.checkCancellation()
@@ -968,7 +992,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         MLX.eval(lastLogits, retained)
         progressHandler?(tokens.count)
         return PrefillResult(
-            lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
+            lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot,
+            boundaryContext: boundaryContext)
     }
 
     // MARK: - Iteration
@@ -1939,9 +1964,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 snapshot, tokens: Array(promptTokenIds.prefix(stripAt)),
                 coordinator: coordinator, mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
                 chainId: cacheInitParameters.cacheChainId,
-                kvMode: .none, kvGroupSize: 64, quantizedKVStart: 0)
+                kvMode: .none, kvGroupSize: 64, quantizedKVStart: 0,
+                dflash2Context: hybridStripConditioningContext)
         else { return }
         hybridStripSnapshot = nil
+        hybridStripConditioningContext = nil
         MemoryStageTrace.log("strip-spilled", tokens: stripAt, detail: "dflash2 accepted")
     }
 
@@ -1968,6 +1995,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         defer {
             promptCacheSnapshot = nil
             hybridStripSnapshot = nil
+            promptConditioningContext = nil
+            hybridStripConditioningContext = nil
         }
 
         // The generation-suffix-stripped boundary is the canonical
@@ -1993,7 +2022,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 cache: snapshot,
                 mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
                 chainId: cacheInitParameters.cacheChainId,
-                isResumeBoundary: true)
+                isResumeBoundary: true,
+                dflash2Context: hybridStripConditioningContext)
             return
         }
 
@@ -2010,6 +2040,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             ssmStates: extractSSMStates(from: snapshot),
             cache: snapshot,
             mediaSalt: mediaSalt,
-            chainId: cacheInitParameters.cacheChainId)
+            chainId: cacheInitParameters.cacheChainId,
+            dflash2Context: promptConditioningContext)
     }
 }
