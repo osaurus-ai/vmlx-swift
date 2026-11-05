@@ -403,7 +403,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
 
         let config = drafter.config
-        let hiddenLimit = config.layerTypes.allSatisfy { $0 == "sliding_attention" }
+        let hiddenLimit =
+            config.layerTypes.allSatisfy { $0 == "sliding_attention" }
             ? config.slidingWindow.map { $0 - 1 } : nil
         var restoredConditioningContext: DFlash2PrefixContext?
         // The bundle's trained block width is the only output-neutral
@@ -764,9 +765,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
                 completedMediaRows += chunkHidden.dim(1)
                 let end = restored + completedMediaRows
-                conditioning = DFlash2PrefixContext.appending(
-                    chunkHidden, endingAt: end, layerIDs: ordered,
-                    to: conditioning, limit: hiddenLimit)
+                conditioning =
+                    DFlash2PrefixContext.appending(
+                        chunkHidden, endingAt: end, layerIDs: ordered,
+                        to: conditioning, limit: hiddenLimit)
                     ?? DFlash2PrefixContext.appending(
                         chunkHidden, endingAt: end, layerIDs: ordered, to: nil, limit: hiddenLimit)
                 retained = conditioning?.hidden
@@ -802,7 +804,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         self.hybridStripSnapshot = prefill.boundarySnapshot
         self.hybridStripConditioningContext = prefill.boundaryContext
-        self.promptConditioningContext = hybridStripBoundary == nil
+        self.promptConditioningContext =
+            hybridStripBoundary == nil
             ? DFlash2PrefixContext(
                 hidden: prefill.hidden, end: promptTokenIds.count, layerIDs: orderedLayerIDs) : nil
         // Vocabulary agreement, checked against the first real logits row.
@@ -962,9 +965,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             logits = chunkLogits
             let chunkHidden = extractContextFeature(
                 captured: captured, targetLayerIDs: orderedLayerIDs)
-            conditioning = DFlash2PrefixContext.appending(
-                chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
-                to: conditioning, limit: hiddenLimit)
+            conditioning =
+                DFlash2PrefixContext.appending(
+                    chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
+                    to: conditioning, limit: hiddenLimit)
                 ?? DFlash2PrefixContext.appending(
                     chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
                     to: nil, limit: hiddenLimit)

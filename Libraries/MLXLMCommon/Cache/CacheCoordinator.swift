@@ -1624,7 +1624,8 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         if let context = dflash2Context, var arrays = diskArrays, let diskCache {
             let baseBytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
-            let companionBytes = persistSeparateRecurrentPayload
+            let companionBytes =
+                persistSeparateRecurrentPayload
                 ? IndexedBytes.total((ssmStates ?? []).map { Int64($0.nbytes) }) : 0
             let cap = Int64(max(1, diskCache.maxSizeBytes))
             let reserved = IndexedBytes.sum(IndexedBytes.sum(baseBytes, companionBytes), 131_072)

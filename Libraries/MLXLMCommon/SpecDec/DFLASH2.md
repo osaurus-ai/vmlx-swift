@@ -115,8 +115,28 @@ naturally, but its generated program was not executed or fully reviewed.
 An AR request also restored a DFlash-produced entry and answered correctly.
 It exposed a separate 9,642.513 ms, 8,043-token finalization re-derive in the
 unchanged batched AR cache path; SSD writes took 66 and 60 ms. That delay remains
-open at this checkpoint. Shared-entry AR read overhead, paired performance,
-real terminal-tool wait, and broader family/media coverage remain incomplete.
+separate from the conditioning change. A stacked boundary-capture follow-up
+subsequently exercised three warm image-history AR turns without that full
+re-derive; it does not remove cold-media or stable-system-seed rebuilds.
+
+The stacked dev app also completed a real foreground `sleep 45` command,
+returned both actual stdout markers with exit code zero, and restored 12,175
+prompt tokens for the post-tool answer. That answer correctly reported the
+marker and the original invoice subtotal (123 generated tokens, 93.14 tokens/s
+in the native receipt). Initial private-archive runs failed before execution
+because the test build lacked sandbox entitlements and its socket path exceeded
+104 bytes; both failures were preserved and only test packaging was repaired.
+Permission time is included in the tool's 81.073-second receipt, so it is not a
+45-second latency benchmark.
+
+The next DFlash answer incorrectly computed `271828 + 2 = 271827`; a warm
+regeneration repeated it, while an edit/resend answered correctly. These remain
+quality failures. Selecting AR and regenerating replayed frozen DFlash controls
+and therefore did not constitute AR proof. A fresh AR submission answered
+correctly but had a different effective request/cache path, so it does not
+establish token-level numerical parity. Its cold stable-system-seed rebuild
+also remains open. Shared-entry AR read overhead, paired performance and broader
+family/media coverage remain incomplete.
 Full-model physical memory usage fails the low-memory gate; owned loading is
 retained. The cache change does not establish numerical parity for every
 speculative verify shape or resolve the earlier long-answer/quality failures.
