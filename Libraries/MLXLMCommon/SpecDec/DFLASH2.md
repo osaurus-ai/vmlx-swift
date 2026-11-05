@@ -102,11 +102,24 @@ with visible output and positive measured rates (3.92–34.01 tokens/s in that
 test artifact). **One follow-up incorrectly answered `3 + 2 = 6` and fails the
 quality gate.** These rates are unpaired measurements, not a speedup claim.
 
-This checkpoint is incomplete. Candidate dev-app UI/restart proof, long prompts
-crossing the declared conditioning window, cancellation/finalization checks,
-and a second drafter family remain required. Full-model physical memory usage
-fails the low-memory gate. The cache change does not establish numerical parity
-for every speculative verify shape or resolve earlier long-answer failures.
+The Release dev app on `5c3e0025` restored 4,932 Qwen prompt tokens after a full
+restart and retained the declared 2,047 feature rows. GLM-5.3-Flash cold/growing
+turns used its distinct five-tap, 20,480-wide capture layout; the growing turn
+restored 143 tokens and conditioned on all 379 prompt rows. Both models returned
+correct arithmetic answers in these scoped GUI checks, with separated GLM
+reasoning. A real Stop ended a Qwen stream after 255 tokens; the next turn
+restored the 7,588-token canonical boundary and answered correctly. Rates and
+typed payload/window observations were retained. A 2,306-token code run stopped
+naturally, but its generated program was not executed or fully reviewed.
+
+An AR request also restored a DFlash-produced entry and answered correctly.
+It exposed a separate 9,642.513 ms, 8,043-token finalization re-derive in the
+unchanged batched AR cache path; SSD writes took 66 and 60 ms. That delay remains
+open at this checkpoint. Shared-entry AR read overhead, paired performance,
+real terminal-tool wait, and broader family/media coverage remain incomplete.
+Full-model physical memory usage fails the low-memory gate; owned loading is
+retained. The cache change does not establish numerical parity for every
+speculative verify shape or resolve the earlier long-answer/quality failures.
 
 ## Rollback on a hybrid target
 
