@@ -317,3 +317,41 @@ No low-RAM certification or speed gain is claimed. Recorded generation rates
 are correctness observations, not controlled speed benchmarks. No BF16/source
 bundle, audio, release tag or publication is in scope. The broader storage/cache,
 terminal wait, native MTP, DFlash2 and DSpark goal remains active.
+
+## Later native closure and selected calculator checks
+
+The previously incomplete 26B A4B JANG native record is now closed: four named
+workflows pass, including executed calculator calls after a real image and
+normal process restart. New 31B MXFP4 and JANG rows also pass those same four
+workflows each. Release26 consumer8327/runtimef174 is hash-verified; consumer
+e87 adds no Core production changes after that build. Native exports, visible
+settled turns, exact calls/results and samples are bound by NATIVE-RECEIPT.json
+in build26-26b-jang-native, build26-31b-mxfp4-native and
+build26-31b-jang-native under the same private evidence root.
+
+Each row contains eight positive-rate actual requests, explicit Thinking Off,
+and twenty typed snapshots. 26B JANG stores F16 with five full/twenty-five
+rotating layers; both 31B variants have ten full/fifty rotating layers, BF16
+for MXFP4 and F16 for JANG. First restart restores are6369/6459,
+6302/6462 and6369/6459 respectively. TurboQuant KV layers remain zero.
+All three physical-footprint gates fail; owned loading is retained. Native
+displayed decode ranges are56.7–61.8,12.6–19.1 and10.1–10.6tok/s respectively,
+not controlled speed measurements. No duplicate tensor snapshots were copied.
+
+Two unchanged calculator cases on each of E2B MXFP4/JANG,26B JANG and31B
+MXFP4/JANG score8/10 overall, with24 positive-rate task model steps.
+Independent integer/Decimal and actual tool-result checks agree with the
+self-judged reports. E2B MXFP4 supplies249.99 instead of the quoted1249.99,
+returns1930.74 and emits reasoning despite Off. E2B JANG chooses naive
+comma-split awk, returns1680.75 and omits required file_read/calculate calls.
+The other three selected rows pass2/2 each. Every transcript and failed
+producer exit is retained by GEMMA-CALCULATOR-SELECTED-RECEIPT-20261105.json.
+These locate model choices, not a demonstrated cache/runtime root cause.
+
+All ten QAT variants now have native observations and a selected scored
+AgentLoop artifact at runtimef174; the earlier statement about six missing
+current-consumer controls is superseded by the later records. Full suites,
+affected setting/cancel/eviction/media gates, earlier OCR/grounding/reasoning
+failures, normal runtime merge and actual-merge-pin consumer proof remain
+partial. No AgentLoop/orchestration/tool source was edited; forty-eight
+protected files are hash-identical. No sampler/prompt rescue, release or tag.
