@@ -112,6 +112,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let cacheCoordinator: CacheCoordinator?
 
     private let sampler: LogitSampler
+    /// Seeded chain proposals, acceptance and residual draws must not use
+    /// process-global randomness. Keep this stream distinct from the target
+    /// sampler's stream; unseeded requests retain their existing behavior.
+    private let sampledCycleRandomState: MLXRandom.RandomState?
     private let temperature: Float
     private let topP: Float
     private let topK: Int
@@ -442,6 +446,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.draftCache = drafter.makeCache()
         self.cacheCoordinator = cacheCoordinator
         self.sampler = effectiveParameters.sampler()
+        self.sampledCycleRandomState = effectiveParameters.randomSeed.map {
+            MLXRandom.RandomState(seed: $0 &+ 0x9E37_79B9_7F4A_7C15)
+        }
         self.temperature = effectiveParameters.temperature
         self.topP = effectiveParameters.topP
         self.topK = effectiveParameters.topK
@@ -990,7 +997,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             return nil
         }
         if pendingIndex >= pendingTokens.count {
-            guard runCycle() else { return nil }
+            let produced: Bool
+            if let randomState = sampledCycleRandomState {
+                produced = withRandomState(randomState) { runCycle() }
+            } else {
+                produced = runCycle()
+            }
+            guard produced else { return nil }
         }
         guard pendingIndex < pendingTokens.count else { return nil }
         let token = pendingTokens[pendingIndex]
