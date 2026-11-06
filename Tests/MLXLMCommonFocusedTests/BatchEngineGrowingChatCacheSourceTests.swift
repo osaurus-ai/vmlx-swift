@@ -16,7 +16,9 @@ struct BatchEngineGrowingChatCacheSourceTests {
             encoding: .utf8)
         let store = try #require(source.components(separatedBy: "mutating func storeCacheAfterGeneration(").last)
         let calls = store.components(separatedBy: "coordinator.storeAfterGeneration(").dropFirst()
-        #expect(calls.count == 2, "canonical stripped and full-prompt boundaries both need ownership")
+        #expect(
+            calls.count == 4,
+            "canonical stripped, full-prompt, stable-root and post-answer boundaries all need ownership")
         for call in calls {
             #expect(call.contains("chainId: cacheInitParameters.cacheChainId"))
         }
@@ -268,7 +270,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
         // boundary-offset guard.
         #expect(source.contains("Self.generatedBoundaryTokensAligned("))
         #expect(source.contains("pendingDrainedTokenId:"))
-        #expect(source.contains("&& !handler.emittedToolCall"))
+        // A tool-call turn stores a post-answer boundary only for a model that re-renders it to the generated tokens.
+        #expect(source.contains("&& (!handler.emittedToolCall || iterator.storesToolCallTurnBoundary)"))
+        #expect(source.contains("public var storesToolCallTurnBoundary: Bool { false }"))
+        #expect(source.contains("public var storesToolCallTurnBoundary: Bool { model is ToolCallTurnBoundaryModel }"))
         #expect(source.contains("input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"))
         #expect(source.contains("let requiresDiskBackedRestore ="))
         #expect(source.contains("cacheRequiresDiskBackedCoordinatorRestore(self.cache)"))
