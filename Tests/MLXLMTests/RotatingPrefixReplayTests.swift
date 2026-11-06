@@ -101,6 +101,24 @@ final class RotatingPrefixReplayTests: XCTestCase {
     expectHit(a, count: a.count - 1, in: c)
   }
 
+  func testShorterMediaIndependentPrefixDoesNotLoseItsSafeCompleteBoundary() {
+    let c = coordinator()
+    let prefix = Array(0..<10)
+    store(prefix, in: c)
+    let request = prefix + [999]
+    guard case .hit(let matched, let remaining, let detail, let blocks, _, _) = c.fetch(
+      tokens: request, mediaSalt: "different-media", skipExactDiskBoundary: true,
+      mediaIndependentPrefix: MediaIndependentPrefix(salt: nil, tokenCount: prefix.count))
+    else { return XCTFail("A shorter safe prefix already leaves an unprocessed request suffix") }
+    defer { c.release(blocks: blocks) }
+    XCTAssertEqual(matched, prefix.count)
+    XCTAssertEqual(remaining, [999])
+    XCTAssertEqual(detail, .paged)
+    let restored: [KVCache] = [KVCacheSimple(), RotatingKVCache(maxSize: 5, keep: 0)]
+    XCTAssertEqual(restoreLayerData(from: blocks, into: restored), prefix.count)
+    XCTAssertTrue(restored.allSatisfy { $0.offset == prefix.count })
+  }
+
   func testPartialCompanionRemainsReachableBehindLongerFullBlocks() {
     for length in [14, 256] {
       let c = coordinator()
