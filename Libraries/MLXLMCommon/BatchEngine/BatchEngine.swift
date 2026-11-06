@@ -755,23 +755,30 @@ public actor BatchEngine {
             )
             parameters.draftStrategy = nil
         }
-        if parameters.draftStrategy?.usesDFlash2 == true,
-            DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
-        {
-            if canStartExclusiveSoloPath {
+        if parameters.draftStrategy?.usesDFlash2 == true {
+            if let reason = DFlash2TokenIterator.unservableReason(
+                parameters, input: input, model: context.model)
+            {
+                // The raw batch path intentionally rejects draft strategies.
+                // Clear an ineligible optimization before handing it the AR
+                // request, preserving media preparation and every sampler field.
+                Self.logger.notice(
+                    "BatchEngine.generate ineligible DFlash 2 request decodes autoregressively: \(reason, privacy: .public)."
+                )
+                parameters.draftStrategy = nil
+            } else if canStartExclusiveSoloPath {
                 return startSoloFastPath(
                     input: input,
                     parameters: parameters,
                     promptTail: promptTail)
+            } else {
+                // Another request owns the engine. Drafting is exclusive;
+                // ordinary batched decode still serves this request.
+                Self.logger.notice(
+                    "BatchEngine.generate DFlash 2 request decodes autoregressively: the engine is serving another request and drafting is an exclusive solo path."
+                )
+                parameters.draftStrategy = nil
             }
-            // Another request owns the engine (continuous batching > 1: a spawned subagent, a parallel
-            // delegation). The drafter is a separate model and the target is untouched, so this request
-            // decodes as an ordinary batched AR slot instead of being cancelled (it was: the second of two
-            // concurrent requests on a DFlash 2 / DSpark model failed outright).
-            Self.logger.notice(
-                "BatchEngine.generate DFlash 2 request decodes autoregressively: the engine is serving another request and drafting is an exclusive solo path."
-            )
-            parameters.draftStrategy = nil
         }
         // Block-diffusion models (e.g. diffusion_gemma) generate whole
         // canvases via denoising and cannot share batched decode slots.

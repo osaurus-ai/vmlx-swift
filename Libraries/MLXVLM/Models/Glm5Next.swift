@@ -2484,8 +2484,8 @@ public final class Glm5NextProcessor: UserInputProcessor {
     /// "Unsupported processor type" — a table filled in on one side only.
     ///
     /// The media ids live in the MODEL config, which is not passed here, so they are resolved from
-    /// the vocabulary instead. `convertTokenToId` rather than `encode(...).last`, because encode
-    /// may prepend a BOS and would then hand back the wrong id with no sign anything was wrong.
+    /// the vocabulary instead. Resolve one token without an added BOS and require an exact
+    /// decode round trip, so an unknown-token alias cannot become an image/cache placeholder.
     public convenience init(
         config: Glm5NextProcessorConfiguration, tokenizer: any Tokenizer
     ) throws {
@@ -2500,7 +2500,9 @@ public final class Glm5NextProcessor: UserInputProcessor {
         videoConfig: Glm5NextImageProcessorConfiguration,
         videoFPS: Double, tokenizer: any Tokenizer
     ) throws {
-        guard let imageToken = tokenizer.convertTokenToId("<|image|>") else {
+        guard let imageToken = MediaTokenIds.resolve(
+            tokenizer: tokenizer, tokens: ["<|image|>"])?.first
+        else {
             throw Glm5NextDecoderUnavailable(
                 detail: "this tokenizer has no <|image|> token, so image placeholders cannot be "
                     + "written; the bundle's tokenizer.json is not GLM-5.3's")
