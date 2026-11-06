@@ -746,8 +746,8 @@ struct LoadBundleFactsNGramTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-invalid-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        // A second valid table shares the shard. Rejecting one malformed
-        // descriptor must not change valid packed-shard accounting.
+        // A valid sibling cannot establish that a malformed shard has a
+        // trustworthy layout. Keep the entire shard in the resident estimate.
         let header: [String: Any] = [
             "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
                 ["dtype": "U32", "shape": [1], "data_offsets": offsets],
@@ -761,8 +761,8 @@ struct LoadBundleFactsNGramTests {
         file.append(Data(count: 16))
         try file.write(to: root.appendingPathComponent("model.safetensors"))
         let facts = LoadBundleFacts.inspect(bundleURL: root)
-        #expect(facts.ssdResidentTableBytes == 4)
-        #expect(facts.gpuResidentWeightBytes == UInt64(file.count) - 4)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
     }
 
     @Test("truncated n-gram payload remains in the conservative resident estimate")
@@ -785,11 +785,89 @@ struct LoadBundleFactsNGramTests {
         #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
     }
 
+    @Test("overlapping SSD table spans never reduce the resident estimate",
+        arguments: [[[0, 64], [0, 64]], [[0, 48], [32, 64]]])
+    func overlappingNGramSpansAreNotSubtracted(spans: [[Int]]) throws {
+        let header: [String: Any] = [
+            "model.layers.0.ple.ngram_embedding.first":
+                ["dtype": "U8", "shape": [spans[0][1] - spans[0][0]], "data_offsets": spans[0]],
+            "model.layers.1.ple.ngram_embedding.second":
+                ["dtype": "U8", "shape": [spans[1][1] - spans[1][0]], "data_offsets": spans[1]],
+        ]
+        try assertInvalidTableSpansAreConservative(header)
+    }
+
+    @Test("an SSD descriptor cannot discount bytes aliased by compute weights")
+    func computeAliasIsNotSubtracted() throws {
+        try assertInvalidTableSpansAreConservative([
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+            "model.layers.0.mlp.weight":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+        ])
+    }
+
+    private func assertInvalidTableSpansAreConservative(_ header: [String: Any]) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("facts-ngram-overlap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 64))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
+    }
+
+    @Test("impossible SSD totals retain the full resident estimate",
+        arguments: [UInt64(10), UInt64(11), UInt64.max])
+    func invalidSSDTotalIsConservative(ssdBytes: UInt64) {
+        var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
+        facts.ssdResidentTableBytes = ssdBytes
+        #expect(facts.gpuResidentWeightBytes == 10)
+    }
+
+    @Test("malformed compute descriptors cannot validate an SSD discount")
+    func malformedComputeSpanIsConservative() throws {
+        try assertInvalidTableSpansAreConservative([
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [16], "data_offsets": [0, 16]],
+            "model.layers.0.mlp.weight":
+                ["dtype": "U8", "shape": [65], "data_offsets": [-1, 64]],
+        ])
+    }
+
+    @Test("an unreadable sibling shard prevents a partial bundle discount")
+    func unreadableSiblingKeepsEveryByteResident() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("facts-ngram-sibling-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let header = try JSONSerialization.data(withJSONObject: [
+            "model.layers.0.ple.ngram_embedding.table":
+                ["dtype": "U8", "shape": [64], "data_offsets": [0, 64]],
+        ])
+        var length = UInt64(header.count).littleEndian
+        var shard = withUnsafeBytes(of: &length) { Data($0) }
+        shard.append(header)
+        shard.append(Data(count: 64))
+        try shard.write(to: root.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try Data(count: 16).write(to: root.appendingPathComponent("model-00002-of-00002.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.totalSafetensorsBytes == UInt64(shard.count + 16))
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(shard.count + 16))
+    }
+
     @Test("bundles without an n-gram table keep every byte as weights")
     func noNGramTable() {
         var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
         #expect(facts.gpuResidentWeightBytes == 10)
         facts.ssdResidentTableBytes = 20
-        #expect(facts.gpuResidentWeightBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == 10)
     }
 }

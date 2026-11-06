@@ -57,7 +57,19 @@ final class JANGHLoadPolicyTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        try Data(count: 4096).write(to: real.appendingPathComponent("model-00001-of-00002.safetensors"))
+        // A valid compute shard keeps this symlink/accounting control separate
+        // from the malformed-header rejection contract.
+        let denseHeader = try JSONSerialization.data(withJSONObject: [
+            "model.dense.weight": ["dtype": "U8", "shape": [3960], "data_offsets": [0, 3960]],
+        ])
+        XCTAssertLessThanOrEqual(denseHeader.count, 128)
+        var denseShard = Data()
+        withUnsafeBytes(of: UInt64(128).littleEndian) { denseShard.append(contentsOf: $0) }
+        denseShard.append(denseHeader)
+        denseShard.append(Data(repeating: 0x20, count: 128 - denseHeader.count))
+        denseShard.append(Data(count: 3960))
+        XCTAssertEqual(denseShard.count, 4096)
+        try denseShard.write(to: real.appendingPathComponent("model-00001-of-00002.safetensors"))
         // A shard whose only tensor is an SSD n-gram table: counted, then subtracted from the
         // resident weights, through the same symlinked directory.
         let header = try JSONSerialization.data(withJSONObject: [
