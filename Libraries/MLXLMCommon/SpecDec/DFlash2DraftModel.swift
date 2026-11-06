@@ -225,7 +225,17 @@ public struct DFlash2Configuration: Sendable {
         }
         self.ropeTraditional = (any("rope_is_neox_style") as? Bool).map { !$0 } ?? false
         self.hasConfidenceHead = (any("enable_confidence_head") as? Bool) ?? false
-        let noRope = (root["no_rope_layers"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
+        let noRope: [Int]
+        if let declared = root["no_rope_layers"] {
+            guard let data = try? JSONSerialization.data(withJSONObject: declared, options: .fragmentsAllowed),
+                let indices = try? JSONDecoder().decode([Int].self, from: data)
+            else {
+                throw DFlash2LoadError.targetMismatch("no_rope_layers must be an array of integer layer indices")
+            }
+            noRope = indices
+        } else {
+            noRope = []
+        }
         let layerCount = self.numHiddenLayers
         guard noRope.allSatisfy({ $0 >= 0 && $0 < layerCount }) else {
             throw DFlash2LoadError.targetMismatch("no_rope_layers names a layer outside the drafter")
