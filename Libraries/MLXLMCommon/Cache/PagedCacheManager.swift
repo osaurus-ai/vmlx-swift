@@ -366,12 +366,16 @@ public final class PagedCacheManager: @unchecked Sendable {
             }
 
             block.tokenIds = chunk
-            block.cacheData = incoming.map {
-                Optional((keys: Self.compact($0.keys), values: Self.compact($0.values)))
+            // Keep cache materialization serialized with background SSM and
+            // safetensors I/O. Lock order is manager, then global cache I/O;
+            // the I/O body does not call back into cache-manager operations.
+            MLXCacheIOLock.withSerializedMLXCacheIO {
+                block.cacheData = incoming.map {
+                    Optional((keys: Self.compact($0.keys), values: Self.compact($0.values)))
+                }
+                // Batch-evaluate one block, not each tensor separately.
+                eval(Self.kvArrays(block))
             }
-            // Batch-evaluate one block to sever lazy source dependencies
-            // without one GPU synchronization per individual tensor.
-            eval(Self.kvArrays(block))
             storageCharges[block.blockId] = (kv: bytes, companion: 0)
             stats.residentBytes += bytes
 
@@ -393,8 +397,10 @@ public final class PagedCacheManager: @unchecked Sendable {
             let previous = storageCharges[leaf.blockId]?.companion ?? 0
             let next = Self.storageCharge(Array((boundaryCompanionData ?? [:]).values))
             if reserveStorage(max(0, next - previous)) {
-                leaf.boundaryCompanionData = boundaryCompanionData?.mapValues(Self.compact)
-                eval(Array((leaf.boundaryCompanionData ?? [:]).values))
+                MLXCacheIOLock.withSerializedMLXCacheIO {
+                    leaf.boundaryCompanionData = boundaryCompanionData?.mapValues(Self.compact)
+                    eval(Array((leaf.boundaryCompanionData ?? [:]).values))
+                }
                 storageCharges[leaf.blockId] = (
                     kv: storageCharges[leaf.blockId]?.kv ?? 0, companion: next)
                 stats.residentBytes += next - previous
