@@ -147,6 +147,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var promptCacheSnapshot: [KVCache]?
     /// Set instead of `promptCacheSnapshot` on append-only caches: `storeCacheAfterGeneration` views this many rows.
     private var deferredPromptSnapshotRows: Int?
+    private var endedOnToolCall = false
+    var storesToolCallTurnBoundary: Bool { target is ToolCallTurnBoundaryModel }
+    mutating func noteEndedOnToolCall() { endedOnToolCall = true }
     /// Prompt tokens restored from the prefix cache; everything past them was prefilled by this request.
     private var restoredPromptTokenCount = 0
 
@@ -2089,7 +2092,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // A completed answer's entry serves the next turn. The exact-prompt entry would only serve a regenerate, which
         // otherwise re-prefills this request's prompt suffix from the entry it restored: not worth a second full SSD
         // write per turn when that suffix is short (a tool call or an interrupted turn has no answer entry and keeps it).
-        if storedAnswer, promptTokenIds.count - restoredPromptTokenCount <= Self.promptEntrySkipSuffixRows { return }
+        if storedAnswer, !endedOnToolCall,
+            promptTokenIds.count - restoredPromptTokenCount <= Self.promptEntrySkipSuffixRows
+        {
+            return
+        }
         if let snapshot = promptSnapshot,
             snapshot.allSatisfy({ $0.offset == promptTokenIds.count })
         {
@@ -2170,7 +2177,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         // Keep the answer plus the forwarded stop token (the AR iterator's post-answer key); rows a speculative cycle
         // committed past it were never returned to the caller and are not history.
-        let keep = Swift.min(offset, promptTokenIds.count + generatedTokenIds.count + 1)
+        // A tool call ends where the consumer stopped reading: exactly the returned tokens.
+        let keep = Swift.min(
+            offset, promptTokenIds.count + generatedTokenIds.count + (endedOnToolCall ? 0 : 1))
         if keep < offset {
             for layer in cache { _ = layer.trim(offset - keep) }
             guard cache.allSatisfy({ $0.offset == keep }) else { return false }

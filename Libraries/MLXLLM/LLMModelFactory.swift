@@ -2262,6 +2262,8 @@ public final class LLMModelFactory: ModelFactory {
                         : reasoningStampFromModelType(baseConfig.modelType))
             }
         }
+        // Ripple bundles stamp the vendor's parser family (qwen3); the separator contract is the model family's.
+        if baseConfig.modelType == "ricursive" { mutableConfiguration.reasoningParserName = "ricursive" }
 
         // Load tokenizer and weights in parallel.
         //

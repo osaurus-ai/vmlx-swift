@@ -491,6 +491,10 @@ extension RicursiveModel: DFlash2WidthLadderPolicy {
     public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }
 
+/// The vendor template reproduces an unchanged assistant message to the exact generated tokens, tool calls included
+/// (with the separator-stripping reasoning parser).
+extension RicursiveModel: ToolCallTurnBoundaryModel {}
+
 extension RicursiveModel: LoRAModel {
     public var loraLayers: [Module] { model.layers }
 }

@@ -117,3 +117,56 @@ import Testing
         #expect(positions(copy.state[0]).last == 300)
     }
 }
+
+/// Ripple's separator contract: parsed text re-rendered by the template (`<think>\n{r}\n</think>\n{c}`,
+/// `{c}\n<tool_call>`) reproduces the generated text, for every chunk split.
+@Suite struct RicursiveReasoningSeparatorTests {
+    private func parse(_ text: String, chunk: Int) -> (reasoning: String, content: String) {
+        var parser = ReasoningParser.forPrompt(stampName: "ricursive", promptTail: "<|im_start|>assistant\n")!
+        var reasoning = ""
+        var content = ""
+        func take(_ segments: [ReasoningSegment]) {
+            for segment in segments {
+                switch segment {
+                case .reasoning(let text): reasoning += text
+                case .content(let text): content += text
+                }
+            }
+        }
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            take(parser.feed(String(rest.prefix(chunk))))
+            rest = rest.dropFirst(chunk)
+        }
+        take(parser.flush())
+        return (reasoning, content)
+    }
+
+    @Test(arguments: [1, 2, 3, 5, 7, 8, 9, 11, 64])
+    func splitsWithoutSeparators(chunk: Int) {
+        let answer = parse("<think>\nline one\n\nline two\n</think>\nThe answer\nis 4.", chunk: chunk)
+        #expect(answer.reasoning == "line one\n\nline two")
+        #expect(answer.content == "The answer\nis 4.")
+        let spaced = parse("<think>\nr\n</think>\n\nAnswer", chunk: chunk)
+        #expect(spaced.reasoning == "r")
+        #expect(spaced.content == "\nAnswer")
+        let plain = parse("No reasoning here.\nSecond line\n", chunk: chunk)
+        #expect(plain.reasoning == "")
+        #expect(plain.content == "No reasoning here.\nSecond line\n")
+    }
+
+    @Test(arguments: [1, 2, 3, 5, 10, 11, 12, 13, 64])
+    func toolCallKeepsItsPayloadAndDropsTheTemplateNewline(chunk: Int) {
+        let call = "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"s\": \"<think>\\n\"}}\n</tool_call>"
+        let bare = parse("<think>\nr\n</think>\n\n" + call, chunk: chunk)
+        #expect(bare.reasoning == "r")
+        #expect(bare.content == call)
+        let text = parse("Checking.\n" + call + "\n" + call, chunk: chunk)
+        #expect(text.content == "Checking." + call + call)
+    }
+
+    @Test func stampFromModelTypeAndBundleStampResolve() {
+        #expect(reasoningStampFromModelType("ricursive") == "ricursive")
+        #expect(ReasoningParser.namesAKnownFamily("ricursive"))
+    }
+}
