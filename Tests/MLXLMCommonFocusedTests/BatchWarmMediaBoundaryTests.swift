@@ -90,15 +90,18 @@ final class BatchWarmMediaBoundaryTests: XCTestCase {
         #endif
     }
 
-    private func input(pixel: Float = 1) -> sending LMInput {
+    private func input(pixel: Float = 1, canonicalBoundaries: Bool = true) -> sending LMInput {
         LMInput(
             text: .init(
                 tokens: MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), tokenIds: ids),
             image: .init(pixels: MLXArray.full([1, 3, 2, 2], values: MLXArray(pixel))),
-            mediaTokenIds: [3], cachePrefixTokenCounts: [11])
+            mediaTokenIds: [3], cachePrefixTokenCounts: canonicalBoundaries ? [11] : [])
     }
 
-    private func exercise(prime: Bool, changedImage: Bool = false) async throws
+    private func exercise(
+        prime: Bool, changedImage: Bool = false, canonicalBoundaries: Bool = true,
+        maxBatchSize: Int = 1
+    ) async throws
         -> (model: BoundaryHybridModel, requiredSuffix: [Int])
     {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -133,9 +136,11 @@ final class BatchWarmMediaBoundaryTests: XCTestCase {
         let context = ModelContext(
             configuration: processor.configuration, model: model,
             processor: processor, tokenizer: processor.tokenizer)
-        let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
+        let engine = BatchEngine(
+            context: context, maxBatchSize: maxBatchSize, cacheCoordinator: coordinator)
         let task = await engine.submit(
-            input: input(pixel: changedImage ? 2 : 1), parameters: parameters)
+            input: input(pixel: changedImage ? 2 : 1, canonicalBoundaries: canonicalBoundaries),
+            parameters: parameters)
         var generated = 0
         for await event in task.stream {
             if case .token = event { generated += 1 }
@@ -166,8 +171,33 @@ final class BatchWarmMediaBoundaryTests: XCTestCase {
         XCTAssertTrue(result.model.prepareMediaFlags.allSatisfy { !$0 })
     }
 
+    func testWarmMediaTemplateBoundaryDoesNotReplayWhenCanonicalCountsAreAbsent() async throws {
+        for maxBatchSize in [1, 2] {
+            let result = try await exercise(
+                prime: true, canonicalBoundaries: false, maxBatchSize: maxBatchSize)
+            XCTAssertEqual(
+                result.model.forwarded, result.requiredSuffix,
+                "batch \(maxBatchSize): the existing template strip boundary must be captured "
+                    + "during the text-only restored suffix, without replaying the old image")
+            XCTAssertTrue(result.model.prepareMediaFlags.allSatisfy { !$0 })
+        }
+    }
+
     func testColdMediaKeepsPayloadDuringPreparation() async throws {
         let result = try await exercise(prime: false)
+        XCTAssertEqual(result.model.prepareSegments.first, ids)
+        XCTAssertEqual(result.model.prepareMediaFlags.first, true)
+    }
+
+    func testColdMediaWithoutCanonicalCountsKeepsPayload() async throws {
+        let result = try await exercise(prime: false, canonicalBoundaries: false)
+        XCTAssertEqual(result.model.prepareSegments.first, ids)
+        XCTAssertEqual(result.model.prepareMediaFlags.first, true)
+    }
+
+    func testChangedImageWithoutCanonicalCountsCannotReuseTheOldImage() async throws {
+        let result = try await exercise(
+            prime: true, changedImage: true, canonicalBoundaries: false)
         XCTAssertEqual(result.model.prepareSegments.first, ids)
         XCTAssertEqual(result.model.prepareMediaFlags.first, true)
     }
