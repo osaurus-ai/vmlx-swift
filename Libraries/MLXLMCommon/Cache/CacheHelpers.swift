@@ -1607,7 +1607,8 @@ private func restoreRotatingLayer(
     into layer: any KVCache
 ) {
     func apply(_ rot: RotatingKVCache) {
-        rot.state = [comp.keys, comp.values]
+        // Isolate mutable wrappers; slices retain copy-on-write storage.
+        rot.state = [comp.keys[0...], comp.values[0...]]
         rot.metaState = [
             String(comp.keep),
             String(comp.maxSize),
