@@ -69,6 +69,18 @@ public final class BlockHashMap: @unchecked Sendable {
         return best
     }
 
+    /// Build once per companion-aware lookup, so a long prefix does not scan
+    /// every full KV block again at every position. Entries share immutable
+    /// block identity; the owning manager lock protects them during the walk.
+    func partialBoundaryCompanionIndex() -> BlockHashMap {
+        let partial = BlockHashMap()
+        for block in map.values where !block.isEmpty && !block.isFull
+            && block.boundaryCompanionData != nil {
+            partial.insert(block)
+        }
+        return partial
+    }
+
     /// Remove the entry for a block (keyed by its ``CacheBlock/blockHash``).
     /// No-op if the block's hash is `nil` or not present.
     public func remove(_ block: CacheBlock) {
