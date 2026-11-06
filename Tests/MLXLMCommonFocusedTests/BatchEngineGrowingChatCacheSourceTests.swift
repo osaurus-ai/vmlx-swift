@@ -97,10 +97,13 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(mtp.contains(
             "coordinator.requiresRecurrentSSMCompanion && boundary > 1"))
 
-        // Solo and batched paths each gate both their N-1/generated stores;
-        // native MTP has no N-1 writer and gates its generated store.
-        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 3)  // + the aligned single store
-        #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        // The batched path additionally excludes warmups when reusing a
+        // durable append-only SWA prompt seed. Its seed/generated gates remain.
+        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 3)
+        #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 3)
+        #expect(batch.contains("let hasReusableNativeSWAPromptSeed ="))
+        #expect(batch.contains("!isReusablePrefixWarmup && slot.appendOnlyPromptCheckpoint != nil"))
+        #expect(batch.contains("coordinator.hasDurableDiskEntry("))
         #expect(mtp.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 1)
     }
 
@@ -135,6 +138,55 @@ struct BatchEngineGrowingChatCacheSourceTests {
             isStableBoundary: true,
             isReusablePrefixWarmup: true,
             requiresRecurrentSSMCompanion: true))
+    }
+
+    @Test(
+        "append-only checkpoints preserve exact KV and sealed rotating state after growth",
+        arguments: [5, 7])
+    func appendOnlyCheckpointPreservesNonalignedBoundary(tokenCount: Int) throws {
+        try FocusedMLXTestSupport.withLock {
+            let full = KVCacheSimple()
+            let rotating = RotatingKVCache(maxSize: 4)
+            let keys = MLXArray((0 ..< tokenCount * 2).map { Float($0) })
+                .reshaped(1, 1, tokenCount, 2)
+            let values = keys + 1000
+            _ = full.update(keys: keys, values: values)
+            _ = rotating.update(keys: keys, values: values)
+            MLX.eval(full.state + rotating.state)
+            let sealedRotating = rotating.state.map { $0.asType(.float32).asArray(Float.self) }
+            #expect(!sealedRotating.isEmpty)
+            let checkpoint = try #require(
+                AppendOnlyPromptCheckpoint.capture(cache: [full, rotating], tokenCount: tokenCount))
+
+            // Advance the real caches across another ring wrap before
+            // materialization. Distinct nonzero values expose stale/live aliasing.
+            let nextKeys = MLXArray((100 ..< 106).map { Float($0) }).reshaped(1, 1, 3, 2)
+            _ = full.update(keys: nextKeys, values: nextKeys + 1000)
+            _ = rotating.update(keys: nextKeys, values: nextKeys + 1000)
+            MLX.eval(full.state + rotating.state)
+            #expect(full.offset == tokenCount + 3)
+            #expect(rotating.offset == tokenCount + 3)
+            let restored = try #require(checkpoint.materialize(from: [full, rotating]))
+            #expect(restored.map(\.offset) == [tokenCount, tokenCount])
+            let fullState = restored[0].state
+            #expect(fullState.count == 2)
+            #expect(fullState[0].shape == [1, 1, tokenCount, 2])
+            #expect(fullState[0].asArray(Float.self) == keys.asArray(Float.self))
+            #expect(fullState[1].asArray(Float.self) == values.asArray(Float.self))
+            let rotatingState = restored[1].state
+            #expect(rotatingState.count == sealedRotating.count)
+            for (actual, expected) in zip(rotatingState, sealedRotating) {
+                #expect(actual.asType(.float32).asArray(Float.self) == expected)
+            }
+
+            // Capturing at the old count, missing a layer, or substituting a
+            // reset append-only cache must fail closed instead of fabricating KV.
+            #expect(
+                AppendOnlyPromptCheckpoint.capture(
+                    cache: [full, rotating], tokenCount: tokenCount) == nil)
+            #expect(checkpoint.materialize(from: [full]) == nil)
+            #expect(checkpoint.materialize(from: [KVCacheSimple(), rotating]) == nil)
+        }
     }
 
     @Test("coordinator miss resets only populated caller-owned caches")
@@ -375,7 +427,12 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(batch.contains(
             "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
         #expect(batch.contains("slot.diskSeedSnapshot = nil"))
-        #expect(batch.contains("let capturedDiskSeed = slot.diskSeedSnapshot"))
+        // Full attention materializes its append-only prefix at finalization;
+        // path-dependent topologies retain the typed snapshot fallback.
+        #expect(
+            batch.contains(
+                "let capturedDiskSeed = slot.appendOnlyDiskSeed?.materialize(from: slot.cache)"))
+        #expect(batch.contains("?? slot.diskSeedSnapshot"))
         #expect(batch.contains("capturedDiskSeed ?? boundarySnapshot("))
         #expect(batch.contains("slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot("))
         #expect(batch.contains("let storageSnapshotTokenCount = promptCacheSnapshot == nil"))
@@ -414,10 +471,13 @@ struct BatchEngineGrowingChatCacheSourceTests {
         let stableLoop = try #require(source.range(
             of: "for boundary in Set(cachePrefixTokenCounts).sorted()",
             range: topology.lowerBound..<source.endIndex))
-        let generatedBoundary = try #require(source.range(
-            of: "guard !usesCanonicalHybridBoundary",
-            range: stableLoop.lowerBound..<source.endIndex))
-        let storageBody = source[topology.lowerBound..<generatedBoundary.lowerBound]
+        // Completed answers are allowed for canonical hybrid templates too;
+        // warmups still cannot publish a generated-answer boundary.
+        let generatedBoundary = try #require(
+            source.range(
+                of: "guard !isReusablePrefixWarmup,",
+                range: stableLoop.lowerBound ..< source.endIndex))
+        let storageBody = source[topology.lowerBound ..< generatedBoundary.lowerBound]
         #expect(storageBody.contains("if let storageTopologySnapshot,"))
         #expect(storageBody.contains("storageSnapshot: storageTopologySnapshot"))
         #expect(topology.lowerBound < stableLoop.lowerBound)
@@ -568,8 +628,17 @@ struct BatchEngineGrowingChatCacheSourceTests {
             "input: slot.originalInput,\n                cache: slot.cache)"))
         #expect(mtp.contains(
             "input: originalInput,\n                cache: cache)"))
-        #expect(dflash2.contains(
-            "input: input,\n            cache: self.cache)"))
+        // The call is now nested under the persistence/non-auxiliary gate.
+        // Match every argument without making indentation part of the policy.
+        let compactDFlash = dflash2.filter { !$0.isWhitespace }
+        #expect(
+            compactDFlash.contains(
+                "TokenIterator.hybridStripBoundaryIndex(coordinator:cacheCoordinator,"
+                    + "promptTokenIds:self.promptTokenIds,input:input,cache:self.cache)"))
+        #expect(
+            dflash2.contains(
+                "cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary"
+            ))
         // The gen-suffix-stripped store itself admits the same topology
         // predicate on the batched and MTP paths; the solo store is driven by
         // `hybridStripBoundary` alone and follows via the helper.
