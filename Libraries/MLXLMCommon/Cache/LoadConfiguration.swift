@@ -238,7 +238,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// materialize-instead-of-mmap rule and the JANGH scheduling allowance size against this, not the whole
     /// bundle (Allosaurus: 32.5 GB of weights in an 88 GB bundle).
     public var gpuResidentWeightBytes: UInt64 {
-        totalSafetensorsBytes >= ssdResidentTableBytes ? totalSafetensorsBytes - ssdResidentTableBytes : 0
+        totalSafetensorsBytes > ssdResidentTableBytes
+            ? totalSafetensorsBytes - ssdResidentTableBytes : totalSafetensorsBytes
     }
 
     /// True iff `config.json` declares any of:
@@ -492,39 +493,29 @@ public struct LoadBundleFacts: Sendable, Equatable {
         return facts
     }
 
-    /// Sum of `*.ple.ngram_embedding.*` tensor payloads, read from safetensors headers only (no weights).
-    /// Unreadable headers and invalid spans are ignored, conservatively retaining those bytes as weights.
+    /// Inspect every shard through the shared catalog/runtime span contract. Any unreadable or
+    /// inconsistent header makes the bundle's SSD discount unknown, retaining all bytes as weights.
     static func ngramTableBytes(bundleURL url: URL) -> UInt64 {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         else { return 0 }
         var total: UInt64 = 0
         for entry in entries where entry.pathExtension == "safetensors" {
-            guard let handle = try? FileHandle(forReadingFrom: entry) else { continue }
+            guard let handle = try? FileHandle(forReadingFrom: entry) else { return 0 }
             defer { try? handle.close() }
-            guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { continue }
-            let length = lengthData.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << UInt64(8 * $1.offset) }
-            guard length > 0, length <= 64 << 20, let headerData = try? handle.read(upToCount: Int(length)),
-                headerData.count == Int(length),
-                let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
-            else { continue }
-            // A header describes offsets relative to the payload, not the file.
-            // Never subtract untrusted signed offsets: Int.min...Int.max can
-            // trap before the actual weight loader gets to reject the shard.
-            guard let fileSize = try? handle.seekToEnd(), fileSize >= 8 + length else { continue }
-            let payloadBytes = fileSize - 8 - length
-            for (name, value) in header where name.contains(".ple.ngram_embedding.") {
-                guard let offsets = (value as? [String: Any])?["data_offsets"] as? [Int],
-                    offsets.count == 2, offsets[0] >= 0, offsets[1] >= offsets[0],
-                    UInt64(offsets[1]) <= payloadBytes
-                else { continue }
-                let bytes = UInt64(offsets[1]) - UInt64(offsets[0])
-                let sum = total.addingReportingOverflow(bytes)
-                // If accounting cannot be represented, subtract nothing from
-                // the resident estimate rather than wrap to a smaller value.
-                guard !sum.overflow else { return 0 }
-                total = sum.partialValue
+            guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { return 0 }
+            let length = lengthData.enumerated().reduce(UInt64(0)) {
+                $0 | UInt64($1.element) << UInt64(8 * $1.offset)
             }
+            guard length > 0, length <= 64 << 20,
+                let headerData = try? handle.read(upToCount: Int(length)), headerData.count == Int(length),
+                let fileSize = try? handle.seekToEnd(), fileSize >= 8 + length,
+                let bytes = SSDTableMetadata.validatedNGramBytes(
+                    inHeader: headerData, payloadLength: fileSize - 8 - length)
+            else { return 0 }
+            let sum = total.addingReportingOverflow(bytes)
+            guard !sum.overflow else { return 0 }
+            total = sum.partialValue
         }
         return total
     }

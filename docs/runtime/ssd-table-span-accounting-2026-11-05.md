@@ -1,0 +1,13 @@
+# Shared SSD table byte accounting
+
+The catalog rejected overlapping safetensors spans, but runtime load facts counted each matching n-gram descriptor independently. Duplicate table spans, a table aliasing compute weights, or malformed sibling descriptors could reduce the runtime's resident-weight estimate incorrectly. An impossible manually supplied SSD total could also turn the estimate into zero.
+
+`SSDTableMetadata` now provides the shared tensor marker and span validator. It measures actual payload ranges without interpreting JANG, JANGH or JANGHT precision labels. Every descriptor must have bounded, ordered, nonoverlapping offsets. This is byte-accounting validation, not a complete safetensors or model-compatibility validator. An unreadable or inconsistent shard prevents the bundle's SSD discount; an impossible SSD total retains the whole weight estimate. The consumer delegates its existing validation to this API.
+
+The negative baseline has 21 selected functions: 17 passed and four failed methods, with 11 issues across the invalid cases. The final metadata/JANGH selection passes all 22 methods, including a malformed sibling shard. Two existing expectations are deliberately stronger: a malformed shard no longer discounts its valid sibling descriptor, and an impossible SSD total no longer produces a zero resident estimate. The positive symlink fixture now contains a valid compute header while preserving its exact 4,096-byte size and existing table/residency assertions.
+
+Production inspection against an independent, explicitly selected read-only inventory covers 11 real local bundles and 339 shards. Baseline and candidate counts are identical, with header hashes, file sizes, modification times and inodes unchanged. Only headers were read; this is not generation, throughput, physical-footprint or family-quality qualification.
+
+The expanded normal Xcode run reports 1,328 functions: 1,281 passed, ten failed and 37 skipped. Seven failures were already retained in the focused lane. The three additional failed methods reproduce with unchanged main library sources: two obsolete mmap expectations and a mixed-quant fused comparison at magnitude 16. The latter retains four failures with maximum absolute differences of 0.000244–0.000977. No mmap policy, numerical tolerance, kernel, sampler or test gate was relaxed. The full target remains red.
+
+Consumer compilation, source-bound native app proof and normal CI/merge receipts remain required. Do not promote component or header parity into a claim that every model family, cache setting or RAM target is qualified. No AgentLoop, app-tool implementation, model-bundle, release or tag changes are included.
