@@ -420,4 +420,15 @@ final class SharedPrefixCacheBudgetTests: XCTestCase {
         XCTAssertTrue(joined, file: file, line: line)
     }
 
+    func testZeroRetainedBudgetWithoutDiskDoesNotAdvertiseBoundaryPersistence() {
+        XCTAssertFalse(coordinator(0).canPersistBoundaries)
+        XCTAssertTrue(coordinator(nil).canPersistBoundaries)
+    }
+
+    func testZeroRetainedBudgetWithDiskStillAdvertisesBoundaryPersistence() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        XCTAssertTrue(coordinator(0, disk: directory).canPersistBoundaries)
+    }
+
 }
