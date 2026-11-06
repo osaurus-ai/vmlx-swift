@@ -915,9 +915,15 @@ public final class CacheCoordinator: @unchecked Sendable {
             pagedProbes.insert((Array(tokens.prefix(segment.upper)), segment.salt), at: 1)
         }
         for probe in pagedProbes {
+        // A shorter salted probe already leaves an unprocessed request suffix.
+        let pagedLookupTokens = skipExactDiskBoundary && requiresPagedBoundaryCompanion
+            && probe.tokens.count == tokens.count
+            ? Array(probe.tokens.dropLast()) : probe.tokens
         if !skipPaged,
            let pagedCache,
-           let result = pagedCache.fetchPrefix(tokens: probe.tokens, mediaSalt: probe.salt)
+           let result = pagedCache.fetchPrefix(
+                tokens: pagedLookupTokens, mediaSalt: probe.salt,
+                requireBoundaryCompanion: requiresPagedBoundaryCompanion)
         {
             let probeSalt = probe.salt
             var matchedBlocks = result.blocks
