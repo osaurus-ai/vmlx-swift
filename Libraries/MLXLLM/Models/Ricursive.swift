@@ -491,6 +491,10 @@ extension RicursiveModel: DFlash2WidthLadderPolicy {
     public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }
 
+extension RicursiveModel: DFlash2DraftContextWindowPolicy {
+    public var dflash2DraftContextWindow: Int { 16_384 }
+}
+
 /// The vendor template reproduces an unchanged assistant message to the exact generated tokens, tool calls included
 /// (with the separator-stripping reasoning parser).
 extension RicursiveModel: ToolCallTurnBoundaryModel {}

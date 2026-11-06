@@ -360,3 +360,73 @@ func runRippleTTFTProbe(modelPath: String) async throws {
         history.append(.assistant(text))
     }
 }
+
+// BENCH_RIPPLE_CHOOSER=1 — paired chooser arms on one loaded model at the app's context length: every arm runs every prompt
+// (prose and code, BENCH_RIPPLE_SAMPLED=1 for T 1.0 / top-p 0.95, fixed seed per prompt and repeat) in ABBA order, through
+// BatchEngine with a disk-backed prefix cache. An arm is "name:ENV=VAL,ENV=VAL" (BENCH_RIPPLE_ARMS, ';'-separated); "ar" is
+// the AR control. Prints one row per generation; the decode-end diagnostic carries widths and acceptance.
+func runRippleChooserProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let dir = URL(fileURLWithPath: modelPath)
+    MLX.Memory.cacheLimit = 8 << 30
+    let context = try await MLXLMCommon.loadModel(
+        from: dir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default)
+    let cacheDir = URL(fileURLWithPath: env["BENCH_RIPPLE_CACHE_DIR"] ?? "/tmp/ripple-chooser-cache")
+    let cfg = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
+        modelKey: dir.lastPathComponent, diskCacheDirectory: cacheDir)
+    let coordinator = CacheCoordinator(config: cfg)
+    let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
+    let sentence = "Policy note: archive shipping manifests, tide tables and lighthouse logs by quarter, and cite the ledger page. "
+    let system = "You are a careful assistant for a harbor office.\n" + String(repeating: sentence, count: Int(env["BENCH_RIPPLE_SYS_REPEAT"] ?? "") ?? 80)
+    let prompts: [(String, String)] = [
+        ("tides", "Explain in about 300 words how ocean tides work, written for a curious 12-year-old."),
+        ("bread", "Write about 300 words on why sourdough bread rises, in a warm conversational tone."),
+        ("story", "Write a short story of about 300 words about a lighthouse keeper who finds a message in a bottle."),
+        ("code", "Write a Python function that parses a CSV file of orders (id, customer, amount, date) and returns total revenue per customer per month, with type hints and a short docstring. Code only."),
+    ]
+    let arms: [(name: String, vars: [(String, String)])] = (env["BENCH_RIPPLE_ARMS"] ?? "ar;cur:").split(separator: ";").map { raw in
+        let parts = raw.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        let vars = parts.count > 1 ? parts[1].split(separator: ",").compactMap { kv -> (String, String)? in
+            let f = kv.split(separator: "=", maxSplits: 1)
+            return f.count == 2 ? (String(f[0]), String(f[1])) : nil
+        } : []
+        return (String(parts[0]), vars)
+    }
+    let sampled = env["BENCH_RIPPLE_SAMPLED"] == "1"
+    let maxTokens = Int(env["BENCH_RIPPLE_MAXTOK"] ?? "") ?? 400
+    let reps = Int(env["BENCH_RIPPLE_REPS"] ?? "") ?? 2
+    var order: [Int] = []
+    for rep in 0 ..< reps { order += rep % 2 == 0 ? Array(arms.indices) : Array(arms.indices.reversed()) }
+    var seedByRep = 0
+    for (position, armIndex) in order.enumerated() {
+        let arm = arms[armIndex]
+        for a in arms { for (k, _) in a.vars { unsetenv(k) } }
+        for (k, v) in arm.vars { setenv(k, v, 1) }
+        seedByRep = position / arms.count
+        for (name, user) in prompts {
+            let history: [Chat.Message] = [.system(system), .user(user)]
+            var input = UserInput(chat: history)
+            input.additionalContext = [:]
+            let prepared = try await context.processor.prepare(input: input)
+            nonisolated(unsafe) let send = prepared
+            var p = GenerateParameters(
+                maxTokens: maxTokens, temperature: sampled ? 1 : 0, topP: sampled ? 0.95 : 1, topK: 0, minP: 0,
+                repetitionPenalty: nil)
+            if sampled { p.randomSeed = 7000 + UInt64(seedByRep) }
+            if arm.name != "ar" {
+                p.draftStrategy = .dflash2(drafterPath: dir.appendingPathComponent("dflash2"), blockSize: nil)
+            }
+            var row = ""
+            for await ev in await engine.generate(input: send, parameters: p) {
+                if case .info(let info) = ev {
+                    row = String(
+                        format: "[RIPPLE_CHOOSER] arm=%@ prompt=%@ rep=%d ctx=%d gen=%d tps=%.2f", arm.name, name, seedByRep,
+                        info.promptTokenCount, info.generationTokenCount, info.tokensPerSecond)
+                }
+            }
+            print(row)
+            fflush(stdout)
+            try await Task.sleep(for: .seconds(2))
+        }
+    }
+}

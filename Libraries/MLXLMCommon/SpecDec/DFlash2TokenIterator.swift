@@ -108,6 +108,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var draftPositionBase = 0
     /// All-sliding drafters see at most `window - 1` context rows; nil otherwise.
     private var drafterContextLimit: Int?
+    /// The target's declared draft context window (``DFlash2DraftContextWindowPolicy``), bounding a full drafter layer.
+    private let draftContextWindow: Int?
     /// Committed target context rows produced after the prompt (verify commits and AR steps), in position order.
     /// Recorded only when a completed answer can be stored as a post-answer boundary (all-trimmable target, no
     /// stripped hybrid boundary), so the next turn's drafter is conditioned on the answer too.
@@ -418,9 +420,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
 
         let config = drafter.config
+        let draftContextWindow: Int? = {
+            if let raw = ProcessInfo.processInfo.environment["VMLX_DFLASH2_DRAFT_WINDOW"], let n = Int(raw) {
+                return n > 0 ? n : nil
+            }
+            return (target as? DFlash2DraftContextWindowPolicy)?.dflash2DraftContextWindow
+        }()
+        self.draftContextWindow = draftContextWindow
         let hiddenLimit =
             config.layerTypes.allSatisfy { $0 == "sliding_attention" }
-            ? config.slidingWindow.map { $0 - 1 } : nil
+            ? config.slidingWindow.map { $0 - 1 } : draftContextWindow.map { $0 - 1 }
         var restoredConditioningContext: DFlash2PrefixContext?
         // The bundle's trained block width is the only output-neutral
         // default: a narrower runtime width (the Python engine's width-5
@@ -464,7 +473,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.orderedLayerIDs = config.targetLayerIds
         self.captureLayerIDs = Set(config.targetLayerIds)
         self.cache = cache ?? target.newCache(parameters: effectiveParameters)
-        self.draftCache = drafter.makeCache()
+        self.draftCache = drafter.makeCache(contextWindow: draftContextWindow)
         self.cacheCoordinator = cacheCoordinator
         self.sampler = effectiveParameters.sampler()
         self.sampledCycleRandomState = effectiveParameters.randomSeed.map {
@@ -1562,7 +1571,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         guard let limit = drafterContextLimit, contextHidden.dim(1) > limit else { return }
         let skip = contextHidden.dim(1) - limit
         draftPositionBase += (draftCache.first?.offset ?? 0) + skip
-        draftCache = drafter.makeCache()
+        draftCache = drafter.makeCache(contextWindow: draftContextWindow)
         contextHidden = contextHidden[0..., skip..., 0...]
     }
 

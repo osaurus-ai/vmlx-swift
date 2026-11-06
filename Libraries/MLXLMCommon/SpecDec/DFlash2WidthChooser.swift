@@ -207,6 +207,14 @@ extension DFlash2WidthLadderPolicy {
     public var dflash2ProbesWhileEvidenceIsThin: Bool { false }
 }
 
+/// The context window a drafter with a full-attention layer was trained on. Without it that layer's KV, the retained
+/// target features and the features in every SSD entry grow with the whole history (51 KB per token on Ripple), and each
+/// draft reads all of it. Ripple's vendor server runs its draft at 16,384 positions and refuses a smaller window.
+/// `VMLX_DFLASH2_DRAFT_WINDOW=<n>` overrides it, 0 = unbounded (A/B tool).
+public protocol DFlash2DraftContextWindowPolicy {
+    var dflash2DraftContextWindow: Int { get }
+}
+
 /// A DFlash 2 target whose AR stretches measured faster pipelined declares the steps per stretch here. Targets that
 /// do not declare it run the serial single step: the pipelined stretch was measured on GLM-5.3 (+4 % prose) and cost
 /// Qwen3.8-27B ~20 % decode on low-acceptance text (JANGH2 and JANG_4D, alternating A/B at matched GPU clock).

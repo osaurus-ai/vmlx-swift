@@ -847,10 +847,16 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     /// Fresh per-generation drafter cache — one entry per layer, sliding
     /// where the layer is.
-    public func makeCache() -> [KVCache] {
+    ///
+    /// - Parameter contextWindow: bounds a full-attention drafter layer to this many context positions
+    ///   (``DFlash2DraftContextWindowPolicy``). Nil keeps its whole history.
+    public func makeCache(contextWindow: Int? = nil) -> [KVCache] {
         config.layerTypes.map { type in
             if type == "sliding_attention", let window = config.slidingWindow {
                 return RotatingKVCache(maxSize: window - 1, keep: 0)
+            }
+            if let contextWindow {
+                return RotatingKVCache(maxSize: contextWindow - 1, keep: 0)
             }
             return KVCacheSimple()
         }

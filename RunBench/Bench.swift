@@ -654,6 +654,10 @@ struct Bench {
             try await runDiplodocusQualification(modelPath: modelPath)
             return
         }
+        if (env["BENCH_RIPPLE_CHOOSER"] ?? "0") == "1" {
+            try await runRippleChooserProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_RIPPLE_TTFT"] ?? "0") == "1" {
             try await runRippleTTFTProbe(modelPath: modelPath)
             return

@@ -170,3 +170,64 @@ import Testing
         #expect(ReasoningParser.namesAKnownFamily("ricursive"))
     }
 }
+
+/// A drafter with a full-attention layer keeps its whole history unless the target declares a context window.
+@Suite struct DFlash2DraftContextWindowTests {
+    private func fullAttentionDrafter() throws -> DFlash2DraftModel {
+        let json: [String: Any] = [
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "vocab_size": 256,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 4096,
+            "num_target_layers": 1,
+            "is_causal": false,
+            "layer_types": ["full_attention"],
+            "rope_parameters": ["rope_theta": 10000, "rope_type": "default"],
+            "dflash_config": [
+                "block_size": 4,
+                "conv_kernel_size": 2,
+                "conv_group_size": 2,
+                "mask_token_id": 250,
+                "selector_rank": 4,
+                "selector_top_k": 2,
+                "target_layer_ids": [0],
+            ],
+        ]
+        return DFlash2DraftModel(try DFlash2Configuration(json: json))
+    }
+
+    @Test func fullLayerKeepsAllRowsWithoutAWindow() throws {
+        let cache = try fullAttentionDrafter().makeCache()
+        #expect(cache.first is KVCacheSimple)
+    }
+
+    /// 37 rows into a window of 16: not a multiple of the window or of any growth step.
+    @Test func windowBoundsAFullLayerToItsLastPositions() throws {
+        let cache = try fullAttentionDrafter().makeCache(contextWindow: 16)
+        let rotating = try #require(cache.first as? RotatingKVCache)
+        for _ in 0 ..< 37 {
+            let k = MLXArray.zeros([1, 1, 1, 4])
+            _ = rotating.update(keys: k, values: k)
+        }
+        #expect(rotating.offset == 37)
+        let stored = rotating.state
+        #expect(stored.first?.dim(2) == 15)
+    }
+
+    @Test func ripplesDeclaredWindowIsTheVendorsDraftWindow() throws {
+        let c = try JSONDecoder.json5().decode(RicursiveConfiguration.self, from: Data(Self.tinyRipple.utf8))
+        #expect(RicursiveModel(c).dflash2DraftContextWindow == 16_384)
+    }
+
+    private static let tinyRipple = """
+        {"model_type":"ricursive","vocab_size":64,"hidden_size":16,"intermediate_size":32,"num_hidden_layers":2,
+        "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"sliding_window":32,"max_position_embeddings":128,
+        "rms_norm_eps":1e-6,"layer_types":["full_attention","sliding_attention"],
+        "rope_parameters":{"rope_theta":10000,"rope_type":"default"}}
+        """
+}
