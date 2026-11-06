@@ -6,6 +6,14 @@ import XCTest
 
 /// Real-Metal, model-free checks of shared paged/SSM retention.
 final class SharedPrefixCacheBudgetTests: XCTestCase {
+    private var mlxLock: MLXTestSerializationToken?
+
+    override func tearDown() {
+        mlxLock?.unlock()
+        mlxLock = nil
+        super.tearDown()
+    }
+
     private func coordinator(_ cap: Int?, disk: URL? = nil, paged: Bool = true) -> CacheCoordinator {
         CacheCoordinator(config: CacheCoordinatorConfig(
             usePagedCache: paged, enableDiskCache: disk != nil,
@@ -34,9 +42,11 @@ final class SharedPrefixCacheBudgetTests: XCTestCase {
     }
 
     override func setUpWithError() throws {
+        try super.setUpWithError()
         guard MTLCreateSystemDefaultDevice() != nil else {
             throw XCTSkip("A real Metal allocator is required")
         }
+        mlxLock = lockSerializedMLXTest()
     }
 
     func testDistinctSSMPrefixesRespectCoordinatorRetainedBudget() {
