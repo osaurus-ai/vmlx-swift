@@ -214,7 +214,7 @@ func runRippleTimingProbe(modelPath: String) async throws {
         print(String(format: "[RIPPLE_TIMING] graph_build=%.1fms eval=%.1fms", build.sorted()[build.count / 2],
                      run.sorted()[run.count / 2]))
     }
-    let widths = [1, 2, 4, 8, 16]
+    let widths = (env["BENCH_RIPPLE_WIDTHS"] ?? "1,2,4,8,16").split(separator: ",").compactMap { Int($0) }
     func components(_ tag: String) {
         guard let r = model as? RicursiveModel, env["BENCH_RIPPLE_COMPONENTS"] != "0" else { return }
         for w in widths {
@@ -286,16 +286,25 @@ func runRippleTTFTProbe(modelPath: String) async throws {
     MLX.Memory.cacheLimit = 8 << 30
     let context = try await MLXLMCommon.loadModel(
         from: dir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default)
-    var cfg = CacheCoordinatorConfig()
-    cfg.usePagedCache = env["BENCH_RIPPLE_PAGED"] == "1"
-    cfg.enableDiskCache = true
-    cfg.diskCacheDir = URL(fileURLWithPath: env["BENCH_RIPPLE_CACHE_DIR"] ?? "/tmp/ripple-ttft-cache")
-    cfg.modelKey = dir.lastPathComponent
+    // BENCH_RIPPLE_SERVING=1: the app's serving configuration (write-behind SSD stores, default paged settings).
+    var cfg: CacheCoordinatorConfig
+    let cacheDir = URL(fileURLWithPath: env["BENCH_RIPPLE_CACHE_DIR"] ?? "/tmp/ripple-ttft-cache")
+    if env["BENCH_RIPPLE_SERVING"] == "1" {
+        cfg = VMLXServerRuntimeSettings().cacheCoordinatorConfig(
+            modelKey: dir.lastPathComponent, diskCacheDirectory: cacheDir)
+    } else {
+        cfg = CacheCoordinatorConfig()
+        cfg.usePagedCache = env["BENCH_RIPPLE_PAGED"] == "1"
+        cfg.enableDiskCache = true
+        cfg.diskCacheDir = cacheDir
+        cfg.modelKey = dir.lastPathComponent
+    }
+    print("[RIPPLE_TTFT] config paged=\(cfg.usePagedCache) disk=\(cfg.enableDiskCache) writeBehind=\(cfg.diskWriteBehind) resident=\(cfg.residentEntryBytes)")
     let coordinator = CacheCoordinator(config: cfg)
     if !cfg.usePagedCache { coordinator.setPagedIncompatible(true) }
     let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
     let sentence = "Policy note: archive shipping manifests, tide tables and lighthouse logs by quarter, and cite the ledger page. "
-    let system = "You are a careful assistant for a harbor office.\n" + String(repeating: sentence, count: 110)
+    let system = "You are a careful assistant for a harbor office.\n" + String(repeating: sentence, count: Int(env["BENCH_RIPPLE_SYS_REPEAT"] ?? "") ?? 110)
     let users = [
         "Write a Python function that totals crates per section from a list of dicts. Code only.",
         "Now add a unittest for it with two cases. Code only.",
@@ -308,13 +317,21 @@ func runRippleTTFTProbe(modelPath: String) async throws {
         input.additionalContext = [:]
         let prepared = try await context.processor.prepare(input: input)
         nonisolated(unsafe) let send = prepared
-        var p = GenerateParameters(maxTokens: 120, temperature: 0, topP: 1, topK: 0, minP: 0, repetitionPenalty: nil)
+        // BENCH_RIPPLE_SAMPLED=1: the app's bundle sampling (T 1.0, top-p 0.95, no top-k), fixed seed.
+        let sampled = env["BENCH_RIPPLE_SAMPLED"] == "1"
+        var p = GenerateParameters(
+            maxTokens: Int(env["BENCH_RIPPLE_MAXTOK"] ?? "") ?? 120, temperature: sampled ? 1 : 0, topP: sampled ? 0.95 : 1,
+            topK: 0, minP: 0, repetitionPenalty: nil)
+        if sampled { p.randomSeed = 1234 + UInt64(turn) }
         if arm == "dflash2" { p.draftStrategy = .dflash2(drafterPath: dir.appendingPathComponent("dflash2"), blockSize: nil) }
         let t0 = CFAbsoluteTimeGetCurrent()
         var first: Double?
         var text = ""
         var line = ""
+        var lastOutput = t0
         for await ev in await engine.generate(input: send, parameters: p) {
+            if case .chunk = ev { lastOutput = CFAbsoluteTimeGetCurrent() }
+            if case .reasoning = ev { lastOutput = CFAbsoluteTimeGetCurrent() }
             switch ev {
             case .chunk(let c):
                 if first == nil { first = CFAbsoluteTimeGetCurrent() - t0 }
@@ -329,7 +346,13 @@ func runRippleTTFTProbe(modelPath: String) async throws {
             default: break
             }
         }
-        print(line)
+        let tail = CFAbsoluteTimeGetCurrent() - lastOutput
+        let diskDir = cfg.diskCacheDir?.path ?? ""
+        let files = (try? FileManager.default.subpathsOfDirectory(atPath: diskDir)) ?? []
+        let bytes = files.reduce(0) { sum, name in
+            sum + (((try? FileManager.default.attributesOfItem(atPath: diskDir + "/" + name))?[.size] as? Int) ?? 0)
+        }
+        print(line + String(format: " tail=%.3fs disk=%.2fGB active=%.2fGB", tail, Double(bytes) / 1e9, Double(MLX.Memory.activeMemory) / 1e9))
         if let out = env["BENCH_RIPPLE_TEXT_OUT"] {
             let url = URL(fileURLWithPath: out + "-turn\(turn).txt")
             try? text.write(to: url, atomically: true, encoding: .utf8)

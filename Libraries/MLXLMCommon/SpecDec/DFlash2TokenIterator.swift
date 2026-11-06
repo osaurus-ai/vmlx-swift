@@ -145,6 +145,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private let mediaSalt: String?
     private let cacheSaltPlan: CacheBoundarySaltPlan
     private var promptCacheSnapshot: [KVCache]?
+    /// Set instead of `promptCacheSnapshot` on append-only caches: `storeCacheAfterGeneration` views this many rows.
+    private var deferredPromptSnapshotRows: Int?
+    /// Prompt tokens restored from the prefix cache; everything past them was prefilled by this request.
+    private var restoredPromptTokenCount = 0
 
     /// Index of the generation-suffix-stripped boundary in
     /// ``promptTokenIds`` — the last turn-start token, i.e. the end of the
@@ -497,7 +501,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             if widths != [effectiveBlockSize] {
                 self.widthChooser = DFlash2WidthChooser(
                     widths: widths,
-                    costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths))
+                    costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths),
+                    boundsCostsByWiderRungs:
+                        (target as? DFlash2WidthLadderPolicy)?.dflash2BoundsCostsByWiderRungs == true
+                        && ProcessInfo.processInfo.environment["VMLX_DFLASH2_BOUND_COSTS"] != "0",
+                    probesWhileEvidenceIsThin:
+                        (target as? DFlash2WidthLadderPolicy)?.dflash2ProbesWhileEvidenceIsThin == true
+                        && ProcessInfo.processInfo.environment["VMLX_DFLASH2_THIN_PROBES"] != "0")
             }
         }
         self.arBurstSteps = Self.arBurstSteps(for: target)
@@ -721,6 +731,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // no capture — a stored boundary at least that long already exists
         // and is the one the next turn will match.
         let restoredCount = self.promptTokenIds.count - tokensToPrefill.count
+        self.restoredPromptTokenCount = restoredCount
         let captureAt: Int? = self.hybridStripBoundary.flatMap { stripAt in
             stripAt > restoredCount ? stripAt - restoredCount : nil
         }
@@ -844,8 +855,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // A canonical stripped boundary is the only checkpoint the terminal
         // store consumes. Keeping an exact-prompt copy as well retains a full
         // unused KV allocation throughout decode (including DSpark requests).
-        self.promptCacheSnapshot = storesPromptBoundary && hybridStripBoundary == nil
-            ? self.cache.map { $0.copy() } : nil
+        // Append-only caches keep the prompt rows untouched through decode (verify appends past them, rollbacks trim
+        // back to them), so the end-of-turn store takes views of the finished cache instead of a copy held through
+        // the whole decode (5 GB at 15.5k tokens on Ripple). Same rule as `TokenIterator.deferredPromptSnapshotRows`.
+        if storesPromptBoundary, hybridStripBoundary == nil, TokenIterator.promptSnapshotViewsEnabled,
+            cacheBoundaryLeafOffsets(self.cache).allSatisfy({ $0 == promptTokenIds.count }),
+            cacheSupportsPrefixViews(self.cache, rows: promptTokenIds.count)
+        {
+            self.deferredPromptSnapshotRows = promptTokenIds.count
+            self.promptCacheSnapshot = nil
+        } else {
+            self.promptCacheSnapshot = storesPromptBoundary && hybridStripBoundary == nil
+                ? self.cache.map { $0.copy() } : nil
+        }
         MemoryStageTrace.log("prompt-snapshot", tokens: promptTokenIds.count,
                              detail: "dflash2 retained=\(retainedCheckpointTokenCounts)")
 
@@ -2054,7 +2076,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // full-prompt snapshot is reusable directly. It is captured before
         // any speculation touched the cache, so it cannot carry a
         // rolled-back recurrent state.
-        if let snapshot = promptCacheSnapshot,
+        if let rows = deferredPromptSnapshotRows {
+            deferredPromptSnapshotRows = nil
+            promptCacheSnapshot = prefixViews(of: cache, rows: rows)
+        }
+        // The views must be taken before the post-answer store, which may trim rows past the answer.
+        let promptSnapshot = promptCacheSnapshot
+        storeStableBoundaries(coordinator: coordinator)
+        let storedAnswer = storePostAnswerBoundary(
+            generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary,
+            coordinator: coordinator)
+        // A completed answer's entry serves the next turn. The exact-prompt entry would only serve a regenerate, which
+        // otherwise re-prefills this request's prompt suffix from the entry it restored: not worth a second full SSD
+        // write per turn when that suffix is short (a tool call or an interrupted turn has no answer entry and keeps it).
+        if storedAnswer, promptTokenIds.count - restoredPromptTokenCount <= Self.promptEntrySkipSuffixRows { return }
+        if let snapshot = promptSnapshot,
             snapshot.allSatisfy({ $0.offset == promptTokenIds.count })
         {
             coordinator.storeAfterGeneration(
@@ -2066,9 +2102,35 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 chainId: cacheInitParameters.cacheChainId,
                 dflash2Context: promptConditioningContext)
         }
-        storePostAnswerBoundary(
-            generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary,
-            coordinator: coordinator)
+    }
+
+    /// Prompt suffix (rows prefilled by this request) up to which a regenerate is cheap enough to re-prefill.
+    private static let promptEntrySkipSuffixRows = 512
+
+    /// Stable template boundaries (the system prompt) this request prefilled past, as views of the finished cache: a
+    /// new chat with the same system prompt restores them instead of prefilling it. A boundary at or inside the
+    /// restored prefix is already stored. Append-only targets only; hybrid targets keep their stripped boundary.
+    private mutating func storeStableBoundaries(coordinator: CacheCoordinator) {
+        guard recordsGeneratedContext, let promptContext = promptConditioningContext else { return }
+        for boundary in originalInput.cacheStablePrefixTokenCounts.sorted()
+        where boundary > restoredPromptTokenCount && boundary < promptTokenIds.count {
+            guard let views = prefixViews(of: cache, rows: boundary) else { return }
+            let tokens = Array(promptTokenIds.prefix(boundary))
+            let rows = boundary - promptContext.start
+            let context = rows > 0
+                ? DFlash2PrefixContext(
+                    hidden: promptContext.hidden[0..., ..<rows, 0...], end: boundary, layerIDs: orderedLayerIDs)?
+                    .trailing(drafterContextLimit) : nil
+            coordinator.storeAfterGeneration(
+                promptTokens: tokens,
+                perLayerData: extractLayerData(from: views),
+                ssmStates: nil,
+                cache: views,
+                mediaSalt: cacheSaltPlan.salt(forBoundary: boundary),
+                chainId: cacheInitParameters.cacheChainId,
+                isStableRoot: true,
+                dflash2Context: context)
+        }
     }
 
     /// A completed answer on an all-trimmable target: store the live cache as a post-answer boundary, as the AR
@@ -2077,9 +2139,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// trimmed), keyed by the tokens it was forwarded (the last emitted token was never forwarded). The drafter's
     /// conditioning for those rows is the prompt context plus every committed row since; any row-count mismatch
     /// stores nothing rather than a misaligned context.
+    @discardableResult
     private mutating func storePostAnswerBoundary(
         generatedTokenIds: [Int], includeGeneratedBoundary: Bool, coordinator: CacheCoordinator
-    ) {
+    ) -> Bool {
         defer { generatedContextRows.removeAll() }
         if Self.traceEnabled {
             RuntimeDiagnostics.write(Data(
@@ -2094,7 +2157,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             offset > promptTokenIds.count, pendingLattice == nil,
             committedTokenLog.count >= offset - promptTokenIds.count,
             committedTokenLog.prefix(generatedTokenIds.count).elementsEqual(generatedTokenIds)
-        else { return }
+        else { return false }
         let rows = generatedContextRows.reduce(0) { $0 + $1.dim(1) }
         guard rows == offset - promptTokenIds.count,
             generatedContextRows.allSatisfy({ $0.dim(-1) == promptContext.hidden.dim(-1) })
@@ -2103,14 +2166,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 RuntimeDiagnostics.write(Data(
                     "[DFlash2] post-answer store skipped: context rows \(rows) != \(offset - promptTokenIds.count)\n".utf8))
             }
-            return
+            return false
         }
         // Keep the answer plus the forwarded stop token (the AR iterator's post-answer key); rows a speculative cycle
         // committed past it were never returned to the caller and are not history.
         let keep = Swift.min(offset, promptTokenIds.count + generatedTokenIds.count + 1)
         if keep < offset {
             for layer in cache { _ = layer.trim(offset - keep) }
-            guard cache.allSatisfy({ $0.offset == keep }) else { return }
+            guard cache.allSatisfy({ $0.offset == keep }) else { return false }
         }
         let tokens = promptTokenIds + Array(committedTokenLog.prefix(keep - promptTokenIds.count))
         var hidden = concatenated(
@@ -2131,5 +2194,6 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             RuntimeDiagnostics.write(Data(
                 "[DFlash2] post-answer boundary stored tokens=\(keep) contextRows=\(hidden.dim(1))\n".utf8))
         }
+        return true
     }
 }

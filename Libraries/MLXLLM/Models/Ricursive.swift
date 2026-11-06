@@ -18,10 +18,10 @@
 //  - embed_scale: the product is taken in float32 and rounded back (a bf16 product rounds the scale first and differs
 //    on 14% of elements). Untied lm_head.
 //
-//  Cache: every layer uses a plain `KVCacheSimple`. Sliding layers attend to the newest `sliding_window` keys through a
-//  slice plus an explicit window mask instead of a ring buffer. That keeps every cache trimmable (speculative rollback
-//  past the window stays exact, which a 1024-row ring cannot do), checkpointable, and storable by the paged / SSD prefix
-//  cache as an ordinary append-only KV layer. The cost is memory: sliding layers keep their full history.
+//  Cache: full-attention layers use `KVCacheSimple`; sliding layers use `RicursiveSlidingKVCache` and attend to the
+//  newest `sliding_window` keys through a slice plus an explicit window mask instead of a ring buffer. That keeps every
+//  cache trimmable (speculative rollback past the window stays exact, which a 1024-row ring cannot do) while SSD entries
+//  and restored caches hold only the window.
 //
 
 import Foundation
@@ -436,10 +436,18 @@ public final class RicursiveModel: Module, LLMModel, KVCacheDimensionProvider,
     /// compiled path: ~130 ms/token).
     public var supportsWholeForwardCompilation: Bool { false }
 
-    /// Every layer is an append-only `KVCacheSimple`; sliding layers bound what they read, not what they keep.
+    /// Full-attention layers read their whole history (`KVCacheSimple`); sliding layers read, persist and restore only
+    /// their window (`RicursiveSlidingKVCache`).
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { _ in KVCacheSimple() }
+        configuration.layerTypes.map { type in
+            type == "sliding_attention"
+                ? RicursiveSlidingKVCache(window: configuration.slidingWindow) as KVCache : KVCacheSimple()
+        }
     }
+
+    /// One sequence per decode: a restored sliding layer holds fewer rows than its position, which the batched
+    /// padding and masks do not model.
+    public var maximumSupportedDecodeBatchSize: Int? { 1 }
 
     /// The drafter shares this embedding, scaled exactly as the target's first layer reads it.
     public func embed(_ tokenIds: MLXArray) -> MLXArray {
@@ -472,6 +480,15 @@ extension RicursiveModel: SafetensorsLoadKeyExcluding {
 extension RicursiveModel: LaneQMMTargetPolicy {
     public var laneQMMTiled: Bool { false }
     public var laneQMMUntiledMinRows: Int { 8 }
+}
+
+/// Candidate verify widths (AR is added by the chooser, which picks among them per cycle). Measured 2026-11-06, ms per
+/// target forward at 1,500 tokens, 1/5/8/16/32 rows: JANGH2 64/174/156/164/259, JANG_4D 90/186/160/165/232. A narrow
+/// width costs what 16 rows do and verifies less, so it can never win; 32 stays for highly predictable text.
+extension RicursiveModel: DFlash2WidthLadderPolicy {
+    public var dflash2WidthLadder: [Int] { [16, 32] }
+    public var dflash2BoundsCostsByWiderRungs: Bool { true }
+    public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }
 
 extension RicursiveModel: LoRAModel {
