@@ -124,6 +124,13 @@ public struct ReasoningParser: Sendable {
     /// Qwen's content-side <tool_call> envelope owns literal reasoning markers
     /// in its values. Separate from MiniCPM's CDATA-aware function envelope.
     public let preservesQwenToolCallPayloads: Bool
+    /// The chat template owns the newlines around the tags and around a tool call: it re-renders
+    /// `<think>\n{reasoning}\n</think>\n{content}` and `{content}\n<tool_call>`. Returning those separators in the text
+    /// would double them in history, so a prompt could never match the tokens the model generated (no restore past an
+    /// answer, on any turn that reasons). One separator is dropped at each of those places, streamed or not.
+    public let stripsTemplateSeparators: Bool
+    /// `stripsTemplateSeparators`: the next character is dropped if it is a newline (right after a tag).
+    private var dropsNextNewline = false
 
     // MARK: State
 
@@ -182,7 +189,8 @@ public struct ReasoningParser: Sendable {
         endTagAliases: [String] = [],
         consumesRecipientHeaders: Bool = false,
         preservesXMLFunctionPayloads: Bool = false,
-        preservesQwenToolCallPayloads: Bool = false
+        preservesQwenToolCallPayloads: Bool = false,
+        stripsTemplateSeparators: Bool = false
     ) {
         self.startTag = startTag
         self.endTag = endTag
@@ -191,6 +199,7 @@ public struct ReasoningParser: Sendable {
         self.consumesRecipientHeaders = consumesRecipientHeaders
         self.preservesXMLFunctionPayloads = preservesXMLFunctionPayloads
         self.preservesQwenToolCallPayloads = preservesQwenToolCallPayloads
+        self.stripsTemplateSeparators = stripsTemplateSeparators
         self.startTagAliases = startTagAliases.filter { !$0.isEmpty && $0 != startTag }
         self.endTagAliases = endTagAliases.filter { !$0.isEmpty && $0 != endTag }
     }
@@ -696,6 +705,13 @@ public struct ReasoningParser: Sendable {
         var out: [ReasoningSegment] = []
 
         while !buffer.isEmpty {
+            if dropsNextNewline {
+                dropsNextNewline = false
+                if buffer.first == "\n" {
+                    buffer.removeFirst()
+                    continue
+                }
+            }
             if insideQwenToolCall {
                 // Stream the opaque payload onward; hold only a possible closing
                 // tag suffix, not the entire (potentially large) tool argument.
@@ -782,7 +798,11 @@ public struct ReasoningParser: Sendable {
                 let tool = buffer.range(of: "<tool_call>"),
                 firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
             {
-                out.append(.content(String(buffer[..<tool.upperBound])))
+                var payload = String(buffer[..<tool.upperBound])
+                if stripsTemplateSeparators, payload.hasSuffix("\n<tool_call>") {
+                    payload.remove(at: payload.index(payload.endIndex, offsetBy: -"\n<tool_call>".count))
+                }
+                out.append(.content(payload))
                 buffer.removeSubrange(buffer.startIndex..<tool.upperBound)
                 insideQwenToolCall = true
                 continue
@@ -854,7 +874,10 @@ public struct ReasoningParser: Sendable {
 
             if let range = firstTagRange, !pendingLongerSpelling {
                 // Emit everything before the tag in the current mode.
-                let before = String(buffer[..<range.lowerBound])
+                var before = String(buffer[..<range.lowerBound])
+                if stripsTemplateSeparators, insideReasoning, !firstTagIsOpener, before.hasSuffix("\n") {
+                    before.removeLast()
+                }
                 if !before.isEmpty {
                     out.append(insideReasoning ? .reasoning(before) : .content(before))
                 }
@@ -865,6 +888,7 @@ public struct ReasoningParser: Sendable {
                 // the tag is still consumed.
                 buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                 insideReasoning = firstTagIsOpener
+                dropsNextNewline = stripsTemplateSeparators
                 continue
             }
 
@@ -889,7 +913,8 @@ public struct ReasoningParser: Sendable {
                 }
                 let longestTag = (openerSpellings + closerSpellings + literalOpeners)
                     .map(\.count).max() ?? 0
-                let safeTail = max(0, longestTag - 1)
+                // A newline directly before a tag may have to be dropped once the tag arrives.
+                let safeTail = max(0, longestTag - 1) + (stripsTemplateSeparators ? 1 : 0)
                 if buffer.count > safeTail {
                     let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
                     let safe = String(buffer[..<splitAt])
@@ -1123,6 +1148,10 @@ extension ReasoningParser {
         }
 
         switch n {
+        case "ricursive":
+            // Ripple-65B: the template never opens `<think>`; the model does when it reasons.
+            return ReasoningParser(
+                startInReasoning: false, preservesQwenToolCallPayloads: true, stripsTemplateSeparators: true)
         case "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36":
             return ReasoningParser(
                 startInReasoning: true, preservesQwenToolCallPayloads: true)
@@ -1328,7 +1357,8 @@ extension ReasoningParser {
             // so three correct parser fixes changed nothing on the app.
             consumesRecipientHeaders: base.consumesRecipientHeaders,
             preservesXMLFunctionPayloads: base.preservesXMLFunctionPayloads,
-            preservesQwenToolCallPayloads: base.preservesQwenToolCallPayloads)
+            preservesQwenToolCallPayloads: base.preservesQwenToolCallPayloads,
+            stripsTemplateSeparators: base.stripsTemplateSeparators)
         if startInReasoning && parser.isHarmonyChannelParser {
             parser.insideHarmonyChannel = true
             parser.harmonyChannelIsReasoning = true
@@ -1419,6 +1449,11 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
     let compact = normalized.replacingOccurrences(of: "_", with: "")
 
     if compact == "k2horizon" { return "k2_horizon" }
+
+    // Ripple-65B (`ricursive`): plain `<think>`/`</think>` text tokens that the model opens itself (the template ends at
+    // the assistant header). The parser starts in
+    // content and latches on an emitted `<think>`.
+    if compact == "ricursive" { return "ricursive" }
 
     // MiniMax-M3 / M3.1 (`minimax_m3`, `minimax_m3_vl`): `<mm:think>` rail, not the M2 `<think>` one. Checked before
     // the `minimax` think_xml prefix below.

@@ -308,6 +308,12 @@ public func cacheContainsPathDependentState(_ cache: [any KVCache]) -> Bool {
 /// property; plain KV keeps its normal reuse under the same policy.
 public protocol ExactPrefixRestoreCache {}
 
+/// A model whose chat template renders an assistant tool-call turn back to the tokens the model generated (reasoning,
+/// content and the call), so that turn may store a post-answer boundary and the next request restores past everything
+/// the model just generated instead of re-prefilling it. Fetch still requires an exact token prefix, so a call rendered
+/// differently falls back to the prompt boundary at the cost of one unused entry.
+public protocol ToolCallTurnBoundaryModel {}
+
 /// True when every layer is either an ordinary (not disk-backed) cache or an ``ExactPrefixRestoreCache``.
 public func cacheRestoreIsExactPrefix(_ cache: [any KVCache]) -> Bool {
     !cache.isEmpty && cache.allSatisfy { layer in

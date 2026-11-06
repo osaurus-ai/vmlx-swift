@@ -189,6 +189,30 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
 /// 2*trained) declares it here (speculative widths only; AR is added unless `VMLX_DFLASH2_AR_OPTION=0`).
 public protocol DFlash2WidthLadderPolicy {
     var dflash2WidthLadder: [Int] { get }
+    /// A wider rung's cost bounds every narrower rung: more rows through the same kernels cannot be cheaper, so a width
+    /// priced above a wider one holds a stale outlier nothing would refresh, because the wider one then wins. Ripple
+    /// JANGH2: width 16's first kept timing was 492 ms (real 160), width 32 at 230 ms took over at equal expected tokens
+    /// and one code prompt fell from 58 to 39 tok/s. The bounded width runs next and corrects its own estimate.
+    /// `VMLX_DFLASH2_BOUND_COSTS=0` turns it off (A/B tool).
+    var dflash2BoundsCostsByWiderRungs: Bool { get }
+    /// While a request has seen only a couple of speculative cycles, an AR decision rests on almost no evidence (a miss on
+    /// the first drafted token of an answer is common and says little), so re-probe after a few AR steps instead of the
+    /// 32-cycle re-time. A failed probe costs about one extra target forward; a missed recovery cost Ripple 31 AR tokens
+    /// on text accepting 11+ per verify (32 vs 52 tok/s, same text).
+    var dflash2ProbesWhileEvidenceIsThin: Bool { get }
+}
+
+extension DFlash2WidthLadderPolicy {
+    public var dflash2BoundsCostsByWiderRungs: Bool { false }
+    public var dflash2ProbesWhileEvidenceIsThin: Bool { false }
+}
+
+/// The context window a drafter with a full-attention layer was trained on. Without it that layer's KV, the retained
+/// target features and the features in every SSD entry grow with the whole history (51 KB per token on Ripple), and each
+/// draft reads all of it. Ripple's vendor server runs its draft at 16,384 positions and refuses a smaller window.
+/// `VMLX_DFLASH2_DRAFT_WINDOW=<n>` overrides it, 0 = unbounded (A/B tool).
+public protocol DFlash2DraftContextWindowPolicy {
+    var dflash2DraftContextWindow: Int { get }
 }
 
 /// A DFlash 2 target whose AR stretches measured faster pipelined declares the steps per stretch here. Targets that
@@ -226,6 +250,13 @@ struct DFlash2WidthChooser {
     /// Start from, and keep updating, the acceptance evidence stored in `costs`, so a request opens
     /// with what this target has been accepting rather than the prior.
     private let sharesAcceptance: Bool
+    private let boundsCostsByWiderRungs: Bool
+    private let probesWhileEvidenceIsThin: Bool
+    /// Speculative cycles' evidence at position 1 below which the AR decision is treated as provisional.
+    static let thinEvidenceTrials = 3.0
+    /// AR steps between provisional re-probes.
+    static let thinEvidenceProbeSteps = 4
+    private var provisionalProbe = false
     /// A probe that beats the width it left earns the next decision (Uno; see `observe`).
     private let rewardsWinningProbes: Bool
     /// Per-cycle decay of acceptance evidence. Uno uses 0.95 (~20 cycles of memory): its
@@ -280,7 +311,8 @@ struct DFlash2WidthChooser {
 
     init(
         widths: [Int], costs: DFlash2WidthCostTable, bonusTokens: Double = 0, initial: Int? = nil,
-        sharesAcceptance: Bool = false, rewardsWinningProbes: Bool = false,
+        sharesAcceptance: Bool = false, boundsCostsByWiderRungs: Bool = false,
+        probesWhileEvidenceIsThin: Bool = false, rewardsWinningProbes: Bool = false,
         decay: Double = DFlash2WidthChooser.decay, lazyExploration: Bool = false
     ) {
         self.decay = decay
@@ -290,6 +322,8 @@ struct DFlash2WidthChooser {
             ?? self.widths.first(where: { $0 > 1 }) ?? self.widths[0]
         self.bonusTokens = bonusTokens
         self.sharesAcceptance = sharesAcceptance
+        self.boundsCostsByWiderRungs = boundsCostsByWiderRungs
+        self.probesWhileEvidenceIsThin = probesWhileEvidenceIsThin
         self.rewardsWinningProbes = rewardsWinningProbes
         let top = self.widths.last ?? 2
         if sharesAcceptance, let stored = costs.storedAcceptance(count: top) {
@@ -307,8 +341,12 @@ struct DFlash2WidthChooser {
 
     /// Cost the decision uses for width `w` in the current bucket.
     private func costOf(_ w: Int) -> Double? {
-        lazyExploration
+        let own = lazyExploration
             ? costs.estimatedCost(of: w, bucket: costBucket) : costs.cost(of: w, bucket: costBucket)
+        guard boundsCostsByWiderRungs, w > 1, let own else { return own }
+        return widths.filter { $0 > w }
+            .compactMap { costs.cost(of: $0, bucket: costBucket) }
+            .reduce(own, Swift.min)
     }
 
     /// The width that must be timed before rates can be compared, if any.
@@ -405,6 +443,21 @@ struct DFlash2WidthChooser {
             return
         }
         let best = bestWidth()
+        if provisionalProbe, let probe = probing, probe.width == verifyWidth {
+            // Its outcome is already in the evidence; the regular re-time schedule is untouched.
+            provisionalProbe = false
+            probing = nil
+        }
+        if probesWhileEvidenceIsThin, best == 1, probing == nil, trials.count > 1,
+            trials[1] < Self.thinEvidenceTrials,
+            let target = widths.filter({ $0 > 1 && rate($0) != nil }).max(by: { rate($0)! < rate($1)! }),
+            cycles - (widths.filter { $0 > 1 }.compactMap { lastTimed[$0] }.max() ?? 0) >= Self.thinEvidenceProbeSteps
+        {
+            provisionalProbe = true
+            probing = (target, best)
+            width = target
+            return
+        }
         if let probe = probing, probe.width == verifyWidth {
             // A probe that itself ran faster than the width it left earns the next decision too.
             // While the chooser sits on AR, a probe is the only source of acceptance evidence, and

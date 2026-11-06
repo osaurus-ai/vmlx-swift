@@ -1404,6 +1404,12 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool)
+    /// True when this request's model re-renders a tool-call turn to the tokens it generated
+    /// (``ToolCallTurnBoundaryModel``), so the turn may store a post-answer boundary too.
+    var storesToolCallTurnBoundary: Bool { get }
+    /// The turn ended on a dispatched tool call: the consumer stopped reading at the call's end, so committed rows
+    /// past the last returned token are not history and must not be in the boundary.
+    mutating func noteEndedOnToolCall()
 }
 
 extension TokenIteratorProtocol {
@@ -1416,6 +1422,8 @@ extension TokenIteratorProtocol {
     public var structuredOutputComplete: Bool? { nil }
 
     public mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {}
+    public var storesToolCallTurnBoundary: Bool { false }
+    public mutating func noteEndedOnToolCall() {}
 
     public mutating func storeCacheAfterGeneration(
         generatedTokenIds: [Int],
@@ -1639,6 +1647,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt rows whose end-of-turn snapshot is taken as views of the finished cache (``AppendOnlyRowsCache``) instead
     /// of a copy retained through decode. Nil: the ordinary retained copy (or none).
     var deferredPromptSnapshotRows: Int?
+    private var endedOnToolCall = false
+    public var storesToolCallTurnBoundary: Bool { model is ToolCallTurnBoundaryModel }
+    public mutating func noteEndedOnToolCall() { endedOnToolCall = true }
     /// `VMLX_PROMPT_SNAPSHOT_VIEWS=0`: the retained copy as before (A/B only; tests: the task-local override).
     static let promptSnapshotViewsEnvironment =
         ProcessInfo.processInfo.environment["VMLX_PROMPT_SNAPSHOT_VIEWS"] != "0"
@@ -4305,7 +4316,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     + "offsets=\(Array(Set(cacheBoundaryLeafOffsets(cache))).sorted()) "
                     + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
         }
-        guard let generatedBoundaryTokens else { return }
+        guard var generatedBoundaryTokens else { return }
+        if endedOnToolCall {
+            // Key exactly the returned tokens: anything the async pipeline forwarded past the call is not history.
+            let keep = promptTokenIds.count + generatedTokenIds.count
+            for layer in cache where layer.offset > keep { layer.trim(layer.offset - keep) }
+            guard cache.allSatisfy({ $0.offset == keep }) else { return }
+            generatedBoundaryTokens = promptTokenIds + generatedTokenIds
+        }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.
         store(
@@ -6054,12 +6072,13 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             let tailT0 = Date()
             StreamOrDevice.default.stream.synchronize()
             let tailT1 = Date()
+            if handler.emittedToolCall { iterator.noteEndedOnToolCall() }
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
                 includeGeneratedBoundary: stopReason == .stop
                     && info.generationFailure == nil
                     && !handler.stopSequenceHit
-                    && !handler.emittedToolCall)
+                    && (!handler.emittedToolCall || iterator.storesToolCallTurnBoundary))
             let tailT2 = Date()
             StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
