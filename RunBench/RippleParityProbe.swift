@@ -1,0 +1,265 @@
+// BENCH_RIPPLE_PARITY=1 — Ripple-65B (ricursive) port check against the Python MLX reference (`ripple_mlx.py`,
+// golden-checked against the release's BF16 logits).
+//
+// Reads BENCH_RIPPLE_DIR/ids.json (token ids + positions written by the Python side) and writes, next to it:
+//   swift_logits_<pos>.f32   no-cache forward rows at each position (compare with py_logits_<pos>.f32)
+//   swift_report.json        per-position top-1, cached-vs-no-cache deltas, rollback deltas, greedy tokens
+//
+// Cache checks, all against the same model's no-cache forward (rounding cannot hide a window or offset defect there):
+//   chunked   prefill in BENCH_RIPPLE_CHUNK (default 333, deliberately not a divisor of the 1024 window) chunks
+//   decode    the last 64 prompt tokens fed one at a time across the window edge
+//   rollback  feed a 16-row block, trim 11 rows (a rejected speculative suffix), re-feed the true tokens one by one
+// Not a speed measurement.
+
+import Foundation
+import MLX
+import MLXHuggingFace
+import MLXLLM
+import MLXLMCommon
+import VMLXTokenizers
+
+func runRippleParityProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    guard let dir = env["BENCH_RIPPLE_DIR"] else {
+        print("[RIPPLE] BENCH_RIPPLE_DIR is required")
+        exit(2)
+    }
+    let outDir = URL(fileURLWithPath: dir)
+    struct IDs: Decodable { let ids: [Int]; let positions: [Int] }
+    let spec = try JSONDecoder().decode(
+        IDs.self, from: Data(contentsOf: outDir.appendingPathComponent("ids.json")))
+    guard !spec.ids.isEmpty, !spec.positions.isEmpty else {
+        print("[RIPPLE] INVALID: empty ids/positions")
+        exit(3)
+    }
+    let chunk = Int(env["BENCH_RIPPLE_CHUNK"] ?? "333") ?? 333
+
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let model = context.model
+    print(
+        String(
+            format: "[RIPPLE] load=%.1fs type=%@ active=%.2fGB", CFAbsoluteTimeGetCurrent() - t0,
+            String(describing: type(of: model)), Double(MLX.Memory.activeMemory) / 1e9))
+
+    let ids = MLXArray(spec.ids.map { Int32($0) })[.newAxis]
+    let n = spec.ids.count
+    var report: [String: Any] = ["prompt_tokens": n, "chunk": chunk]
+
+    // 1. No-cache forward (whole sequence, explicit window masks).
+    let full = model(ids, cache: nil).asType(.float32)
+    eval(full)
+    var rows: [String: Any] = [:]
+    for p in spec.positions where p < n {
+        let row = full[0, p]
+        let data = row.asArray(Float.self).withUnsafeBufferPointer { Data(buffer: $0) }
+        try data.write(to: outDir.appendingPathComponent("swift_logits_\(p).f32"))
+        rows[String(p)] = row.argMax().item(Int.self)
+    }
+    report["nocache_top1"] = rows
+
+    func maxAbs(_ a: MLXArray, _ b: MLXArray) -> Float {
+        abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+    }
+    func top1(_ a: MLXArray) -> Int { a.argMax().item(Int.self) }
+    /// KL(reference || candidate) over the full vocabulary, in float32.
+    func kl(_ ref: MLXArray, _ cand: MLXArray) -> Float {
+        let r = ref.asType(.float32), c = cand.asType(.float32)
+        let lr = r - logSumExp(r), lc = c - logSumExp(c)
+        return (exp(lr) * (lr - lc)).sum().item(Float.self)
+    }
+
+    // 2. Chunked cached prefill vs no-cache, every chunk's last row.
+    var cache = model.newCache(parameters: nil)
+    var start = 0
+    var chunkRows: [[String: Any]] = []
+    let prefillEnd = n - 64
+    while start < prefillEnd {
+        let end = min(start + chunk, prefillEnd)
+        let out = model(ids[0..., start ..< end], cache: cache).asType(.float32)
+        eval(out)
+        let ref = full[0, end - 1]
+        chunkRows.append([
+            "end": end, "max_abs": maxAbs(out[0, -1], ref), "kl": kl(ref, out[0, -1]),
+            "top1_match": top1(out[0, -1]) == top1(ref),
+        ])
+        start = end
+    }
+    report["chunked"] = chunkRows
+
+    // 3. Token-by-token decode over the rest (crosses position 1024 when the prompt does).
+    var decodeWorst: Float = 0
+    var decodeKL: Float = 0
+    var decodeTop1Mismatch = 0
+    for i in prefillEnd ..< n {
+        let out = model(ids[0..., i ..< (i + 1)], cache: cache).asType(.float32)
+        eval(out)
+        decodeWorst = max(decodeWorst, maxAbs(out[0, 0], full[0, i]))
+        decodeKL = max(decodeKL, kl(full[0, i], out[0, 0]))
+        if top1(out[0, 0]) != top1(full[0, i]) { decodeTop1Mismatch += 1 }
+    }
+    report["decode"] = ["rows": n - prefillEnd, "max_abs": decodeWorst, "max_kl": decodeKL, "top1_mismatch": decodeTop1Mismatch]
+
+    // 4. Rollback: rebuild to (n - 40), feed a 16-row block whose last 11 rows are wrong, trim them, continue.
+    cache = model.newCache(parameters: nil)
+    let base = n - 40
+    var s = 0
+    while s < base {
+        let e = min(s + chunk, base)
+        eval(model(ids[0..., s ..< e], cache: cache))
+        s = e
+    }
+    var block = Array(spec.ids[base ..< (base + 16)].map { Int32($0) })
+    for j in 5 ..< 16 { block[j] = Int32((Int(block[j]) + 7919 * j) % 100_000) }
+    eval(model(MLXArray(block)[.newAxis], cache: cache))
+    let trimmed = cache.map { $0.trim(11) }
+    var rollbackWorst: Float = 0
+    var rollbackKL: Float = 0
+    var rollbackMismatch = 0
+    for i in (base + 5) ..< n {
+        let out = model(ids[0..., i ..< (i + 1)], cache: cache).asType(.float32)
+        eval(out)
+        rollbackWorst = max(rollbackWorst, maxAbs(out[0, 0], full[0, i]))
+        rollbackKL = max(rollbackKL, kl(full[0, i], out[0, 0]))
+        if top1(out[0, 0]) != top1(full[0, i]) { rollbackMismatch += 1 }
+    }
+    report["rollback"] = [
+        "base": base, "trimmed": Set(trimmed).sorted(), "rows": n - base - 5, "max_abs": rollbackWorst, "max_kl": rollbackKL,
+        "top1_mismatch": rollbackMismatch,
+    ]
+
+    // 5. Greedy 48 tokens from the full prompt (the Python side writes its own).
+    cache = model.newCache(parameters: nil)
+    s = 0
+    var last = MLXArray(0)
+    while s < n {
+        let e = min(s + chunk, n)
+        last = model(ids[0..., s ..< e], cache: cache)[0, -1]
+        eval(last)
+        s = e
+    }
+    var greedy: [Int] = []
+    var next = top1(last)
+    for _ in 0 ..< 48 {
+        greedy.append(next)
+        if next == 100_265 || next == 100_257 { break }
+        let out = model(MLXArray([Int32(next)])[.newAxis], cache: cache)
+        next = top1(out[0, -1])
+    }
+    report["greedy"] = greedy
+    report["greedy_text"] = context.tokenizer.decode(tokenIds: greedy)
+    report["peak_gb"] = Double(MLX.Memory.peakMemory) / 1e9
+    let json = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+    try json.write(to: outDir.appendingPathComponent("swift_report.json"))
+    print("[RIPPLE] " + String(decoding: json, as: UTF8.self))
+}
+
+// BENCH_RIPPLE_TIMING=1 — forward cost per row count (median of BENCH_RIPPLE_REPS, default 9) at a fixed context
+// (BENCH_RIPPLE_CTX, default 1500 tokens), before and after `LaneQMM.installForDFlash2Target`. Each timed forward is
+// trimmed back so the context stays fixed. Development measurement only; the app is the proof.
+func runRippleTimingProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let reps = Int(env["BENCH_RIPPLE_REPS"] ?? "9") ?? 9
+    let ctx = Int(env["BENCH_RIPPLE_CTX"] ?? "1500") ?? 1500
+    MLX.Memory.cacheLimit = 8 << 30
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let model = context.model
+    let cache = model.newCache(parameters: nil)
+    var s = 0
+    while s < ctx {
+        let e = min(s + 512, ctx)
+        eval(model(MLXArray((s ..< e).map { Int32(1000 + $0 % 5000) })[.newAxis], cache: cache))
+        s = e
+    }
+    func time(rows: Int) -> Double {
+        var samples: [Double] = []
+        for r in 0 ..< (reps + 2) {
+            let x = MLXArray((0 ..< rows).map { Int32(2000 + ($0 * 31 + r) % 4000) })[.newAxis]
+            let t = CFAbsoluteTimeGetCurrent()
+            eval(model(x, cache: cache))
+            let dt = (CFAbsoluteTimeGetCurrent() - t) * 1000
+            for c in cache { c.trim(rows) }
+            if r >= 2 { samples.append(dt) }
+        }
+        return samples.sorted()[samples.count / 2]
+    }
+    // CPU graph construction vs GPU execution for one decode step (median of reps).
+    do {
+        var build: [Double] = [], run: [Double] = []
+        for r in 0 ..< (reps + 2) {
+            let x = MLXArray([Int32(2000 + r)])[.newAxis]
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let y = model(x, cache: cache)
+            let t1 = CFAbsoluteTimeGetCurrent()
+            eval(y)
+            let t2 = CFAbsoluteTimeGetCurrent()
+            for c in cache { c.trim(1) }
+            if r >= 2 { build.append((t1 - t0) * 1000); run.append((t2 - t1) * 1000) }
+        }
+        print(String(format: "[RIPPLE_TIMING] graph_build=%.1fms eval=%.1fms", build.sorted()[build.count / 2],
+                     run.sorted()[run.count / 2]))
+    }
+    let widths = [1, 2, 4, 8, 16]
+    func components(_ tag: String) {
+        guard let r = model as? RicursiveModel, env["BENCH_RIPPLE_COMPONENTS"] != "0" else { return }
+        for w in widths {
+            let t = r.diagnosticComponentTimings(rows: w)
+            print(String(format: "[RIPPLE_COMPONENTS] %@ rows=%d mlp=%.1fms attn_proj=%.1fms head=%.1fms", tag, w,
+                         t["mlp"] ?? -1, t["attn_proj"] ?? -1, t["head"] ?? -1))
+        }
+    }
+    components("mlx")
+    // Same process, same thermal state: the production token iterator (eager, greedy) on this model.
+    if env["BENCH_RIPPLE_ITER"] != "0" {
+        for round in 0 ..< 3 {
+            var params = GenerateParameters(maxTokens: 160, temperature: 0)
+            params.enableCompiledDecode = false
+            let input = try await context.processor.prepare(
+                input: UserInput(prompt: "Write a long story about a lighthouse keeper and a storm."))
+            let t = CFAbsoluteTimeGetCurrent()
+            var n = 0
+            var first = 0.0
+            for await item in try MLXLMCommon.generate(input: input, parameters: params, context: context) {
+                if case .chunk = item { n += 1; if n == 1 { first = CFAbsoluteTimeGetCurrent() } }
+                if case .info(let info) = item {
+                    print(String(format: "[RIPPLE_ITER] round=%d tokens=%d decode=%.2f tok/s (%.1f ms/token) wall_after_first=%.1f ms/chunk",
+                                 round, info.generationTokenCount, info.tokensPerSecond, 1000 / max(info.tokensPerSecond, 1e-9),
+                                 n > 1 ? (CFAbsoluteTimeGetCurrent() - first) * 1000 / Double(n - 1) : 0))
+                }
+            }
+            _ = t
+        }
+        print(String(format: "[RIPPLE_TIMING] after-iter w1=%.1fms", time(rows: 1)))
+        // The host chat window's route: BatchEngine.generate (maxBatchSize 1, as the speed probe and app use).
+        let engine = BatchEngine(context: context, maxBatchSize: 1)
+        for round in 0 ..< 3 {
+            let prepared = try await context.processor.prepare(
+                input: UserInput(prompt: "Write a long story about a lighthouse keeper and a storm."))
+            nonisolated(unsafe) let send = prepared
+            var p = GenerateParameters(maxTokens: 160, temperature: 0, topP: 1, topK: 0, minP: 0, repetitionPenalty: nil)
+            p.draftStrategy = nil
+            let stream = await engine.generate(input: send, parameters: p)
+            for await ev in stream {
+                if case .info(let info) = ev {
+                    print(String(format: "[RIPPLE_BATCH] round=%d tokens=%d decode=%.2f tok/s", round,
+                                 info.generationTokenCount, info.tokensPerSecond))
+                }
+            }
+        }
+    }
+    var line = "[RIPPLE_TIMING] mlx ctx=\(ctx)"
+    for w in widths { line += String(format: " w%d=%.1fms", w, time(rows: w)) }
+    print(line)
+    if env["BENCH_RIPPLE_LANE"] != "0" {
+        LaneQMM.installForDFlash2Target(model)
+        let r = LaneQMM.lastInstallReport
+        line = "[RIPPLE_TIMING] lane(\(r?.lane ?? -1) tiled=\(r?.tiled ?? -1) skipped=\(r?.skipped ?? -1)) flat=\(LaneQMM.isLaneFlat(model))"
+        for w in widths { line += String(format: " w%d=%.1fms", w, time(rows: w)) }
+        print(line)
+        components("lane")
+    }
+}

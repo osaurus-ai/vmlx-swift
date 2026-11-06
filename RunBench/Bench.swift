@@ -654,6 +654,14 @@ struct Bench {
             try await runDiplodocusQualification(modelPath: modelPath)
             return
         }
+        if (env["BENCH_RIPPLE_TIMING"] ?? "0") == "1" {
+            try await runRippleTimingProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_RIPPLE_PARITY"] ?? "0") == "1" {
+            try await runRippleParityProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_SPEED"] ?? "0") == "1" {
             try await runSpeedProbe(modelPath: modelPath)
             return

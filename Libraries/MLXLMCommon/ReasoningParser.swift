@@ -1420,6 +1420,11 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
 
     if compact == "k2horizon" { return "k2_horizon" }
 
+    // Ripple-65B (`ricursive`): plain `<think>`/`</think>` text tokens that the model opens itself (the template ends at
+    // the assistant header). `forPrompt` resolves the start state from the prompt tail, so the qwen3 stamp starts in
+    // content and latches on an emitted `<think>`. Released bundles also stamp `reasoning_parser: qwen3`.
+    if compact == "ricursive" { return "qwen3" }
+
     // MiniMax-M3 / M3.1 (`minimax_m3`, `minimax_m3_vl`): `<mm:think>` rail, not the M2 `<think>` one. Checked before
     // the `minimax` think_xml prefix below.
     if compact.hasPrefix("minimaxm3") { return "minimax_m3" }

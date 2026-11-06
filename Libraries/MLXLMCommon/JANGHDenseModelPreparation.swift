@@ -14,7 +14,10 @@ public final class JANGHDenseModelPreparation {
     /// layer are JANGH (Qwen3.5-family: gate/up/down). Empty for K2.
     private var pathInputs: [String: Int] = [:]
 
-    /// Dense Qwen3.5-family JANGH (Qwen3.8-27B JANGH2): all 3 MLP projections of every decoder layer are
+    /// Model types whose dense JANGH bundles make every decoder MLP projection (gate/up/down) a codebook bank.
+    static let denseAllProjectionModelTypes: Set<String> = ["qwen3_5", "ricursive"]
+
+    /// Dense Qwen3.5-family JANGH (Qwen3.8-27B JANGH2) and Ripple (ricursive) JANGH2: all 3 MLP projections of every decoder layer are
     /// one-expert codebook banks (gate/up hidden->intermediate, down intermediate->hidden). Mirrors vMLX
     /// Python `jangh/dense.py` (`TQLinear`). Fails closed: every custom module must be one of those paths
     /// and every layer's triple must be present (the format contract enforces complete triples).
@@ -32,7 +35,8 @@ public final class JANGHDenseModelPreparation {
         }
         let partition = try JANGHConfigurationPartition(
             configuration: configuration, sidecar: sidecar)
-        guard partition.modelType == "qwen3_5", hiddenSize > 0, intermediateSize > 0,
+        guard Self.denseAllProjectionModelTypes.contains(partition.modelType),
+            hiddenSize > 0, intermediateSize > 0,
             layerCount > 0,
             hiddenSize.isMultiple(of: 32), intermediateSize.isMultiple(of: 32)
         else {
@@ -42,8 +46,10 @@ public final class JANGHDenseModelPreparation {
         var dims: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var inputs: [String: Int] = [:]
         for name in partition.customModules {
-            let parts = name.split(separator: ".")
-            guard let layer = Int(parts[3]), layer < layerCount else {
+            let parts = name.split(separator: ".").map(String.init)
+            guard let at = parts.firstIndex(of: "layers"), at + 1 < parts.count,
+                let layer = Int(parts[at + 1]), layer < layerCount
+            else {
                 throw JANGHFormatContract.ValidationError.invalid(
                     "dense JANGH layer out of range \(name)")
             }

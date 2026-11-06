@@ -234,8 +234,22 @@ struct JANGHConfigurationPartition: Sendable {
         // one-expert codebook bank at `language_model.model.layers.L.mlp.{gate,up,down}_proj` (complete
         // triples are enforced by JANGHFormatContract). Nothing else may be custom in such a bundle.
         let denseQwen35 = modelType == "qwen3_5"
+        // Dense Ripple (ricursive) JANGH2: every decoder MLP projection at `model.layers.L.mlp.{gate,up,down}_proj` is a
+        // one-expert codebook bank; attention, embeddings and the head stay affine.
+        let denseRicursive = modelType == "ricursive"
         for name in customModules {
             if denseK2 { continue } // Exact down-only namespace was validated by the format contract.
+            if denseRicursive {
+                let parts = name.split(separator: ".", omittingEmptySubsequences: false)
+                guard parts.count == 5, parts[0] == "model", parts[1] == "layers",
+                    let layer = Int(parts[2]), layer >= 0, String(layer) == String(parts[2]),
+                    parts[3] == "mlp",
+                    ["gate_proj", "up_proj", "down_proj"].contains(String(parts[4]))
+                else {
+                    throw Failure.invalid("unsupported dense ricursive JANGH module path \(name)")
+                }
+                continue
+            }
             if denseQwen35 {
                 let parts = name.split(separator: ".", omittingEmptySubsequences: false)
                 guard parts.count == 6, parts[0] == "language_model", parts[1] == "model",
