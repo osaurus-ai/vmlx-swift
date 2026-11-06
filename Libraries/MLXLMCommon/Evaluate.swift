@@ -5452,6 +5452,7 @@ public func generate(
 ///   - tokenizer: tokenizer (for EOS id, unknown token id, and detokenization)
 ///   - iterator: token iterator
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+///   - parseChatMarkup: Set false for literal text completions. Chat parsing is on by default.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask(
     promptTokenCount: Int,
@@ -5461,7 +5462,8 @@ public func generateTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     extraStopStrings: [String] = [],
     promptTail: String? = nil,
-    toolSchemas: [ToolSpec]? = nil
+    toolSchemas: [ToolSpec]? = nil,
+    parseChatMarkup: Bool = true
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     let structuredOutput = iterator.structuredOutputComplete != nil
     let effectivePromptTail =
@@ -5496,6 +5498,7 @@ public func generateTask(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
             stopStringMatcher: StopStringMatcher(stopStrings: effectiveStopStrings),
+            parseChatMarkup: parseChatMarkup,
             structuredOutput: structuredOutput
         )
     )
@@ -6574,6 +6577,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         tools: [[String: any Sendable]]? = nil,
         reasoningParser: ReasoningParser? = nil,
         stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: []),
+        parseChatMarkup: Bool = true,
         structuredOutput: Bool = false
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
@@ -6584,8 +6588,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         // whose tool schema rides in the system prompt sends an empty `tools`
         // field — and without a processor the raw `<|tool_call>…<tool_call|>`
         // envelope leaks verbatim into visible text. Mirrors BatchEngine.
-        if structuredOutput {
-            // JSON string values may contain protocol markers literally.
+        if structuredOutput || !parseChatMarkup {
             toolCallProcessor = nil
         } else if let activeTools {
             toolCallProcessor = ToolCallProcessor(format: format, tools: activeTools)
@@ -6594,7 +6597,7 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         } else {
             toolCallProcessor = nil
         }
-        self.reasoningParser = structuredOutput ? nil : reasoningParser
+        self.reasoningParser = parseChatMarkup && !structuredOutput ? reasoningParser : nil
         // Grammar-approved EOS, not a substring inside JSON, ends this response.
         self.stopStringMatcher =
             structuredOutput ? StopStringMatcher(stopStrings: []) : stopStringMatcher
