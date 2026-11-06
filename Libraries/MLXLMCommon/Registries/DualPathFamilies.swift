@@ -71,6 +71,7 @@ public enum DualPathFamilies {
         "gemma3",            // Gemma3TextModel          / Gemma3
         "gemma4",            // Gemma4TextModel          / Gemma4
         "gemma4_unified",    // Gemma4TextModel          / Gemma4
+        "mimo_v2",           // MiMoV2Flash/MiMoV26Text  / MiMoV26 (bundle-gated)
         "ministral3",        // dispatchMistral3LLM      / dispatchMistral3VLM
         "mistral3",          // dispatchMistral3LLM      / dispatchMistral3VLM
         "muse_glimmer",      // MuseGlimmerTextModel     / MuseGlimmer
