@@ -2797,10 +2797,16 @@ public actor BatchEngine {
                         let remainingLen = inputForPrepare.text.tokens.size
                         let processed = fullLen - remainingLen
                         guard processed >= 0 else { return nil }
+                        // Capture the same boundary finalization will publish.
+                        // Media processors can omit canonical history counts;
+                        // the existing template suffix still proves that target.
                         guard
-                            let boundary = slot.originalInput.cachePrefixTokenCounts
-                                .filter({ $0 > processed && $0 < fullLen })
-                                .max()
+                            let boundary = TokenIterator.hybridStripBoundaryIndex(
+                                coordinator: cacheCoordinator,
+                                promptTokenIds: slot.cachePromptTokenIds,
+                                input: slot.originalInput,
+                                cache: slot.cache),
+                            boundary > processed
                         else { return nil }
                         let split = boundary - processed
                         return (split > 0 && split < remainingLen) ? split : nil
