@@ -1511,15 +1511,35 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     leafOffsets == [postAnswerTokens.count + 1]
                         && tokenCount == generatedTokenIds.count + 1
                     ? lastReturnedTokenId : nil
+                // A stop can occur before the end of an accepted verifier queue. Its
+                // remaining accepted tokens have already reached recurrent state;
+                // only the queue's final bonus/correction token is unforwarded.
+                // Preserve that exact state/key pairing instead of guessing a tail
+                // or trimming recurrent state. Keep the existing trimmable path.
+                let forwardedStopTail =
+                    stopRowToken == nil && !canTrimPromptCache(postAnswerSnapshot)
+                    ? Self.verifiedForwardedStopTail(
+                        promptTokenCount: promptTokenIds.count,
+                        generatedTokenIds: generatedTokenIds,
+                        returnedTokenCount: tokenCount,
+                        lastReturnedTokenId: lastReturnedTokenId,
+                        pendingTokens: pendingTokens, pendingIndex: pendingIndex,
+                        leafOffsets: Array(leafOffsets)) : nil
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     RuntimeDiagnostics.write(Data(
                         ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
                             + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
-                            + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil)\n").utf8))
+                            + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil) "
+                            + "forwardedStopTail=\(forwardedStopTail?.count ?? 0)\n").utf8))
                 }
                 if let stopRowToken {
                     store(
                         tokens: postAnswerTokens + [stopRowToken],
+                        snapshot: postAnswerSnapshot,
+                        label: "post-answer")
+                } else if let forwardedStopTail {
+                    store(
+                        tokens: postAnswerTokens + forwardedStopTail,
                         snapshot: postAnswerSnapshot,
                         label: "post-answer")
                 } else if let offset = offsets.first,
@@ -1547,6 +1567,31 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         finalizeGenerationStats(generatedTokenIds: generatedTokenIds)
+    }
+
+    /// Recover only already-forwarded accepted tokens after a consumer stop.
+    /// The final queued bonus/correction has not been forwarded and is excluded.
+    /// This is a persistence-key decision, never an output-token transformation.
+    static func verifiedForwardedStopTail(
+        promptTokenCount: Int, generatedTokenIds: [Int], returnedTokenCount: Int,
+        lastReturnedTokenId: Int?, pendingTokens: [Int], pendingIndex: Int,
+        leafOffsets: [Int]
+    ) -> [Int]? {
+        guard promptTokenCount >= 0,
+            returnedTokenCount == generatedTokenIds.count + 1,
+            let offset = leafOffsets.first, leafOffsets.allSatisfy({ $0 == offset }),
+            pendingIndex > 0, pendingIndex <= pendingTokens.count,
+            pendingTokens[pendingIndex - 1] == lastReturnedTokenId
+        else { return nil }
+
+        let tailCount = offset - promptTokenCount - generatedTokenIds.count
+        let start = pendingIndex - 1
+        guard tailCount > 1,
+            start <= generatedTokenIds.count,
+            pendingTokens.prefix(start).elementsEqual(generatedTokenIds.suffix(start)),
+            tailCount == pendingTokens.count - 1 - start
+        else { return nil }
+        return Array(pendingTokens[start ..< start + tailCount])
     }
 
     /// CPU-only stats snapshot + stderr summary, split out of

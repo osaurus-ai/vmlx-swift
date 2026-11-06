@@ -932,6 +932,7 @@ let package = Package(
                 "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "NativeDiskDurabilityTests.swift",
+                "NativeForwardedStopTailTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "ExpertDownProjectionQuantOrderTests.swift",
                 "VMLXUmbrellaProductTests.swift",
