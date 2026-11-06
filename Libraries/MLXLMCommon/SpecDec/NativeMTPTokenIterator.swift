@@ -1526,11 +1526,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         pendingTokens: pendingTokens, pendingIndex: pendingIndex,
                         leafOffsets: Array(leafOffsets)) : nil
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    RuntimeDiagnostics.write(Data(
-                        ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
-                            + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
-                            + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil) "
-                            + "forwardedStopTail=\(forwardedStopTail?.count ?? 0)\n").utf8))
+                    RuntimeDiagnostics.write(
+                        Data(
+                            ("[vmlx][cache/post-answer] native-mtp prompt=\(promptTokenIds.count) "
+                                + "generated=\(generatedTokenIds.count) returned=\(tokenCount) "
+                                + "offsets=\(leafOffsets.sorted()) stopRow=\(stopRowToken != nil) "
+                                + "forwardedStopTail=\(forwardedStopTail?.count ?? 0)\n").utf8))
                 }
                 if let stopRowToken {
                     store(
