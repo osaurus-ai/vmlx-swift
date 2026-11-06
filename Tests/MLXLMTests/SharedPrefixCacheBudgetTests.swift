@@ -363,4 +363,61 @@ final class SharedPrefixCacheBudgetTests: XCTestCase {
         c.clear()
         XCTAssertEqual(c.retainedCacheBytes, 0)
     }
+    func testPagedKVMaterializationWaitsForGlobalCacheIO() {
+        assertPagedStoreWaitsForGlobalCacheIO(replaceCompanion: false)
+    }
+
+    func testPagedCompanionMaterializationWaitsForGlobalCacheIO() {
+        assertPagedStoreWaitsForGlobalCacheIO(replaceCompanion: true)
+    }
+
+    private func assertPagedStoreWaitsForGlobalCacheIO(
+        replaceCompanion: Bool, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let c = coordinator(1 << 20)
+        let tokens = [1, 2, 3, 4]
+        let input = SSMStateCache.FetchResult(
+            states: [MLXArray.zeros([1, 1, 4, 64]), MLXArray.zeros([1, 2, 8, 64])],
+            isComplete: true)
+        eval(input.states)
+        Stream.gpu.synchronize()
+        if replaceCompanion {
+            c.pagedCache!.storeTokenSequence(
+                tokens: tokens, layerData: [[(keys: input.states[0], values: input.states[0])]])
+        }
+        let priorCharge = c.retainedCacheBytes
+        let worker = DispatchGroup()
+        var joined = false
+        defer {
+            if !joined { joined = worker.wait(timeout: .now() + 10) == .success }
+            XCTAssertTrue(joined, "Paged worker did not finish after opening the I/O gate", file: file, line: line)
+            if joined { c.clear() }
+        }
+        MLXCacheIOLock.withSerializedMLXCacheIO {
+            worker.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { worker.leave() }
+                c.pagedCache!.storeTokenSequence(
+                    tokens: tokens,
+                    layerData: [[(keys: input.states[0], values: input.states[0])]],
+                    boundaryCompanionData: replaceCompanion ? ["ring": input.states[1]] : nil)
+            }
+            // Confirm the worker reached byte reservation; do not assume a sleep
+            // put it at the materialization gate. This counter has its own lock.
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
+            while c.retainedCacheBytes <= priorCharge,
+                  ProcessInfo.processInfo.systemUptime < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            guard c.retainedCacheBytes > priorCharge else {
+                return XCTFail("Paged worker never reserved its copy", file: file, line: line)
+            }
+            XCTAssertEqual(worker.wait(timeout: .now() + 0.1), .timedOut,
+                "Paged materialization completed while another cache I/O owner held the gate",
+                file: file, line: line)
+        }
+        joined = worker.wait(timeout: .now() + 10) == .success
+        XCTAssertTrue(joined, file: file, line: line)
+    }
+
 }
