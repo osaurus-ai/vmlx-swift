@@ -225,6 +225,57 @@ struct NativeDiskDurabilityTests {
         }
     }
 
+    @Test("verified stop tail makes an exact nonaligned recurrent key durable")
+    func forwardedStopTailRoundTrip() throws {
+        try withRoot { root in
+            let prompt = [71, 72, 73, 74, 75]
+            let generated = [76, 77]
+            let tail = try #require(
+                NativeMTPTokenIterator.verifiedForwardedStopTail(
+                    promptTokenCount: prompt.count, generatedTokenIds: generated,
+                    returnedTokenCount: 3, lastReturnedTokenId: 78,
+                    pendingTokens: [77, 78, 79, 999], pendingIndex: 2,
+                    leafOffsets: [9, 9]))
+            #expect(tail == [78, 79])
+            let source = sourceCache(tokenCount: 9)
+            let writer = nativeCoordinator(root)
+            // Both old keys must still be rejected; no boundary guard changes.
+            for key in [prompt + generated, prompt + generated + [78]] {
+                writer.storeAfterGeneration(
+                    promptTokens: key, perLayerData: [], ssmStates: nil, cache: source)
+                #expect(!writer.hasDurableDiskEntry(tokens: key))
+            }
+            #expect(writer.diskCache?.snapshotStats().stores == 0)
+            let key = prompt + generated + tail
+            writer.storeAfterGeneration(
+                promptTokens: key, perLayerData: [], ssmStates: nil, cache: source)
+            #expect(writer.hasValidatedDiskEntry(tokens: key))
+            let reader = nativeCoordinator(root)
+            guard
+                case .hit(let matched, _, let detail, _, _, let payload) = reader.fetch(
+                    tokens: key + [80])
+            else {
+                Issue.record("Exact forwarded-tail key must restore after reopening")
+                return
+            }
+            #expect(matched == 9 && detail == .disk)
+            let arrays = try #require(payload)
+            let recurrent = MambaCache(slots: 6, persistentSlotCount: 4)
+            var restored: [any KVCache] = [KVCacheSimple(), recurrent]
+            #expect(restoreFromDiskArrays(arrays, into: &restored) == 9)
+            #expect(cacheBoundaryLeafOffsets(restored) == [9, 9])
+            let restoredKV = try #require(restored[0] as? KVCacheSimple)
+            #expect(
+                restoredKV.state[0].asArray(Float.self) == source[0].state[0].asArray(Float.self))
+            #expect(
+                restoredKV.state[1].asArray(Float.self) == source[0].state[1].asArray(Float.self))
+            #expect(recurrent[0]?.item(Int32.self) == 11)
+            #expect(recurrent[2]?.item(Int32.self) == 13)
+            #expect(recurrent[3]?.item(Int32.self) == 14)
+            #expect(recurrent[1] == nil && recurrent[4] == nil && recurrent[5] == nil)
+        }
+    }
+
     @Test(
         "separate and unknown topologies retain complete-sidecar requirement",
         arguments: [false, true])
