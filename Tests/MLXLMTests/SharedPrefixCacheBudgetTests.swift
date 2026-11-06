@@ -332,7 +332,7 @@ final class SharedPrefixCacheBudgetTests: XCTestCase {
         XCTAssertGreaterThan(large.companionBytes, 0)
         storeCompanion(MLXArray.full([1, 2, 128, 64], values: MLXArray(Float(2))))
         XCTAssertEqual(c.retainedCacheBytes, large.residentBytes)
-        let replacement = try XCTUnwrap(c.pagedCache!.fetchPrefix(tokens: tokens, requireBoundaryCompanion: true))
+        let replacement = try XCTUnwrap(c.pagedCache!.fetchPrefix(tokens: tokens))
         XCTAssertEqual(replacement.blocks.last!.boundaryCompanionData!["ring"]!.asArray(Float.self).first, 2)
         c.release(blocks: replacement.blocks)
 
@@ -352,7 +352,9 @@ final class SharedPrefixCacheBudgetTests: XCTestCase {
         XCTAssertEqual(removed.companionBytes, 0)
         XCTAssertEqual(small.residentBytes - removed.residentBytes, small.companionBytes)
         XCTAssertEqual(c.retainedCacheBytes, removed.residentBytes)
-        XCTAssertNil(c.pagedCache!.fetchPrefix(tokens: tokens, requireBoundaryCompanion: true))
+        let withoutCompanion = try XCTUnwrap(c.pagedCache!.fetchPrefix(tokens: tokens))
+        XCTAssertNil(withoutCompanion.blocks.last!.boundaryCompanionData)
+        c.release(blocks: withoutCompanion.blocks)
         c.ssmStateCache.store(ssmStates: [ssm], tokens: [7], boundary: 1)
         XCTAssertTrue(c.ssmStateCache.contains(tokens: [7], boundary: 1),
                       "Removing the ring must make its shared bytes reusable by SSM")
