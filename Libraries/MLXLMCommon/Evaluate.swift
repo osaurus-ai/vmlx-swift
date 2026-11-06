@@ -1380,6 +1380,90 @@ public struct PenaltyProcessor: LogitProcessor {
     }
 }
 
+/// Composes the built-in effective processor with a request-supplied
+/// additional processor.
+///
+/// Order is fixed and load-bearing: `base` (the processor built from
+/// ``GenerateParameters`` — repetition/presence/frequency/suppress/reasoning
+/// stages) runs first and `additional` runs next, before any native JSON schema
+/// mask. An additional constraint
+/// such as a structured-output token mask therefore sees the same penalised
+/// logits the sampler would have seen without it, and no later penalty stage
+/// can re-open a token the constraint masked. The native JSON schema mask remains
+/// outermost, so an additional processor cannot reopen a schema-rejected token.
+/// `prompt` and `didSample` are
+/// forwarded to both members in the same order.
+///
+/// This is the composition behind
+/// parameters-based ``TokenIterator`` initializer.
+/// Ordinary callers never see it: without an `additionalProcessor` the
+/// iterator stores the built-in effective processor unchanged.
+///
+/// Scope: the ordinary single-sequence, non-speculative decode path. The
+/// additional processor runs host-side on every sampled position of the
+/// `TokenIterator` — including compiled decode, whose sampling still runs in
+/// Swift — and does not participate in speculative draft/verify.
+public struct CompositeLogitProcessor: LogitProcessor {
+
+    /// The built-in effective processor (`GenerateParameters.processor()`),
+    /// or `nil` when the parameters configure no penalty stage at all.
+    var base: LogitProcessor?
+
+    /// The request-supplied processor. Runs after base, before native schema masking.
+    var additional: LogitProcessor
+
+    public init(base: LogitProcessor?, additional: LogitProcessor) {
+        self.base = base
+        self.additional = additional
+    }
+
+    /// Deep copy: BOTH members may hold reference-typed state
+    /// (`GeneratedTokenCounts`, embedder state), so the default value copy is
+    /// not enough — see ``LogitProcessor/independentCopy()``.
+    public func independentCopy() -> Self {
+        var copy = self
+        copy.base = base?.independentCopy()
+        copy.additional = additional.independentCopy()
+        return copy
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        base?.prompt(prompt)
+        additional.prompt(prompt)
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        if let base {
+            logits = base.process(logits: logits)
+        }
+        return additional.process(logits: logits)
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        base?.didSample(token: token)
+        additional.didSample(token: token)
+    }
+}
+
+// Preserve constraint metadata through composites without classifying an
+// ordinary penalty or filter as structured output.
+func logitConstraintFailure(_ processor: (any LogitProcessor)?) -> JSONSchemaGrammarError? {
+    if let composite = processor as? CompositeLogitProcessor {
+        return logitConstraintFailure(composite.base) ?? logitConstraintFailure(composite.additional)
+    }
+    return (processor as? any ConstraintFailureReporting)?.constraintFailure
+}
+
+func logitConstraintCompletion(_ processor: (any LogitProcessor)?) -> Bool? {
+    if let composite = processor as? CompositeLogitProcessor {
+        let states = [logitConstraintCompletion(composite.base),
+                      logitConstraintCompletion(composite.additional)].compactMap { $0 }
+        return states.isEmpty ? nil : states.allSatisfy { $0 }
+    }
+    return (processor as? any ConstraintFailureReporting)?.constraintIsComplete
+}
+
 /// Common properties shared by token-generating iterators.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
@@ -1690,7 +1774,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     var cache: [KVCache]
     public private(set) var generationFailure: GenerationFailure? = nil
     public var structuredOutputComplete: Bool? {
-        (processor as? any ConstraintFailureReporting)?.constraintIsComplete
+        logitConstraintCompletion(processor)
     }
 
     var processor: LogitProcessor?
@@ -1919,6 +2003,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - cache: optional ``KVCache``
     ///   - parameters: the generation parameters
     ///   - cacheCoordinator: optional multi-tier cache coordinator for prefix reuse
+    ///   - additionalProcessor: optional request-local processor composed after
+    ///     built-in penalties and before the native JSON schema mask. Receives
+    ///     prompt/process/didSample in the ordinary single-sequence iterator.
+    ///     Speculative iterators do not support this option.
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters,
@@ -1926,6 +2014,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         disableDiskBackedRequiredToolRestore: Bool = false,
         skipDiskBackedToolPromptSeedBoundary: Bool = false,
         prefillProgressHandler: (@Sendable (PrefillProgress) -> Void)? = nil,
+        additionalProcessor: LogitProcessor? = nil,
         tokenizer: (any Tokenizer)? = nil,
         stopTokenIDs: Set<Int> = []
     ) throws {
@@ -1975,6 +2064,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         self.processor = effectiveParameters.processor()
+        if let additionalProcessor {
+            self.processor = CompositeLogitProcessor(
+                base: self.processor, additional: additionalProcessor)
+        }
+        // Native schema constraints remain authoritative after optional processors.
         if let schema = effectiveParameters.jsonSchema {
             guard let tokenizer else {
                 throw GenerationFailure(
@@ -3455,7 +3549,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         if var processor {
             logits = processor.process(logits: logits)
-            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+            if let failure = logitConstraintFailure(processor) {
                 self.generationFailure = GenerationFailure(
                     stage: .decoding, cause: failure.localizedDescription)
                 self.processor = processor
@@ -3465,7 +3559,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             let y = sampler.sample(logits: logits)
             processor.didSample(token: y)
             self.processor = processor
-            if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
+            if let failure = logitConstraintFailure(processor) {
                 self.generationFailure = GenerationFailure(
                     stage: .decoding, cause: failure.localizedDescription)
             }

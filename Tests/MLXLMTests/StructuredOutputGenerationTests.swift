@@ -434,3 +434,64 @@ private final class SchemaBatchTarget: Module, LanguageModel {
         return MLXArray(values).reshaped(batch, sequence, vocabularySize)
     }
 }
+
+extension StructuredOutputGenerationTests {
+    func testAdditionalProcessorCannotReopenSchemaMaskOrHideEOS() throws {
+        try MLXMetalTestLock.withLock {
+            let model = SchemaGenerationTarget(plan: [1, 0])
+            var iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])), model: model,
+                parameters: Self.parameters(), additionalProcessor: SchemaReopeningProcessor(),
+                tokenizer: SchemaGenerationTokenizer(), stopTokenIDs: [0])
+            XCTAssertEqual(iterator.next(), 1)
+            XCTAssertEqual(iterator.next(), 0)
+            XCTAssertEqual(model.forwarded, [[3], [1]])
+            XCTAssertEqual(iterator.structuredOutputComplete, true)
+            XCTAssertNil(iterator.generationFailure)
+        }
+    }
+
+    func testAdditionalConstraintFailureStopsSchemaGeneration() throws {
+        try MLXMetalTestLock.withLock {
+            let model = SchemaGenerationTarget(plan: [1, 0])
+            var iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])), model: model,
+                parameters: Self.parameters(), additionalProcessor: SchemaFailingProcessor(),
+                tokenizer: SchemaGenerationTokenizer(), stopTokenIDs: [0])
+            XCTAssertNil(iterator.next())
+            XCTAssertNotNil(iterator.generationFailure)
+            XCTAssertEqual(iterator.structuredOutputComplete, false)
+            XCTAssertEqual(model.forwarded, [[3]])
+        }
+    }
+
+    func testAdditionalOrdinaryProcessorDoesNotActivateStructuredOutput() throws {
+        try MLXMetalTestLock.withLock {
+            var p = GenerateParameters(maxTokens: 2, temperature: 0)
+            p.jsonSchema = nil
+            let iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
+                model: SchemaGenerationTarget(plan: [1, 0]), parameters: p,
+                additionalProcessor: SchemaReopeningProcessor())
+            XCTAssertNil(iterator.structuredOutputComplete)
+        }
+    }
+}
+
+/// Deliberately discards the incoming mask and strongly favors invalid bytes.
+/// The native schema must apply after this processor and retain EOS semantics.
+private struct SchemaReopeningProcessor: LogitProcessor {
+    mutating func prompt(_ prompt: MLXArray) {}
+    mutating func didSample(token: MLXArray) {}
+    func process(logits: MLXArray) -> MLXArray {
+        MLXArray([Float(20), 10, 9, 100, 0, 0, 0, 0, 0]).reshaped(logits.shape)
+    }
+}
+
+private struct SchemaFailingProcessor: LogitProcessor, ConstraintFailureReporting {
+    var constraintFailure: JSONSchemaGrammarError? { .runtime("fixture additional constraint failed") }
+    var constraintIsComplete: Bool { false }
+    mutating func prompt(_ prompt: MLXArray) {}
+    mutating func didSample(token: MLXArray) {}
+    func process(logits: MLXArray) -> MLXArray { logits }
+}

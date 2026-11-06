@@ -28,9 +28,13 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
     private let stopTokenIDs: Set<Int>
     private let excludedTokenIDs: Set<Int>
 
-    public var constraintFailure: JSONSchemaGrammarError? { state.failure }
-    public var constraintIsComplete: Bool { state.terminated && state.failure == nil }
-    public var isTerminated: Bool { constraintIsComplete }
+    public var constraintFailure: JSONSchemaGrammarError? {
+        state.failure ?? logitConstraintFailure(base)
+    }
+    public var constraintIsComplete: Bool {
+        state.terminated && constraintFailure == nil && logitConstraintCompletion(base) != false
+    }
+    public var isTerminated: Bool { state.terminated && constraintFailure == nil }
 
     public init(
         schema: String, tokenizer: any Tokenizer, stopTokenIDs: Set<Int>,
@@ -89,7 +93,7 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
     public func process(logits: MLXArray) -> MLXArray {
         guard state.failure == nil else { return logits }
         let processed = base?.process(logits: logits) ?? logits
-        if let failure = (base as? any ConstraintFailureReporting)?.constraintFailure {
+        if let failure = logitConstraintFailure(base) {
             state.failure = failure
             return logits
         }
