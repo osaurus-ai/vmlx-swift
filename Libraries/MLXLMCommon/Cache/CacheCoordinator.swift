@@ -105,6 +105,12 @@ public struct CacheCoordinatorStatsSnapshot: Sendable {
 /// Individual sub-caches handle their own internal locking.
 public final class CacheCoordinator: @unchecked Sendable {
 
+    private let retainedBudget: RetainedCacheBudget
+
+    /// Conservative retained charge across paged KV, rotating companions and
+    /// separate SSM snapshots, including reservations for in-flight stores.
+    public var retainedCacheBytes: Int { retainedBudget.residentBytes }
+
     // MARK: - Properties
 
     private let initialConfig: CacheCoordinatorConfig
@@ -231,6 +237,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.initialConfig = config
+        let retainedBudget = RetainedCacheBudget(limit: config.maxCacheBytes)
+        self.retainedBudget = retainedBudget
         self.importRetryInterval = importRetryInterval
         self.now = now
 
@@ -238,7 +246,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.pagedCache = PagedCacheManager(
                 blockSize: config.pagedBlockSize,
                 maxBlocks: config.maxCacheBlocks,
-                modelKey: config.modelKey
+                modelKey: config.modelKey,
+                retainedBudget: retainedBudget
             )
         } else {
             self.pagedCache = nil
@@ -264,7 +273,8 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         self.ssmStateCache = SSMStateCache(
             maxEntries: config.ssmMaxEntries,
-            modelKey: config.modelKey)
+            modelKey: config.modelKey,
+            retainedBudget: retainedBudget)
 
         if config.enableDiskCache {
             let baseDir = config.diskCacheDir

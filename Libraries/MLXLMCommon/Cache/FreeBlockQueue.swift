@@ -72,6 +72,20 @@ public final class FreeBlockQueue: @unchecked Sendable {
         return frontNode.block
     }
 
+    /// Remove the oldest matching entry without perturbing other LRU nodes.
+    /// Byte-budget eviction skips empty slots and externally pinned blocks.
+    public func popFirst(where predicate: (CacheBlock) -> Bool) -> CacheBlock? {
+        var node = head
+        while let current = node {
+            if predicate(current.block) {
+                unlinkNode(current)
+                return current.block
+            }
+            node = current.next
+        }
+        return nil
+    }
+
     /// Remove a specific block from the queue by its ``CacheBlock/blockId``.
     ///
     /// This is a no-op if the block is not in the queue.
