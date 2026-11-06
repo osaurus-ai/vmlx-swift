@@ -628,7 +628,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// boundary snapshot — the hybrid stripped boundary in particular costs a
     /// retained cache copy or, failing that, a whole extra prefill.
     public var canPersistBoundaries: Bool {
-        (pagedCache != nil && !isPagedIncompatible) || diskCache != nil
+        (pagedCache != nil && !isPagedIncompatible && retainedBudget.limit != 0) || diskCache != nil
     }
 
     /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool
