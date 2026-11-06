@@ -15,6 +15,7 @@ struct Glm5NextProcessorRegistrationTests {
     /// Minimal GLM-5.3 tokenizer stand-in: the processor's initialiser only
     /// requires `<|image|>` to resolve; the image/video delimiters are optional.
     struct ImageTokenTokenizer: MLXLMCommon.Tokenizer {
+        var imageMode: String = "genuine"
         var bosToken: String? = nil
         var eosToken: String? = nil
         var eosTokenId: Int? = 154_820
@@ -22,16 +23,21 @@ struct Glm5NextProcessorRegistrationTests {
         var unknownTokenId: Int? = nil
 
         func encode(text: String, addSpecialTokens: Bool = true) -> [Int] {
-            text.utf8.map { Int($0) }
+            if text == "<|image|>", imageMode == "split" { return [41, 42] }
+            if let id = convertTokenToId(text) { return [id] }
+            return text.utf8.map { Int($0) }
         }
 
         func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-            tokenIds.map(String.init).joined(separator: " ")
+            tokenIds.map { convertIdToToken($0) ?? String($0) }.joined()
         }
 
         func convertTokenToId(_ token: String) -> Int? {
             switch token {
-            case "<|image|>": return 154_854
+            case "<|image|>":
+                if imageMode == "missing" { return nil }
+                if imageMode == "unknown-alias" { return 77 }
+                return 154_854
             case "<|begin_of_image|>": return 154_830
             case "<|end_of_image|>": return 154_831
             case "<|video|>": return 154_855
@@ -39,7 +45,16 @@ struct Glm5NextProcessorRegistrationTests {
             }
         }
 
-        func convertIdToToken(_ id: Int) -> String? { String(id) }
+        func convertIdToToken(_ id: Int) -> String? {
+            switch id {
+            case 77: return "<unk>"
+            case 154_854: return imageMode == "wrong-roundtrip" ? "ordinary" : "<|image|>"
+            case 154_830: return "<|begin_of_image|>"
+            case 154_831: return "<|end_of_image|>"
+            case 154_855: return "<|video|>"
+            default: return nil
+            }
+        }
 
         func applyChatTemplate(
             messages: [[String: any Sendable]],
@@ -84,6 +99,16 @@ struct Glm5NextProcessorRegistrationTests {
             tokenizer: ImageTokenTokenizer())
 
         #expect(processor is Glm5NextProcessor)
+    }
+
+    @Test("Image placeholders require one genuine round-tripping token",
+        arguments: ["missing", "unknown-alias", "split", "wrong-roundtrip"])
+    func rejectsFalseImageToken(mode: String) throws {
+        let config = try JSONDecoder().decode(
+            Glm5NextProcessorConfiguration.self, from: Self.processorConfigurationData())
+        #expect(throws: Glm5NextDecoderUnavailable.self) {
+            try Glm5NextProcessor(config: config, tokenizer: ImageTokenTokenizer(imageMode: mode))
+        }
     }
 
     @Test("The glm5_next model type is served by the VLM factory")
