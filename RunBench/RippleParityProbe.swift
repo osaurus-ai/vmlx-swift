@@ -187,6 +187,17 @@ func runRippleTimingProbe(modelPath: String) async throws {
         }
         return samples.sorted()[samples.count / 2]
     }
+    // BENCH_RIPPLE_DUMP=<dir>: write fixed 8- and 16-row verify-shape logits (kernel A/B bit-identity checks).
+    if let dump = env["BENCH_RIPPLE_DUMP"] {
+        for rows in [8, 16] {
+            let x = MLXArray((0 ..< rows).map { Int32(3000 + $0 * 97) })[.newAxis]
+            let y = model(x, cache: cache).asType(.float32)
+            eval(y)
+            for c in cache { c.trim(rows) }
+            let data = y.asArray(Float.self).withUnsafeBufferPointer { Data(buffer: $0) }
+            try data.write(to: URL(fileURLWithPath: dump).appendingPathComponent("rows\(rows).f32"))
+        }
+    }
     // CPU graph construction vs GPU execution for one decode step (median of reps).
     do {
         var build: [Double] = [], run: [Double] = []
