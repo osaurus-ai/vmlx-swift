@@ -274,3 +274,66 @@ func runRippleTimingProbe(modelPath: String) async throws {
         components("lane")
     }
 }
+
+// BENCH_RIPPLE_TTFT=1 — multi-turn restore shape the app runs: [system ~2.5k tokens, user] then append
+// (assistant, user) twice, through BatchEngine with a disk-backed prefix cache (BENCH_RIPPLE_CACHE_DIR, fresh per arm).
+// Arm via BENCH_RIPPLE_ARM=ar|dflash2. Reports per turn: prompt tokens, engine promptTime, TTFT, decode tok/s.
+// Restored-token counts come from the cache traces (VMLX_CACHE_FETCH_TRACE=1 / VMLX_DFLASH2_TRACE=1).
+func runRippleTTFTProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let dir = URL(fileURLWithPath: modelPath)
+    let arm = env["BENCH_RIPPLE_ARM"] ?? "ar"
+    MLX.Memory.cacheLimit = 8 << 30
+    let context = try await MLXLMCommon.loadModel(
+        from: dir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default)
+    var cfg = CacheCoordinatorConfig()
+    cfg.usePagedCache = env["BENCH_RIPPLE_PAGED"] == "1"
+    cfg.enableDiskCache = true
+    cfg.diskCacheDir = URL(fileURLWithPath: env["BENCH_RIPPLE_CACHE_DIR"] ?? "/tmp/ripple-ttft-cache")
+    cfg.modelKey = dir.lastPathComponent
+    let coordinator = CacheCoordinator(config: cfg)
+    if !cfg.usePagedCache { coordinator.setPagedIncompatible(true) }
+    let engine = BatchEngine(context: context, maxBatchSize: 1, cacheCoordinator: coordinator)
+    let sentence = "Policy note: archive shipping manifests, tide tables and lighthouse logs by quarter, and cite the ledger page. "
+    let system = "You are a careful assistant for a harbor office.\n" + String(repeating: sentence, count: 110)
+    let users = [
+        "Write a Python function that totals crates per section from a list of dicts. Code only.",
+        "Now add a unittest for it with two cases. Code only.",
+        "Now make it ignore rows whose section is missing. Code only.",
+    ]
+    var history: [Chat.Message] = [.system(system)]
+    for (turn, u) in users.enumerated() {
+        history.append(.user(u))
+        var input = UserInput(chat: history)
+        input.additionalContext = [:]
+        let prepared = try await context.processor.prepare(input: input)
+        nonisolated(unsafe) let send = prepared
+        var p = GenerateParameters(maxTokens: 120, temperature: 0, topP: 1, topK: 0, minP: 0, repetitionPenalty: nil)
+        if arm == "dflash2" { p.draftStrategy = .dflash2(drafterPath: dir.appendingPathComponent("dflash2"), blockSize: nil) }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var first: Double?
+        var text = ""
+        var line = ""
+        for await ev in await engine.generate(input: send, parameters: p) {
+            switch ev {
+            case .chunk(let c):
+                if first == nil { first = CFAbsoluteTimeGetCurrent() - t0 }
+                text += c
+            case .reasoning:
+                if first == nil { first = CFAbsoluteTimeGetCurrent() - t0 }
+            case .info(let info):
+                line = String(
+                    format: "[RIPPLE_TTFT] arm=%@ turn=%d prompt=%d promptTime=%.2fs ttft=%.2fs gen=%d decode=%.2f tok/s",
+                    arm, turn, info.promptTokenCount, info.promptTime, first ?? -1, info.generationTokenCount,
+                    info.tokensPerSecond)
+            default: break
+            }
+        }
+        print(line)
+        if let out = env["BENCH_RIPPLE_TEXT_OUT"] {
+            let url = URL(fileURLWithPath: out + "-turn\(turn).txt")
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+        history.append(.assistant(text))
+    }
+}

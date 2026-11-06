@@ -108,6 +108,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var draftPositionBase = 0
     /// All-sliding drafters see at most `window - 1` context rows; nil otherwise.
     private var drafterContextLimit: Int?
+    /// Committed target context rows produced after the prompt (verify commits and AR steps), in position order.
+    /// Recorded only when a completed answer can be stored as a post-answer boundary (all-trimmable target, no
+    /// stripped hybrid boundary), so the next turn's drafter is conditioned on the answer too.
+    private var generatedContextRows: [MLXArray] = []
+    private var recordsGeneratedContext = false
+    /// Every committed token in order, before any max-token clipping: the tokens forwarded into the cache are its
+    /// prefix (the newest one is forwarded by the next cycle). Keys the post-answer boundary.
+    private var committedTokenLog: [Int] = []
     private var committedDraftRows: Int { promptTokenIds.count + stats.emittedTokens - 1 - draftPositionBase }
     private let cacheCoordinator: CacheCoordinator?
 
@@ -808,6 +816,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             hybridStripBoundary == nil
             ? DFlash2PrefixContext(
                 hidden: prefill.hidden, end: promptTokenIds.count, layerIDs: orderedLayerIDs) : nil
+        self.recordsGeneratedContext =
+            cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary
+            && hybridStripBoundary == nil && promptConditioningContext != nil
+            && self.cache.allSatisfy { $0.isTrimmable && !($0 is MambaCache) }
         // Vocabulary agreement, checked against the first real logits row.
         // The drafter borrows the target's LM head, so a mismatch here
         // would not throw — it would silently index a different token
@@ -849,6 +861,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let firstToken = first.reshaped(-1)[0].item(Int.self)
         self.lastToken = firstToken
         self.pendingTokens = [firstToken]
+        if recordsGeneratedContext { committedTokenLog.append(firstToken) }
         self.pendingIndex = 0
         self.stats.emittedTokens = 1
         spillHybridStripBoundaryAfterPrefill()
@@ -1447,9 +1460,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
 
         contextHidden = newHidden[0..., ..<committedInputs, 0...]
+        if recordsGeneratedContext { generatedContextRows.append(contextHidden) }
 
         var emitted = draftIDs.prefix(accepted).map { $0 }
         emitted.append(acceptance.bonus)
+        if recordsGeneratedContext { committedTokenLog.append(contentsOf: emitted) }
         if emitted.count > budget {
             emitted = Array(emitted.prefix(budget))
         }
@@ -1613,10 +1628,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
         contextHidden = take(newHidden, MLXArray(keptRows.map(Int32.init)), axis: 1)
+        if recordsGeneratedContext { generatedContextRows.append(contextHidden) }
 
         let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
         var emitted = keptRows.dropFirst().map { plan.tokens[$0] }
         emitted.append(bonus)
+        if recordsGeneratedContext { committedTokenLog.append(contentsOf: emitted) }
         if emitted.count > budget { emitted = Array(emitted.prefix(budget)) }
         guard let last = emitted.last else { return false }
         lastToken = last
@@ -1884,6 +1901,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let token = sampled.reshaped(-1)[0].item(Int.self)
             // Rows the drafter has not read yet accumulate across consecutive AR steps.
             arContextRows.append(hidden)
+            if recordsGeneratedContext { generatedContextRows.append(hidden); committedTokenLog.append(token) }
             pendingTokens.append(token)
             lastToken = token
         }
@@ -1911,6 +1929,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let token = sampled.reshaped(-1)[0].item(Int.self)
         // Rows the drafter has not read yet accumulate across consecutive AR steps.
         arContextRows.append(hidden)
+        if recordsGeneratedContext { generatedContextRows.append(hidden); committedTokenLog.append(token) }
         lastToken = token
         pendingTokens = [token]
         pendingIndex = 0
@@ -2035,16 +2054,82 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // full-prompt snapshot is reusable directly. It is captured before
         // any speculation touched the cache, so it cannot carry a
         // rolled-back recurrent state.
-        guard let snapshot = promptCacheSnapshot,
+        if let snapshot = promptCacheSnapshot,
             snapshot.allSatisfy({ $0.offset == promptTokenIds.count })
+        {
+            coordinator.storeAfterGeneration(
+                promptTokens: promptTokenIds,
+                perLayerData: extractLayerData(from: snapshot),
+                ssmStates: extractSSMStates(from: snapshot),
+                cache: snapshot,
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters.cacheChainId,
+                dflash2Context: promptConditioningContext)
+        }
+        storePostAnswerBoundary(
+            generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary,
+            coordinator: coordinator)
+    }
+
+    /// A completed answer on an all-trimmable target: store the live cache as a post-answer boundary, as the AR
+    /// iterator does, so the next turn restores past the answer instead of re-prefilling it from the prompt
+    /// boundary. The live cache holds exactly the committed rows (`abandonInFlightVerify` ran; rejected drafts were
+    /// trimmed), keyed by the tokens it was forwarded (the last emitted token was never forwarded). The drafter's
+    /// conditioning for those rows is the prompt context plus every committed row since; any row-count mismatch
+    /// stores nothing rather than a misaligned context.
+    private mutating func storePostAnswerBoundary(
+        generatedTokenIds: [Int], includeGeneratedBoundary: Bool, coordinator: CacheCoordinator
+    ) {
+        defer { generatedContextRows.removeAll() }
+        if Self.traceEnabled {
+            RuntimeDiagnostics.write(Data(
+                ("[DFlash2] post-answer gate records=\(recordsGeneratedContext) include=\(includeGeneratedBoundary) "
+                    + "generated=\(generatedTokenIds.count) prompt=\(promptTokenIds.count) "
+                    + "offsets=\(Set(cache.map(\.offset)).sorted()) context=\(promptConditioningContext != nil) "
+                    + "lattice=\(pendingLattice != nil) rows=\(generatedContextRows.reduce(0) { $0 + $1.dim(1) })\n").utf8))
+        }
+        guard recordsGeneratedContext, includeGeneratedBoundary, !generatedTokenIds.isEmpty,
+            let promptContext = promptConditioningContext,
+            let offset = cache.first?.offset, cache.allSatisfy({ $0.offset == offset }),
+            offset > promptTokenIds.count, pendingLattice == nil,
+            committedTokenLog.count >= offset - promptTokenIds.count,
+            committedTokenLog.prefix(generatedTokenIds.count).elementsEqual(generatedTokenIds)
         else { return }
+        let rows = generatedContextRows.reduce(0) { $0 + $1.dim(1) }
+        guard rows == offset - promptTokenIds.count,
+            generatedContextRows.allSatisfy({ $0.dim(-1) == promptContext.hidden.dim(-1) })
+        else {
+            if Self.traceEnabled {
+                RuntimeDiagnostics.write(Data(
+                    "[DFlash2] post-answer store skipped: context rows \(rows) != \(offset - promptTokenIds.count)\n".utf8))
+            }
+            return
+        }
+        // Keep the answer plus the forwarded stop token (the AR iterator's post-answer key); rows a speculative cycle
+        // committed past it were never returned to the caller and are not history.
+        let keep = Swift.min(offset, promptTokenIds.count + generatedTokenIds.count + 1)
+        if keep < offset {
+            for layer in cache { _ = layer.trim(offset - keep) }
+            guard cache.allSatisfy({ $0.offset == keep }) else { return }
+        }
+        let tokens = promptTokenIds + Array(committedTokenLog.prefix(keep - promptTokenIds.count))
+        var hidden = concatenated(
+            [promptContext.hidden] + generatedContextRows.map { $0.asType(promptContext.hidden.dtype) }, axis: 1)
+        hidden = hidden[0..., ..<(keep - promptContext.start), 0...]
+        let context = DFlash2PrefixContext(hidden: hidden, end: keep, layerIDs: orderedLayerIDs)?
+            .trailing(drafterContextLimit)
         coordinator.storeAfterGeneration(
-            promptTokens: promptTokenIds,
-            perLayerData: extractLayerData(from: snapshot),
-            ssmStates: extractSSMStates(from: snapshot),
-            cache: snapshot,
-            mediaSalt: mediaSalt,
+            promptTokens: tokens,
+            perLayerData: extractLayerData(from: cache),
+            ssmStates: nil,
+            cache: cache,
+            mediaSalt: cacheSaltPlan.salt(forBoundary: keep),
             chainId: cacheInitParameters.cacheChainId,
-            dflash2Context: promptConditioningContext)
+            isPostAnswer: true,
+            dflash2Context: context)
+        if Self.traceEnabled {
+            RuntimeDiagnostics.write(Data(
+                "[DFlash2] post-answer boundary stored tokens=\(keep) contextRows=\(hidden.dim(1))\n".utf8))
+        }
     }
 }
