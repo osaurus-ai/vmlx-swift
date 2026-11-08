@@ -61,6 +61,17 @@ enum Glm5NextPrefillMemoryProbe {
     nonisolated(unsafe) static let enabled: Bool =
         ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_MEMORY"] == "1"
 
+    /// Bytes held by derived state the caches keep outside `state`, which `kvcache=` cannot see:
+    /// today, the GLM-5.3 indexer's pooled-key lane.
+    static func derivedBytes(_ caches: [KVCache]) -> Int {
+        caches.reduce(0) { total, cache in
+            guard let lane = (cache as? Glm5NextIndexedKVCache)?.derivedPooledKeys else {
+                return total
+            }
+            return total + lane.size * lane.dtype.size
+        }
+    }
+
     static func report(tokens: Int, caches: [KVCache]) {
         guard enabled else { return }
         var cacheBytes = 0
@@ -74,14 +85,18 @@ enum Glm5NextPrefillMemoryProbe {
         let g = 1024.0 * 1024.0 * 1024.0
         #if canImport(Metal)
         RuntimeDiagnostics.write(Data(String(
-            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG"
+                + " slots=%d lane=%.3fG\n",
             tokens, Double(GPU.activeMemory) / g, Double(GPU.cacheMemory) / g,
-            Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+            Double(GPU.peakMemory) / g, Double(cacheBytes) / g, slots,
+            Double(derivedBytes(caches)) / g).utf8))
         #else
         RuntimeDiagnostics.write(Data(String(
-            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG slots=%d\n",
+            format: "[glm5-mem] tokens=%d active=%.2fG cache=%.2fG peak=%.2fG kvcache=%.3fG"
+                + " slots=%d lane=%.3fG\n",
             tokens, Double(Memory.activeMemory) / g, Double(Memory.cacheMemory) / g,
-            Double(Memory.peakMemory) / g, Double(cacheBytes) / g, slots).utf8))
+            Double(Memory.peakMemory) / g, Double(cacheBytes) / g, slots,
+            Double(derivedBytes(caches)) / g).utf8))
         #endif
     }
 }
@@ -134,6 +149,17 @@ public enum Glm5NextIndexerRuntime {
 
     nonisolated(unsafe) public static var absorbMLA: Bool = {
         let v = ProcessInfo.processInfo.environment["VMLX_GLM5_MLA_ABSORB"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return v == nil || ["1", "true", "yes", "on"].contains(v!)
+    }()
+
+    /// Keep the pooled keys of COMPLETE pools in the indexer's cache, so a decode step pools only
+    /// the rows the cache lacks instead of the whole history. The answer is bit-identical either
+    /// way (`Glm5NextPooledStatesCacheTests`); only the work differs, and that work grows with
+    /// context. Default ON. `VMLX_GLM5_DSA_POOL_CACHE=0` turns it off for A/B, as does any value
+    /// other than 1, true, yes or on, an empty one included.
+    nonisolated(unsafe) public static var poolCache: Bool = {
+        let v = ProcessInfo.processInfo.environment["VMLX_GLM5_DSA_POOL_CACHE"]?
             .trimmingCharacters(in: .whitespaces).lowercased()
         return v == nil || ["1", "true", "yes", "on"].contains(v!)
     }()
@@ -1052,12 +1078,12 @@ public final class Glm5NextIndexer: Module {
         let gateScores = matmul(hidden, gate.transposed()).asType(k.dtype)
         let validChannel = MLXArray.ones([B, S, 1], dtype: k.dtype)
         let packedNew = concatenated([k, gateScores, validChannel], axis: -1)
-        let packed = cache?.updateIndexer(packedNew) ?? packedNew
+        let packed = cache?.updateIndexer(packedNew, allRowsValid: true) ?? packedNew
 
         guard selecting else { return nil }
         let q = wqB(qResid).reshaped(B, S, numHeads, headDim)
         return try selectTopK(
-            packed: packed, queries: q, hidden: hidden, queryOffset: queryOffset)
+            packed: packed, queries: q, hidden: hidden, queryOffset: queryOffset, cache: cache)
     }
 }
 
@@ -1091,6 +1117,77 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     /// anyway because the reference's pooling reads it, and a pooler that cannot express "this slot
     /// is padding" would have to be rewritten rather than fed differently if padding ever arrives.
     public private(set) var indexerPacked: MLXArray?
+
+    /// Whether every row of `indexerPacked` is known to be valid. That is what lets
+    /// `pooledStates(packed:cache:)` lay the pool grid out from row 0 without reading anything
+    /// back.
+    public enum HistoryValidity: Sendable, Equatable {
+        /// Known all-valid: an empty history, one only `Glm5NextIndexer` appended to (it never
+        /// pads), or one checked and found valid.
+        case allRowsValid
+        /// Rows came from elsewhere (a restore, another caller) and have not been checked yet.
+        case unknown
+        /// Checked once, and some row is not valid. The lane stays off for this history.
+        case notAllValid
+    }
+
+    /// DERIVED pooled-index lane: the pooled keys of the first `derivedPooledCount` COMPLETE
+    /// pools, `[B, derivedPooledCount, indexHeadDim]`, in the history's dtype.
+    ///
+    /// A pool's key is a reduction over its own `poolSize` rows, so once a pool is complete its key
+    /// never changes, and a decode step needs to pool only the rows the lane lacks, not the whole
+    /// history. Like `QSAKVCache.derivedPooledBlocks`, it is pure derivation: never serialized
+    /// (`state` leaves it out) and never copied. A restore, a trim that removes rows, and an append
+    /// the indexer did not vouch for each clear it, and the next `pooledStates` rebuilds it in one
+    /// pass.
+    public private(set) var derivedPooledKeys: MLXArray?
+    public private(set) var derivedPooledCount = 0
+
+    /// See `HistoryValidity`. Only the indexer's own appends keep it at `.allRowsValid`.
+    public private(set) var historyValidity: HistoryValidity = .allRowsValid
+
+    /// How many times this cache has resolved `.unknown`, each at the cost of one host sync at
+    /// most.
+    internal private(set) var historyValidityChecks = 0
+
+    func dropDerivedPooledKeys() {
+        derivedPooledKeys = nil
+        derivedPooledCount = 0
+    }
+
+    /// Adopt `keys` as the lane covering the first `count` complete pools. A lane is only ever
+    /// built from, and kept for, an all-valid history.
+    func storeDerivedPooledKeys(_ keys: MLXArray, count: Int) {
+        precondition(keys.dim(1) == count, "a lane holds exactly `count` pools")
+        assert(historyValidity == .allRowsValid, "a lane belongs to an all-valid history only")
+        derivedPooledKeys = keys
+        derivedPooledCount = count
+    }
+
+    /// Whether every row of this cache's own history is valid, read back at most once per
+    /// history.
+    ///
+    /// The validity is the last channel of `indexerPacked`, decoded as `pooledStates` decodes it.
+    /// `.unknown` costs one host sync. A yes is kept until the history is replaced or extended by
+    /// an append the indexer did not vouch for, and a no until the history is replaced. The cache
+    /// reads its own rows rather than an array a caller passes, so no other array can settle this
+    /// answer.
+    func historyIsAllValid() -> Bool {
+        switch historyValidity {
+        case .allRowsValid:
+            return true
+        case .notAllValid:
+            return false
+        case .unknown:
+            historyValidityChecks += 1
+            let allValid =
+                indexerPacked.map {
+                    ($0[.ellipsis, $0.dim(2) - 1] .!= MLXArray(Float(0))).all().item(Bool.self)
+                } ?? true
+            historyValidity = allValid ? .allRowsValid : .notAllValid
+            return allValid
+        }
+    }
 
     /// Which K/V representation this cache holds: the shared `kv_a` latent (compact) or the expanded
     /// per-head K/V.
@@ -1129,11 +1226,24 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     }
 
     /// Append this step's rows and return the whole history.
-    public func updateIndexer(_ new: MLXArray) -> MLXArray {
+    ///
+    /// `allRowsValid` promises that every appended row's validity channel is nonzero, as the
+    /// indexer's own producer writes them: it never pads. A false promise lets `pooledStates` lay
+    /// pools out from row 0, and its result then differs from the full rebuild. Without the
+    /// promise, an all-valid history becomes `.unknown` until `pooledStates` checks it, and the
+    /// lane is dropped.
+    public func updateIndexer(_ new: MLXArray, allRowsValid: Bool = false) -> MLXArray {
+        if !allRowsValid, historyValidity == .allRowsValid {
+            historyValidity = .unknown
+            dropDerivedPooledKeys()
+        }
         if let existing = indexerPacked {
             indexerPacked = concatenated([existing, new], axis: 1)
         } else {
-            indexerPacked = new
+            // Adopt the data, not the caller's wrapper, as the `state` setter does: the lane
+            // recognises this history by object identity, so an in-place write to the caller's
+            // array must not reach it.
+            indexerPacked = new[0..., 0..., 0...]
         }
         return indexerPacked!
     }
@@ -1142,7 +1252,7 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     public var maxSize: Int? { kv.maxSize }
 
     public func innerState() -> [MLXArray] {
-        kv.innerState() + [indexerPacked].compactMap { $0 }
+        kv.innerState() + [indexerPacked, derivedPooledKeys].compactMap { $0 }
     }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -1152,6 +1262,9 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     public var state: [MLXArray] {
         get { kv.state + [indexerPacked].compactMap { $0 } }
         set {
+            // Whatever lane this cache held describes some other history. It is rebuilt on the
+            // next `pooledStates`.
+            dropDerivedPooledKeys()
             // The serialized layout is [keys, values, optional indexer],
             // independent of whether the destination has received tokens.
             // Inferring the layout from a fresh destination's empty state
@@ -1159,11 +1272,16 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
             if newValue.isEmpty {
                 kv = KVCacheSimple()
                 indexerPacked = nil
+                historyValidity = .allRowsValid
                 return
             }
             precondition(newValue.count == 2 || newValue.count == 3)
             kv.state = Array(newValue.prefix(2))
-            indexerPacked = newValue.count == 3 ? newValue[2] : nil
+            // Adopt the data, not the caller's mutable Swift wrapper, as `QSAKVCache` does:
+            // `pooledStates` recognises this history by object identity, so a later in-place
+            // write to the caller's array must not reach it.
+            indexerPacked = newValue.count == 3 ? newValue[2][0..., 0..., 0...] : nil
+            historyValidity = .unknown
         }
     }
 
@@ -1177,9 +1295,14 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
     @discardableResult
     public func trim(_ n: Int) -> Int {
         let trimmed = kv.trim(n)
-        if trimmed > 0, let packed = indexerPacked {
-            let keep = max(0, packed.dim(1) - trimmed)
-            indexerPacked = keep > 0 ? packed[0..., ..<keep, 0...] : nil
+        if trimmed > 0 {
+            // A trim can cut into a pool the lane covers, and the rows that replace the cut ones
+            // differ. Rebuilt on the next `pooledStates`.
+            dropDerivedPooledKeys()
+            if let packed = indexerPacked {
+                let keep = max(0, packed.dim(1) - trimmed)
+                indexerPacked = keep > 0 ? packed[0..., ..<keep, 0...] : nil
+            }
         }
         return trimmed
     }
@@ -1206,6 +1329,9 @@ public final class Glm5NextIndexedKVCache: DiskCacheStateProviding {
         copy.kv.metaState = kv.metaState
         copy.kv.offset = kv.offset
         copy.indexerPacked = indexerPacked.map(Self.owned)
+        // The copy holds the same rows, so it inherits what is known about them. It does NOT take
+        // the lane, which is derived state: it rebuilds its own on first use.
+        copy.historyValidity = historyValidity
         return copy
     }
 
@@ -1236,14 +1362,25 @@ extension Glm5NextIndexer {
     /// boundary. And a pool is valid only if ALL `K` of its members are — an incomplete trailing
     /// pool is never selectable, which is precisely why `index_kpool_always_select_tail` exists to
     /// put those tokens back.
+    ///
+    /// With `cache`, the cache whose history `packed` IS, the pooled keys of complete pools are
+    /// kept in the cache's derived lane and reused on later calls, so a decode step pools only the
+    /// rows the lane lacks. The answer is identical either way; see `pooledStatesFromLane`.
     public func pooledStates(
-        packed: MLXArray
+        packed: MLXArray, cache: Glm5NextIndexedKVCache? = nil
     ) throws -> (keys: MLXArray, indices: MLXArray, valid: MLXArray) {
         let B = packed.dim(0)
         let N = packed.dim(1)
         let keys = packed[.ellipsis, ..<headDim]
         let gate = packed[.ellipsis, headDim ..< (2 * headDim)]
         let valid = packed[.ellipsis, 2 * headDim] .!= MLXArray(Float(0))
+
+        if let cache,
+            let fromLane = try pooledStatesFromLane(
+                packed: packed, cache: cache, keys: keys, gate: gate, valid: valid)
+        {
+            return fromLane
+        }
 
         // Pool layout is shared across the batch only when every sequence starts at the same slot.
         // Without padding that is trivially true; with it, per-sequence gathers would be required,
@@ -1267,18 +1404,46 @@ extension Glm5NextIndexer {
         }
 
         let poolCount = (N + poolSize - 1) / poolSize
-        let offsets = Glm5NextIndexerRuntime.layoutRange(poolCount * poolSize)
-            .reshaped(poolCount, poolSize)
+        return try poolRows(0 ..< poolCount, keys: keys, gate: gate, valid: valid, start: start)
+    }
+
+    /// Pool the members of each pool in `grid`: the pooling arithmetic, shared by every path.
+    ///
+    /// `grid` indexes POOLS of the `(P, poolSize)` layout that `pooledStates` lays out from
+    /// `start`, not history rows. `keys`, `gate` and `valid` are taken from the packed history.
+    /// Returns the pooled keys `(B, grid.count, headDim)`, the indices `(grid.count, poolSize)`
+    /// and the validity `(B, grid.count)`.
+    ///
+    /// A pool's key reduces over its own `poolSize` members only, a softmax over the member axis
+    /// and then a weighted sum. So pooling part of the grid yields, for those pools, exactly what
+    /// pooling the whole grid does.
+    private func poolRows(
+        _ grid: Range<Int>, keys: MLXArray, gate: MLXArray, valid: MLXArray, start: MLXArray
+    ) throws -> (keys: MLXArray, indices: MLXArray, valid: MLXArray) {
+        precondition(
+            grid.lowerBound >= 0, "a pool range must start at or after the grid's first pool")
+        let B = keys.dim(0)
+        let N = keys.dim(1)
+        let dtype = keys.dtype
+        let (lo, hi) = (grid.lowerBound, grid.upperBound)
+        let pools = hi - lo
+        precondition(
+            Glm5NextIndexerRuntime.layoutRangeCountIsRepresentable(hi * poolSize),
+            "GLM layout count exceeds Int32 range")
+        // Built on the device: an `MLXArray` made from a Swift range would fill these offsets on
+        // the host, O(N) per layer per step; `arange` produces them in place.
+        let offsets = MLXArray.arange(lo * poolSize, hi * poolSize, dtype: .int32)
+            .reshaped(pools, poolSize)
         let poolIndices = offsets + start
         let safe = clip(poolIndices, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
         let flatSafe = safe.reshaped(-1)
 
         let groupedKeys = take(keys, flatSafe, axis: 1)
-            .reshaped(B, poolCount, poolSize, headDim)
+            .reshaped(B, pools, poolSize, headDim)
         let groupedGate = take(gate, flatSafe, axis: 1)
-            .reshaped(B, poolCount, poolSize, headDim)
+            .reshaped(B, pools, poolSize, headDim)
         var groupedValid = take(valid, flatSafe, axis: 1)
-            .reshaped(B, poolCount, poolSize)
+            .reshaped(B, pools, poolSize)
         groupedValid = groupedValid .&& (poolIndices .< MLXArray(Int32(N)))
 
         let poolValid = groupedValid.all(axis: -1)
@@ -1290,43 +1455,119 @@ extension Glm5NextIndexer {
         // A LEARNED weighted average within each pool: softmax over the POOL-MEMBER axis, per
         // feature channel — not one scalar weight per member.
         //
-        // The gathers above span the ENTIRE packed index history and this
-        // runs every decode step, so fp32 casts here materialized two
-        // full-context fp32 tensors per token (the MLA-cast tax class).
-        // The softmax reduces over the tiny pool-member axis only, and the
-        // pooled keys feed SELECTION scores, so native-dtype math changes
-        // at most near-tie pool choices. `VMLX_GLM5_INDEX_FP32=1` restores
-        // the fp32 pipeline for A/B.
+        // The gathers above cover every row being pooled. On a full rebuild
+        // that is the ENTIRE packed index history, and pooling runs every
+        // decode step. On that path, fp32 casts here materialized two
+        // full-context fp32 tensors per token (the MLA-cast tax class). The
+        // softmax reduces over the tiny pool-member axis only, and the pooled
+        // keys feed SELECTION scores, so native-dtype math changes at most
+        // near-tie pool choices. `VMLX_GLM5_INDEX_FP32=1` restores the fp32
+        // pipeline for A/B.
         let poolMathDtype: DType =
-            Glm5NextIndexerRuntime.poolFP32 ? .float32 : packed.dtype
+            Glm5NextIndexerRuntime.poolFP32 ? .float32 : dtype
         var logits = groupedGate.asType(poolMathDtype)
             + ape.asType(poolMathDtype)[.newAxis, .newAxis]
         logits = MLX.where(
             groupedValid.expandedDimensions(axis: -1), logits,
             MLXArray(-Float.greatestFiniteMagnitude).asType(poolMathDtype))
         var probabilities = softmax(logits, axis: 2)
-        // A fully invalid pool softmaxes -inf against -inf and yields NaN; it is masked out of the
-        // selection anyway, but a NaN here would poison the pooled key and, through it, the scores
-        // of every VALID pool in the same matmul.
+        // A fully invalid pool masks every member. With float32 pool math the mask value is
+        // finite, so its softmax is uniform: the mean of its members' keys. In float16 and
+        // bfloat16 the mask rounds to -inf, the softmax is NaN, and this guard zeroes it. Either
+        // way the pool is masked out of the selection; the guard keeps a NaN out of the pooled
+        // keys, which feed the selection matmul.
         probabilities = MLX.where(
             isNaN(probabilities), MLXArray(Float(0)).asType(poolMathDtype), probabilities)
         let pooled = (probabilities * groupedKeys.asType(poolMathDtype)).sum(axis: 2)
 
-        return (pooled.asType(packed.dtype), poolIndices, poolValid)
+        return (pooled.asType(dtype), poolIndices, poolValid)
+    }
+
+    /// The incremental path: what the cache's lane already holds is reused, and only the rows it
+    /// lacks are pooled. Returns nil whenever the full rebuild must run instead.
+    ///
+    /// Exact, not approximate, for three reasons:
+    /// - A pool's key reduces over its own `poolSize` members only, so pooling part of the grid
+    ///   gives those pools' values (`poolRows`).
+    /// - A complete pool's rows never change while the lane lives: a restore, a trim that removes
+    ///   rows, and an append the indexer did not vouch for each clear it.
+    /// - Under `.allRowsValid` the full path's `start` is 0, so the grid here starts at row 0
+    ///   without reading anything back.
+    private func pooledStatesFromLane(
+        packed: MLXArray, cache: Glm5NextIndexedKVCache, keys: MLXArray, gate: MLXArray,
+        valid: MLXArray
+    ) throws -> (keys: MLXArray, indices: MLXArray, valid: MLXArray)? {
+        let B = packed.dim(0)
+        let N = packed.dim(1)
+        // Host-only checks first. The validity check, last, may sync and changes the cache's
+        // state, and a call with an array that is not this cache's history must cause neither.
+        //
+        // Identity, not equality: `packed` is the cache's history only if it is the very object
+        // `indexerPacked` holds. Every append, trim and restore assigns a new object, so this pins
+        // one exact history. It relies on nobody mutating `indexerPacked` in place.
+        guard Glm5NextIndexerRuntime.poolCache, N > 0, packed === cache.indexerPacked,
+            poolPositionalCode != nil, cache.historyIsAllValid()
+        else { return nil }
+
+        // The lane holds keys pooled under ONE configuration, this indexer's parameters and
+        // `Glm5NextIndexerRuntime.poolFP32`, both fixed for the life of a process. Each DSA layer
+        // owns its cache; a cache must never be shared between indexers.
+        let poolCount = (N + poolSize - 1) / poolSize
+        let completed = N / poolSize
+        // A lane of another batch width or dtype cannot be spliced in, and is replaced below.
+        let lane = cache.derivedPooledKeys.flatMap {
+            $0.dim(0) == B && $0.dtype == packed.dtype ? $0 : nil
+        }
+        let laneCount = lane == nil ? 0 : cache.derivedPooledCount
+        let reused = min(laneCount, completed)
+
+        let pooled: MLXArray
+        let poolValid: MLXArray
+        if reused < poolCount {
+            let fresh = try poolRows(
+                reused ..< poolCount, keys: keys, gate: gate, valid: valid,
+                start: MLXArray(Int32(0)))
+            if let lane, reused > 0 {
+                pooled = concatenated([lane[0..., ..<reused, 0...], fresh.keys], axis: 1)
+                // Every complete pool of an all-valid history is valid.
+                poolValid = concatenated(
+                    [MLXArray.ones([B, reused], dtype: .bool), fresh.valid], axis: 1)
+            } else {
+                pooled = fresh.keys
+                poolValid = fresh.valid
+            }
+        } else {
+            // `N` is a multiple of `poolSize` and the lane already covers every pool, as on a
+            // second call at the same length. Nothing is fresh, and every pool is valid.
+            pooled = lane![0..., ..<poolCount, 0...]
+            poolValid = MLXArray.ones([B, poolCount], dtype: .bool)
+        }
+        let poolIndices = Glm5NextIndexerRuntime.layoutRange(poolCount * poolSize)
+            .reshaped(poolCount, poolSize)
+
+        // Complete pools only. The trailing partial pool changes with the next append.
+        if completed > laneCount {
+            cache.storeDerivedPooledKeys(pooled[0..., ..<completed, 0...], count: completed)
+        }
+        return (pooled, poolIndices, poolValid)
     }
 
     /// Select the pools each query attends to, and expand them back into raw token indices.
     ///
     /// The result is `(B, S, width)` of Int32 where -1 means "nothing selected here"; `width` is
     /// `index_topk`, plus `index_kpool - 1` when the incomplete tail is always appended.
+    ///
+    /// With `cache`, the cache whose history `packed` is, pooling reuses the cache's lane; see
+    /// `pooledStates(packed:cache:)`.
     public func selectTopK(
-        packed: MLXArray, queries: MLXArray, hidden: MLXArray, queryOffset: Int
+        packed: MLXArray, queries: MLXArray, hidden: MLXArray, queryOffset: Int,
+        cache: Glm5NextIndexedKVCache? = nil
     ) throws -> MLXArray {
         let B = packed.dim(0)
         let N = packed.dim(1)
         let S = hidden.dim(1)
 
-        let (poolKeys, poolIndices, poolValid) = try pooledStates(packed: packed)
+        let (poolKeys, poolIndices, poolValid) = try pooledStates(packed: packed, cache: cache)
         let poolCount = poolIndices.dim(0)
 
         // (B, S, H, D) @ (B, 1, D, P) -> (B, S, H, P)
