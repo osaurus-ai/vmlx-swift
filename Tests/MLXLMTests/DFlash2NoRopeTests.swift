@@ -24,6 +24,8 @@ final class DFlash2NoRopeTests: XCTestCase {
     }
 
     func testDefaultAndExplicitLayerSelection() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
         for value: Any? in [nil, [Int]()] {
             let config = try configuration(value)
             XCTAssertTrue(config.noRopeLayers.isEmpty)
@@ -62,8 +64,8 @@ final class DFlash2NoRopeTests: XCTestCase {
         }
         eval(plain(query, context: context, rope: rope, cache: a))
         eval(rotated(query, context: context, rope: rope, cache: b))
-        let keysA = a.state[0][0..., 0..., 7..<9, 0...]
-        let keysB = b.state[0][0..., 0..., 7..<9, 0...]
+        let keysA = a.state[0][0..., 0..., 7 ..< 9, 0...]
+        let keysB = b.state[0][0..., 0..., 7 ..< 9, 0...]
         XCTAssertLessThan(abs(keysA - expected).max().item(Float.self), 1e-5)
         XCTAssertLessThan(abs(keysB - rope(expected, offset: 7)).max().item(Float.self), 1e-5)
         XCTAssertGreaterThan(abs(keysB - expected).max().item(Float.self), 1e-3)

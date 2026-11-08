@@ -168,7 +168,8 @@ public struct DFlash2Configuration: Sendable {
         self.maxPositionEmbeddings = (root["max_position_embeddings"] as? Int) ?? 131_072
 
         // `rope_parameters` (transformers ≥5) or the legacy flat key.
-        let ropeObject = (root["rope_parameters"] as? [String: Any])
+        let ropeObject =
+            (root["rope_parameters"] as? [String: Any])
             ?? (root["rope_scaling"] as? [String: Any])
         self.ropeTheta =
             ((root["rope_theta"] as? NSNumber)?.floatValue)
@@ -227,10 +228,13 @@ public struct DFlash2Configuration: Sendable {
         self.hasConfidenceHead = (any("enable_confidence_head") as? Bool) ?? false
         let noRope: [Int]
         if let declared = root["no_rope_layers"] {
-            guard let data = try? JSONSerialization.data(withJSONObject: declared, options: .fragmentsAllowed),
+            guard
+                let data = try? JSONSerialization.data(
+                    withJSONObject: declared, options: .fragmentsAllowed),
                 let indices = try? JSONDecoder().decode([Int].self, from: data)
             else {
-                throw DFlash2LoadError.targetMismatch("no_rope_layers must be an array of integer layer indices")
+                throw DFlash2LoadError.targetMismatch(
+                    "no_rope_layers must be an array of integer layer indices")
             }
             noRope = indices
         } else {
@@ -238,7 +242,8 @@ public struct DFlash2Configuration: Sendable {
         }
         let layerCount = self.numHiddenLayers
         guard noRope.allSatisfy({ $0 >= 0 && $0 < layerCount }) else {
-            throw DFlash2LoadError.targetMismatch("no_rope_layers names a layer outside the drafter")
+            throw DFlash2LoadError.targetMismatch(
+                "no_rope_layers names a layer outside the drafter")
         }
         self.noRopeLayers = Set(noRope)
         self.dflash = inner
@@ -338,7 +343,8 @@ final class GroupedDynamicCausalConv: Module {
         hidden: MLXArray, dynamic: MLXArray, base: MLXArray, groupSize: Int
     ) -> MLXArray {
         if convTraceEnabled {
-            let line = "[DFlash2Conv] hidden=\(hidden.shape) dynamic=\(dynamic.shape)"
+            let line =
+                "[DFlash2Conv] hidden=\(hidden.shape) dynamic=\(dynamic.shape)"
                 + " base=\(base.shape) groupSize=\(groupSize)\n"
             RuntimeDiagnostics.write(Data(line.utf8))
         }
@@ -619,7 +625,8 @@ final class DFlash2DecoderLayer: Module {
         }
         var residual = x
         var (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
-        h = residual
+        h =
+            residual
             + attentionConv.finish(
                 attention(h, context: context, rope: rope, cache: cache), dynamic: kernel)
 
@@ -730,9 +737,11 @@ final class DFlash2CandidateSelector: Module {
             } else {
                 selected = argMax(scores, axis: -1)
             }
-            predecessor = takeAlong(
-                candidates[0..., position, 0...], selected.expandedDimensions(axis: -1), axis: -1
-            )[0..., 0]
+            predecessor =
+                takeAlong(
+                    candidates[0..., position, 0...], selected.expandedDimensions(axis: -1),
+                    axis: -1
+                )[0..., 0]
             path.append(predecessor)
         }
 
@@ -758,7 +767,8 @@ extension DFlash2CandidateSelector {
         let projected = hiddenProjection(hidden).asType(.float32)  // [1, L, R]
         let successor = successorCodebook(candidates).asType(.float32)  // [1, L, K, R]
         let anchor = predecessorCodebook(anchorIds).asType(.float32)  // [1, R]
-        let rootEdges = (anchor.expandedDimensions(axis: 1)
+        let rootEdges =
+            (anchor.expandedDimensions(axis: 1)
             * projected[0..., 0, 0...].expandedDimensions(axis: 1)
             * successor[0..., 0, 0..., 0...]).sum(axis: -1)  // [1, K]
         var edges: MLXArray? = nil
@@ -1071,12 +1081,14 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
                 // Sample from the top-K restriction so q is exactly zero outside `candidates`, which is what the
                 // sampled accept test (and its residual) assumes, as with the DFlash 2 selector.
                 let vocab = scores.dim(-1)
-                let candidates = argPartition(scores, kth: vocab - topK, axis: -1)[0..., (vocab - topK)...]
+                let candidates = argPartition(scores, kth: vocab - topK, axis: -1)[
+                    0..., (vocab - topK)...]
                 let q = DFlash2Sampling.probabilities(
                     takeAlong(scores, candidates, axis: -1).expandedDimensions(axis: 1),
                     temperature: temperature)[0..., 0, 0...]
                 let chosen = DFlash2Sampling.sample(probabilities: q)
-                previous = takeAlong(candidates, chosen.expandedDimensions(axis: -1), axis: -1)[0..., 0]
+                previous =
+                    takeAlong(candidates, chosen.expandedDimensions(axis: -1), axis: -1)[0..., 0]
                 candidateRows.append(candidates)
                 probabilityRows.append(q)
             } else {
