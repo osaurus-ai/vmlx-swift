@@ -705,16 +705,32 @@ public final class Glm5NextSparseAttention: Module {
     ///
     /// The weight must be DEQUANTIZED first: the absorbed form multiplies it into the query rather
     /// than applying it as a layer, so the packed representation cannot be used directly.
+    ///
+    /// HYDRATE IN THE ACTIVATION DTYPE, which is why `dtype` is a parameter rather than left to the
+    /// default. `dequantized` types its output as `result_type(scales, biases)`, and this bundle
+    /// stores those as float16 while the activations are bfloat16 — so hydrating at the default put
+    /// a float16 array behind a use site that casts to the query dtype, and `asType` short-circuits
+    /// ONLY on an exact match. The cast therefore converted all 33 MB, on all 11 MLA layers, on
+    /// every decode step: ~740 MB of dtype conversion per token, buying nothing. It cannot simply be
+    /// dropped either, because float16 meeting bfloat16 promotes to float32 in MLX rather than to
+    /// one of the two. Asking for the target dtype here makes the use-site cast free and never
+    /// materializes the float16 copy at all. The reference reaches the same place by hardcoding
+    /// bfloat16 after its own dequantize; taking it from the caller also holds for a model whose
+    /// activations are not bfloat16.
     private var wKNope: MLXArray?
     private var wKV: MLXArray?
+    private var wKBDType: DType?
 
-    private func kbFactors() -> (MLXArray, MLXArray) {
-        if let k = wKNope, let v = wKV { return (k, v) }
+    /// Internal rather than private so that `Glm5NextKbFactorDTypeTests` can check the dtype.
+    func kbFactors(dtype: DType) -> (MLXArray, MLXArray) {
+        if let k = wKNope, let v = wKV, wKBDType == dtype { return (k, v) }
         var w = kvBProj.weight
         if let q = kvBProj as? QuantizedLinear {
             w = dequantized(
                 w, scales: q.scales, biases: q.biases,
-                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode, dtype: dtype)
+        } else {
+            w = w.asType(dtype)
         }
         w = w.reshaped(numHeads, qkNopeHeadDim + vHeadDim, -1)
         let k = w[0..., ..<qkNopeHeadDim, 0...]
@@ -722,6 +738,7 @@ public final class Glm5NextSparseAttention: Module {
         eval(k, v)
         wKNope = k
         wKV = v
+        wKBDType = dtype
         return (k, v)
     }
 
@@ -909,7 +926,7 @@ public final class Glm5NextSparseAttention: Module {
                 // DECODE, and the sparse path: attend in latent space. `q·Kᵀ = (q·W_k)·Cᵀ`, so the
                 // query absorbs `W_k`; `A·V = (A·C)·W_vᵀ`, so the output absorbs `W_v`. `scale` is
                 // unchanged because it is the same dot product, merely regrouped.
-                let (wk, wv) = kbFactors()
+                let (wk, wv) = kbFactors(dtype: q.dtype)
                 let qEff = matmul(q, wk.expandedDimensions(axis: 0).asType(q.dtype))
                 let attended: MLXArray
                 if let selected, Glm5NextIndexerRuntime.gatherSelected {
