@@ -13,7 +13,7 @@ final class RotatingRestoreIsolationTests: XCTestCase {
         for nested in [false, true] {
             for keep in [0, 1] {
                 let source = RotatingKVCache(maxSize: 5, keep: keep, step: 1)
-                for token in 1...12 { append(Float(token), to: source) }
+                for token in 1 ... 12 { append(Float(token), to: source) }
                 let retained: [any KVCache] = nested ? [CacheList(source)] : [source]
                 let payload = TQDiskSerializer.serialize(cache: retained)
                 eval(Array(payload.values))
@@ -27,7 +27,7 @@ final class RotatingRestoreIsolationTests: XCTestCase {
                 var secondTarget: [any KVCache] = nested ? [CacheList(second)] : [second]
                 XCTAssertEqual(restoreFromDiskArrays(payload, into: &firstTarget), 12)
                 XCTAssertEqual(restoreFromDiskArrays(payload, into: &secondTarget), 12)
-                for token in 13...24 { append(Float(token), to: first) }
+                for token in 13 ... 24 { append(Float(token), to: first) }
                 XCTAssertEqual(first.offset, 24)
                 XCTAssertNotEqual(first.state.map { $0.asArray(Float.self) }, expected)
                 XCTAssertEqual(second.state.map { $0.asArray(Float.self) }, expected)
