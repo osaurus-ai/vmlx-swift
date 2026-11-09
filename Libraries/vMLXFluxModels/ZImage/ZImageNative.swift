@@ -1134,8 +1134,6 @@ final class ZImageNativePipeline {
 
     func generate(
         prompt: String,
-        negativePrompt: String?,
-        guidance: Float,
         width: Int,
         height: Int,
         steps: Int,
@@ -1148,7 +1146,9 @@ final class ZImageNativePipeline {
         let start = Date()
         var latents = initialNoise(width: width, height: height, seed: seed)
         let textEncodings = encodePrompt(prompt)
-        let negativeEncodings = (guidance > 0 && negativePrompt != nil) ? encodePrompt(negativePrompt ?? "") : nil
+        // This pipeline is registered only for the distilled Turbo model.
+        // Its publisher and mflux 0.18 ModelConfig disable CFG; base Z-Image's
+        // negative branch must not be applied to these Turbo weights.
         let sigmas = linearSigmas(steps: steps)
         for step in 0..<steps {
             try FluxInterruptScope.check()
@@ -1156,11 +1156,7 @@ final class ZImageNativePipeline {
                 throw CancellationError()
             }
             let timestep = MLXArray([Float(1) - sigmas[step]])
-            var noise = transformer(x: latents, timestep: timestep, capFeats: textEncodings)
-            if let negativeEncodings {
-                let negativeNoise = transformer(x: latents, timestep: timestep, capFeats: negativeEncodings)
-                noise = noise + MLXArray(guidance) * (noise - negativeNoise)
-            }
+            let noise = transformer(x: latents, timestep: timestep, capFeats: textEncodings)
             latents = latents + noise * MLXArray(sigmas[step + 1] - sigmas[step])
             eval(latents)
             preview?.emit(step: step + 1) {
