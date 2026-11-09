@@ -81,8 +81,6 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
                     defer { preview?.close() }
         let image = try await pipeline.generate(
             prompt: request.prompt,
-            negativePrompt: request.negativePrompt,
-            guidance: request.guidance,
             width: request.width,
             height: request.height,
             steps: request.steps,
@@ -100,7 +98,9 @@ public final class ZImage: ImageGenerator, @unchecked Sendable {
         )
         continuation.yield(.completed(url: outURL, seed: seed,
             effectiveParameters: try NativeImageRequestContracts.parameters(url: outURL,
-                steps: request.steps, guidance: request.negativePrompt != nil && request.guidance > 0 ? request.guidance : 0,
+                // Turbo is guidance-distilled. Like its publisher and mflux
+                // ModelConfig, it accepts legacy options without using CFG.
+                steps: request.steps, guidance: 0,
                 seed: seed, scheduler: "z-image-linear")))
     }
 
