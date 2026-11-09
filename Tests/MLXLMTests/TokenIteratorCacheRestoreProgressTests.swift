@@ -52,7 +52,7 @@ private final class CacheRestoreProgressRecorder: @unchecked Sendable {
 
 /// A real iterator pipeline with distinguishable visible, stop and lookahead
 /// tokens. Cache values record the tokens actually forwarded through the model.
-private final class PostAnswerBoundaryModel: Module, LanguageModel, @unchecked Sendable {
+private class PostAnswerBoundaryModel: Module, LanguageModel, @unchecked Sendable {
     var vocabularySize: Int { 32 }
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -77,7 +77,39 @@ private final class PostAnswerBoundaryModel: Module, LanguageModel, @unchecked S
     }
 }
 
+private final class ToolBoundaryModel: PostAnswerBoundaryModel,
+    ToolCallTurnBoundaryModel, @unchecked Sendable {}
+
 final class TokenIteratorCacheRestoreProgressTests: XCTestCase {
+    func testToolCallBoundaryDropsForwardedLookahead() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+            modelKey: "tool-call-boundary"))
+        let input = LMInput(tokens: MLXArray([Int32(1)]))
+        let settings = GenerateParameters(maxTokens: 8, temperature: 0)
+        var iterator = try TokenIterator(
+            input: input, model: ToolBoundaryModel(), parameters: settings,
+            cacheCoordinator: coordinator)
+        XCTAssertTrue(iterator.storesToolCallTurnBoundary)
+        XCTAssertEqual(iterator.next(), 10)
+        XCTAssertEqual(iterator.next(), 11)
+        iterator.noteEndedOnToolCall()
+        iterator.storeCacheAfterGeneration(generatedTokenIds: [10], includeGeneratedBoundary: true)
+        XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+        guard case .hit(let matched, _, _, _, _, let arrays) = coordinator.fetch(
+            tokens: [1, 10, 11, 13], mediaSalt: computeCacheSalt(for: input, parameters: settings))
+        else { return XCTFail("tool-call boundary missing") }
+        XCTAssertEqual(matched, 2)
+        let stored = try XCTUnwrap(arrays)
+        var restored: [KVCache] = [KVCacheSimple(), RotatingKVCache(maxSize: 16, keep: 0)]
+        XCTAssertEqual(restoreFromDiskArrays(stored, into: &restored), 2)
+        XCTAssertEqual(restored[0].state[0].asArray(Float.self), [1, 10])
+    }
+
     func testLegacyLookaheadBoundaryCannotRestoreUnderCurrentPolicy() throws {
         let mlxLock = lockSerializedMLXTest()
         defer { mlxLock.unlock() }
