@@ -319,13 +319,22 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// - Parameter tokens: The full token sequence to match.
     /// - Returns: A ``PrefixFetchResult`` describing how many tokens matched
     ///   and which blocks hold the cached data, or `nil` if no prefix matches.
-    public func fetchPrefix(tokens: [Int], mediaSalt: String? = nil) -> PrefixFetchResult? {
+    public func fetchPrefix(
+        tokens: [Int], mediaSalt: String? = nil,
+        requireBoundaryCompanion: Bool = false
+    ) -> PrefixFetchResult? {
         lock.lock()
         defer { lock.unlock() }
 
         var parentHash: String? = nil
         var matchedBlocks: [CacheBlock] = []
         var offset = 0
+        // A longer full-block match may bypass a restorable partial leaf.
+        // Remember the best complete boundary while walking the ordinary
+        // chain; selecting only a companion on that chain loses valid reuse.
+        var bestBoundary: (parents: Int, leaf: CacheBlock, tokens: Int)?
+        let partialBoundaries = requireBoundaryCompanion
+            ? hashMap.partialBoundaryCompanionIndex() : nil
 
         while offset < tokens.count {
             let end = min(offset + blockSize, tokens.count)
@@ -333,6 +342,13 @@ public final class PagedCacheManager: @unchecked Sendable {
             let hash = CacheBlock.computeBlockHash(
                 parentHash: parentHash, tokenIds: chunk,
                 modelKey: modelKey, mediaSalt: mediaSalt)
+            if requireBoundaryCompanion,
+               let partial = partialBoundaries?.findLongestPartialPrefix(
+                    parentHash: parentHash, tokenIds: chunk, modelKey: modelKey,
+                    mediaSalt: mediaSalt)
+            {
+                bestBoundary = (matchedBlocks.count, partial, offset + partial.tokenCount)
+            }
             let exact = hashMap.find(hash: hash)
             let block = exact ?? hashMap.findLongestPartialPrefix(
                 parentHash: parentHash,
@@ -354,6 +370,9 @@ public final class PagedCacheManager: @unchecked Sendable {
                 matchedBlocks.append(block)
                 parentHash = block.blockHash
                 offset += block.tokenCount
+                if requireBoundaryCompanion, block.boundaryCompanionData != nil {
+                    bestBoundary = (matchedBlocks.count - 1, block, offset)
+                }
                 // A stored partial leaf is a complete cache boundary. It can
                 // seed the remaining prompt, but no later fixed-size block can
                 // be chained after it because block partitioning restarts from
@@ -366,6 +385,30 @@ public final class PagedCacheManager: @unchecked Sendable {
         }
 
         guard !matchedBlocks.isEmpty else { return nil }
+        if requireBoundaryCompanion {
+            guard let boundary = bestBoundary else {
+                for block in matchedBlocks { _freeBlock(block) }
+                return nil
+            }
+            let selected = Array(matchedBlocks.prefix(boundary.parents)) + [boundary.leaf]
+            let selectedIDs = Set(selected.map(\.blockId))
+            let leafAlreadyPinned = matchedBlocks.contains { $0 === boundary.leaf }
+            for block in matchedBlocks where !selectedIDs.contains(block.blockId) {
+                _freeBlock(block)
+            }
+            if !leafAlreadyPinned {
+                // The manager lock protects this off-chain candidate until it
+                // is pinned; it cannot be recycled during boundary selection.
+                if boundary.leaf.refCount == 0 {
+                    _ = freeQueue.remove(boundary.leaf)
+                    stats.allocatedBlocks += 1
+                    stats.freeBlocks -= 1
+                }
+                boundary.leaf.incrementRef()
+            }
+            matchedBlocks = selected
+            offset = boundary.tokens
+        }
 
         let matchedTokens = matchedBlocks.reduce(0) { $0 + $1.tokenCount }
         let remainingTokens = Array(tokens[offset...])
