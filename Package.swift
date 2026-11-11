@@ -869,6 +869,7 @@ let package = Package(
             dependencies: ["MLX", "MLXLMCommon", "MLXLLM", "MLXVLM", "VMLXJinja", "VMLX"],
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
+                "TokenIteratorAdditionalProcessorTests.swift",
                 "MultiRowDecodeAttentionTests.swift",
                 "ProposalHeadStampTests.swift",
                 "DFlash2TreeAndTopKAcceptanceTests.swift",
