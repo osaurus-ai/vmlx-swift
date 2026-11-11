@@ -1489,9 +1489,13 @@ public enum NativeMTPPhaseDiagnostics {
     private static let storage = Storage()
 
     public static var enabled: Bool {
-        let env = ProcessInfo.processInfo.environment
-        return env["VMLX_NATIVE_MTP_PHASE_DIAG"] == "1"
-            || env["VMLINUX_NATIVE_MTP_PHASE_DIAG"] == "1"
+        // Qwen checks this twice per decoder layer even during ordinary AR
+        // generation. Read only these variables instead of rebuilding the
+        // entire process environment on every check. Preserve the original
+        // OR contract: a legacy "1" still enables diagnostics when the
+        // current spelling is present with another value. Values stay live.
+        RuntimeEnvironment.value("VMLX_NATIVE_MTP_PHASE_DIAG") == "1"
+            || RuntimeEnvironment.value("VMLINUX_NATIVE_MTP_PHASE_DIAG") == "1"
     }
 
     public static func reset() {
