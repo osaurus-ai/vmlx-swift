@@ -7,7 +7,7 @@ import MLX
     import Darwin
 #endif
 
-/// How much of the host's remaining memory a single prefix-cache store may take.
+/// How much process-budget headroom one prefix-cache store may take.
 ///
 /// This is the engine-side projection of the user's memory-safety level. The
 /// resolver in `ServerRuntimeSettings` turns that level into load-time caps
@@ -27,7 +27,8 @@ import MLX
 /// the safety level bite without that collapse.
 public struct CacheStorePolicy: Sendable, Equatable {
 
-    /// Share of current free headroom (`physical - active`) that one store may use.
+    /// Share of process-budget headroom (`physical - footprint`) a store may use.
+    /// This estimate is separate from the host-pressure veto below.
     public var headroomFraction: Double
 
     public init(headroomFraction: Double) {
@@ -104,16 +105,19 @@ public enum CacheStoreBudget {
         }
     }
 
-    /// Whether storing `cache` fits in what the host can still give us.
+    /// Whether an optional store is allowed by host pressure and its byte budget.
     ///
-    /// Budgeted against **physical memory**, not the GPU working set. The working
+    /// The byte estimate uses **physical memory**, not the GPU working set. The working
     /// set is the wrong ceiling for this decision in both directions: exceeding it
     /// only means macOS pages the excess — slow, survivable — whereas exhausting
     /// physical memory is what actually kills the host, and that is the only thing
-    /// this guard exists to prevent.
+    /// this guard exists to prevent. Process footprint is not total host use and
+    /// can omit substantial GPU/mmap occupancy. Independently refuse nonempty
+    /// optional stores when the kernel already reports warning/critical pressure.
     public static func canStore(_ cache: [KVCache]) -> Bool {
         let liveBytes = cacheBytes(cache)
         guard liveBytes > 0 else { return true }
+        let hostPressureLevel = currentHostMemoryPressureLevel()
         let physicalFootprint = currentProcessPhysicalFootprintBytes()
         let activeBytes = activeBytesForStoreBudget(
             physicalFootprintBytes: physicalFootprint,
@@ -123,14 +127,20 @@ public enum CacheStoreBudget {
         let allowed = canStore(
             cacheBytes: liveBytes,
             activeBytes: activeBytes,
-            budgetBytes: budgetBytes
+            budgetBytes: budgetBytes,
+            hostPressureLevel: hostPressureLevel
         )
+        if !allowed, hostPressureLevel == 2 || hostPressureLevel == 4 {
+            let level = hostPressureLevel == 2 ? "warning" : "critical"
+            FileHandle.standardError.write(Data(
+                "prefix-cache: skipping optional store under host memory pressure (\(level))\n".utf8))
+        }
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             let source = physicalFootprint == nil ? "mlx_active_fallback" : "phys_footprint"
             let budget = budgetBytes.map(String.init) ?? "unknown"
             RuntimeDiagnostics.write(
                 Data(
-                    "[vmlx][cache/store-budget] cache=\(liveBytes) active=\(activeBytes) budget=\(budget) source=\(source) fraction=\(policy.headroomFraction) allowed=\(allowed)\n"
+                    "[vmlx][cache/store-budget] cache=\(liveBytes) active=\(activeBytes) budget=\(budget) source=\(source) fraction=\(policy.headroomFraction) hostPressure=\(hostPressureLevel.map(String.init) ?? "unavailable") allowed=\(allowed)\n"
                         .utf8
                 ))
         }
@@ -143,10 +153,9 @@ public enum CacheStoreBudget {
     /// memory. With mmap-backed/JANG models it can remain near the logical model
     /// size while macOS has reclaimed most cold pages. Charging that number as
     /// physical occupancy silently disabled Safe Auto SSD checkpoints even when
-    /// the process had ample real headroom. `phys_footprint` is the kernel's
-    /// resident + compressed + IOKit accounting and is the number the host's RAM
-    /// safety gate and Activity Monitor expose. Keep MLX accounting only as a
-    /// conservative fallback on platforms where the kernel query is unavailable.
+    /// the process had ample real headroom. Keep the kernel's process charge for
+    /// this estimate, with MLX accounting as a fallback. Neither counter measures
+    /// all host use; the independent kernel-pressure veto handles that signal.
     static func activeBytesForStoreBudget(
         physicalFootprintBytes: UInt64?,
         mlxActiveBytes: Int
@@ -179,9 +188,11 @@ public enum CacheStoreBudget {
             mlxActiveBytes: max(0, MLX.Memory.activeMemory)
         ),
         budgetBytes: Int? = Int(exactly: ProcessInfo.processInfo.physicalMemory),
-        policy: CacheStorePolicy = CacheStoreBudget.policy
+        policy: CacheStorePolicy = CacheStoreBudget.policy,
+        hostPressureLevel: Int? = nil
     ) -> Bool {
         guard liveBytes > 0 else { return true }
+        guard hostPressureLevel != 2, hostPressureLevel != 4 else { return false }
         guard let budgetBytes, budgetBytes > 0 else {
             // No budget to reason about: don't guess, don't block.
             return true
@@ -199,6 +210,18 @@ public enum CacheStoreBudget {
 }
 
 #if canImport(Darwin)
+    /// Same kernel states as the host supervisor: normal=1, warning=2, critical=4.
+    /// An unavailable/unknown reading preserves the existing byte-budget policy.
+    private func currentHostMemoryPressureLevel() -> Int? {
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0,
+            size == MemoryLayout<Int32>.size,
+            level == 1 || level == 2 || level == 4
+        else { return nil }
+        return Int(level)
+    }
+
     private func currentProcessPhysicalFootprintBytes() -> UInt64? {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
@@ -218,6 +241,10 @@ public enum CacheStoreBudget {
         return UInt64(info.phys_footprint)
     }
 #else
+    private func currentHostMemoryPressureLevel() -> Int? {
+        nil
+    }
+
     private func currentProcessPhysicalFootprintBytes() -> UInt64? {
         nil
     }
