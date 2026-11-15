@@ -268,6 +268,21 @@ public struct JangCapabilities: Sendable {
     /// ``DraftStrategy/dflash(drafterPath:blockSize:)`` etc.
     public let blockSize: Int?
 
+    /// `reasoning_modes`: named modes, each the exact chat-template kwargs that select it
+    /// (Nemotron 3.5: `on` = `enable_thinking: true`, `medium` = that plus `medium_effort: true`,
+    /// `off` = `enable_thinking: false`). `nil` when absent, and also when any mode is not an
+    /// object whose values are all booleans or strings: such a table cannot be sent verbatim, and
+    /// the part of it that could be must not be sent alone. What the mode NAMES mean is
+    /// `ReasoningCapability`'s business, not the loader's.
+    public let reasoningModes: [String: [String: ReasoningCapability.TemplateValue]]?
+
+    /// `reasoning_efforts`, with its `reasoning_effort_default` (alias `default_reasoning_effort`)
+    /// and `reasoning_effort_transport`: the flat effort list in its second placement. The first is
+    /// `chat` (``JangChatConfig/reasoningEfforts``), and a bundle with a list there is read there.
+    public let reasoningEfforts: [String]?
+    public let reasoningEffortDefault: String?
+    public let reasoningEffortTransport: String?
+
     public init(
         reasoningParser: String? = nil,
         toolParser: String? = nil,
@@ -284,8 +299,16 @@ public struct JangCapabilities: Sendable {
         draftStrategy: String? = nil,
         drafterPath: String? = nil,
         branchingBudget: Int? = nil,
-        blockSize: Int? = nil
+        blockSize: Int? = nil,
+        reasoningModes: [String: [String: ReasoningCapability.TemplateValue]]? = nil,
+        reasoningEfforts: [String]? = nil,
+        reasoningEffortDefault: String? = nil,
+        reasoningEffortTransport: String? = nil
     ) {
+        self.reasoningModes = reasoningModes
+        self.reasoningEfforts = reasoningEfforts
+        self.reasoningEffortDefault = reasoningEffortDefault
+        self.reasoningEffortTransport = reasoningEffortTransport
         self.reasoningParser = reasoningParser
         self.toolParser = toolParser
         self.thinkInTemplate = thinkInTemplate
@@ -687,9 +710,21 @@ public enum ParserResolution {
 ///   - `thinking_start` / `thinking_end`: the envelope tags the
 ///     runtime should watch for (e.g. `<think>` / `</think>`)
 ///   - `reasoning_effort_levels`: allowed `reasoning_effort` knob
-///     values (e.g. `["max", "high", nil]`)
+///     values (e.g. `["max", "high", nil]`). A block without it may
+///     name the same list `supported_reasoning_efforts`, with
+///     `default_reasoning_effort` beside it (the top-level block's
+///     names), and both land in the same two fields
 ///   - `drop_earlier_reasoning`: whether multi-turn chat should
 ///     strip earlier assistant reasoning before re-encoding
+///   - `template_flag` / `mode_kwargs`: the chat-template kwarg the
+///     modes are selected through, and each mode's exact kwargs
+///     (Diplodocus: `think` = `reasoning_effort: high`, `no_think` =
+///     `reasoning_effort: low`). Read from the nested block only: the
+///     top-level block's `default` is synthesised into `defaultMode`,
+///     so a mode contract there could not be checked against its own
+///     default
+///   - `reasoning_effort_transport`: how the effort reaches the model;
+///     `chat_template_kwarg` is the only one a template can receive
 ///
 /// DSV4 is the first family that splits reasoning into a `"chat"`
 /// mode (prompt ends with a CLOSED `</think>` empty block — parser
@@ -707,6 +742,11 @@ public struct JangChatReasoning: Sendable, Equatable {
     public let thinkingEnd: String?
     public let reasoningEffortLevels: [String?]?
     public let dropEarlierReasoning: Bool?
+    public let templateFlag: String?
+    /// A mode whose kwargs are not all booleans and strings is left out, so a contract that
+    /// needs that mode does not match rather than matching on part of it.
+    public let modeKwargs: [String: [String: ReasoningCapability.TemplateValue]]?
+    public let reasoningEffortTransport: String?
 
     public init(
         supported: Bool? = nil,
@@ -716,8 +756,14 @@ public struct JangChatReasoning: Sendable, Equatable {
         thinkingStart: String? = nil,
         thinkingEnd: String? = nil,
         reasoningEffortLevels: [String?]? = nil,
-        dropEarlierReasoning: Bool? = nil
+        dropEarlierReasoning: Bool? = nil,
+        templateFlag: String? = nil,
+        modeKwargs: [String: [String: ReasoningCapability.TemplateValue]]? = nil,
+        reasoningEffortTransport: String? = nil
     ) {
+        self.templateFlag = templateFlag
+        self.modeKwargs = modeKwargs
+        self.reasoningEffortTransport = reasoningEffortTransport
         self.supported = supported
         self.modes = modes
         self.defaultMode = defaultMode
@@ -821,6 +867,21 @@ public struct JangChatSamplingDefaults: Sendable, Equatable {
     }
 }
 
+/// `jang_config.json -> chat.thinking`: the thinking toggle's own block (Nemotron 3.5, Raptor).
+/// `default` is a boolean only on some bundles; others write prose there ("on (high)"), which
+/// reads as `nil` rather than as a guess.
+public struct JangChatThinking: Sendable, Equatable {
+    public let supported: Bool?
+    public let templateFlag: String?
+    public let defaultEnabled: Bool?
+
+    public init(supported: Bool? = nil, templateFlag: String? = nil, defaultEnabled: Bool? = nil) {
+        self.supported = supported
+        self.templateFlag = templateFlag
+        self.defaultEnabled = defaultEnabled
+    }
+}
+
 /// Top-level `jang_config.json -> chat` block. Aggregates reasoning
 /// + tool-calling + sampling hints the runtime applies when
 /// building prompts and configuring generation. Populated only
@@ -835,6 +896,26 @@ public struct JangChatConfig: Sendable, Equatable {
     public let eosTokenId: Int?
     public let roleTokens: [String: String]?
     public let reasoning: JangChatReasoning?
+    /// `chat.reasoning_values` — a SIBLING of `chat.reasoning`, not a field inside it. Muse Glimmer
+    /// writes its effort vocabulary here. Exposed so a caller does not have to re-read the raw JSON
+    /// to find it, which is how a second, weaker config reader came to exist.
+    public let reasoningValues: [String]?
+    /// `chat.reasoning_default` — the default that goes with `reasoning_values`, in the same
+    /// place, and the last of the places a default is read from (a block's own comes first).
+    /// Reading the vocabulary and not this left a bundle at its weakest level.
+    public let reasoningDefault: String?
+    /// `chat.reasoning_efforts` and `chat.reasoning_effort_default`, the spelling OsaurusAI's
+    /// JANGH2 bundles use. Both are SIBLINGS inside `chat`, and such a bundle has no `reasoning`
+    /// block at all, so the loader had nothing to hang them on and read neither. The default also
+    /// goes by `default_reasoning_effort`, the top-level block's name for it, which Osaurus
+    /// accepts as an alias; `reasoning_effort_default` wins when both are present.
+    /// `chat.reasoning_effort_transport` says how that list's effort travels. The same three keys
+    /// may sit under `capabilities` instead (``JangCapabilities/reasoningEfforts``); `chat` is
+    /// read first.
+    public let reasoningEfforts: [String]?
+    public let reasoningEffortDefault: String?
+    public let reasoningEffortTransport: String?
+    public let thinking: JangChatThinking?
     public let toolCalling: JangChatToolCalling?
     public let samplingDefaults: JangChatSamplingDefaults?
     public let templateKwargsDefaults: ChatTemplateKwargsDefaults?
@@ -854,11 +935,19 @@ public struct JangChatConfig: Sendable, Equatable {
         eosTokenId: Int? = nil,
         roleTokens: [String: String]? = nil,
         reasoning: JangChatReasoning? = nil,
+        reasoningValues: [String]? = nil,
+        reasoningDefault: String? = nil,
+        reasoningEfforts: [String]? = nil,
+        reasoningEffortDefault: String? = nil,
         toolCalling: JangChatToolCalling? = nil,
         samplingDefaults: JangChatSamplingDefaults? = nil,
         templateKwargsDefaults: ChatTemplateKwargsDefaults? = nil,
-        stopTokenIds: [Int]? = nil
+        stopTokenIds: [Int]? = nil,
+        reasoningEffortTransport: String? = nil,
+        thinking: JangChatThinking? = nil
     ) {
+        self.reasoningEffortTransport = reasoningEffortTransport
+        self.thinking = thinking
         self.encoder = encoder
         self.hasTokenizerChatTemplate = hasTokenizerChatTemplate
         self.bosToken = bosToken
@@ -867,6 +956,10 @@ public struct JangChatConfig: Sendable, Equatable {
         self.eosTokenId = eosTokenId
         self.roleTokens = roleTokens
         self.reasoning = reasoning
+        self.reasoningValues = reasoningValues
+        self.reasoningDefault = reasoningDefault
+        self.reasoningEfforts = reasoningEfforts
+        self.reasoningEffortDefault = reasoningEffortDefault
         self.toolCalling = toolCalling
         self.samplingDefaults = samplingDefaults
         self.templateKwargsDefaults = templateKwargsDefaults
@@ -1882,7 +1975,12 @@ public struct JangLoader: Sendable {
                 draftStrategy: cDict["draft_strategy"] as? String,
                 drafterPath: cDict["drafter_path"] as? String,
                 branchingBudget: cDict["branching_budget"] as? Int,
-                blockSize: cDict["block_size"] as? Int
+                blockSize: cDict["block_size"] as? Int,
+                reasoningModes: parseReasoningModes(cDict["reasoning_modes"]),
+                reasoningEfforts: cDict["reasoning_efforts"] as? [String],
+                reasoningEffortDefault: (cDict["reasoning_effort_default"] as? String)
+                    ?? (cDict["default_reasoning_effort"] as? String),
+                reasoningEffortTransport: cDict["reasoning_effort_transport"] as? String
             )
         } else if let synthesized = topLevelStampCapabilities(json) {
             // Raptor-era (Ling 3 / KDA) bundles carry the stamp as top-level
@@ -1961,16 +2059,36 @@ public struct JangLoader: Sendable {
             // reasoning subblock
             let reasoning: JangChatReasoning?
             if let rDict = chDict["reasoning"] as? [String: Any] {
+                // The effort vocabulary goes by two names here too: DSV4 wrote
+                // `reasoning_effort_levels` / `default_effort`, and later stamps
+                // (Diplodocus) write the top-level block's
+                // `supported_reasoning_efforts` / `default_reasoning_effort`
+                // inside `chat.reasoning`. Reading only the first left such a
+                // block with no list at all. The older names are read first, so
+                // a block that already parsed keeps meaning what it meant.
+                //
+                // Those later names come with the top-level block's flag:
+                // `reasoning_effort_supported: false` withholds them here as it
+                // does there.
+                let laterSpellingsDeclared =
+                    (rDict["reasoning_effort_supported"] as? Bool) != false
                 reasoning = JangChatReasoning(
                     supported: rDict["supported"] as? Bool,
                     modes: rDict["modes"] as? [String],
                     defaultMode: rDict["default_mode"] as? String,
-                    defaultEffort: rDict["default_effort"] as? String,
+                    defaultEffort: (rDict["default_effort"] as? String)
+                        ?? (laterSpellingsDeclared
+                            ? rDict["default_reasoning_effort"] as? String : nil),
                     thinkingStart: rDict["thinking_start"] as? String,
                     thinkingEnd: rDict["thinking_end"] as? String,
-                    reasoningEffortLevels: parseEffortLevels(
-                        rDict["reasoning_effort_levels"]),
-                    dropEarlierReasoning: rDict["drop_earlier_reasoning"] as? Bool
+                    reasoningEffortLevels: parseEffortLevels(rDict["reasoning_effort_levels"])
+                        ?? (laterSpellingsDeclared
+                            ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil)
+                        ?? parseEffortLevels(rDict["efforts"]),
+                    dropEarlierReasoning: rDict["drop_earlier_reasoning"] as? Bool,
+                    templateFlag: rDict["template_flag"] as? String,
+                    modeKwargs: parseModeKwargs(rDict["mode_kwargs"]),
+                    reasoningEffortTransport: rDict["reasoning_effort_transport"] as? String
                 )
             } else if let rDict = topLevelReasoning {
                 // Raptor-era top-level `reasoning` block: `default` is
@@ -1997,7 +2115,9 @@ public struct JangLoader: Sendable {
                     defaultEffort: effortsDeclared
                         ? rDict["default_reasoning_effort"] as? String : nil,
                     reasoningEffortLevels: effortsDeclared
-                        ? parseEffortLevels(rDict["supported_reasoning_efforts"]) : nil
+                        ? parseEffortLevels(rDict["supported_reasoning_efforts"])
+                            ?? parseEffortLevels(rDict["efforts"]) : nil,
+                    reasoningEffortTransport: rDict["reasoning_effort_transport"] as? String
                 )
             } else {
                 reasoning = splitReasoning
@@ -2084,10 +2204,22 @@ public struct JangLoader: Sendable {
                 eosTokenId: chDict["eos_token_id"] as? Int,
                 roleTokens: chDict["role_tokens"] as? [String: String],
                 reasoning: reasoning,
+                reasoningValues: chDict["reasoning_values"] as? [String],
+                reasoningDefault: chDict["reasoning_default"] as? String,
+                reasoningEfforts: chDict["reasoning_efforts"] as? [String],
+                reasoningEffortDefault: (chDict["reasoning_effort_default"] as? String)
+                    ?? (chDict["default_reasoning_effort"] as? String),
                 toolCalling: toolCalling,
                 samplingDefaults: sampling,
                 templateKwargsDefaults: templateKwargsDefaults,
-                stopTokenIds: stopTokenIds
+                stopTokenIds: stopTokenIds,
+                reasoningEffortTransport: chDict["reasoning_effort_transport"] as? String,
+                thinking: (chDict["thinking"] as? [String: Any]).map {
+                    JangChatThinking(
+                        supported: $0["supported"] as? Bool,
+                        templateFlag: $0["template_flag"] as? String,
+                        defaultEnabled: $0["default"] as? Bool)
+                }
             )
         } else {
             chat = nil
@@ -2271,6 +2403,48 @@ public struct JangLoader: Sendable {
             if item is NSNull { return nil }
             return item as? String
         }
+    }
+
+    /// A `{kwarg: value}` object whose every value is a JSON boolean or string, typed, or `nil`
+    /// for anything else (not an object, or any value a number, null, array or object). Strict
+    /// about booleans: `1` is a number, not `true`, though Foundation bridges either way.
+    private static func parseTemplateKwargs(
+        _ raw: Any?
+    ) -> [String: ReasoningCapability.TemplateValue]? {
+        guard let dict = raw as? [String: Any] else { return nil }
+        var out: [String: ReasoningCapability.TemplateValue] = [:]
+        for (key, value) in dict {
+            if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+                out[key] = .bool(number.boolValue)
+            } else if let string = value as? String {
+                out[key] = .string(string)
+            } else {
+                return nil
+            }
+        }
+        return out
+    }
+
+    /// `chat.reasoning.mode_kwargs`, per mode: a mode that cannot be typed is left out, so a
+    /// contract needing it fails to match while the block's other keys still parse.
+    private static func parseModeKwargs(
+        _ raw: Any?
+    ) -> [String: [String: ReasoningCapability.TemplateValue]]? {
+        (raw as? [String: Any])?.compactMapValues { parseTemplateKwargs($0) }
+    }
+
+    /// `capabilities.reasoning_modes`, all or nothing: one mode that cannot be typed voids the
+    /// table, because what remains would be a contract the bundle never wrote.
+    private static func parseReasoningModes(
+        _ raw: Any?
+    ) -> [String: [String: ReasoningCapability.TemplateValue]]? {
+        guard let modes = raw as? [String: Any] else { return nil }
+        var out: [String: [String: ReasoningCapability.TemplateValue]] = [:]
+        for (name, kwargs) in modes {
+            guard let typed = parseTemplateKwargs(kwargs) else { return nil }
+            out[name] = typed
+        }
+        return out
     }
 
     // MARK: - Per-Layer Bit Width Inference
