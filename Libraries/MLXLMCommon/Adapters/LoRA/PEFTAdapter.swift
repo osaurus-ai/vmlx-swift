@@ -50,8 +50,11 @@ enum PEFTAdapter {
     /// Three things change, and the last is the one that fails silently if it is wrong:
     ///
     ///   1. the `base_model.model.` wrapper PEFT adds is stripped;
-    ///   2. `…lora_A.weight` / `…lora_B.weight` become `…lora_a` / `…lora_b`;
-    ///   3. BOTH factors are TRANSPOSED.
+    ///   2. `…lora_A.weight` / `…lora_B.weight` become `…lora_a` / `…lora_b`, and a DoRA
+    ///      adapter's `…lora_magnitude_vector` becomes `…m`: the key PEFT saves, or
+    ///      `…lora_magnitude_vector.weight`, the module's own name for it since PEFT's
+    ///      DoRA refactor (PR 1806, May 2024), which a plain `state_dict()` dump keeps;
+    ///   3. BOTH factors are TRANSPOSED. The magnitudes are 1-D and stay as they are.
     ///
     /// On (3): `LoRALinear` stores `loraA` as `[in, rank]` and `loraB` as `[rank, out]`, and its
     /// forward is `y + scale * (x @ loraA @ loraB)`. PEFT stores the transpose of each — verified
@@ -60,6 +63,13 @@ enum PEFTAdapter {
     /// a shape mismatch or, where dimensions happen to agree, quietly compute a different function
     /// — which is why the round trip is checked numerically in the tests rather than by loading
     /// successfully.
+    ///
+    /// On (2): `configuration(from:weights:)` builds DoRA layers when `use_dora` is set, and a DoRA
+    /// layer scales its output by `m / norm(W + scale * Bᵀ Aᵀ)`. A dropped magnitude leaves `m` at
+    /// the value the layer's `init` derives from the base weight, so the adapter loads, generates,
+    /// and computes a different function from the trained one. A magnitude in an adapter that is
+    /// not DoRA has no `m` slot to go to, so `load(into:)` throws on it (it matches no module)
+    /// rather than dropping it.
     static func translate(weights: [String: MLXArray]) -> [String: MLXArray] {
         var out: [String: MLXArray] = [:]
         out.reserveCapacity(weights.count)
@@ -72,8 +82,12 @@ enum PEFTAdapter {
                 k = String(k.dropLast(".lora_A.weight".count)) + ".lora_a"
             } else if k.hasSuffix(".lora_B.weight") {
                 k = String(k.dropLast(".lora_B.weight".count)) + ".lora_b"
+            } else if k.hasSuffix(".lora_magnitude_vector") {
+                k = String(k.dropLast(".lora_magnitude_vector".count)) + ".m"
+            } else if k.hasSuffix(".lora_magnitude_vector.weight") {
+                k = String(k.dropLast(".lora_magnitude_vector.weight".count)) + ".m"
             } else {
-                continue                       // biases, magnitudes, anything else: not ours
+                continue                       // biases, anything else: not ours
             }
             out[k] = value.ndim == 2 ? value.transposed(1, 0) : value
         }
