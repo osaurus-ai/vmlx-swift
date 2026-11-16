@@ -55,7 +55,11 @@ public enum EmbedderError: LocalizedError {
                 return "Invalid JSON"
             } else {
                 let path = context.codingPath.map { $0.stringValue }.joined(separator: ".")
-                return "Invalid data at '\(path)'"
+                // A model can refuse a value on purpose, for example ModernBERT an activation it does
+                // not implement. The reason is in debugDescription; without it the message reads like
+                // a corrupt file.
+                let reason = context.debugDescription.isEmpty ? "" : ": \(context.debugDescription)"
+                return "Invalid data at '\(path)'\(reason)"
             }
         @unknown default:
             return error.localizedDescription
