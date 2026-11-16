@@ -209,7 +209,8 @@ func loadSynchronous(modelDirectory: URL, modelName: String) throws -> Embedding
                 let quantization = perLayerQuantization.quantization(layer: path)
             else { continue }
             let (groupSize, bits, mode) = quantization.asTuple
-            let columns = (module as? Linear)?.weight.dim(-1) ?? (module as? Embedding)?.weight.dim(-1)
+            let columns =
+                (module as? Linear)?.weight.dim(-1) ?? (module as? Embedding)?.weight.dim(-1)
             if let reason = quantizationProblem(
                 groupSize: groupSize, bits: bits, mode: mode, columns: columns)
             {
