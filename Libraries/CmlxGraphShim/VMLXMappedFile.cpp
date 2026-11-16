@@ -109,10 +109,12 @@ extern "C" int vmlx_mapped_file_array(void **result, void *opaque, uint64_t offs
         if (!buffer.ptr()) throw std::runtime_error("[mapped_file] Metal buffer creation failed");
         auto release = [](void *p) { allocator::release(allocator::Buffer(p)); };
         std::unique_ptr<void, decltype(release)> pending(buffer.ptr(), release);
-        array base(buffer, Shape{ShapeElem(span)}, uint8,
-                   [owner](allocator::Buffer b) { allocator::release(b); });
+        // Data with a deleter does not own the memory, so MLX never donates it to an op's output: the mapping is
+        // read-only, and a write into it is a SIGBUS on the CPU (ml-explore/mlx#4634).
+        allocator::Data data(buffer, [owner](allocator::Buffer b) { allocator::release(b); });
         pending.release();
-        array view(allocator::Buffer(nullptr), shape, dtype, [](allocator::Buffer) {});
+        array base(std::move(data), Shape{ShapeElem(span)}, uint8);
+        array view(allocator::Data(allocator::Buffer(nullptr), [](allocator::Buffer) {}), shape, dtype);
         view.copy_shared_buffer(base, view.strides(), view.flags(), view.size(), int64_t(delta / item));
         owner->validate();
         mlx_array output{*result};
