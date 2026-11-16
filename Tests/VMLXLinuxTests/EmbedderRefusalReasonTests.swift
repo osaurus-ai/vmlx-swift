@@ -39,7 +39,11 @@ struct EmbedderRefusalReasonTests {
         }
         let error = EmbedderError.configurationDecodingError(
             "config.json", "refusal-test",
-            .dataCorrupted(.init(codingPath: [Key(stringValue: "hidden_size")], debugDescription: "")))
-        #expect(error.errorDescription == "Failed to parse config.json for model 'refusal-test': Invalid data at 'hidden_size'")
+            .dataCorrupted(
+                .init(codingPath: [Key(stringValue: "hidden_size")], debugDescription: "")))
+        #expect(
+            error.errorDescription
+                == "Failed to parse config.json for model 'refusal-test': Invalid data at 'hidden_size'"
+        )
     }
 }
