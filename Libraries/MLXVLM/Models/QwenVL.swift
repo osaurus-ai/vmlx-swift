@@ -150,23 +150,21 @@ public struct QwenVL {
         throws
         -> (Int, Int)
     {
-
-
-        if height < factor {
+        // The reference has no minimum side: an image smaller than `factor` is scaled up below,
+        // through the min_pixels branch, and is not rejected. A side of zero cannot be scaled.
+        guard height > 0, width > 0 else {
             throw VLMError.imageProcessingFailure(
-                "Height: \(height) must be larger than factor: \(factor)")
-        }
-        if width < factor {
-            throw VLMError.imageProcessingFailure(
-                "Width: \(width) must be larger than factor: \(factor)")
+                "Invalid image dimensions \(width) × \(height); both must be positive.")
         }
         if max(height, width) / min(height, width) > 200 {
             throw VLMError.imageProcessingFailure(
                 "Absolute aspect ratio must be smaller than 200: \(width) × \(height)")
         }
 
-        var hBar = max(factor, Int(round(Float(height) / Float(factor))) * factor)
-        var wBar = max(factor, Int(round(Float(width) / Float(factor))) * factor)
+        // A side below factor / 2 rounds to 0 here, as in the reference, so that the product is
+        // below min_pixels and the branch below scales both sides up together.
+        var hBar = Int(round(Float(height) / Float(factor))) * factor
+        var wBar = Int(round(Float(width) / Float(factor))) * factor
 
         // Scale based on total pixel count
         if hBar * wBar > maxPixels {
