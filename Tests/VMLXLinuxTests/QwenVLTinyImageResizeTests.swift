@@ -72,7 +72,9 @@ struct QwenVLTinyImageResizeTests {
             #expect(narrow.0 == 28 && narrow.1 == 2800, "got \(narrow)")
         }
 
-        @Test("A video frame of normal size keeps its size; zero and extreme aspect ratios are errors")
+        @Test(
+            "A video frame of normal size keeps its size; zero and extreme aspect ratios are errors"
+        )
         func videoFrameEdgeCases() throws {
             let frame = try Qwen3VLProcessor.videoTargetSize(
                 frameCount: 4, height: 480, width: 640, temporalFactor: 2, factor: 32,
