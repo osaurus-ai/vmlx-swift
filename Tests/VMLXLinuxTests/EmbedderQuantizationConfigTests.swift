@@ -20,10 +20,12 @@ struct EmbedderQuantizationConfigTests {
         // A child process, so that the failure before the fix fails this test, not the test run.
         // Exit codes: 3, the loader accepted the configuration; 4, the error does not name the layer
         // and the group size; 5, the test's own setup is wrong. A signal is the process ending.
-        let result = await #expect(processExitsWith: .success, observing: [\.standardErrorContent]) {
+        let result = await #expect(processExitsWith: .success, observing: [\.standardErrorContent])
+        {
             let directory = FileManager.default.temporaryDirectory
                 .appending(component: "embedder-quantization-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
             let config = #"""
                 {"model_type": "bert", "hidden_size": 32, "num_attention_heads": 2,
@@ -34,7 +36,8 @@ struct EmbedderQuantizationConfigTests {
             try Data(config.utf8).write(to: directory.appending(component: "config.json"))
 
             // One Linear layer carries scales, so the loader quantizes it.
-            let model = try ModelType(rawValue: "bert").createModel(configuration: Data(config.utf8))
+            let model = try ModelType(rawValue: "bert").createModel(
+                configuration: Data(config.utf8))
             guard let path = model.leafModules().flattened().first(where: { $0.1 is Linear })?.0
             else { exit(5) }  // the test's own setup is wrong
             let weights = ["\(path).scales": MLXArray.zeros([2, 2])]
@@ -62,8 +65,10 @@ struct EmbedderQuantizationConfigTests {
             for groupSize in [8, 16, 32, 64, 128, 256] {
                 for bits in 0 ... 9 {
                     for columns in [48, 64, 96, 256] {
-                        let check = quantizationProblem(
-                            groupSize: groupSize, bits: bits, mode: mode, columns: columns) == nil
+                        let check =
+                            quantizationProblem(
+                                groupSize: groupSize, bits: bits, mode: mode, columns: columns)
+                            == nil
                         let mlx = Self.mlxAccepts(
                             groupSize: groupSize, bits: bits, mode: mode, columns: columns)
                         if check != mlx {
@@ -80,7 +85,8 @@ struct EmbedderQuantizationConfigTests {
 
     /// Whether MLX's quantize accepts the parameters. It calls mlx-c directly: the Swift wrapper
     /// reads the first result even when the call failed.
-    static func mlxAccepts(groupSize: Int, bits: Int, mode: QuantizationMode, columns: Int) -> Bool {
+    static func mlxAccepts(groupSize: Int, bits: Int, mode: QuantizationMode, columns: Int) -> Bool
+    {
         let w = MLXArray.zeros([2, columns])
         var result = mlx_vector_array_new()
         defer { mlx_vector_array_free(result) }
