@@ -1438,6 +1438,13 @@ public func loadWeights(
                 + "} lm_head={" + parameterDTypeSummary(matching: "lm_head") + "}\n").utf8))
     }
 
+    // Inference runs in eval mode, as in the reference: mlx_lm's and mlx_vlm's loaders call
+    // `model.eval()`. `Module.training` starts true, and before this nothing cleared it, so every
+    // loaded model ran its forward in training mode. That changes what layers compute:
+    // `BatchNorm` normalizes with the batch's own statistics and folds them into its running statistics
+    // on every call (FastVLM's vision tower), and `Dropout` draws a fresh random mask.
+    model.train(false)
+
     eval(model)
     MLX.Memory.clearCache()
 
