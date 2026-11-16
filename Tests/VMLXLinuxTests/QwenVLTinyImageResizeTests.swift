@@ -35,52 +35,59 @@ struct QwenVLTinyImageResizeTests {
         #expect(size.0 == 28 && size.1 == 448, "got \(size)")
     }
 
-    @Test("A video frame smaller than the factor is scaled up before it is resized")
-    func videoFrameSmallerThanFactorScalesUp() throws {
-        let short = try Qwen3VLProcessor.videoTargetSize(
-            frameCount: 4, height: 17, width: 640, temporalFactor: 2, factor: 32,
-            minPixels: 4096, maxPixels: 25_165_824)
-        #expect(short.0 == 32 && short.1 == 1216, "got \(short)")
-        let narrow = try Qwen3VLProcessor.videoTargetSize(
-            frameCount: 4, height: 10, width: 1000, temporalFactor: 2, factor: 28,
-            minPixels: 4096, maxPixels: 25_165_824)
-        #expect(narrow.0 == 28 && narrow.1 == 2800, "got \(narrow)")
-    }
-
-    @Test("An image or frame of normal size keeps its size")
-    func normalSizeIsUnchanged() throws {
+    @Test("An image of normal size keeps its size")
+    func normalImageIsUnchanged() throws {
         let image = try QwenVL.targetSize(
             height: 480, width: 640, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
         #expect(image.0 == 480 && image.1 == 640, "got \(image)")
-        let frame = try Qwen3VLProcessor.videoTargetSize(
-            frameCount: 4, height: 480, width: 640, temporalFactor: 2, factor: 32,
-            minPixels: 4096, maxPixels: 25_165_824)
-        #expect(frame.0 == 480 && frame.1 == 640, "got \(frame)")
     }
 
-    @Test("A side of zero is an error, not a division by zero")
-    func zeroSideIsAnError() {
+    @Test("An image side of zero is an error, not a division by zero")
+    func zeroImageSideIsAnError() {
         #expect(throws: (any Error).self) {
             try QwenVL.targetSize(
                 height: 0, width: 640, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
         }
-        #expect(throws: (any Error).self) {
-            try Qwen3VLProcessor.videoTargetSize(
-                frameCount: 4, height: 17, width: 0, temporalFactor: 2, factor: 32,
-                minPixels: 4096, maxPixels: 25_165_824)
-        }
     }
 
-    @Test("An aspect ratio over 200 is still an error, as in the reference")
-    func extremeAspectRatioIsStillAnError() {
+    @Test("An image aspect ratio over 200 is still an error, as in the reference")
+    func extremeImageAspectRatioIsStillAnError() {
         #expect(throws: (any Error).self) {
             try QwenVL.targetSize(
                 height: 1, width: 300, factor: 32, minPixels: 65536, maxPixels: 16_777_216)
         }
-        #expect(throws: (any Error).self) {
-            try Qwen3VLProcessor.videoTargetSize(
-                frameCount: 4, height: 1, width: 300, temporalFactor: 2, factor: 32,
-                minPixels: 4096, maxPixels: 25_165_824)
-        }
     }
+
+    // Qwen3VLProcessor exists only where CoreImage and AVFoundation do, so not on Linux.
+    #if canImport(CoreImage) && canImport(AVFoundation)
+        @Test("A video frame smaller than the factor is scaled up before it is resized")
+        func videoFrameSmallerThanFactorScalesUp() throws {
+            let short = try Qwen3VLProcessor.videoTargetSize(
+                frameCount: 4, height: 17, width: 640, temporalFactor: 2, factor: 32,
+                minPixels: 4096, maxPixels: 25_165_824)
+            #expect(short.0 == 32 && short.1 == 1216, "got \(short)")
+            let narrow = try Qwen3VLProcessor.videoTargetSize(
+                frameCount: 4, height: 10, width: 1000, temporalFactor: 2, factor: 28,
+                minPixels: 4096, maxPixels: 25_165_824)
+            #expect(narrow.0 == 28 && narrow.1 == 2800, "got \(narrow)")
+        }
+
+        @Test("A video frame of normal size keeps its size; zero and extreme aspect ratios are errors")
+        func videoFrameEdgeCases() throws {
+            let frame = try Qwen3VLProcessor.videoTargetSize(
+                frameCount: 4, height: 480, width: 640, temporalFactor: 2, factor: 32,
+                minPixels: 4096, maxPixels: 25_165_824)
+            #expect(frame.0 == 480 && frame.1 == 640, "got \(frame)")
+            #expect(throws: (any Error).self) {
+                try Qwen3VLProcessor.videoTargetSize(
+                    frameCount: 4, height: 17, width: 0, temporalFactor: 2, factor: 32,
+                    minPixels: 4096, maxPixels: 25_165_824)
+            }
+            #expect(throws: (any Error).self) {
+                try Qwen3VLProcessor.videoTargetSize(
+                    frameCount: 4, height: 1, width: 300, temporalFactor: 2, factor: 32,
+                    minPixels: 4096, maxPixels: 25_165_824)
+            }
+        }
+    #endif
 }
