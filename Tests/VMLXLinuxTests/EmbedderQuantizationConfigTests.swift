@@ -49,7 +49,8 @@ struct EmbedderQuantizationConfigTests {
                 exit(3)  // the loader accepted group size 16 for affine quantization
             } catch let error as EmbedderError {
                 let text = error.errorDescription ?? ""
-                guard text.contains(path), text.contains("16") else { exit(4) }  // the message names neither
+                // The message must name the layer and the group size.
+                guard text.contains(path), text.contains("16") else { exit(4) }
             }
         }
         if let result, !Self.exitedCleanly(result.exitStatus) {
