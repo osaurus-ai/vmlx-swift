@@ -10,6 +10,51 @@ import XCTest
 
 final class DFlash2WidthChooserTests: XCTestCase {
 
+    func testWiderRungBoundsStaleNarrowCostOnlyWhenEnabled() {
+        let costs = DFlash2WidthCostTable()
+        costs.markWarm([1, 4, 8])
+        costs.observe(width: 1, seconds: 1)
+        costs.observe(width: 4, seconds: 10)
+        costs.observe(width: 8, seconds: 2)
+        let ordinary = DFlash2WidthChooser(widths: [1, 4, 8], costs: costs)
+        let bounded = DFlash2WidthChooser(
+            widths: [1, 4, 8], costs: costs, boundsCostsByWiderRungs: true)
+        XCTAssertEqual(ordinary.rate(4)!, ordinary.expectedTokens(4) / 10, accuracy: 1e-12)
+        XCTAssertEqual(bounded.rate(4)!, bounded.expectedTokens(4) / 2, accuracy: 1e-12)
+        XCTAssertEqual(bounded.rate(1), ordinary.rate(1))
+        XCTAssertEqual(bounded.rate(8), ordinary.rate(8))
+    }
+
+    func testThinEvidenceProbesAfterFourARStepsOnlyWhenEnabled() {
+        func chooser(enabled: Bool, evidence: Int = 1) -> DFlash2WidthChooser {
+            let costs = DFlash2WidthCostTable()
+            costs.markWarm([1, 4])
+            costs.observe(width: 1, seconds: 1)
+            costs.observe(width: 4, seconds: 10)
+            var result = DFlash2WidthChooser(
+                widths: [1, 4], costs: costs, probesWhileEvidenceIsThin: enabled)
+            for _ in 0 ..< evidence {
+                result.observe(verifyWidth: 4, tokens: 1, seconds: 10)
+            }
+            return result
+        }
+        var enabled = chooser(enabled: true)
+        var disabled = chooser(enabled: false)
+        var established = chooser(enabled: true, evidence: 4)
+        for _ in 0 ..< 3 {
+            enabled.observe(verifyWidth: 1, tokens: 1, seconds: 1)
+            XCTAssertEqual(enabled.width, 1)
+        }
+        enabled.observe(verifyWidth: 1, tokens: 1, seconds: 1)
+        XCTAssertEqual(enabled.width, 4)
+        for _ in 0 ..< 4 {
+            disabled.observe(verifyWidth: 1, tokens: 1, seconds: 1)
+            established.observe(verifyWidth: 1, tokens: 1, seconds: 1)
+        }
+        XCTAssertEqual(disabled.width, 1)
+        XCTAssertEqual(established.width, 1)
+    }
+
     func testTraceReportsOneExpectedTokenForAR() {
         let chooser = DFlash2WidthChooser(widths: [1, 5, 16], costs: DFlash2WidthCostTable())
         XCTAssertTrue(chooser.traceDescription.hasPrefix("1:-/1.00/- "))
