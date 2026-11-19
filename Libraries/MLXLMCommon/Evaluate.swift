@@ -5996,6 +5996,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             }
 
             handler.onGenerationEnd(emit: continuation.yield)
+            // A final detokenizer flush can discover a natural stop at the token cap.
+            // Actual cancellation and decoding failure keep their original reasons.
+            if handler.stopSequenceHit && !Task.isCancelled && decodeFailure == nil
+                && iterator.generationFailure == nil {
+                stopReason = .stop
+            }
             // Read AFTER the flush: `onGenerationEnd` pushes the detokenizer's
             // held-back tail through the parser, which is where a close marker
             // stuck in that tail finally lands. Reading before it reported
