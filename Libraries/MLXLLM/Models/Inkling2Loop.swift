@@ -1823,3 +1823,9 @@ extension Inkling2LoopModel {
         return lines
     }
 }
+
+/// Inkling's template renders an assistant tool-call turn (`reasoning_content` + `<|message_model|>NAME
+/// <|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|><|content_model_end_sampling|>`) back to exactly
+/// the tokens the model generated, so the tool-call turn stores a post-answer boundary and the request carrying the
+/// tool result restores past it instead of re-prefilling the conversation.
+extension Inkling2LoopModel: ToolCallTurnBoundaryModel {}
