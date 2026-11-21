@@ -18,8 +18,10 @@ import Testing
 
 @Suite("Inkling channel reasoning + tool calls")
 struct InklingChannelParserTests {
-    static let thinking = "<|message_model|><|content_thinking|>The user wants Paris weather. Call the tool.<|end_message|>"
-    static let text = "<|message_model|><|content_text|>It is 18 °C and clear in Paris.<|end_message|>"
+    static let thinking =
+        "<|message_model|><|content_thinking|>The user wants Paris weather. Call the tool.<|end_message|>"
+    static let text =
+        "<|message_model|><|content_text|>It is 18 °C and clear in Paris.<|end_message|>"
     static let toolCall =
         "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|>"
     static let eos = "<|content_model_end_sampling|>"
@@ -30,9 +32,12 @@ struct InklingChannelParserTests {
 
     /// Run `output` through the reasoning parser + tool processor exactly as the generation loop
     /// routes it, in chunks of `chunk` characters.
-    static func route(_ output: String, chunk: Int) -> (reasoning: String, content: String, calls: [ToolCall]) {
+    static func route(_ output: String, chunk: Int) -> (
+        reasoning: String, content: String, calls: [ToolCall]
+    ) {
         var parser = ReasoningParser.fromCapabilityName("inkling")!
-        let processor = ToolCallProcessor(format: .inkling, tools: [["type": "function", "function": ["name": "get_weather"]]])
+        let processor = ToolCallProcessor(
+            format: .inkling, tools: [["type": "function", "function": ["name": "get_weather"]]])
         var reasoning = ""
         var content = ""
         var calls: [ToolCall] = []
@@ -49,8 +54,10 @@ struct InklingChannelParserTests {
         func feedSegments(_ segments: [ReasoningSegment]) {
             for seg in segments {
                 switch seg {
-                case .content(let c): absorb(routeGenerationText(c, channel: .content, through: processor))
-                case .reasoning(let r): absorb(routeGenerationText(r, channel: .reasoning, through: processor))
+                case .content(let c):
+                    absorb(routeGenerationText(c, channel: .content, through: processor))
+                case .reasoning(let r):
+                    absorb(routeGenerationText(r, channel: .reasoning, through: processor))
                 }
             }
         }
@@ -125,7 +132,8 @@ struct InklingChannelParserTests {
 
     @Test("prose containing '<|' that is not a marker survives")
     func literalAngle() {
-        let turn = "<|message_model|><|content_text|>Use a <| b in Haskell.<|end_message|>" + Self.eos
+        let turn =
+            "<|message_model|><|content_text|>Use a <| b in Haskell.<|end_message|>" + Self.eos
         let r = Self.route(turn, chunk: 1)
         #expect(r.content == "Use a <| b in Haskell.")
     }
@@ -133,7 +141,10 @@ struct InklingChannelParserTests {
     @Test("tool parser accepts arguments / parameters spellings and a JSON-string args")
     func argumentSpellings() {
         let p = InklingToolCallParser()
-        let a = p.parse(content: "<|content_invoke_tool_json|>{\"name\":\"f\",\"arguments\":{\"k\":1}}<|end_message|>", tools: nil)
+        let a = p.parse(
+            content:
+                "<|content_invoke_tool_json|>{\"name\":\"f\",\"arguments\":{\"k\":1}}<|end_message|>",
+            tools: nil)
         #expect(a?.function.name == "f")
         #expect(a?.function.arguments["k"] == .int(1))
         let b = p.parse(content: "{\"name\":\"f\",\"args\":\"{\\\"k\\\":\\\"v\\\"}\"}", tools: nil)

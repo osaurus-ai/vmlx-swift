@@ -2,9 +2,8 @@
 //
 // Inkling-2-Mini native drafter: DSpark (DFlash block drafter + `rnn_hidden` Markov head).
 //
-// Reference: SGLang PR #51926 (OPEN) — models/inkling2_mtp.py, models/dflash.py, models/dspark.py,
-// kernels/ops/speculative/inkling2_mtp.py. Port spec with file:line citations:
-// vmlx-private-evidence/inkling2-mini-runtime-2026-11-20/DSPARK-SPEC.md.
+// Reference: SGLang PR #51926 — models/inkling2_mtp.py, models/dflash.py, models/dspark.py,
+// kernels/ops/speculative/inkling2_mtp.py.
 //
 // One round, committed length P, anchor = the token at position P (not yet in the target KV):
 //   draft   block [embed_norm(embed(anchor)), mask_embed x 7] at positions P..P+7 through 3
@@ -78,7 +77,8 @@ final class Inkling2DSparkLayer: Module {
     @ModuleInfo(key: "dflare_norm") var dflareNorm: RMSNorm
     let isLocal: Bool
 
-    init(hidden: Int, inter: Int, nq: Int, nkv: Int, hd: Int, eps: Float, theta: Float, local: Bool) {
+    init(hidden: Int, inter: Int, nq: Int, nkv: Int, hd: Int, eps: Float, theta: Float, local: Bool)
+    {
         _attn.wrappedValue = Inkling2DSparkAttention(
             hidden: hidden, nq: nq, nkv: nkv, hd: hd, eps: eps, theta: theta)
         _mlp.wrappedValue = Inkling2DSparkMLP(hidden: hidden, inter: inter)
@@ -161,7 +161,8 @@ public final class Inkling2DSparkDrafter: Module {
         guard derived.foldWeight == nil else { return }
         derived.fuseAlpha = MLX.softmax(fuseWeight.asType(f32), axis: -1).asType(.bfloat16)
         let wu = lmHeadWeight.asType(f32)
-        derived.foldWeight = MLX.matmul(wu, markovHead.hiddenOut.weight.asType(f32)).asType(.bfloat16)
+        derived.foldWeight = MLX.matmul(wu, markovHead.hiddenOut.weight.asType(f32)).asType(
+            .bfloat16)
         derived.foldBias = MLX.matmul(wu, markovHead.hiddenOut.bias!.asType(f32)).asType(.bfloat16)
         eval(derived.fuseAlpha!, derived.foldWeight!, derived.foldBias!)
     }
@@ -180,7 +181,9 @@ public final class Inkling2DSparkDrafter: Module {
         let n = targets.dim(0)
         for (i, layer) in layers.enumerated() {
             let a = layer.attn
-            let c = mix(targets, row: i, weight: layer.dflareNorm.weight).reshaped([1, n, cfg.hidden])
+            let c = mix(targets, row: i, weight: layer.dflareNorm.weight).reshaped([
+                1, n, cfg.hidden,
+            ])
             var k = a.kProjCtx(c).reshaped([1, n, a.nkv, a.hd])
             let v = a.vProjCtx(c).reshaped([1, n, a.nkv, a.hd]).transposed(0, 2, 1, 3)
             k = a.kNormCtx(k).transposed(0, 2, 1, 3)
@@ -192,8 +195,11 @@ public final class Inkling2DSparkDrafter: Module {
 
     /// The Markov head's per-block feature from the last committed position's captures `[4, H]`.
     func fRnn(_ lastTargets: MLXArray) -> MLXArray {
-        mix(lastTargets.reshaped([1, -1, cfg.hidden]), row: cfg.layers, weight: markovHead.dflareNorm.weight)
-            .reshaped([cfg.hidden])
+        mix(
+            lastTargets.reshaped([1, -1, cfg.hidden]), row: cfg.layers,
+            weight: markovHead.dflareNorm.weight
+        )
+        .reshaped([cfg.hidden])
     }
 
     /// Draft hidden for one block at positions `P ..< P + B`: `[B - 1, H]` (anchor row dropped).
@@ -203,8 +209,10 @@ public final class Inkling2DSparkDrafter: Module {
         let H = cfg.hidden
         let dtype = maskEmbed.dtype
         let x = MLX.concatenated(
-            [anchorEmbedding.asType(dtype).reshaped([1, H]),
-             MLX.broadcast(maskEmbed.reshaped([1, H]), to: [B - 1, H])], axis: 0
+            [
+                anchorEmbedding.asType(dtype).reshaped([1, H]),
+                MLX.broadcast(maskEmbed.reshaped([1, H]), to: [B - 1, H]),
+            ], axis: 0
         ).reshaped([1, B, H])
         var res = x
         var mlpOut: MLXArray? = nil
@@ -259,7 +267,8 @@ public final class Inkling2DSparkDrafter: Module {
         for s in 0 ..< n {
             let emb = MLX.take(w1, prev, axis: 0).reshaped([R])
             let xin = MLX.concatenated(
-                [state, emb.asType(.bfloat16), h[s].asType(.bfloat16), fRnn.asType(.bfloat16)], axis: 0)
+                [state, emb.asType(.bfloat16), h[s].asType(.bfloat16), fRnn.asType(.bfloat16)],
+                axis: 0)
             let p = mh.rnnProj(xin.reshaped([1, -1])).reshaped([3 * R]).asType(f32)
             func bf(_ a: MLXArray) -> MLXArray { a.asType(.bfloat16).asType(f32) }
             let gate = bf(MLX.sigmoid(p[0 ..< R]))

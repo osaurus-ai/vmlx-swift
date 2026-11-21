@@ -670,6 +670,10 @@ struct Bench {
             try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_INKLING2_VT"] ?? "0") == "1" {
+            try await runInkling2VerifyTimeProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_INKLING2_TEMPLATE"] ?? "0") == "1" {
             try await runInkling2TemplateProbe(modelPath: modelPath)
             return

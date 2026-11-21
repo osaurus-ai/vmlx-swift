@@ -152,7 +152,9 @@ enum Inkling2DecodeKernels {
     /// Template: NQ, NKV, D, DR, DYN.
     static let qkv = MLXFast.metalKernel(
         name: "inkling2_dec_qkv",
-        inputNames: ["qa", "ka", "va", "kw", "vw", "packed", "qscale", "rscale", "proj", "fmeta", "imeta"],
+        inputNames: [
+            "qa", "ka", "va", "kw", "vw", "packed", "qscale", "rscale", "proj", "fmeta", "imeta",
+        ],
         outputNames: ["qo", "ko", "vo", "bias", "kvst"],
         source: """
             uint head = threadgroup_position_in_grid.x;
@@ -519,6 +521,15 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var ones: MLXArray?
     var downOnes: MLXArray?
     var ready = false
+    private var zeroSinkCache: MLXArray?
+
+    /// A zero native sink per head: the multi-row step folds each row's sink into its mask.
+    func zeroSinks(nq: Int, dtype: DType) -> MLXArray {
+        if let z = zeroSinkCache, z.dim(0) == nq, z.dtype == dtype { return z }
+        let z = MLXArray.zeros([nq], dtype: dtype)
+        zeroSinkCache = z
+        return z
+    }
 }
 
 extension Inkling2DecoderLayer {
@@ -527,7 +538,9 @@ extension Inkling2DecoderLayer {
     func supportsDecodeStep() -> Bool {
         let a = selfAttn
         let plain: [Linear] = [a.qProj, a.rProj, a.gateProj, a.sinkProj, a.kProj, a.vProj]
-        guard plain.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil }) else { return false }
+        guard plain.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil }) else {
+            return false
+        }
         if let gates = [qGate, kGate, vGate, mlpGate] as? [Inkling2MessageGate] {
             for g in gates {
                 guard type(of: g.downProj) == Linear.self, type(of: g.forgetProj) == Linear.self,
@@ -561,14 +574,17 @@ extension Inkling2DecoderLayer {
         let norms: [Inkling2RMSNorm] = isSliding ? [inputLN!] : [qInputLN!, kInputLN!, vInputLN!]
         w.attnNorm = MLX.stacked(norms.map { $0.weight.asType(f32) }, axis: 0)
         // Gate rows always come as q, k, v: sliding layers use input_layernorm for all three.
-        w.gateNorm = isSliding
+        w.gateNorm =
+            isSliding
             ? MLX.stacked([inputLN!, inputLN!, inputLN!].map { $0.weight.asType(f32) }, axis: 0)
             : w.attnNorm
         w.normEps = MLXArray([postAttnLN.eps])
         if isLoopLayer, let qg = qGate, let kg = kGate, let vg = vGate, let mg = mlpGate {
             func fg(_ g: Inkling2MessageGate) -> MLXArray {
-                MLX.concatenated([g.forgetProj.weight.asType(f32), g.gainProj.weight.asType(f32)], axis: 0)
-                    .T  // [rank, 2H]
+                MLX.concatenated(
+                    [g.forgetProj.weight.asType(f32), g.gainProj.weight.asType(f32)], axis: 0
+                )
+                .T  // [rank, 2H]
             }
             w.qkvDown = MLX.contiguous(
                 MLX.stacked([qg, kg, vg].map { $0.downProj.weight }, axis: 0).transposed(0, 2, 1))
@@ -581,8 +597,10 @@ extension Inkling2DecoderLayer {
         w.ones = MLXArray.ones([mlp.switchMLP.gateUp.expertScale.dim(0)], dtype: f32)
         w.downOnes = w.ones
         eval(
-            [w.xFused, w.qFused, w.kFused, w.vFused, w.attnNorm, w.gateNorm, w.qkvDown, w.qkvFG,
-             w.mlpDown, w.mlpFG, w.routerT, w.ones].compactMap { $0 })
+            [
+                w.xFused, w.qFused, w.kFused, w.vFused, w.attnNorm, w.gateNorm, w.qkvDown, w.qkvFG,
+                w.mlpDown, w.mlpFG, w.routerT, w.ones,
+            ].compactMap { $0 })
         w.ready = true
     }
 
@@ -614,15 +632,28 @@ extension Inkling2DecoderLayer {
         if attentionInput == nil {
             rows = inputLN!(h1)  // layer 0: input_layernorm(h)
         } else if msgs == nil {
-            rows = Inkling2DecodeKernels.depth(
-                [st0, h1, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!, w.normEps!],
-                template: [("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 1), ("ELEMS", elems), ("TG", tg)],
-                grid: (tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[nqa, H]],
-                outputDTypes: [dtype])[0]
+            rows =
+                Inkling2DecodeKernels.depth(
+                    [
+                        st0, h1, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                        w.normEps!,
+                    ],
+                    template: [
+                        ("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 1), ("ELEMS", elems),
+                        ("TG", tg),
+                    ],
+                    grid: (tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[nqa, H]],
+                    outputDTypes: [dtype])[0]
         } else {
             let xr = Inkling2DecodeKernels.depth(
-                [st0, h1, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!, w.normEps!],
-                template: [("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 0), ("ELEMS", elems), ("TG", tg)],
+                [
+                    st0, h1, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                    w.normEps!,
+                ],
+                template: [
+                    ("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 0), ("ELEMS", elems),
+                    ("TG", tg),
+                ],
                 grid: (tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[nqa, H]],
                 outputDTypes: [f32])[0]
             let meta = MLXArray([Int32(4 * loopIndex), Int32(nqa)])
@@ -632,10 +663,13 @@ extension Inkling2DecoderLayer {
                 outputDTypes: [w.qkvDown!.dtype])[0]
             let d = MLX.matmul(gin.reshaped([3, 1, 2 * H]), w.qkvDown!).asType(f32)  // [3, 1, rank]
             let fg = MLX.matmul(d, w.qkvFG!).reshaped([3, 2 * H])
-            rows = Inkling2DecodeKernels.gateOut(
-                [fg, xr, msgs!, w.gateNorm!, w.normEps!, meta], template: [("ELEMS", elems), ("TG", tg)],
-                grid: (3 * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[3, H], [3, H]],
-                outputDTypes: [dtype, f32])[0]
+            rows =
+                Inkling2DecodeKernels.gateOut(
+                    [fg, xr, msgs!, w.gateNorm!, w.normEps!, meta],
+                    template: [("ELEMS", elems), ("TG", tg)],
+                    grid: (3 * tg, 1, 1), threadGroup: (tg, 1, 1),
+                    outputShapes: [[3, H], [3, H]],
+                    outputDTypes: [dtype, f32])[0]
         }
 
         // 2. projections
@@ -647,7 +681,9 @@ extension Inkling2DecoderLayer {
         var imeta: [Int32]
         if rows.dim(0) == 1 {
             let y = MLX.matmul(rows, w.xFused!.T).reshaped([-1])
-            qa = y; ka = y; va = y
+            qa = y
+            ka = y
+            va = y
             let base = 2 * nQ + nR + nq
             imeta = [0, Int32(nQ), Int32(base), 0, Int32(base + C), 0]
         } else {
@@ -677,7 +713,9 @@ extension Inkling2DecoderLayer {
                 qa, ka, va, kwStatic, vwStatic, packed, a.qL2Clip.scale, a.relL2Clip.scale,
                 a.relLogits.proj, MLXArray([a.qkClip, a.relClip, a.eps, tau]), MLXArray(imeta),
             ],
-            template: [("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1)],
+            template: [
+                ("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1),
+            ],
             grid: ((2 * nq + 2 * nkv) * 32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[nQ], [C], [C], [nq * S], [3, 2 * C]],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
@@ -706,11 +744,15 @@ extension Inkling2DecoderLayer {
         let st1 = states?.reshaped([S1, H]) ?? MLXArray.zeros([1, H], dtype: f32)
         let norm = msgs == nil
         let midOut = Inkling2DecodeKernels.mid(
-            [o.reshaped([H]), h1.reshaped([H]), packed, postAttnConv.weight, st1,
-             mlpInput.query.reshaped([1, H]), postAttnLN.weight.asType(f32), w.normEps!,
-             MLXArray([Int32(2 * C)])],
-            template: [("NS", S1 + 1), ("ELEMS", elems), ("TG", tg), ("NORM", norm ? 1 : 0),
-                       ("BOUNDARY", isBlockBoundary ? 1 : 0)],
+            [
+                o.reshaped([H]), h1.reshaped([H]), packed, postAttnConv.weight, st1,
+                mlpInput.query.reshaped([1, H]), postAttnLN.weight.asType(f32), w.normEps!,
+                MLXArray([Int32(2 * C)]),
+            ],
+            template: [
+                ("NS", S1 + 1), ("ELEMS", elems), ("TG", tg), ("NORM", norm ? 1 : 0),
+                ("BOUNDARY", isBlockBoundary ? 1 : 0),
+            ],
             grid: (tg, 1, 1), threadGroup: (tg, 1, 1),
             outputShapes: [[H], [H], [H], [3, H]], outputDTypes: [dtype, f32, f32, f32])
         var xm32 = midOut[1]
@@ -723,10 +765,15 @@ extension Inkling2DecoderLayer {
                 outputDTypes: [w.mlpDown!.dtype])[0]
             let d = MLX.matmul(gin.reshaped([1, 1, 2 * H]), w.mlpDown!).asType(f32)
             let fg = MLX.matmul(d, w.mlpFG!).reshaped([1, 2 * H])
-            xm32 = Inkling2DecodeKernels.gateOut(
-                [fg, mrow, msgs, postAttnLN.weight.asType(f32).reshaped([1, H]), w.normEps!, meta],
-                template: [("ELEMS", elems), ("TG", tg)], grid: (tg, 1, 1), threadGroup: (tg, 1, 1),
-                outputShapes: [[1, H], [1, H]], outputDTypes: [dtype, f32])[1]
+            xm32 =
+                Inkling2DecodeKernels.gateOut(
+                    [
+                        fg, mrow, msgs, postAttnLN.weight.asType(f32).reshaped([1, H]), w.normEps!,
+                        meta,
+                    ],
+                    template: [("ELEMS", elems), ("TG", tg)], grid: (tg, 1, 1),
+                    threadGroup: (tg, 1, 1),
+                    outputShapes: [[1, H], [1, H]], outputDTypes: [dtype, f32])[1]
         }
 
         // 5. MoE
@@ -742,15 +789,20 @@ extension Inkling2DecoderLayer {
         let k = router.topK
         let gu = sw.gateUp(x32.reshaped([1, 1, 1, H]), inds, sorted: false)  // [1, k, 1, 2I]
         let act = Inkling2Kernels.moeActivation(
-            [gu.reshaped([k, 2 * sw.inter]), inds.reshaped([k]),
-             sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps],
+            [
+                gu.reshaped([k, 2 * sw.inter]), inds.reshaped([k]),
+                sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
+            ],
             grid: (sw.inter, k, 1), threadGroup: (min(256, sw.inter), 1, 1),
             outputShapes: [[k, sw.inter]], outputDTypes: [f32])[0]
         let down = sw.down(act.reshaped([1, k, 1, sw.inter]), inds, sorted: false)  // [1, k, 1, H]
         let fin = Inkling2DecodeKernels.final(
-            [down.reshaped([k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!, sel[1],
-             packed, postMLPConv.weight, midOut[2], outs[4], midOut[3],
-             MLXArray([Int32(2 * C), Int32(H)])],
+            [
+                down.reshaped([k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,
+                sel[1],
+                packed, postMLPConv.weight, midOut[2], outs[4], midOut[3],
+                MLXArray([Int32(2 * C), Int32(H)]),
+            ],
             grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[H], [3, P]],
             outputDTypes: [dtype, f32])
         conv[0] = fin[1].reshaped([1, 3, P])

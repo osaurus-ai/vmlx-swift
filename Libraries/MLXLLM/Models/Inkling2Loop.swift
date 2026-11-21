@@ -126,13 +126,20 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
         var markovHeadType: String?
         var targetLayerIds: [Int]?
         enum CodingKeys: String, CodingKey {
-            case hiddenSize = "hidden_size", numHiddenLayers = "num_hidden_layers"
-            case numAttentionHeads = "num_attention_heads", numKeyValueHeads = "num_key_value_heads"
-            case headDim = "head_dim", intermediateSize = "intermediate_size"
-            case rmsNormEps = "rms_norm_eps", ropeTheta = "rope_theta"
-            case localLayerIds = "local_layer_ids", slidingWindowSize = "sliding_window_size"
-            case blockSize = "block_size", markovRank = "markov_rank"
-            case markovHeadType = "markov_head_type", targetLayerIds = "target_layer_ids"
+            case hiddenSize = "hidden_size"
+            case numHiddenLayers = "num_hidden_layers"
+            case numAttentionHeads = "num_attention_heads"
+            case numKeyValueHeads = "num_key_value_heads"
+            case headDim = "head_dim"
+            case intermediateSize = "intermediate_size"
+            case rmsNormEps = "rms_norm_eps"
+            case ropeTheta = "rope_theta"
+            case localLayerIds = "local_layer_ids"
+            case slidingWindowSize = "sliding_window_size"
+            case blockSize = "block_size"
+            case markovRank = "markov_rank"
+            case markovHeadType = "markov_head_type"
+            case targetLayerIds = "target_layer_ids"
         }
     }
 
@@ -290,7 +297,6 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
 
 private let f32 = DType.float32
 
-
 /// Runtime switch (diagnostics / parity A/B): run single-token steps through the general path.
 public enum Inkling2Runtime {
     nonisolated(unsafe) public static var forceGeneralDecode = false
@@ -342,7 +348,8 @@ private func softcap(_ x: MLXArray, _ cap: Float) -> MLXArray {
 
 /// A layer's four conv states live in ONE packed fp32 `[B, K-1, P]` array; each conv reads its
 /// columns `offset ..< offset + C` and returns its new `[B, K-1, C]` state.
-private func convState(_ packed: MLXArray?, offset: Int, like x: MLXArray, kernel: Int) -> MLXArray {
+private func convState(_ packed: MLXArray?, offset: Int, like x: MLXArray, kernel: Int) -> MLXArray
+{
     packed?[0..., 0..., offset ..< (offset + x.dim(2))]
         ?? MLXArray.zeros([x.dim(0), kernel - 1, x.dim(2)], dtype: f32)
 }
@@ -530,7 +537,9 @@ final class Inkling2Attention: Module {
         _relLogits.wrappedValue = Inkling2RelLogits(dRel: dRel, extent: relExtent)
         _qL2Clip.wrappedValue = Inkling2ScaledL2Clip(heads: nq, dim: hd)
         _relL2Clip.wrappedValue = Inkling2ScaledL2Clip(heads: nq, dim: dRel)
-        clipThresholds = MLXArray([args.qkL2ClipThreshold, args.relL2ClipThreshold, args.rmsNormEps])
+        clipThresholds = MLXArray([
+            args.qkL2ClipThreshold, args.relL2ClipThreshold, args.rmsNormEps,
+        ])
     }
 
     /// `[q/k clip, rel clip, v-norm eps]` for `Inkling2Kernels.attnClips`.
@@ -557,7 +566,8 @@ final class Inkling2Attention: Module {
             if box.value == nil {
                 box.value = MLX.concatenated(qs.map(\.weight), axis: 0)
                 box.extra = MLX.concatenated(qs.map(\.scales), axis: 0)
-                box.extra2 = q0.biases == nil ? nil : MLX.concatenated(qs.map { $0.biases! }, axis: 0)
+                box.extra2 =
+                    q0.biases == nil ? nil : MLX.concatenated(qs.map { $0.biases! }, axis: 0)
             }
             let (w, sc, bi) = (box.value!, box.extra!, box.extra2)
             let (gs, bits, mode) = (q0.groupSize, q0.bits, q0.mode)
@@ -567,7 +577,9 @@ final class Inkling2Attention: Module {
                     mode: mode)
             }
         }
-        guard parts.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil }) else { return nil }
+        guard parts.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil }) else {
+            return nil
+        }
         if box.value == nil {
             // [out, in] row-major like `Linear.weight`: MLX's GEMV is fastest on its transpose.
             box.value = MLX.concatenated(parts.map(\.weight), axis: 0)
@@ -637,7 +649,8 @@ final class Inkling2Attention: Module {
             let R = B * T
             let outs = Inkling2Kernels.attnClips(
                 [
-                    q.reshaped([R, nq * hd]), r.reshaped([R, nq * dRel]), k.reshaped([R, nkv * hd]),
+                    q.reshaped([R, nq * hd]), r.reshaped([R, nq * dRel]),
+                    k.reshaped([R, nkv * hd]),
                     v.reshaped([R, nkv * hd]), qL2Clip.scale.asType(f32),
                     relL2Clip.scale.asType(f32), clipThresholds,
                 ], grid: ((2 * nq + 2 * nkv) * 32, R, 1), threadGroup: (32, 1, 1),
@@ -706,7 +719,10 @@ final class Inkling2Attention: Module {
             var bias: MLXArray
             if inklingUseKernels, B == 1 {
                 bias = Inkling2Kernels.decodeBias(
-                    [r.reshaped([nq, dRel]), relLogits.proj.asType(r.dtype), MLXArray([Int32(S)])],
+                    [
+                        r.reshaped([nq, dRel]), relLogits.proj.asType(r.dtype),
+                        MLXArray([Int32(S)]),
+                    ],
                     grid: (S, nq, 1), threadGroup: (min(256, S), 1, 1), outputShapes: [[nq, S]],
                     outputDTypes: [r.dtype])[0].reshaped([1, nq, 1, S])
             } else {
@@ -845,10 +861,11 @@ final class Inkling2SwitchMLP: Module {
         var act: MLXArray
         if inklingUseKernels {
             let ones = MLXArray.ones([gateUp.expertScale.dim(0)], dtype: f32)
-            act = Inkling2Kernels.moeActivation(
-                [gu.reshaped([rows, 2 * inter]), idx.flattened(), gateScale ?? ones, caps],
-                grid: (inter, rows, 1), threadGroup: (min(256, inter), 1, 1),
-                outputShapes: [[rows, inter]], outputDTypes: [f32])[0]
+            act =
+                Inkling2Kernels.moeActivation(
+                    [gu.reshaped([rows, 2 * inter]), idx.flattened(), gateScale ?? ones, caps],
+                    grid: (inter, rows, 1), threadGroup: (min(256, inter), 1, 1),
+                    outputShapes: [[rows, inter]], outputDTypes: [f32])[0]
             act = act.reshaped(Array(gu.shape.dropLast()) + [inter])
         } else {
             var g2 = gu
@@ -1173,7 +1190,8 @@ final class Inkling2DecoderLayer: Module {
                 pre = selfAttn.project(
                     ln(qGate!(x, messages[.ellipsis, 0, 0...], ones: ones)).asType(dtype),
                     keyInput: ln(kGate!(x, messages[.ellipsis, 1, 0...], ones: ones)).asType(dtype),
-                    valueInput: ln(vGate!(x, messages[.ellipsis, 2, 0...], ones: ones)).asType(dtype),
+                    valueInput: ln(vGate!(x, messages[.ellipsis, 2, 0...], ones: ones)).asType(
+                        dtype),
                     packed: packed, ones: ones)
             } else {
                 pre = selfAttn.project(
@@ -1213,9 +1231,10 @@ final class Inkling2DecoderLayer: Module {
             m = mlpGate!(m, messages[.ellipsis, 3, 0...], ones: ones)
             m = postAttnLN(m).asType(dtype)
         } else {
-            m = mlpInput.normed(
-                states, residual, norms: [postAttnLN], dtype: dtype, ones: ones, box: mlpNormBox
-            )[.ellipsis, 0, 0...]
+            m =
+                mlpInput.normed(
+                    states, residual, norms: [postAttnLN], dtype: dtype, ones: ones, box: mlpNormBox
+                )[.ellipsis, 0, 0...]
         }
         m = mlp(m)
         let (out, newMLP) = postMLPConv.residual(
@@ -1227,7 +1246,10 @@ final class Inkling2DecoderLayer: Module {
                 conv: conv,
                 oldState: packed ?? MLXArray.zeros([h.dim(0), 3, 2 * c + 2 * hidden], dtype: f32),
                 inputs: MLX.concatenated(
-                    [pre[8].asType(f32), pre[9].asType(f32), attnConvIn.asType(f32), m.asType(f32)],
+                    [
+                        pre[8].asType(f32), pre[9].asType(f32), attnConvIn.asType(f32),
+                        m.asType(f32),
+                    ],
                     axis: -1))
         }
         if let conv {
@@ -1466,7 +1488,8 @@ public final class Inkling2LoopModel: Module, LLMModel {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let slots = args.numCacheSlots
-        var cache = (0 ..< slots).map { _ in KVCacheSimple() as KVCache }
+        var cache =
+            (0 ..< slots).map { _ in KVCacheSimple() as KVCache }
             + (0 ..< slots).map { _ in MambaCache(slots: 1) as KVCache }
         if parameters?.draftStrategy?.usesDSpark == true, dsparkAvailable, let d = drafter {
             // dSpark: the drafter's context KV per draft layer + the last row's target features.
@@ -1549,7 +1572,9 @@ public final class Inkling2LoopModel: Module, LLMModel {
             {
                 continue
             }
-            if key.hasPrefix("mtp_drafter.") || !(key.hasPrefix("model.") || key.hasPrefix("lm_head")) {
+            if key.hasPrefix("mtp_drafter.")
+                || !(key.hasPrefix("model.") || key.hasPrefix("lm_head"))
+            {
                 // Native drafter (`mtp.safetensors`: `layers.N.*`, `markov_head.*`, `mask_embed`,
                 // `fuse_weight`, `norm.weight`) -> the `mtp_drafter` submodule, as stored (BF16).
                 if drafter != nil {
@@ -1562,14 +1587,16 @@ public final class Inkling2LoopModel: Module, LLMModel {
             if key.hasSuffix("mlp.experts.w13_weight") || key.hasSuffix("mlp.experts.w2_weight") {
                 let isW13 = key.hasSuffix("w13_weight")
                 let base = Inkling2LoopModel.mapKey(
-                    String(key.dropLast((isW13 ? "experts.w13_weight" : "experts.w2_weight").count)))
+                    String(key.dropLast((isW13 ? "experts.w13_weight" : "experts.w2_weight").count))
+                )
                 let leg = isW13 ? "gate_up_proj" : "down_proj"
                 let prefix = base + "switch_mlp.\(leg)."
                 guard let scales = weights[key + "_scale"] else { continue }
                 out[prefix + "codes"] = MLX.contiguous(value).view(dtype: .uint32)
                 out[prefix + "block_scales"] = scales
                 if let amax = weights[key + "_amax"] {
-                    let den = weights[key + "_outer_scale_denominator"]?.reshaped([-1])[0]
+                    let den =
+                        weights[key + "_outer_scale_denominator"]?.reshaped([-1])[0]
                         ?? MLXArray(Float(2688))
                     out[prefix + "expert_scale"] = amax.asType(.float32) / den.asType(.float32)
                 } else {

@@ -12,7 +12,6 @@ import MLXNN
 
 private let f32 = DType.float32
 
-
 enum Inkling2VerifyKernels {
     static let header = Inkling2DecodeKernels.header
 
@@ -24,7 +23,9 @@ enum Inkling2VerifyKernels {
     /// the last row).
     static let qkvT = MLXFast.metalKernel(
         name: "inkling2_ver_qkv",
-        inputNames: ["qa", "ka", "va", "kw", "vw", "packed", "qscale", "rscale", "tau", "fmeta", "imeta"],
+        inputNames: [
+            "qa", "ka", "va", "kw", "vw", "packed", "qscale", "rscale", "tau", "fmeta", "imeta",
+        ],
         outputNames: ["qo", "ro", "ko", "vo", "kvst"],
         source: """
             uint head = threadgroup_position_in_grid.x;
@@ -114,9 +115,13 @@ enum Inkling2VerifyKernels {
             """,
         header: header)
 
-    /// mask [NQ, T, S + 1]: column 0 = row t's sink logit for head h (from qa at meta[3]); key j at
-    /// absolute position kStart + j: d = (seen + t) - (kStart + j); valid = d >= 0 (and d < W if
-    /// W > 0); value = bf16(r[t, h] . proj[:, d]) for d < E, 0 beyond, -inf when invalid.
+    /// mask [NQ, T, S]: key j at absolute position kStart + j: d = (seen + t) - (kStart + j);
+    /// valid = d >= 0 (and d < W if W > 0); value = bf16(r[t, h] . proj[:, d]) for d < E, 0 beyond,
+    /// minus row t's sink logit for head h (qa at meta[3]); -inf when invalid.
+    ///
+    /// The per-token sink is folded into the mask: attention runs with a zero native sink, and a
+    /// row-constant shift of every key's logit by -sink gives exp(s_j) / (exp(sink) + sum exp(s_i)),
+    /// the sink softmax, without a zero key concatenated in front of the whole cache each visit.
     /// meta = [S, seen, kStart, sink off, qa row stride, W].
     static let maskT = MLXFast.metalKernel(
         name: "inkling2_ver_mask",
@@ -131,17 +136,17 @@ enum Inkling2VerifyKernels {
             int DR = proj_shape[0];
             int E = proj_shape[1];
             int T = r_shape[0];
-            if (j > (uint)S) return;
-            size_t o = ((size_t)h * T + t) * (S + 1) + j;
-            if (j == 0) { ink_store(out, o, float(qa[(size_t)t * qs + soff + h])); return; }
-            int d = (seen + (int)t) - (kStart + (int)j - 1);
+            if (j >= (uint)S) return;
+            size_t o = ((size_t)h * T + t) * S + j;
+            int d = (seen + (int)t) - (kStart + (int)j);
             bool valid = d >= 0 && (W <= 0 || d < W);
             if (!valid) { ink_store(out, o, -INFINITY); return; }
             float b = 0.f;
             if (d < E) {
                 for (int k = 0; k < DR; ++k) b += float(r[((size_t)t * NQ + h) * DR + k]) * float(proj[k * E + d]);
             }
-            ink_store(out, o, b);
+            float sink = float(qa[(size_t)t * qs + soff + h]);
+            ink_store(out, o, ink_round_as(out, b) - sink);
             """,
         header: header)
 
@@ -318,8 +323,14 @@ extension Inkling2DecoderLayer {
             rowsQ = inputLN!(hT)
         } else if msgs == nil {
             let out = Inkling2DecodeKernels.depth(
-                [st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!, w.normEps!],
-                template: [("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 1), ("ELEMS", elems), ("TG", tg)],
+                [
+                    st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                    w.normEps!,
+                ],
+                template: [
+                    ("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 1), ("ELEMS", elems),
+                    ("TG", tg),
+                ],
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, nqa, H]],
                 outputDTypes: [dtype])[0]
             if nqa == 1 {
@@ -331,8 +342,14 @@ extension Inkling2DecoderLayer {
             }
         } else {
             let xr = Inkling2DecodeKernels.depth(
-                [st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!, w.normEps!],
-                template: [("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 0), ("ELEMS", elems), ("TG", tg)],
+                [
+                    st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                    w.normEps!,
+                ],
+                template: [
+                    ("NS", S0 + 1), ("HASP", 1), ("NQ", nqa), ("NORM", 0), ("ELEMS", elems),
+                    ("TG", tg),
+                ],
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, nqa, H]],
                 outputDTypes: [f32])[0].reshaped([T * nqa, H])
             let meta = MLXArray([Int32(4 * loopIndex), Int32(nqa), Int32(T), Int32(L4)])
@@ -343,8 +360,10 @@ extension Inkling2DecoderLayer {
             let d = MLX.matmul(gin.reshaped([3, T, 2 * H]), w.qkvDown!).asType(f32)  // [3, T, rank]
             let fg = MLX.matmul(d, w.qkvFG!).reshaped([3 * T, 2 * H])
             let g = Inkling2VerifyKernels.gateOutT(
-                [fg, xr, msgs!, w.gateNorm!, w.normEps!, meta], template: [("ELEMS", elems), ("TG", tg)],
-                grid: (3 * T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[3 * T, H], [3 * T, H]],
+                [fg, xr, msgs!, w.gateNorm!, w.normEps!, meta],
+                template: [("ELEMS", elems), ("TG", tg)],
+                grid: (3 * T * tg, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [[3 * T, H], [3 * T, H]],
                 outputDTypes: [dtype, f32])[0].reshaped([3, T, H])
             rowsQ = g[0]
             rowsK = g[1]
@@ -360,7 +379,9 @@ extension Inkling2DecoderLayer {
         var imeta: [Int32]
         if rowsK == nil {
             let y = MLX.matmul(rowsQ, w.xFused!.T)  // [T, N]
-            qa = y; ka = y; va = y
+            qa = y
+            ka = y
+            va = y
             let base = 2 * nQ + nR + nq
             let N = Int32(y.dim(1))
             imeta = [0, Int32(nQ), Int32(base), 0, Int32(base + C), 0, N, N, N]
@@ -368,7 +389,10 @@ extension Inkling2DecoderLayer {
             qa = MLX.matmul(rowsQ, w.qFused!.T)
             ka = MLX.matmul(rowsK!, w.kFused!.T)
             va = MLX.matmul(rowsV!, w.vFused!.T)
-            imeta = [0, Int32(nQ), 0, Int32(C), 0, Int32(C), Int32(qa.dim(1)), Int32(ka.dim(1)), Int32(va.dim(1))]
+            imeta = [
+                0, Int32(nQ), 0, Int32(C), 0, Int32(C), Int32(qa.dim(1)), Int32(ka.dim(1)),
+                Int32(va.dim(1)),
+            ]
         }
         let seen = kv.offset
         var taus = [Float](repeating: 1, count: T)
@@ -387,9 +411,14 @@ extension Inkling2DecoderLayer {
             vwStatic = (a.vSconv as! Inkling2DynamicShortConv).staticWeight
         }
         let outs = Inkling2VerifyKernels.qkvT(
-            [qa, ka, va, kwStatic, vwStatic, packed, a.qL2Clip.scale, a.relL2Clip.scale, MLXArray(taus),
-             MLXArray([a.qkClip, a.relClip, a.eps]), MLXArray(imeta)],
-            template: [("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1)],
+            [
+                qa, ka, va, kwStatic, vwStatic, packed, a.qL2Clip.scale, a.relL2Clip.scale,
+                MLXArray(taus),
+                MLXArray([a.qkClip, a.relClip, a.eps]), MLXArray(imeta),
+            ],
+            template: [
+                ("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1),
+            ],
             grid: ((2 * nq + 2 * nkv) * 32, T, 1), threadGroup: (32, 1, 1),
             outputShapes: [[T, nQ], [T, nR], [T, C], [T, C], [3, 2 * C]],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
@@ -411,16 +440,20 @@ extension Inkling2DecoderLayer {
         }
         let sinkOff = 2 * nQ + nR
         let mask = Inkling2VerifyKernels.maskT(
-            [outs[1].reshaped([T, nq, dRel]), a.relLogits.proj, qa,
-             MLXArray([Int32(S), Int32(seen), Int32(kStart), Int32(sinkOff), Int32(qa.dim(1)), Int32(a.window ?? 0)])],
-            grid: (S + 1, T, nq), threadGroup: (min(256, S + 1), 1, 1),
-            outputShapes: [[nq, T, S + 1]], outputDTypes: [dtype])[0]
-        let zk = MLXArray.zeros([1, nkv, 1, hd], dtype: keys.dtype)
+            [
+                outs[1].reshaped([T, nq, dRel]), a.relLogits.proj, qa,
+                MLXArray([
+                    Int32(S), Int32(seen), Int32(kStart), Int32(sinkOff), Int32(qa.dim(1)),
+                    Int32(a.window ?? 0),
+                ]),
+            ],
+            grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
+            outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
         let attn = MLXFast.scaledDotProductAttention(
             queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
-            keys: MLX.concatenated([zk, keys], axis: 2),
-            values: MLX.concatenated([zk.asType(values.dtype), values], axis: 2),
-            scale: a.scale, mask: .array(mask.reshaped([1, nq, T, S + 1])))
+            keys: keys, values: values, scale: a.scale,
+            mask: .array(mask.reshaped([1, nq, T, S])),
+            sinks: w.zeroSinks(nq: nq, dtype: dtype))
         let merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [merged, qa[0..., (nQ + nR) ..< (2 * nQ + nR)], MLXArray([Int32(0)])],
@@ -440,7 +473,10 @@ extension Inkling2DecoderLayer {
         if let msgs {
             let mraw = Inkling2DecodeKernels.depth(
                 [st1, res2, mlpInput.query.asType(f32).reshaped([1, H]), w.mlpNorm!, w.normEps!],
-                template: [("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 0), ("ELEMS", elems), ("TG", tg)],
+                template: [
+                    ("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 0), ("ELEMS", elems),
+                    ("TG", tg),
+                ],
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, 1, H]],
                 outputDTypes: [f32])[0].reshaped([T, H])
             let meta = MLXArray([Int32(4 * loopIndex + 3), Int32(1), Int32(T), Int32(L4)])
@@ -450,14 +486,19 @@ extension Inkling2DecoderLayer {
                 outputDTypes: [w.mlpDown!.dtype])[0]
             let d = MLX.matmul(gin.reshaped([1, T, 2 * H]), w.mlpDown!).asType(f32)
             let fg = MLX.matmul(d, w.mlpFG!).reshaped([T, 2 * H])
-            xm32 = Inkling2VerifyKernels.gateOutT(
-                [fg, mraw, msgs, w.mlpNorm!.reshaped([1, H]), w.normEps!, meta],
-                template: [("ELEMS", elems), ("TG", tg)], grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1),
-                outputShapes: [[T, H], [T, H]], outputDTypes: [dtype, f32])[1]
+            xm32 =
+                Inkling2VerifyKernels.gateOutT(
+                    [fg, mraw, msgs, w.mlpNorm!.reshaped([1, H]), w.normEps!, meta],
+                    template: [("ELEMS", elems), ("TG", tg)], grid: (T * tg, 1, 1),
+                    threadGroup: (tg, 1, 1),
+                    outputShapes: [[T, H], [T, H]], outputDTypes: [dtype, f32])[1]
         } else {
             let xm = Inkling2DecodeKernels.depth(
                 [st1, res2, mlpInput.query.asType(f32).reshaped([1, H]), w.mlpNorm!, w.normEps!],
-                template: [("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 1), ("ELEMS", elems), ("TG", tg)],
+                template: [
+                    ("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 1), ("ELEMS", elems),
+                    ("TG", tg),
+                ],
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, 1, H]],
                 outputDTypes: [dtype])[0].reshaped([T, H])
             xm32 = xm.asType(f32)
@@ -478,15 +519,20 @@ extension Inkling2DecoderLayer {
         // experts, so the gather is already at bandwidth.
         let gu = sw.gateUp(xm32.reshaped([T, 1, 1, H]), inds, sorted: false)  // [T, k, 1, 2I]
         let act = Inkling2Kernels.moeActivation(
-            [gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
-             sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps],
+            [
+                gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
+                sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
+            ],
             grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
             outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
         let down = sw.down(act.reshaped([T, k, 1, sw.inter]), inds, sorted: false)  // [T, k, 1, H]
         let fin = Inkling2VerifyKernels.finalT(
-            [down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!, sel[1],
-             packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
-             MLXArray([Int32(2 * C), Int32(H)])],
+            [
+                down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,
+                sel[1],
+                packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
+                MLXArray([Int32(2 * C), Int32(H)]),
+            ],
             grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
             outputDTypes: [dtype, f32, f32])
         if let recorder {
@@ -494,7 +540,9 @@ extension Inkling2DecoderLayer {
             let vRaw = va[0..., Int(imeta[4]) ..< (Int(imeta[4]) + C)].asType(f32)
             recorder.record(
                 conv: conv, oldState: packed.reshaped([1, 3, P]),
-                inputs: MLX.concatenated([kRaw, vRaw, o.asType(f32), fin[2]], axis: -1).reshaped([1, T, P]))
+                inputs: MLX.concatenated([kRaw, vRaw, o.asType(f32), fin[2]], axis: -1).reshaped([
+                    1, T, P,
+                ]))
         }
         conv[0] = fin[1].reshaped([1, 3, P])
         conv.offset += T

@@ -497,7 +497,8 @@ enum Inkling2Kernels {
         let q = query.ndim == 1 ? query.reshaped([1, H]) : query
         let S = stack?.dim(1) ?? 0
         let meta = MLXArray([
-            Int32(S), Int32(partial == nil ? 0 : 1), Int32(q.dim(0)), Int32(normWeight == nil ? 0 : 1),
+            Int32(S), Int32(partial == nil ? 0 : 1), Int32(q.dim(0)),
+            Int32(normWeight == nil ? 0 : 1),
         ])
         let st = stack ?? MLXArray.zeros([1, 1, H], dtype: .float32)
         let pa = partial ?? MLXArray.zeros([1, H], dtype: .float32)

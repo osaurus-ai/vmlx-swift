@@ -110,21 +110,26 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         let (h, fRnn) = block(seed: seed, cache: cache)
         let d = model.drafter!
         return Array(
-            d.walk(h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
-                   steps: min(count, d.cfg.blockSize - 1)))
+            d.walk(
+                h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
+                steps: min(count, d.cfg.blockSize - 1)))
     }
 
     func draft(seed: Int, cache: [KVCache], noise: MLXArray, inverseTemperature: Float) -> [Int] {
-        draft(seed: seed, cache: cache, count: model.drafter!.cfg.blockSize - 1, noise: noise,
-              inverseTemperature: inverseTemperature)
+        draft(
+            seed: seed, cache: cache, count: model.drafter!.cfg.blockSize - 1, noise: noise,
+            inverseTemperature: inverseTemperature)
     }
 
-    func draft(seed: Int, cache: [KVCache], count: Int, noise: MLXArray, inverseTemperature: Float) -> [Int] {
+    func draft(seed: Int, cache: [KVCache], count: Int, noise: MLXArray, inverseTemperature: Float)
+        -> [Int]
+    {
         let (h, fRnn) = block(seed: seed, cache: cache)
         let d = model.drafter!
         return d.walk(
             h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
-            steps: min(count, d.cfg.blockSize - 1), noise: noise, inverseTemperature: inverseTemperature)
+            steps: min(count, d.cfg.blockSize - 1), noise: noise,
+            inverseTemperature: inverseTemperature)
     }
 
     func beginVerifyCapture(cache: [KVCache]) -> Bool {
