@@ -4317,7 +4317,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                     + "key=\(generatedBoundaryTokens.map { String($0.count) } ?? "nil")\n").utf8))
         }
         guard var generatedBoundaryTokens else { return }
-        if endedOnToolCall {
+        let stopTokenIsHistory: Bool = {
+            guard endedOnToolCall, let m = model as? ToolCallTurnStopTokenModel,
+                generatedBoundaryTokens.count == promptTokenIds.count + generatedTokenIds.count + 1,
+                let last = generatedBoundaryTokens.last
+            else { return false }
+            return m.toolCallTurnStopTokenIds.contains(last)
+        }()
+        if endedOnToolCall, !stopTokenIsHistory {
             // Key exactly the returned tokens: anything the async pipeline forwarded past the call is not history.
             let keep = promptTokenIds.count + generatedTokenIds.count
             for layer in cache where layer.offset > keep { layer.trim(layer.offset - keep) }

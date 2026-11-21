@@ -1350,8 +1350,12 @@ public final class Inkling2LoopModelInner: Module {
         let fastDecode =
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) == 1
             && !inklingSkip.contains("fastdecode") && inklingSkip.isEmpty
-            && !Inkling2Runtime.forceGeneralDecode && decodeSupported
-            && capture == nil && recorder == nil
+            && !Inkling2Runtime.forceGeneralDecode && decodeSupported && recorder == nil
+        // Short multi-row calls (speculative verify, small chunks) take the fused multi-row path.
+        let multiRow =
+            inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) > 1
+            && ids.dim(1) <= 16 && inklingSkip.isEmpty && !Inkling2Runtime.forceGeneralDecode
+            && decodeSupported
         func visit(_ layer: Int, _ pass: Int) -> Int {
             if layer < args.loopStart { return layer }
             if layer >= args.loopEnd {
@@ -1363,6 +1367,12 @@ public final class Inkling2LoopModelInner: Module {
             for (j, i) in ids.enumerated() {
                 if let capture, capture.ids.contains(visit(i, pass)) {
                     capture.values[visit(i, pass)] = h
+                }
+                if multiRow {
+                    (h, stack) = layers[i].multiRowStep(
+                        h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
+                        loopIndex: j, ones: ones, recorder: recorder)
+                    continue
                 }
                 if let recorder {
                     let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
@@ -1765,6 +1775,55 @@ extension Inkling2LoopModel {
                 layer.decodeStep(x, stack: i == 0 ? nil : st1, kv: kv, conv: cv, messages: m, loopIndex: 0, ones: model.ones).0
             }, seed: xb)
         }
+        // multi-row (T = 8) pieces
+        func multiChain(_ i: Int, msgs: Bool, T: Int) {
+            let kv = KVCacheSimple()
+            let cv = MambaCache(slots: 1)
+            let layer = L[i]
+            let warm = MLXRandom.normal([1, 64, H]).asType(.bfloat16)
+            _ = layer(warm, stack: MLXRandom.normal([1, 64, 3, H]), kv: kv, conv: cv, messages: nil, ones: model.ones)
+            eval(kv.state + [cv[0]!])
+            let stT = MLXRandom.normal([1, T, 3, H])
+            let m = msgs ? MLXRandom.normal([1, T, 48, H]) : nil
+            let xT = MLXRandom.normal([1, T, H]).asType(.bfloat16)
+            time("multiRowStep L\(i) T=\(T)\(msgs ? " +msgs" : "")", { x in
+                let out = layer.multiRowStep(x, stack: stT, kv: kv, conv: cv, messages: m, loopIndex: 0, ones: model.ones, recorder: nil).0
+                _ = kv.trim(T)
+                cv.offset -= T
+                return out
+            }, seed: xT)
+        }
+        multiChain(7, msgs: false, T: 8)
+        multiChain(7, msgs: false, T: 4)
+        multiChain(7, msgs: true, T: 8)
+        let x8 = MLXRandom.normal([8, H]).asType(.bfloat16)
+        let inds8 = MLXRandom.randInt(0 ..< 128, [8, 8]).asType(.uint32)
+        let w8 = MLXArray.ones([8, 8], dtype: .float32)
+        time("experts T=8 (sorted via SwitchMLP)", { x in sw6(x, inds8, w8) }, seed: x8)
+        do {
+            let xf = x8.asType(.float32)
+            let ref = sw6.gateUp(xf.reshaped([8, 1, 1, H]), inds8, sorted: false).reshaped([64, -1])
+            let got = Inkling2VerifyKernels.groupedExperts(
+                xf, inds: inds8, codes: sw6.gateUp.codes, scales: sw6.gateUp.blockScales, xPerPair: false)
+            let rel = (abs(ref - got).max() / abs(ref).max()).item(Float.self)
+            lines.append(String(format: "grouped vs gather_qmm gate_up (nvfp4) max rel %.2e", rel))
+            let sw21 = L[21].mlp.switchMLP
+            let ref8 = sw21.gateUp(xf.reshaped([8, 1, 1, H]), inds8, sorted: false).reshaped([64, -1])
+            let got8 = Inkling2VerifyKernels.groupedExperts(
+                xf, inds: inds8, codes: sw21.gateUp.codes, scales: sw21.gateUp.blockScales, xPerPair: false)
+            let rel8 = (abs(ref8 - got8).max() / abs(ref8).max()).item(Float.self)
+            lines.append(String(format: "grouped vs gather_qmm gate_up (mxfp8) max rel %.2e", rel8))
+            time("grouped gate_up T=8", { x in
+                Inkling2VerifyKernels.groupedExperts(x.asType(.float32), inds: inds8, codes: sw6.gateUp.codes,
+                    scales: sw6.gateUp.blockScales, xPerPair: false)[0..., 0 ..< H].asType(.bfloat16)
+            }, seed: x8)
+        }
+        let x81 = x8.asType(.float32).reshaped([8, 1, 1, H])
+        time("gate_up gather T=8 unsorted", { x in sw6.gateUp(x.asType(.float32).reshaped([8, 1, 1, H]), inds8, sorted: false)[0..., 0, 0, 0 ..< H].asType(.bfloat16) }, seed: x8)
+        _ = x81
+        if let f = a6.fusedProjection(includeKV: true) {
+            time("proj fused T=8", { x in f(x)[.ellipsis, 0 ..< H] }, seed: x8)
+        }
         decodeChain(7, msgs: false)
         decodeChain(5, msgs: false)
         decodeChain(7, msgs: true)
@@ -1828,4 +1887,7 @@ extension Inkling2LoopModel {
 /// <|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|><|content_model_end_sampling|>`) back to exactly
 /// the tokens the model generated, so the tool-call turn stores a post-answer boundary and the request carrying the
 /// tool result restores past it instead of re-prefilling the conversation.
-extension Inkling2LoopModel: ToolCallTurnBoundaryModel {}
+extension Inkling2LoopModel: ToolCallTurnStopTokenModel {
+    /// `<|content_model_end_sampling|>` closes every assistant turn in the template, tool calls included.
+    public var toolCallTurnStopTokenIds: Set<Int> { Set(args.eosTokenId ?? [200006]) }
+}

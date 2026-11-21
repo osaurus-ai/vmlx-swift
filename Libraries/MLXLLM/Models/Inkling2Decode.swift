@@ -515,6 +515,7 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var mlpFG: MLXArray?
     var gateEps: MLXArray?
     var routerT: MLXArray?
+    var mlpNorm: MLXArray?
     var ones: MLXArray?
     var downOnes: MLXArray?
     var ready = false
@@ -541,7 +542,7 @@ extension Inkling2DecoderLayer {
             && router.weight.dim(0) <= 256 && router.topK <= 16 && router.topK >= 1
     }
 
-    private func prepareDecodeWeights() {
+    func prepareDecodeWeights() {
         let w = decodeWeights
         guard !w.ready else { return }
         let a = selfAttn
