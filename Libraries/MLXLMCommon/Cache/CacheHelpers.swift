@@ -314,6 +314,14 @@ public protocol ExactPrefixRestoreCache {}
 /// differently falls back to the prompt boundary at the cost of one unused entry.
 public protocol ToolCallTurnBoundaryModel {}
 
+/// A ``ToolCallTurnBoundaryModel`` whose template closes a tool-call turn with a stop token (Inkling:
+/// `…<|end_message|><|content_model_end_sampling|>`). That token is history, so when the decode pipeline
+/// forwarded exactly it past the call, the post-answer boundary keeps it instead of trimming the row —
+/// which a recurrent / conv-state layer cannot do, and which would otherwise skip the store.
+public protocol ToolCallTurnStopTokenModel: ToolCallTurnBoundaryModel {
+    var toolCallTurnStopTokenIds: Set<Int> { get }
+}
+
 /// True when every layer is either an ordinary (not disk-backed) cache or an ``ExactPrefixRestoreCache``.
 public func cacheRestoreIsExactPrefix(_ cache: [any KVCache]) -> Bool {
     !cache.isEmpty && cache.allSatisfy { layer in

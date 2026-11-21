@@ -42,6 +42,7 @@ struct ZeroArgumentToolCallTests {
         (.xmlFunction, "<tool_call><function=list_mailboxes></function></tool_call>"),
         (.glm4, "<tool_call>list_mailboxes</tool_call>"),
         (.hunyuan, "<tool_calls><tool_call>list_mailboxes<tool_sep></tool_call></tool_calls>"),
+        (.inkling, "<|content_invoke_tool_json|>{\"name\":\"list_mailboxes\",\"args\":{}}<|end_message|>"),
         (.minimaxM2, #"<invoke name="list_mailboxes"></invoke>"#),
         (.minimaxM3, "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"list_mailboxes\">\n]<]minimax[>[</invoke>\n</tool_call>"),
         (.minicpm5, #"<function name="list_mailboxes"></function>"#),

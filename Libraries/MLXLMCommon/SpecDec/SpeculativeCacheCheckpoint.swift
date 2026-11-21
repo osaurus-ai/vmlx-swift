@@ -239,3 +239,28 @@ public struct HybridPoolHiddenTail {
         }
     }
 }
+
+/// Plain single- or multi-slot recurrent state (`MambaCache`): the occupied arrays as fresh
+/// wrappers (``ArraysCache`` writes through `_updateInternal`, which would change a shared wrapper)
+/// plus the offset. Inkling-2's packed short-conv states use it; a verify commit rewinds them itself
+/// and this snapshot backs the restore-and-refeed fallback.
+extension MambaCache: SpeculativeCheckpointCache {
+    private struct Checkpoint {
+        let arrays: [MLXArray]
+        let offset: Int
+    }
+
+    public var speculativeCheckpointIsExact: Bool { type(of: self) == MambaCache.self }
+
+    public func speculativeCheckpoint() -> Any {
+        Checkpoint(arrays: state.compactMap { speculativeReference($0) }, offset: offset)
+    }
+
+    public func restoreSpeculativeCheckpoint(_ checkpoint: Any) {
+        guard let c = checkpoint as? Checkpoint else {
+            preconditionFailure("MambaCache: foreign speculative checkpoint")
+        }
+        state = c.arrays
+        offset = c.offset
+    }
+}
