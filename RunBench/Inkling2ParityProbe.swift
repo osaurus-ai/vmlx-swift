@@ -6,6 +6,7 @@
 // consistency, greedy continuation agreement, and decode timing.
 
 import Foundation
+import CmlxGraphShim
 import MLX
 import MLXHuggingFace
 import MLXLLM
@@ -83,7 +84,140 @@ func runInkling2ParityProbe(modelPath: String) async throws {
         var agree = 0
         for (a, b) in zip(gen, pyGreedy) { if a == b { agree += 1 } else { break } }
         let text = context.tokenizer.decode(tokenIds: Array(gen.prefix(pyGreedy.count)), skipSpecialTokens: false)
+        // Teacher-forced vs Python: feed Python's greedy tokens, compare each step's logits.
+        let stepsPath = refPath.replacingOccurrences(of: ".json", with: "_\(name)_steps.f32")
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: stepsPath)) {
+            let all = d.withUnsafeBytes { MLXArray(Array($0.bindMemory(to: Float.self))) }
+            let V = all.size / (pyGreedy.count - 1)
+            let pySteps = all.reshaped([pyGreedy.count - 1, V])
+            var c = model.newCache(parameters: nil)
+            var s3 = 0
+            while s3 < n { let e = min(s3 + chunk, n); eval(model(ids[0..., s3 ..< e], cache: c)); s3 = e }
+            var kls: [Float] = []
+            var top1 = 0
+            for t in 0 ..< (pyGreedy.count - 1) {
+                let lg = model(MLXArray([Int32(pyGreedy[t])])[.newAxis], cache: c)[0, -1].asType(.float32)
+                eval(lg)
+                kls.append(kl(pySteps[t], lg))
+                if lg.argMax().item(Int.self) == pySteps[t].argMax().item(Int.self) { top1 += 1 }
+            }
+            c = []
+            let srt = kls.sorted()
+            print(String(format: "[INK2] %@ teacher-forced vs py: %d steps top1 %d/%d KL median %.2e max %.2e",
+                         name, kls.count, top1, kls.count, srt[srt.count / 2], srt.last!))
+        }
+        // Self-consistency control: the same tokens decoded after two different prefill chunkings.
+        if name == "long" {
+            func tf(_ ck: Int) -> [MLXArray] {
+                let c = model.newCache(parameters: nil)
+                var s4 = 0
+                while s4 < n { let e = min(s4 + ck, n); eval(model(ids[0..., s4 ..< e], cache: c)); s4 = e }
+                var out: [MLXArray] = []
+                for t in 0 ..< (pyGreedy.count - 1) {
+                    let lg = model(MLXArray([Int32(pyGreedy[t])])[.newAxis], cache: c)[0, -1].asType(.float32)
+                    eval(lg)
+                    out.append(lg)
+                }
+                return out
+            }
+            let a1 = tf(512), a2 = tf(333)
+            let kls = zip(a1, a2).map { kl($0.0, $0.1) }.sorted()
+            print(String(format: "[INK2] control swift(512) vs swift(333): KL median %.2e max %.2e", kls[kls.count / 2], kls.last!))
+        }
+        // Teacher-forced fast-decode vs general-path decode from identical cache states.
+        if name == "long" {
+            let gold = pyGreedy
+            var cA = model.newCache(parameters: nil)
+            var s2 = 0
+            while s2 < n { let e = min(s2 + chunk, n); eval(model(ids[0..., s2 ..< e], cache: cA)); s2 = e }
+            let cB = cA.map { $0.copy() }
+            var worstKL: Float = 0
+            var mism = 0
+            for t in 0 ..< min(24, gold.count) {
+                let y = MLXArray([Int32(gold[t])])[.newAxis]
+                Inkling2Runtime.forceGeneralDecode = false
+                let la = model(y, cache: cA)[0, -1].asType(.float32)
+                Inkling2Runtime.forceGeneralDecode = true
+                let lb = model(y, cache: cB)[0, -1].asType(.float32)
+                Inkling2Runtime.forceGeneralDecode = false
+                eval(la, lb)
+                worstKL = max(worstKL, kl(lb, la))
+                if la.argMax().item(Int.self) != lb.argMax().item(Int.self) { mism += 1 }
+            }
+            if env["BENCH_INKLING2_LAYERDIFF"] == "1", let im = model as? Inkling2LoopModel {
+                for line in im.inklingDebugCompareDecode(token: gold[0], cache: cB.map { $0.copy() }) {
+                    print("[INK2L] " + line)
+                }
+            }
+            _ = cA
+            print(String(format: "[INK2] fast-vs-general teacher-forced 24 steps: max KL %.3e, argmax mismatches %d", worstKL, mism))
+        }
         print("[INK2] \(name) greedy prefix agree=\(agree)/\(pyGreedy.count) decode=\(String(format: "%.1f", Double(gen.count - 1) / decodeS)) tok/s (naive loop, \(gen.count - 1) steps)")
         print("[INK2] \(name) text: \(text.replacingOccurrences(of: "\n", with: "\\n").prefix(300))")
     }
+}
+
+/// BENCH_INKLING2_TIMING=1: decode-step anatomy on a short prompt. Reports graph node count per
+/// step, CPU graph-build time, synchronous eval time, and pipelined decode tok/s (median of 3 runs).
+func runInkling2TimingProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let steps = Int(env["BENCH_INKLING2_STEPS"] ?? "128") ?? 128
+    let ctxTokens = Int(env["BENCH_INKLING2_CTX"] ?? "64") ?? 64
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let model = context.model
+    let prompt = MLXArray((0 ..< ctxTokens).map { Int32(1000 + ($0 * 37) % 5000) })[.newAxis]
+    func fresh() -> [KVCache] {
+        let c = model.newCache(parameters: nil)
+        eval(model(prompt, cache: c)[0, -1].argMax())
+        return c
+    }
+    // anatomy
+    var cache = fresh()
+    var y = MLXArray([Int32(1234)])[.newAxis]
+    var builds: [Double] = []
+    var evals: [Double] = []
+    var nodes: Int32 = -1
+    for i in 0 ..< 24 {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let tok = model(y, cache: cache)[0, -1].argMax()
+        let t1 = CFAbsoluteTimeGetCurrent()
+        if i == 0 {
+            var asType: Int32 = -1
+            let ptr = unsafeBitCast(tok.ctx, to: UnsafeMutableRawPointer?.self)
+            _ = vmlx_graph_stats(ptr, &nodes, &asType)
+        }
+        eval(tok, cache)
+        let t2 = CFAbsoluteTimeGetCurrent()
+        if i >= 4 { builds.append((t1 - t0) * 1000); evals.append((t2 - t1) * 1000) }
+        y = tok.reshaped([1, 1]).asType(.int32)
+    }
+    func med(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+    print(String(format: "[INK2T] nodes/step=%d build=%.2fms eval(sync)=%.2fms", nodes, med(builds), med(evals)))
+    // pipelined decode
+    var rates: [Double] = []
+    for _ in 0 ..< 3 {
+        cache = fresh()
+        var prev = model(MLXArray([Int32(1234)])[.newAxis], cache: cache)[0, -1].argMax()
+        asyncEval(prev)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        for _ in 0 ..< steps {
+            let next = model(prev.reshaped([1, 1]), cache: cache)[0, -1].argMax()
+            asyncEval(next)
+            _ = prev.item(Int.self)
+            prev = next
+        }
+        _ = prev.item(Int.self)
+        rates.append(Double(steps) / (CFAbsoluteTimeGetCurrent() - t0))
+    }
+    print(String(format: "[INK2T] pipelined decode tok/s runs=%@ median=%.1f", rates.map { String(format: "%.1f", $0) }.joined(separator: ","), med(rates)))
+}
+
+func runInkling2MicroProbe(modelPath: String) async throws {
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    guard let m = context.model as? Inkling2LoopModel else { print("[INK2M] not inkling"); return }
+    for line in m.inklingMicrobench() { print("[INK2M] " + line) }
 }
