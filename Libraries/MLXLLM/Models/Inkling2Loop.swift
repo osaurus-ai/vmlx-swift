@@ -1354,6 +1354,7 @@ public final class Inkling2LoopModelInner: Module {
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) > 1
             && ids.dim(1) <= 16 && !Inkling2Runtime.forceGeneralDecode
             && decodeSupported
+        let scalars = Inkling2StepScalars()
         func visit(_ layer: Int, _ pass: Int) -> Int {
             if layer < args.loopStart { return layer }
             if layer >= args.loopEnd {
@@ -1382,7 +1383,7 @@ public final class Inkling2LoopModelInner: Module {
                 if fastDecode {
                     (h, stack) = layers[i].decodeStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
-                        loopIndex: j, ones: ones)
+                        loopIndex: j, ones: ones, scalars: scalars)
                     continue
                 }
                 let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }

@@ -670,6 +670,18 @@ struct Bench {
             try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_INKLING2_APPPATH"] ?? "0") == "1" {
+            try await runInkling2AppPathProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_CPUPROF"] ?? "0") == "1" {
+            try await runInkling2CPUProfileProbe(modelPath: modelPath)
+            return
+        }
+        if env["BENCH_INKLING2_CTXSWEEP"] != nil {
+            try await runInkling2ContextSweepProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_INKLING2_VT"] ?? "0") == "1" {
             try await runInkling2VerifyTimeProbe(modelPath: modelPath)
             return
