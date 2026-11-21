@@ -107,7 +107,38 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
         case loopConfig = "loop_config"
         case textConfig = "text_config"
         case eosTokenId = "eos_token_id"
+        case mtpConfig = "mtp_config"
     }
+
+    struct MTPConfig: Codable {
+        var hiddenSize: Int?
+        var numHiddenLayers: Int?
+        var numAttentionHeads: Int?
+        var numKeyValueHeads: Int?
+        var headDim: Int?
+        var intermediateSize: Int?
+        var rmsNormEps: Float?
+        var ropeTheta: Float?
+        var localLayerIds: [Int]?
+        var slidingWindowSize: Int?
+        var blockSize: Int?
+        var markovRank: Int?
+        var markovHeadType: String?
+        var targetLayerIds: [Int]?
+        enum CodingKeys: String, CodingKey {
+            case hiddenSize = "hidden_size", numHiddenLayers = "num_hidden_layers"
+            case numAttentionHeads = "num_attention_heads", numKeyValueHeads = "num_key_value_heads"
+            case headDim = "head_dim", intermediateSize = "intermediate_size"
+            case rmsNormEps = "rms_norm_eps", ropeTheta = "rope_theta"
+            case localLayerIds = "local_layer_ids", slidingWindowSize = "sliding_window_size"
+            case blockSize = "block_size", markovRank = "markov_rank"
+            case markovHeadType = "markov_head_type", targetLayerIds = "target_layer_ids"
+        }
+    }
+
+    /// The native DSpark drafter (`mtp_config` + `mtp.safetensors`), when the bundle declares one
+    /// with the `rnn_hidden` Markov head this runtime implements.
+    var dspark: Inkling2DSparkConfig?
 
     struct LoopConfig: Codable {
         var coreStart: Int?
@@ -172,6 +203,28 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
         loopEnd = loop?.coreEnd ?? 18
         loopPasses = max(loop?.numPasses ?? 3, 1)
         loopGateRank = loop?.gateRank ?? 64
+        if let m = try? outer.decodeIfPresent(MTPConfig.self, forKey: .mtpConfig),
+            (m.markovHeadType ?? "rnn_hidden") == "rnn_hidden"
+        {
+            var d = Inkling2DSparkConfig()
+            d.hidden = m.hiddenSize ?? hiddenSize
+            d.layers = m.numHiddenLayers ?? 3
+            d.nq = m.numAttentionHeads ?? numAttentionHeads
+            d.nkv = m.numKeyValueHeads ?? numKeyValueHeads
+            d.hd = m.headDim ?? headDim
+            d.inter = m.intermediateSize ?? 9216
+            d.eps = m.rmsNormEps ?? rmsNormEps
+            d.theta = m.ropeTheta ?? 1_000_000
+            d.localLayers = m.localLayerIds ?? [0, 2]
+            d.window = m.slidingWindowSize ?? 1024
+            d.blockSize = m.blockSize ?? 8
+            d.markovRank = m.markovRank ?? 256
+            d.vocab = vocabSize
+            d.unpaddedVocab = unpaddedVocabSize ?? vocabSize
+            d.softcap = finalLogitSoftcapping ?? 30
+            d.targetLayerIds = m.targetLayerIds ?? [5, 23, 41, 48]
+            dspark = d
+        }
         if let one = try? outer.decodeIfPresent(Int.self, forKey: .eosTokenId) {
             eosTokenId = [one]
         } else {
@@ -604,7 +657,7 @@ final class Inkling2Attention: Module {
                 outs[0].reshaped([B, T, nq, hd]).transposed(0, 2, 1, 3),
                 outs[2].reshaped([B, T, nkv, hd]).transposed(0, 2, 1, 3),
                 outs[3].reshaped([B, T, nkv, hd]).transposed(0, 2, 1, 3),
-                outs[1].reshaped([B, T, nq, dRel]), gate, sinks, newK, newV,
+                outs[1].reshaped([B, T, nq, dRel]), gate, sinks, newK, newV, kRaw, vRaw,
             ]
         }
         q = l2Clip(q.reshaped([B, T, nq, hd]), threshold: qkClip, scale: qL2Clip.scale)
@@ -613,7 +666,7 @@ final class Inkling2Attention: Module {
         k = l2Clip(k.reshaped([B, T, nkv, hd]), threshold: qkClip).transposed(0, 2, 1, 3)
         v = unweightedRMS(v.reshaped([B, T, nkv, hd]), ones: ones[0 ..< hd], eps: eps)
             .transposed(0, 2, 1, 3)
-        return [q, k, v, r, gate, sinks, newK, newV]
+        return [q, k, v, r, gate, sinks, newK, newV, kRaw, vRaw]
     }
 
     /// Log scaling, cache update, relative bias and attention. q / k / v `[B, H, T, D]`,
@@ -1114,7 +1167,7 @@ final class Inkling2DecoderLayer: Module {
     /// `messages` `[B, T, 4, H]` (q, k, v, mlp) only in loop passes after the first.
     func callAsFunction(
         _ h: MLXArray, stack: MLXArray?, kv: KVCacheSimple?, conv: MambaCache?,
-        messages: MLXArray?, ones: MLXArray
+        messages: MLXArray?, ones: MLXArray, recorder: Inkling2ConvRecorder? = nil
     ) -> (MLXArray, MLXArray?) {
         let dtype = h.dtype
         let T = h.dim(1)
@@ -1172,8 +1225,9 @@ final class Inkling2DecoderLayer: Module {
             q: pre[0], k: pre[1], v: pre[2], r: pre[3], sinks: pre[5], kv: kv)
 
         // residual = a (block boundary) or h + a, fp32, fused with the post-attention conv.
+        let attnConvIn = selfAttn.finish(merged, gate: pre[4])
         let (residual, newAttn) = postAttnConv.residual(
-            selfAttn.finish(merged, gate: pre[4]), packed: packed, offset: 2 * c, res: h,
+            attnConvIn, packed: packed, offset: 2 * c, res: h,
             mode: isBlockBoundary ? 0 : 1, outDType: f32)
         let states = isBlockBoundary ? inklingAppendState(stack, h) : stack
         var m: MLXArray
@@ -1189,6 +1243,16 @@ final class Inkling2DecoderLayer: Module {
         m = mlp(m)
         let (out, newMLP) = postMLPConv.residual(
             m, packed: packed, offset: 2 * c + hidden, res: residual, mode: 2, outDType: dtype)
+        if let recorder, let conv {
+            // Speculative verify: keep every row's PRE-conv inputs so the state can be rewound
+            // to any accepted row (conv state = the last K-1 inputs).
+            recorder.record(
+                conv: conv,
+                oldState: packed ?? MLXArray.zeros([h.dim(0), 3, 2 * c + 2 * hidden], dtype: f32),
+                inputs: MLX.concatenated(
+                    [pre[8].asType(f32), pre[9].asType(f32), attnConvIn.asType(f32), m.asType(f32)],
+                    axis: -1))
+        }
         if let conv {
             conv[0] = MLX.concatenated([pre[6], pre[7], newAttn, newMLP], axis: -1)
             conv.offset += T
@@ -1257,6 +1321,16 @@ public final class Inkling2LoopModelInner: Module {
     func embed(_ ids: MLXArray) -> MLXArray { embedNorm(embedTokens(ids)) }
 
     func callAsFunction(_ ids: MLXArray, cache: [KVCache]?) -> MLXArray {
+        forward(ids, cache: cache, capture: nil, recorder: nil)
+    }
+
+    /// `capture`: unrolled layer-visit ids whose layer INPUT (the attn-res partial accumulator,
+    /// BF16) is collected; `numLayerVisits` (48) means the final normed hidden. In capture order.
+    /// `recorder`: speculative verify bookkeeping (conv inputs per slot).
+    func forward(
+        _ ids: MLXArray, cache: [KVCache]?, capture: Inkling2Capture?,
+        recorder: Inkling2ConvRecorder?
+    ) -> MLXArray {
         var h = embed(ids)
         let dtype = h.dtype
         let slots = args.numCacheSlots
@@ -1277,8 +1351,26 @@ public final class Inkling2LoopModelInner: Module {
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) == 1
             && !inklingSkip.contains("fastdecode") && inklingSkip.isEmpty
             && !Inkling2Runtime.forceGeneralDecode && decodeSupported
+            && capture == nil && recorder == nil
+        func visit(_ layer: Int, _ pass: Int) -> Int {
+            if layer < args.loopStart { return layer }
+            if layer >= args.loopEnd {
+                return layer + (args.loopPasses - 1) * args.numLoopLayers
+            }
+            return layer + pass * args.numLoopLayers
+        }
         func run(_ ids: Range<Int>, pass: Int, messages: MLXArray?) {
             for (j, i) in ids.enumerated() {
+                if let capture, capture.ids.contains(visit(i, pass)) {
+                    capture.values[visit(i, pass)] = h
+                }
+                if let recorder {
+                    let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
+                    (h, stack) = layers[i](
+                        h, stack: stack, kv: kv(i, pass), conv: conv(i, pass), messages: msgs,
+                        ones: ones, recorder: recorder)
+                    continue
+                }
                 if fastDecode {
                     (h, stack) = layers[i].decodeStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
@@ -1317,7 +1409,47 @@ public final class Inkling2LoopModelInner: Module {
             run(s1 ..< args.numHiddenLayers, pass: 0, messages: nil)
         }
         h = finalInput(stack, h, ones: ones)[.ellipsis, 0, 0...]
-        return norm(h).asType(dtype)
+        let out = norm(h).asType(dtype)
+        if let capture {
+            capture.values[args.numHiddenLayers + (args.loopPasses - 1) * args.numLoopLayers] = out
+        }
+        return out
+    }
+}
+
+/// Layer-visit capture for the DSpark drafter (see `Inkling2LoopModelInner.forward`).
+public final class Inkling2Capture: @unchecked Sendable {
+    let ids: [Int]
+    var values: [Int: MLXArray] = [:]
+    init(ids: [Int]) { self.ids = ids }
+
+    /// `[B * T, ids.count, H]` in capture order.
+    func stacked() -> MLXArray {
+        let parts = ids.map { values[$0]! }
+        let s = MLX.stacked(parts, axis: 2)  // [B, T, n, H]
+        return s.reshaped([-1, ids.count, s.dim(-1)])
+    }
+}
+
+/// Speculative-verify bookkeeping: per conv cache, its state before the verify and every row's
+/// PRE-conv inputs, so `rewind(keep:)` can rebuild the state after any accepted row.
+public final class Inkling2ConvRecorder: @unchecked Sendable {
+    private var entries: [(MambaCache, MLXArray, MLXArray)] = []
+
+    func record(conv: MambaCache, oldState: MLXArray, inputs: MLXArray) {
+        entries.append((conv, oldState, inputs))
+    }
+
+    /// Keep the first `keep` verify rows: state = last 3 of [old state, inputs[0 ..< keep]].
+    func rewind(keep: Int) {
+        for (conv, old, inputs) in entries {
+            let T = inputs.dim(1)
+            guard keep < T else { continue }
+            let xp = MLX.concatenated([old, inputs], axis: 1)  // [B, 3 + T, P]
+            conv[0] = xp[0..., keep ..< (keep + 3), 0...]
+            conv.offset -= (T - keep)
+        }
+        entries.removeAll()
     }
 }
 
@@ -1328,11 +1460,15 @@ public final class Inkling2LoopModel: Module, LLMModel {
     let args: Inkling2LoopConfiguration
     public let model: Inkling2LoopModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
+    @ModuleInfo(key: "mtp_drafter") var drafter: Inkling2DSparkDrafter?
+    /// Set by `sanitize` when the bundle actually ships the drafter's tensors.
+    public private(set) var hasDrafterWeights = false
 
     public init(_ args: Inkling2LoopConfiguration) {
         self.args = args
         vocabularySize = args.vocabSize
         model = Inkling2LoopModelInner(args)
+        if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
         // `embed` and `unembed` are separate tensors in the checkpoint, never tied.
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -1416,9 +1552,18 @@ public final class Inkling2LoopModel: Module, LLMModel {
             // outside `model.`), audio: not part of this module tree.
             if key.hasPrefix("model.visual.") || key.hasPrefix("model.vision_tower.")
                 || key.hasPrefix("vision_tower.") || key.hasPrefix("visual.")
-                || key.hasPrefix("model.audio") || key.hasPrefix("mtp_drafter.")
-                || !(key.hasPrefix("model.") || key.hasPrefix("lm_head"))
+                || key.hasPrefix("model.audio")
             {
+                continue
+            }
+            if key.hasPrefix("mtp_drafter.") || !(key.hasPrefix("model.") || key.hasPrefix("lm_head")) {
+                // Native drafter (`mtp.safetensors`: `layers.N.*`, `markov_head.*`, `mask_embed`,
+                // `fuse_weight`, `norm.weight`) -> the `mtp_drafter` submodule, as stored (BF16).
+                if drafter != nil {
+                    let k = key.hasPrefix("mtp_drafter.") ? key : "mtp_drafter." + key
+                    out[k] = value
+                    hasDrafterWeights = true
+                }
                 continue
             }
             if key.hasSuffix("mlp.experts.w13_weight") || key.hasSuffix("mlp.experts.w2_weight") {

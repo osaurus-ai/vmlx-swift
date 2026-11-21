@@ -221,3 +221,114 @@ func runInkling2MicroProbe(modelPath: String) async throws {
     guard let m = context.model as? Inkling2LoopModel else { print("[INK2M] not inkling"); return }
     for line in m.inklingMicrobench() { print("[INK2M] " + line) }
 }
+
+/// BENCH_INKLING2_TEMPLATE=1: the app's prompt path (UserInput(chat:tools:additionalContext:) ->
+/// processor -> chat template -> tokenizer) against transformers' apply_chat_template renders
+/// (BENCH_INKLING2_RENDERS json from make_renders.py). Token ids must match exactly.
+func runInkling2TemplateProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let refs = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_RENDERS"]!))) as! [String: [String: Any]]
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let weather: ToolSpec = ["type": "function", "function": [
+        "name": "get_weather", "description": "Current weather for a city",
+        "parameters": ["type": "object", "properties": [
+            "city": ["type": "string", "description": "City name"] as [String: any Sendable],
+            "unit": ["type": "string", "enum": ["c", "f"]] as [String: any Sendable]] as [String: any Sendable],
+            "required": ["city"]] as [String: any Sendable]] as [String: any Sendable]]
+    let shell: ToolSpec = ["type": "function", "function": [
+        "name": "run_shell", "description": "Run a shell command / script",
+        "parameters": ["type": "object", "properties": [
+            "cmd": ["type": "string"] as [String: any Sendable]] as [String: any Sendable],
+            "required": ["cmd"]] as [String: any Sendable]] as [String: any Sendable]]
+    let call = ToolCall(function: .init(name: "get_weather", arguments: ["unit": "c", "city": "Paris"] as [String: any Sendable]), id: "call_1")
+    var assistantTool = Chat.Message.assistant("", toolCalls: [call])
+    assistantTool.reasoningContent = "Need tool."
+    var assistantReason = Chat.Message.assistant("4")
+    assistantReason.reasoningContent = "Simple sum."
+    let cases: [String: ([Chat.Message], [ToolSpec]?, [String: any Sendable]?)] = [
+        "plain": ([.user("Hello there")], nil, nil),
+        "system": ([.system("You are terse."), .user("Hi")], nil, nil),
+        "effort_low": ([.user("Hi")], nil, ["reasoning_effort": "low"]),
+        "effort_none": ([.user("Hi")], nil, ["reasoning_effort": "none"]),
+        "multiturn_reasoning": ([.user("2+2?"), assistantReason, .user("and 3+3?")], nil, nil),
+        "tools": ([.user("Weather in Paris? Use unit c.")], [weather, shell], nil),
+        "tool_roundtrip": ([.user("Weather in Paris?"), assistantTool,
+                            .tool("{\"temp\": 18, \"sky\": \"clear\"}", toolCallId: "call_1"),
+                            .user("Thanks. And unicode: café ☕ / path a/b")], [weather, shell], nil),
+    ]
+    var fails = 0
+    for (name, (msgs, tools, extra)) in cases.sorted(by: { $0.key < $1.key }) {
+        guard let ref = refs[name], let refIds = ref["ids"] as? [Int] else { continue }
+        do {
+            let input = try await context.processor.prepare(
+                input: UserInput(chat: msgs, tools: tools, additionalContext: extra))
+            let ids = input.text.tokens.asArray(Int32.self).map(Int.init)
+            if ids == refIds {
+                print("[INK2TPL] \(name): MATCH (\(ids.count) tokens)")
+            } else {
+                fails += 1
+                let k = (0 ..< min(ids.count, refIds.count)).first(where: { ids[$0] != refIds[$0] }) ?? min(ids.count, refIds.count)
+                let swiftText = context.tokenizer.decode(tokenIds: ids, skipSpecialTokens: false)
+                print("[INK2TPL] \(name): MISMATCH swift=\(ids.count) py=\(refIds.count) first diff at \(k)")
+                print("  swift: \(swiftText.replacingOccurrences(of: "\n", with: "⏎"))")
+                print("  py   : \((ref["text"] as? String ?? "").replacingOccurrences(of: "\n", with: "⏎"))")
+            }
+        } catch {
+            fails += 1
+            print("[INK2TPL] \(name): ERROR \(error)")
+        }
+    }
+    print("[INK2TPL] \(fails == 0 ? "ALL MATCH" : "\(fails) FAILED")")
+}
+
+/// BENCH_INKLING2_DSPARK=1: greedy DSpark (native drafter) vs plain greedy decode on the parity
+/// prompts: acceptance per round, emitted-token agreement, and wall tok/s for both.
+func runInkling2DSparkProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let ref = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_REF"]!))) as! [String: [String: Any]]
+    let maxNew = Int(env["BENCH_INKLING2_NEW"] ?? "192") ?? 192
+    let widths = (env["BENCH_INKLING2_WIDTHS"] ?? "7").split(separator: ",").compactMap { Int($0) }
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    guard let m = context.model as? Inkling2LoopModel, m.dsparkAvailable else {
+        print("[INK2D] drafter not available"); return
+    }
+    for name in ["short", "long"] {
+        guard let ids = ref[name]?["ids"] as? [Int] else { continue }
+        // plain greedy (fast decode path)
+        var cache = m.newCache(parameters: nil)
+        var s = 0
+        var last = MLXArray(0)
+        let arr = MLXArray(ids.map { Int32($0) }).reshaped([1, -1])
+        while s < ids.count { let e = min(s + 512, ids.count); last = m(arr[0..., s ..< e], cache: cache)[0, -1]; eval(last); s = e }
+        var plain = [last.argMax().item(Int.self)]
+        let t0 = CFAbsoluteTimeGetCurrent()
+        while plain.count < maxNew {
+            let lg = m(MLXArray([Int32(plain.last!)]).reshaped([1, 1]), cache: cache)[0, -1]
+            plain.append(lg.argMax().item(Int.self))
+        }
+        let plainTps = Double(maxNew - 1) / (CFAbsoluteTimeGetCurrent() - t0)
+        for w in widths {
+            cache = m.newCache(parameters: nil)
+            let (sess, _) = m.dsparkPrefill(ids, cache: cache)
+            var out = [sess.anchor]
+            let t1 = CFAbsoluteTimeGetCurrent()
+            while out.count < maxNew { out += m.dsparkRound(sess, cache: cache, width: w) }
+            let dt = CFAbsoluteTimeGetCurrent() - t1
+            var agree = 0
+            for (a, b) in zip(out, plain) { if a == b { agree += 1 } else { break } }
+            print(String(format: "[INK2D] %@ w=%d rounds=%d accepted/round=%.2f emitted/round=%.2f tok/s=%.1f (plain %.1f) agree=%d/%d",
+                         name, w, sess.rounds, Double(sess.accepted) / Double(max(sess.rounds, 1)),
+                         Double(out.count - 1) / Double(max(sess.rounds, 1)), Double(out.count - 1) / dt, plainTps, agree, maxNew))
+            let r = Double(max(sess.rounds, 1)) / 1000
+            print(String(format: "[INK2D] %@ w=%d ms/round: block %.1f walk %.1f verify %.1f commit %.1f",
+                         name, w, sess.timing[0] / r, sess.timing[1] / r, sess.timing[2] / r, sess.timing[3] / r))
+            print("[INK2D] \(name) text: " + context.tokenizer.decode(tokenIds: Array(out.prefix(80)), skipSpecialTokens: false).replacingOccurrences(of: "\n", with: "⏎"))
+        }
+    }
+}

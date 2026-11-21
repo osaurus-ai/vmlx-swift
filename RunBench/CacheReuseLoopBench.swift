@@ -60,9 +60,14 @@ func runCacheReuseLoopBench(modelPath: String) async throws {
     let config = settings.cacheCoordinatorConfig(
         modelKey: "cache-loop-\(modelDir.lastPathComponent)", diskCacheDirectory: diskDir)
     await container.enableCachingAsync(config: config)
-    let warm = await container.makeBatchEngine(maxBatchSize: 1)
-    let coordinator = container.cacheCoordinator
     nonisolated(unsafe) let ctx = context
+    // CL_SEGMENTATION_CONTROL=1: both engines uncached; only the cold engine's prefill chunking
+    // differs (CL_COLD_PREFILL_STEP) — the noise floor for the warm/cold text comparison.
+    let segmentationControl = env["CL_SEGMENTATION_CONTROL"] == "1"
+    let warm = segmentationControl
+        ? BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil)
+        : await container.makeBatchEngine(maxBatchSize: 1)
+    let coordinator = segmentationControl ? nil : container.cacheCoordinator
     let cold = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil)
     let iso = ISO8601DateFormatter()
     iso.formatOptions = [.withFullTime, .withColonSeparatorInTime, .withFractionalSeconds]
@@ -181,6 +186,7 @@ func runCacheReuseLoopBench(modelPath: String) async throws {
         p.maxTokens = maxTokens
         p.temperature = 0; p.topP = 1; p.topK = 0
         p.cacheChainId = request.chatId
+        if label == "cold", let step = Int(env["CL_COLD_PREFILL_STEP"] ?? "") { p.prefillStepSize = step }
         if let strategy { p.draftStrategy = strategy }
         let stats0 = coordinator?.snapshotStats()
         nonisolated(unsafe) let send = input
