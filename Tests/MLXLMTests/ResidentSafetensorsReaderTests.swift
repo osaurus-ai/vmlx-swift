@@ -26,6 +26,15 @@ struct ResidentSafetensorsReaderTests {
             // A little over the 8-MiB physical read chunk, with a partial EOF page.
             let expected = MLXArray((0..<(2 * 1024 * 1024 + 3)).map { UInt32($0) })
             try MLX.save(arrays: ["w": expected], url: url)
+            // The property under test: the payload starts off a page boundary.
+            // `MLX.save` pads its header to 8 bytes, not to a page.
+            let header = try FileHandle(forReadingFrom: url)
+            let prefix = try #require(try header.read(upToCount: 8))
+            try header.close()
+            let headerLength = prefix.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+            try #require(
+                (8 + headerLength) % 16_384 != 0,
+                "INVALID: the payload starts on a page boundary, so it is not unaligned")
             let (loaded, _) = try ResidentSafetensorsReader.load(url: url, excludingKeys: [])
             let actual = try #require(loaded["w"])
             #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
