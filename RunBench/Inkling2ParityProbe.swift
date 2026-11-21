@@ -332,3 +332,47 @@ func runInkling2DSparkProbe(modelPath: String) async throws {
         }
     }
 }
+
+/// BENCH_INKLING2_DSPARK_ITER=1: the production TokenIterator route with `draftStrategy = .dspark(bundle)`
+/// (the generic dSpark runtime + Inkling draft session) vs AR, greedy and sampled. Text equality at T=0,
+/// decode tok/s from the completion info.
+func runInkling2DSparkIteratorProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let ref = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_REF"]!))) as! [String: [String: Any]]
+    let maxNew = Int(env["BENCH_INKLING2_NEW"] ?? "256") ?? 256
+    let bundle = URL(fileURLWithPath: modelPath)
+    let context = try await MLXLMCommon.loadModel(
+        from: bundle, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default)
+    for name in ["long", "short"] {
+        guard let ids = ref[name]?["ids"] as? [Int] else { continue }
+        let input = LMInput(tokens: MLXArray(ids.map { Int32($0) }))
+        for temp: Float in [0, 1] {
+            var texts: [String] = []
+            for useDSpark in [false, true] {
+                var p = GenerateParameters(maxTokens: maxNew, temperature: temp)
+                p.randomSeed = 7
+                if useDSpark { p.draftStrategy = .dspark(drafterPath: bundle) }
+                var text = ""
+                var info: GenerateCompletionInfo?
+                for await g in try MLXLMCommon.generate(input: input, parameters: p, context: context) {
+                    switch g {
+                    case .chunk(let c): text += c
+                    case .reasoning(let r): text += r
+                    case .info(let i): info = i
+                    default: break
+                    }
+                }
+                texts.append(text)
+                let tps = info.map { Double(max(0, $0.generationTokenCount - 1)) / max($0.generateTime, 1e-9) } ?? 0
+                print(String(format: "[INK2I] %@ T=%.0f %@ gen=%d decode tok/s=%.1f", name, temp,
+                             useDSpark ? "dspark" : "ar    ", info?.generationTokenCount ?? -1, tps))
+            }
+            if temp == 0 {
+                let a = texts[0], b = texts[1]
+                let common = zip(a, b).prefix { $0 == $1 }.count
+                print("[INK2I] \(name) T=0 text equal=\(a == b) common prefix chars=\(common)/\(a.count)")
+            }
+        }
+    }
+}

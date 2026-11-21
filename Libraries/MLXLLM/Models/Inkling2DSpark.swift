@@ -238,18 +238,23 @@ public final class Inkling2DSparkDrafter: Module {
         return norm(res)[0, 1...]  // [B-1, H]
     }
 
-    /// Greedy 7-step Markov walk. `h` [B-1, H] post-norm draft hidden, `lmHead` the target's
-    /// unembedding, `fRnn` [H]. Returns the drafted token ids.
-    func walk(h: MLXArray, lmHeadWeight: MLXArray, anchor: Int, fRnn: MLXArray) -> [Int] {
+    /// The Markov walk over `steps` (<= block-1) positions. `h` [B-1, H] post-norm draft hidden,
+    /// `fRnn` [H]. Greedy (argmax) unless `noise` [>= steps, unpadded vocab] is given: then step i
+    /// proposes argmax(v * inverseTemperature + noise[i]) (coupled sampled drafting).
+    func walk(
+        h: MLXArray, lmHeadWeight: MLXArray, anchor: Int, fRnn: MLXArray, steps: Int? = nil,
+        noise: MLXArray? = nil, inverseTemperature: Float = 1
+    ) -> [Int] {
         let mh = markovHead
         let R = cfg.markovRank
-        let base = MLX.matmul(h, lmHeadWeight.T)  // [B-1, V] bf16
+        let n = min(steps ?? (cfg.blockSize - 1), cfg.blockSize - 1)
+        let base = MLX.matmul(h[0 ..< n], lmHeadWeight.T)  // [n, V] bf16
         var state = MLXArray.zeros([R], dtype: .bfloat16)
         var prev = anchor
         var out: [Int] = []
         let fw = derived.foldWeight!
         let fb = derived.foldBias!
-        for s in 0 ..< (cfg.blockSize - 1) {
+        for s in 0 ..< n {
             let emb = mh.markovW1(MLXArray([Int32(prev)])).reshaped([R])
             let xin = MLX.concatenated(
                 [state, emb.asType(.bfloat16), h[s].asType(.bfloat16), fRnn.asType(.bfloat16)], axis: 0)
@@ -264,6 +269,7 @@ public final class Inkling2DSparkDrafter: Module {
             var v = (base[s].asType(f32) + bias.asType(f32)).asType(.bfloat16).asType(f32)
             v = (MLX.tanh(v / cfg.softcap) * cfg.softcap).asType(.bfloat16).asType(f32)
             v = v[..<cfg.unpaddedVocab]
+            if let noise { v = v * inverseTemperature + noise[s][..<cfg.unpaddedVocab].asType(f32) }
             let tok = v.argMax().item(Int.self)
             out.append(tok)
             prev = tok

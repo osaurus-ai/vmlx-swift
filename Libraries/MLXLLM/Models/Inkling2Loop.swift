@@ -1473,6 +1473,8 @@ public final class Inkling2LoopModel: Module, LLMModel {
     @ModuleInfo(key: "mtp_drafter") var drafter: Inkling2DSparkDrafter?
     /// Set by `sanitize` when the bundle actually ships the drafter's tensors.
     public private(set) var hasDrafterWeights = false
+    /// A dSpark verify in flight (set by the draft session around one target forward).
+    var pendingVerify: Inkling2PendingVerify?
 
     public init(_ args: Inkling2LoopConfiguration) {
         self.args = args
@@ -1488,8 +1490,14 @@ public final class Inkling2LoopModel: Module, LLMModel {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let slots = args.numCacheSlots
-        return (0 ..< slots).map { _ in KVCacheSimple() as KVCache }
+        var cache = (0 ..< slots).map { _ in KVCacheSimple() as KVCache }
             + (0 ..< slots).map { _ in MambaCache(slots: 1) as KVCache }
+        if parameters?.draftStrategy?.usesDSpark == true, dsparkAvailable, let d = drafter {
+            // dSpark: the drafter's context KV per draft layer + the last row's target features.
+            cache += (0 ..< d.cfg.layers).map { _ in KVCacheSimple() as KVCache }
+            cache.append(MambaCache(slots: 1))
+        }
+        return cache
     }
 
     func logits(_ h: MLXArray) -> MLXArray {
@@ -1505,7 +1513,7 @@ public final class Inkling2LoopModel: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(model(inputs, cache: cache))
+        logits(trunk(inputs, cache: cache))
     }
 
     /// Chunked text prefill. Non-final chunks run the trunk only (no 200k-vocab logits); the
@@ -1522,13 +1530,13 @@ public final class Inkling2LoopModel: Module, LLMModel {
         var offset = 0
         while n - offset > step {
             try Task.checkCancellation()
-            _ = model(ids[0..., offset ..< (offset + step)], cache: cache)
+            _ = trunk(ids[0..., offset ..< (offset + step)], cache: cache)
             MLX.eval(cache)
             offset += step
             PrefillProgressReporter.reportCompletedUnits(offset)
             MLX.Memory.clearCache()
         }
-        let h = model(ids[0..., offset...], cache: cache)
+        let h = trunk(ids[0..., offset...], cache: cache)
         return .logits(LMOutput(logits: logits(h[0..., (h.dim(1) - 1)..., 0...])))
     }
 
