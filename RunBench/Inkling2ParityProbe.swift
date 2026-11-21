@@ -574,3 +574,68 @@ func runInkling2CPUProfileProbe(modelPath: String) async throws {
                 "[CPUPROF] n=%d build wall=%.2f cpu=%.2f | eval wall=%.2f cpu=%.2f | sync total=%.2f ms | pipelined=%.2f ms/tok",
             n, med(bw), med(bc), med(ew), med(ec), med(bw) + med(ew), med(pipe)))
 }
+
+/// BENCH_INKLING2_APPPATH=1: the app's engine route — `ModelContainer` with the server cache
+/// configuration (memory + disk), `makeBatchEngine(maxBatchSize: 1)`, a ~2k-token system prompt —
+/// sending the same chat `BENCH_INKLING2_RUNS` (3) times: run 1 prefills cold, later runs restore
+/// the prefix from the cache. Decode tok/s per run, AR or dSpark (`BENCH_INKLING2_SWEEP_DSPARK=1`).
+func runInkling2AppPathProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let runs = Int(env["BENCH_INKLING2_RUNS"] ?? "3") ?? 3
+    let maxNew = Int(env["BENCH_INKLING2_NEW"] ?? "384") ?? 384
+    let diskDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("ink2-apppath-\(ProcessInfo.processInfo.processIdentifier)")
+    try? FileManager.default.removeItem(at: diskDir)
+    try FileManager.default.createDirectory(at: diskDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: diskDir) }
+    let settings = VMLXServerRuntimeSettings()
+    let context = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader(), loadConfiguration: .osaurusProduction)
+    let container = ModelContainer(context: context)
+    let cacheOn = env["BENCH_INKLING2_NOCACHE"] != "1"
+    if cacheOn {
+        await container.enableCachingAsync(
+            config: settings.cacheCoordinatorConfig(
+                modelKey: "ink2-apppath", diskCacheDirectory: diskDir))
+    }
+    let engine = await container.makeBatchEngine(maxBatchSize: 1)
+    var system = "You are a helpful assistant. Answer carefully and completely.\n"
+    var i = 1
+    while system.count < 8000 {
+        system +=
+            "Guideline \(i): keep answers accurate, structured and free of filler (item \(i)).\n"
+        i += 1
+    }
+    let message =
+        env["BENCH_INKLING2_CHAT"]
+        ?? "Write a detailed 700-word explanation of how a refrigerator works, covering the compressor, condenser, expansion valve and evaporator."
+    for r in 0 ..< runs {
+        let input = try await context.processor.prepare(
+            input: UserInput(chat: [.system(system), .user(message)]))
+        var p = GenerateParameters(
+            maxTokens: maxNew, temperature: Float(env["BENCH_INKLING2_TEMP"] ?? "0") ?? 0)
+        if env["BENCH_INKLING2_SWEEP_DSPARK"] == "1" {
+            p.draftStrategy = .dspark(drafterPath: modelDir)
+        }
+        nonisolated(unsafe) let send = input
+        var restored = 0
+        var info: GenerateCompletionInfo?
+        for await item in await engine.generate(input: send, parameters: p) {
+            switch item {
+            case .prefillProgress(let progress):
+                if progress.stage == .cacheRestore {
+                    restored = max(restored, progress.completedUnitCount)
+                }
+            case .info(let x): info = x
+            default: break
+            }
+        }
+        guard let info else { continue }
+        print(
+            String(
+                format: "[APPPATH] run=%d cache=%@ prompt=%d restored=%d gen=%d decode tok/s=%.1f",
+                r + 1, cacheOn ? "on" : "off", info.promptTokenCount, restored,
+                info.generationTokenCount, info.tokensPerSecond))
+    }
+}

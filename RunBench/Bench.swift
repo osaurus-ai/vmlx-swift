@@ -670,6 +670,10 @@ struct Bench {
             try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_INKLING2_APPPATH"] ?? "0") == "1" {
+            try await runInkling2AppPathProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_INKLING2_CPUPROF"] ?? "0") == "1" {
             try await runInkling2CPUProfileProbe(modelPath: modelPath)
             return
