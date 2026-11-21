@@ -250,12 +250,14 @@ public final class Inkling2DSparkDrafter: Module {
         let n = min(steps ?? (cfg.blockSize - 1), cfg.blockSize - 1)
         let base = MLX.matmul(h[0 ..< n], lmHeadWeight.T)  // [n, V] bf16
         var state = MLXArray.zeros([R], dtype: .bfloat16)
-        var prev = anchor
-        var out: [Int] = []
+        // `prev` stays on the GPU: argmax -> embedding gather, one evaluation for the whole walk.
+        var prev = MLXArray([Int32(anchor)])
+        var toks: [MLXArray] = []
         let fw = derived.foldWeight!
         let fb = derived.foldBias!
+        let w1 = mh.markovW1.weight
         for s in 0 ..< n {
-            let emb = mh.markovW1(MLXArray([Int32(prev)])).reshaped([R])
+            let emb = MLX.take(w1, prev, axis: 0).reshaped([R])
             let xin = MLX.concatenated(
                 [state, emb.asType(.bfloat16), h[s].asType(.bfloat16), fRnn.asType(.bfloat16)], axis: 0)
             let p = mh.rnnProj(xin.reshaped([1, -1])).reshaped([3 * R]).asType(f32)
@@ -270,10 +272,10 @@ public final class Inkling2DSparkDrafter: Module {
             v = (MLX.tanh(v / cfg.softcap) * cfg.softcap).asType(.bfloat16).asType(f32)
             v = v[..<cfg.unpaddedVocab]
             if let noise { v = v * inverseTemperature + noise[s][..<cfg.unpaddedVocab].asType(f32) }
-            let tok = v.argMax().item(Int.self)
-            out.append(tok)
-            prev = tok
+            prev = v.argMax(keepDims: true).asType(.int32).reshaped([1])
+            toks.append(prev)
         }
+        let out = MLX.concatenated(toks).asArray(Int32.self).map(Int.init)
         return out
     }
 }
