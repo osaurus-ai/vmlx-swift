@@ -12,9 +12,6 @@ import MLXNN
 
 private let f32 = DType.float32
 
-/// Multi-row MoE route: unsorted per-row gathers (default; measured fastest at T = 8 on M5 Max:
-/// 326 us gate/up vs 636 grouped vs ~800 sorted), `VMLX_INKLING2_MOE=grouped|sorted` for A/B.
-let inklingMultiRowMoE = ProcessInfo.processInfo.environment["VMLX_INKLING2_MOE"] ?? "unsorted"
 
 enum Inkling2VerifyKernels {
     static let header = Inkling2DecodeKernels.header
@@ -476,48 +473,22 @@ extension Inkling2DecoderLayer {
         let inds = sel[0]
         let sw = mlp.switchMLP
         let k = router.topK
-        let fin: [MLXArray]
-        if inklingMultiRowMoE == "unsorted" {
-            let gu = sw.gateUp(xm32.reshaped([T, 1, 1, H]), inds, sorted: false)  // [T, k, 1, 2I]
-            let act = Inkling2Kernels.moeActivation(
-                [gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
-                 sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps],
-                grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
-                outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
-            let down = sw.down(act.reshaped([T, k, 1, sw.inter]), inds, sorted: false)  // [T, k, 1, H]
-            fin = Inkling2VerifyKernels.finalT(
-                [down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!, sel[1],
-                 packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
-                 MLXArray([Int32(2 * C), Int32(H)])],
-                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
-                outputDTypes: [dtype, f32, f32])
-        } else if inklingMultiRowMoE == "grouped" {
-            // Grouped expert matmuls: each routed expert's weights are read once for all its rows.
-            let gu = Inkling2VerifyKernels.groupedExperts(
-                xm32, inds: inds, codes: sw.gateUp.codes, scales: sw.gateUp.blockScales, xPerPair: false)
-            let act = Inkling2Kernels.moeActivation(
-                [gu, inds.reshaped([T * k]), sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps],
-                grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
-                outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
-            let down = Inkling2VerifyKernels.groupedExperts(
-                act, inds: inds, codes: sw.down.codes, scales: sw.down.blockScales, xPerPair: true)
-            fin = Inkling2VerifyKernels.finalT(
-                [down, inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!, sel[1],
-                 packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
-                 MLXArray([Int32(2 * C), Int32(H)])],
-                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
-                outputDTypes: [dtype, f32, f32])
-        } else {
-            // Sorted expert gathers through the general SwitchMLP; the post-MLP kernel then takes
-            // the combined output with K = 1 / unit scales, which reproduces its rounding exactly.
-            let m = sw(xm32.asType(dtype), inds, sel[1]).asType(f32)  // [T, H], dtype values
-            fin = Inkling2VerifyKernels.finalT(
-                [m, MLXArray.zeros([T, 1], dtype: .uint32), w.ones!, MLXArray.ones([T, 1], dtype: f32),
-                 packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
-                 MLXArray([Int32(2 * C), Int32(H)])],
-                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
-                outputDTypes: [dtype, f32, f32])
-        }
+        // Per-row expert gathers: measured fastest at T = 8 on M5 Max (gate/up 326 us vs 636 for a
+        // grouped one-read-per-expert kernel and ~800 sorted): rows in a verify block rarely share
+        // experts, so the gather is already at bandwidth.
+        let gu = sw.gateUp(xm32.reshaped([T, 1, 1, H]), inds, sorted: false)  // [T, k, 1, 2I]
+        let act = Inkling2Kernels.moeActivation(
+            [gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
+             sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps],
+            grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
+            outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
+        let down = sw.down(act.reshaped([T, k, 1, sw.inter]), inds, sorted: false)  // [T, k, 1, H]
+        let fin = Inkling2VerifyKernels.finalT(
+            [down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!, sel[1],
+             packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
+             MLXArray([Int32(2 * C), Int32(H)])],
+            grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
+            outputDTypes: [dtype, f32, f32])
         if let recorder {
             let kRaw = ka[0..., Int(imeta[2]) ..< (Int(imeta[2]) + C)].asType(f32)
             let vRaw = va[0..., Int(imeta[4]) ..< (Int(imeta[4]) + C)].asType(f32)
@@ -536,107 +507,5 @@ extension Inkling2DecoderLayer {
         if decodeWeights.mlpNorm == nil {
             decodeWeights.mlpNorm = postAttnLN.weight.asType(f32).reshaped([1, hidden])
         }
-    }
-}
-
-// MARK: - Grouped expert matmul (each expert's weights streamed once for all its rows)
-
-extension Inkling2VerifyKernels {
-    static let groupedHeader = header + """
-
-        inline float ink_e4m3(uint b) {
-            uint s = b >> 7, e = (b >> 3) & 0xF, m = b & 7;
-            float v = e == 0 ? (float(m) / 8.f) * 0.015625f : (1.f + float(m) / 8.f) * exp2(float(e) - 7.f);
-            if (e == 15 && m == 7) v = NAN;
-            return s ? -v : v;
-        }
-        constant float ink_e2m1_lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-        inline float ink_e2m1(uint n) { float v = ink_e2m1_lut[n & 7]; return (n & 8) ? -v : v; }
-        """
-
-    /// y[pair, n] = sum_k x[row(pair), k] * W_{inds[pair]}[n, k] for every routed pair; pairs = T*KTOP,
-    /// row(pair) = pair / KTOP (XPER = 0, gate/up) or pair (XPER = 1, down). FMT 0 = NVFP4 (codes
-    /// [E, N, K/8] uint32, e4m3 scale per 16), 1 = MXFP8 (codes [E, N, K/4], ue8m0 scale per 32).
-    /// Grid: x = (N / 8) * 256 threads (8 rows per group, one simdgroup per row), y = expert.
-    /// Raw products: any per-expert global factor is applied by the caller.
-    static let grouped = MLXFast.metalKernel(
-        name: "inkling2_ver_grouped_experts",
-        inputNames: ["x", "inds", "codes", "scales"],
-        outputNames: ["y"],
-        source: """
-            uint tile = threadgroup_position_in_grid.x;
-            uint e = threadgroup_position_in_grid.y;
-            uint tid = thread_position_in_threadgroup.x;
-            uint lane = thread_index_in_simdgroup;
-            uint sg = simdgroup_index_in_threadgroup;
-            int K = x_shape[1];
-            int N = codes_shape[1];
-            int WPR = codes_shape[2];          // uint32 words per row
-            int SPR = scales_shape[2];         // scale bytes per row
-            int PAIRS = inds_shape[0];
-            threadgroup int plist[256];
-            threadgroup int pcount;
-            if (tid == 0) {
-                int c = 0;
-                for (int p = 0; p < PAIRS; ++p) if (inds[p] == e) plist[c++] = p;
-                pcount = c;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            int np = pcount;
-            if (np == 0) return;
-            int n = tile * 8 + sg;
-            if (n >= N) return;
-            const device uint* wrow = codes + ((size_t)e * N + n) * WPR;
-            const device uint8_t* srow = scales + ((size_t)e * N + n) * SPR;
-            for (int p0 = 0; p0 < np; p0 += 8) {
-                int pc = min(8, np - p0);
-                float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-                int xr[8];
-                for (int i = 0; i < 8; ++i) {
-                    int p = plist[p0 + min(i, pc - 1)];
-                    xr[i] = XPER ? p : p / KTOP;
-                }
-                for (int q = lane; q < WPR; q += 32) {
-                    uint word = wrow[q];
-                    float wv[8];
-                    int kbase;
-                    int cnt;
-                    if (FMT == 0) {
-                        float s = ink_e4m3(srow[q >> 1]);
-                        for (int i = 0; i < 8; ++i) wv[i] = ink_e2m1((word >> (4 * i)) & 0xF) * s;
-                        kbase = q * 8; cnt = 8;
-                    } else {
-                        float s = exp2(float(srow[q >> 3]) - 127.f);
-                        for (int i = 0; i < 4; ++i) wv[i] = ink_e4m3((word >> (8 * i)) & 0xFF) * s;
-                        kbase = q * 4; cnt = 4;
-                    }
-                    for (int i = 0; i < pc; ++i) {
-                        const device float* xp = x + (size_t)xr[i] * K + kbase;
-                        float a = 0.f;
-                        for (int j = 0; j < cnt; ++j) a += wv[j] * xp[j];
-                        acc[i] += a;
-                    }
-                }
-                for (int i = 0; i < pc; ++i) {
-                    float v = simd_sum(acc[i]);
-                    if (lane == 0) y[(size_t)plist[p0 + i] * N + n] = v;
-                }
-            }
-            """,
-        header: groupedHeader)
-
-    /// Wrapper: `x` [rows, K] fp32, `inds` [T, KTOP] uint32 → [T*KTOP, N] fp32.
-    static func groupedExperts(
-        _ x: MLXArray, inds: MLXArray, codes: MLXArray, scales: MLXArray, xPerPair: Bool
-    ) -> MLXArray {
-        let N = codes.dim(1)
-        let E = codes.dim(0)
-        let pairs = inds.size
-        let nv = codes.dim(-1) / scales.dim(-1) == 2
-        return grouped(
-            [x, inds.reshaped([-1]), codes, scales],
-            template: [("FMT", nv ? 0 : 1), ("XPER", xPerPair ? 1 : 0), ("KTOP", inds.dim(-1))],
-            grid: (((N + 7) / 8) * 256, E, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[pairs, N]], outputDTypes: [.float32])[0]
     }
 }

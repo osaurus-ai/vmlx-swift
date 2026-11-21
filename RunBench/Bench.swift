@@ -670,16 +670,8 @@ struct Bench {
             try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
             return
         }
-        if (env["BENCH_INKLING2_DSPARK"] ?? "0") == "1" {
-            try await runInkling2DSparkProbe(modelPath: modelPath)
-            return
-        }
         if (env["BENCH_INKLING2_TEMPLATE"] ?? "0") == "1" {
             try await runInkling2TemplateProbe(modelPath: modelPath)
-            return
-        }
-        if (env["BENCH_INKLING2_MICRO"] ?? "0") == "1" {
-            try await runInkling2MicroProbe(modelPath: modelPath)
             return
         }
         if (env["BENCH_INKLING2_TIMING"] ?? "0") == "1" {

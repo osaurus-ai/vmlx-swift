@@ -28,6 +28,9 @@ final class Inkling2PendingVerify: @unchecked Sendable {
 }
 
 extension Inkling2LoopModel {
+    /// The bundle ships the native drafter and this runtime implements its head type.
+    public var dsparkAvailable: Bool { drafter != nil && hasDrafterWeights }
+
     var draftSlotCount: Int { (drafter?.cfg.layers ?? 0) + 1 }
 
     func cacheHasDraftState(_ cache: [KVCache]?) -> Bool {

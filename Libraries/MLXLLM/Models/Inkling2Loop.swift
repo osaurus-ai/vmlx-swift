@@ -290,10 +290,6 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
 
 private let f32 = DType.float32
 
-/// TEMPORARY timing diagnostics (removed before merge): comma list of subsystems to replace with
-/// cheap stand-ins so their GPU cost can be measured by difference. Output is garbage when set.
-let inklingSkip: Set<String> = Set(
-    (ProcessInfo.processInfo.environment["VMLX_INKLING2_SKIP"] ?? "").split(separator: ",").map(String.init))
 
 /// Runtime switch (diagnostics / parity A/B): run single-token steps through the general path.
 public enum Inkling2Runtime {
@@ -364,9 +360,6 @@ final class Inkling2ShortConv: Module {
 
     /// Returns `(output in x.dtype, new state [B, K-1, C] fp32)`.
     func callAsFunction(_ x: MLXArray, packed: MLXArray?, offset: Int) -> (MLXArray, MLXArray) {
-        if inklingSkip.contains("conv") {
-            return (x, convState(packed, offset: offset, like: x, kernel: kernel))
-        }
         if inklingUseKernels, kernel == 4 {
             let st = packed ?? MLXArray.zeros([x.dim(0), 3, offset + x.dim(2)], dtype: f32)
             return Inkling2Kernels.conv(x, packed: st, offset: offset, weight: weight)
@@ -393,7 +386,7 @@ extension Inkling2ShortConv {
     func residual(
         _ x: MLXArray, packed: MLXArray?, offset: Int, res: MLXArray, mode: Int, outDType: DType
     ) -> (MLXArray, MLXArray) {
-        if inklingUseKernels, kernel == 4, !inklingSkip.contains("conv") {
+        if inklingUseKernels, kernel == 4 {
             let (B, T, C) = (x.dim(0), x.dim(1), x.dim(2))
             let st = packed ?? MLXArray.zeros([B, 3, offset + C], dtype: f32)
             let outs = Inkling2Kernels.residualConv(
@@ -430,9 +423,6 @@ final class Inkling2DynamicShortConv: Module {
     func callAsFunction(_ x: MLXArray, dynamicInput: MLXArray, packed: MLXArray?, offset: Int)
         -> (MLXArray, MLXArray)
     {
-        if inklingSkip.contains("conv") {
-            return (x, convState(packed, offset: offset, like: x, kernel: kernel))
-        }
         let K = kernel
         let pad = K - 1
         let (B, T, C) = (x.dim(0), x.dim(1), x.dim(2))
@@ -676,10 +666,6 @@ final class Inkling2Attention: Module {
         kv: KVCacheSimple?
     ) -> MLXArray {
         let (B, T) = (qIn.dim(0), qIn.dim(2))
-        if inklingSkip.contains("attn") {
-            if let kv { _ = kv.update(keys: k, values: v) }
-            return (qIn + rIn.sum() + sinks.sum()).transposed(0, 2, 1, 3).reshaped([B, T, nq * hd])
-        }
         var q = qIn
         var r = rIn
         // Absolute positions; `seen` is read BEFORE the cache update.
@@ -715,7 +701,7 @@ final class Inkling2Attention: Module {
         // Relative bias: rel[b, h, t, d] = (r @ proj)[b, t, h, d], gathered at d = q_pos - k_pos,
         // exactly zero outside 0 <= d < extent.
         let out: MLXArray
-        if T == 1, !inklingSkip.contains("decodesinkkey") {
+        if T == 1 {
             // Decode: keys sit at kStart ... seen, distance runs S-1 ... 0.
             var bias: MLXArray
             if inklingUseKernels, B == 1 {
@@ -942,13 +928,9 @@ final class Inkling2MoE: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if inklingSkip.contains("moe") { return x }
         let (B, T, H) = (x.dim(0), x.dim(1), x.dim(2))
         let flat = x.reshaped([-1, H])
         let (inds, w) = gate(flat)
-        if inklingSkip.contains("experts") {
-            return (x.asType(f32) * w.sum() + inds.sum().asType(f32)).asType(x.dtype)
-        }
         return switchMLP(flat, inds, w).reshaped([B, T, H])
     }
 }
@@ -977,10 +959,6 @@ final class Inkling2BlockAttentionResidual: Module {
     /// Returns `[B, T, nq, H]` fp32.
     func callAsFunction(_ stack: MLXArray?, _ partial: MLXArray, ones: MLXArray) -> MLXArray {
         let (B, T, H) = (partial.dim(0), partial.dim(1), partial.dim(2))
-        if inklingSkip.contains("bar") {
-            return MLX.broadcast(partial.asType(f32).expandedDimensions(axis: -2),
-                                 to: [B, T, numQueries, H])
-        }
         if inklingUseKernels {
             let R = B * T
             return Inkling2Kernels.depth(
@@ -1005,7 +983,7 @@ extension Inkling2BlockAttentionResidual {
         ones: MLXArray, box: Inkling2DerivedBox
     ) -> MLXArray {
         let (B, T, H) = (partial.dim(0), partial.dim(1), partial.dim(2))
-        if inklingUseKernels, !inklingSkip.contains("bar") {
+        if inklingUseKernels {
             if box.value == nil {
                 box.value = MLX.stacked(norms.map { $0.weight.asType(f32) }, axis: 0)
                 box.extra = MLXArray([norms[0].eps])
@@ -1046,7 +1024,6 @@ final class Inkling2MessageGate: Module {
 
     /// Returns fp32 `[..., H]`.
     func callAsFunction(_ h: MLXArray, _ msg: MLXArray, ones: MLXArray) -> MLXArray {
-        if inklingSkip.contains("mgate") { return h.asType(f32) + msg.asType(f32) }
         let wdt: DType = (downProj as? QuantizedLinear)?.scales.dtype ?? downProj.weight.dtype
         if inklingUseKernels {
             let H = h.dim(-1)
@@ -1349,12 +1326,11 @@ public final class Inkling2LoopModelInner: Module {
         var stack: MLXArray? = nil
         let fastDecode =
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) == 1
-            && !inklingSkip.contains("fastdecode") && inklingSkip.isEmpty
             && !Inkling2Runtime.forceGeneralDecode && decodeSupported && recorder == nil
         // Short multi-row calls (speculative verify, small chunks) take the fused multi-row path.
         let multiRow =
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) > 1
-            && ids.dim(1) <= 16 && inklingSkip.isEmpty && !Inkling2Runtime.forceGeneralDecode
+            && ids.dim(1) <= 16 && !Inkling2Runtime.forceGeneralDecode
             && decodeSupported
         func visit(_ layer: Int, _ pass: Int) -> Int {
             if layer < args.loopStart { return layer }
@@ -1501,7 +1477,6 @@ public final class Inkling2LoopModel: Module, LLMModel {
     }
 
     func logits(_ h: MLXArray) -> MLXArray {
-        if inklingSkip.contains("head") { return h.asType(.float32) }
         var out = lmHead(h).asType(.float32)
         if let cap = args.finalLogitSoftcapping, cap > 0 {
             out = softcap(out, cap)
@@ -1698,197 +1673,6 @@ public final class Inkling2LoopModel: Module, LLMModel {
 
 extension Inkling2LoopModel: LoRAModel {
     public var loraLayers: [Module] { model.layers }
-}
-
-// MARK: - TEMPORARY decode microbenchmark (diagnostics; removed before merge)
-
-extension Inkling2LoopModel {
-    /// Per-component latency on real weights, each run as a 200-long DEPENDENT chain (decode is
-    /// one long dependency chain, so latency, not throughput, is what a step pays).
-    public func inklingMicrobench() -> [String] {
-        let L = model.layers
-        let n = 200
-        var lines: [String] = []
-        func time(_ name: String, _ body: (MLXArray) -> MLXArray, seed: MLXArray) {
-            var x = seed
-            eval(x)
-            for _ in 0 ..< 10 { x = body(x) }
-            eval(x)
-            let t0 = CFAbsoluteTimeGetCurrent()
-            x = seed
-            for _ in 0 ..< n { x = body(x) }
-            eval(x)
-            let us = (CFAbsoluteTimeGetCurrent() - t0) / Double(n) * 1e6
-            lines.append(String(format: "%-34@ %8.1f us/call", name as NSString, us))
-        }
-        let H = args.hiddenSize
-        let xb = MLXRandom.normal([1, 1, H]).asType(.bfloat16)
-        time("floor: x + 1 (bf16 [H])", { x in x + 1 }, seed: xb)
-        time("floor: x * x + 1 (2 ops)", { x in x * x + 1 }, seed: xb)
-        let xf = MLXRandom.normal([1, 1, H])
-        time("floor: rmsNorm fp32", { x in MLXFast.rmsNorm(x, weight: model.ones, eps: 1e-6) }, seed: xf)
-        let a6 = L[6].selfAttn
-        let a5 = L[5].selfAttn
-        // projections
-        if let f = a6.fusedProjection(includeKV: true) {
-            time("proj fused x6 (L6)", { x in f(x)[.ellipsis, 0 ..< H] }, seed: xb)
-        }
-        time("proj q only (L6)", { x in a6.qProj(x)[.ellipsis, 0 ..< H] }, seed: xb)
-        time("proj k only (L6)", { x in MLX.concatenated([a6.kProj(x), a6.kProj(x)[.ellipsis, 0 ..< (H - 2048)], a6.kProj(x)], axis: -1) }, seed: xb)
-        time("o_proj (L6)", { x in a6.oProj(MLX.concatenated([x, x[.ellipsis, 0 ..< 768]], axis: -1)) }, seed: xb)
-        time("lm_head", { x in lmHead(x)[.ellipsis, 0 ..< H] }, seed: xb)
-        // router
-        let r6 = L[6].mlp.gate
-        time("router matmul+select (L6)", { x in
-            let (i, w) = r6(x.reshaped([1, H]))
-            return x + (w.sum() + i.sum().asType(.float32)).asType(x.dtype) * 0
-        }, seed: xb)
-        // experts
-        let sw6 = L[6].mlp.switchMLP
-        let inds = MLXArray((0 ..< 8).map { UInt32($0 * 13) }).reshaped([1, 8])
-        let wts = MLXArray.ones([1, 8], dtype: .float32)
-        time("experts nvfp4 (L6)", { x in sw6(x.reshaped([1, H]), inds, wts).reshaped([1, 1, H]) }, seed: xb)
-        let sw21 = L[21].mlp.switchMLP
-        time("experts mxfp8 (L21)", { x in sw21(x.reshaped([1, H]), inds, wts).reshaped([1, 1, H]) }, seed: xb)
-        // depth attention
-        let stack4 = MLXRandom.normal([1, 1, 4, H]).asType(.float32)
-        let bar = L[7].attentionInput!
-        time("depth S=4 nq=1", { x in bar(stack4, x, ones: model.ones)[.ellipsis, 0, 0...].asType(x.dtype) }, seed: xb)
-        time("depth+norm S=4 nq=1", { x in bar.normed(stack4, x, norms: [L[7].inputLN!], dtype: x.dtype, ones: model.ones, box: Inkling2DerivedBox())[.ellipsis, 0, 0...] }, seed: xb)
-        let bar3 = L[5].attentionInput!
-        time("depth S=4 nq=3", { x in bar3(stack4, x, ones: model.ones)[.ellipsis, 0, 0...].asType(x.dtype) }, seed: xb)
-        // conv
-        let pc = L[6].postAttnConv
-        let packed = MLXRandom.normal([1, 3, 6656]).asType(.float32)
-        time("residual conv H", { x in pc.residual(x, packed: packed, offset: 2048, res: x, mode: 2, outDType: x.dtype).0 }, seed: xb)
-        // message gate
-        let g6 = L[6].qGate!
-        let msg = MLXRandom.normal([1, 1, H]).asType(.float32)
-        time("message gate (L6)", { x in g6(x, msg, ones: model.ones).asType(x.dtype) }, seed: xb)
-        // full attention step pieces at S=64
-        time("project L6 (no msgs)", { x in a6.project(x, keyInput: nil, valueInput: nil, packed: packed, ones: model.ones)[4][.ellipsis, 0 ..< H] }, seed: xb)
-        time("project L5 (full)", { x in a5.project(x, keyInput: x, valueInput: x, packed: packed, ones: model.ones)[4][.ellipsis, 0 ..< H] }, seed: xb)
-        // whole decode steps (fresh caches with 64 prefilled positions)
-        func decodeChain(_ i: Int, msgs: Bool) {
-            let kv = KVCacheSimple()
-            let cv = MambaCache(slots: 1)
-            let layer = L[i]
-            let warm = MLXRandom.normal([1, 64, H]).asType(.bfloat16)
-            let st = MLXRandom.normal([1, 64, i == 0 ? 0 : 3, H])
-            _ = layer(warm, stack: i == 0 ? nil : st, kv: kv, conv: cv, messages: nil, ones: model.ones)
-            eval(kv.state + [cv[0]!])
-            let st1 = MLXRandom.normal([1, 1, i == 0 ? 0 : 3, H])
-            let m = msgs ? MLXRandom.normal([1, 1, 48, H]) : nil
-            time("decodeStep L\(i)\(msgs ? " +msgs" : "")", { x in
-                layer.decodeStep(x, stack: i == 0 ? nil : st1, kv: kv, conv: cv, messages: m, loopIndex: 0, ones: model.ones).0
-            }, seed: xb)
-        }
-        // multi-row (T = 8) pieces
-        func multiChain(_ i: Int, msgs: Bool, T: Int) {
-            let kv = KVCacheSimple()
-            let cv = MambaCache(slots: 1)
-            let layer = L[i]
-            let warm = MLXRandom.normal([1, 64, H]).asType(.bfloat16)
-            _ = layer(warm, stack: MLXRandom.normal([1, 64, 3, H]), kv: kv, conv: cv, messages: nil, ones: model.ones)
-            eval(kv.state + [cv[0]!])
-            let stT = MLXRandom.normal([1, T, 3, H])
-            let m = msgs ? MLXRandom.normal([1, T, 48, H]) : nil
-            let xT = MLXRandom.normal([1, T, H]).asType(.bfloat16)
-            time("multiRowStep L\(i) T=\(T)\(msgs ? " +msgs" : "")", { x in
-                let out = layer.multiRowStep(x, stack: stT, kv: kv, conv: cv, messages: m, loopIndex: 0, ones: model.ones, recorder: nil).0
-                _ = kv.trim(T)
-                cv.offset -= T
-                return out
-            }, seed: xT)
-        }
-        multiChain(7, msgs: false, T: 8)
-        multiChain(7, msgs: false, T: 4)
-        multiChain(7, msgs: true, T: 8)
-        let x8 = MLXRandom.normal([8, H]).asType(.bfloat16)
-        let inds8 = MLXRandom.randInt(0 ..< 128, [8, 8]).asType(.uint32)
-        let w8 = MLXArray.ones([8, 8], dtype: .float32)
-        time("experts T=8 (sorted via SwitchMLP)", { x in sw6(x, inds8, w8) }, seed: x8)
-        do {
-            let xf = x8.asType(.float32)
-            let ref = sw6.gateUp(xf.reshaped([8, 1, 1, H]), inds8, sorted: false).reshaped([64, -1])
-            let got = Inkling2VerifyKernels.groupedExperts(
-                xf, inds: inds8, codes: sw6.gateUp.codes, scales: sw6.gateUp.blockScales, xPerPair: false)
-            let rel = (abs(ref - got).max() / abs(ref).max()).item(Float.self)
-            lines.append(String(format: "grouped vs gather_qmm gate_up (nvfp4) max rel %.2e", rel))
-            let sw21 = L[21].mlp.switchMLP
-            let ref8 = sw21.gateUp(xf.reshaped([8, 1, 1, H]), inds8, sorted: false).reshaped([64, -1])
-            let got8 = Inkling2VerifyKernels.groupedExperts(
-                xf, inds: inds8, codes: sw21.gateUp.codes, scales: sw21.gateUp.blockScales, xPerPair: false)
-            let rel8 = (abs(ref8 - got8).max() / abs(ref8).max()).item(Float.self)
-            lines.append(String(format: "grouped vs gather_qmm gate_up (mxfp8) max rel %.2e", rel8))
-            time("grouped gate_up T=8", { x in
-                Inkling2VerifyKernels.groupedExperts(x.asType(.float32), inds: inds8, codes: sw6.gateUp.codes,
-                    scales: sw6.gateUp.blockScales, xPerPair: false)[0..., 0 ..< H].asType(.bfloat16)
-            }, seed: x8)
-        }
-        let x81 = x8.asType(.float32).reshaped([8, 1, 1, H])
-        time("gate_up gather T=8 unsorted", { x in sw6.gateUp(x.asType(.float32).reshaped([8, 1, 1, H]), inds8, sorted: false)[0..., 0, 0, 0 ..< H].asType(.bfloat16) }, seed: x8)
-        _ = x81
-        if let f = a6.fusedProjection(includeKV: true) {
-            time("proj fused T=8", { x in f(x)[.ellipsis, 0 ..< H] }, seed: x8)
-        }
-        decodeChain(7, msgs: false)
-        decodeChain(5, msgs: false)
-        decodeChain(7, msgs: true)
-        decodeChain(11, msgs: true)
-        decodeChain(21, msgs: false)
-        return lines
-    }
-}
-
-extension Inkling2LoopModel {
-    /// TEMPORARY parity diagnostics: one decode token, every layer execution run through BOTH the
-    /// fast decode step and the general path from identical inputs / cache copies; reports the
-    /// max |diff| of the layer output and of the new conv state, then continues on the general
-    /// path's values.
-    public func inklingDebugCompareDecode(token: Int, cache: [KVCache]) -> [String] {
-        let a = args
-        let m = model
-        var lines: [String] = []
-        var h = m.embed(MLXArray([Int32(token)]).reshaped([1, 1]))
-        var stack: MLXArray? = nil
-        let slots = a.numCacheSlots
-        func run(_ ids: Range<Int>, pass: Int, messages: MLXArray?) {
-            for (j, i) in ids.enumerated() {
-                let kvA = cache[a.cacheSlot(layer: i, pass: pass)] as! KVCacheSimple
-                let cvA = cache[slots + a.cacheSlot(layer: i, pass: pass)] as! MambaCache
-                let kvB = kvA.copy() as! KVCacheSimple
-                let cvB = cvA.copy() as! MambaCache
-                let (hf, _) = m.layers[i].decodeStep(
-                    h, stack: stack, kv: kvB, conv: cvB, messages: messages, loopIndex: j, ones: m.ones)
-                let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
-                let (hg, sg) = m.layers[i](
-                    h, stack: stack, kv: kvA, conv: cvA, messages: msgs, ones: m.ones)
-                let dh = abs(hf.asType(.float32) - hg.asType(.float32)).max().item(Float.self)
-                let dc = abs(cvB[0]! - cvA[0]!).max().item(Float.self)
-                let ka = kvA.state[0], kb = kvB.state[0]
-                let dk = abs(kb.asType(.float32) - ka.asType(.float32)).max().item(Float.self)
-                lines.append(String(format: "L%2d p%d |dh|=%.3e |dconv|=%.3e |dk|=%.3e", i, pass, dh, dc, dk))
-                h = hg
-                stack = sg
-            }
-        }
-        let s0 = a.loopStart, s1 = a.loopEnd
-        run(0 ..< s0, pass: 0, messages: nil)
-        let preH = h, preStack = stack
-        let nPre = preStack?.dim(2) ?? 0
-        run(s0 ..< s1, pass: 0, messages: nil)
-        for p in 1 ..< a.loopPasses {
-            let all = stack!
-            let prev: MLXArray? = all.dim(2) > nPre + 1 ? all[0..., 0..., (nPre + 1)..., 0...] : nil
-            let messages = m.messageInput!(prev, h, ones: m.ones)
-            h = preH
-            stack = preStack
-            run(s0 ..< s1, pass: p, messages: messages)
-        }
-        run(s1 ..< a.numHiddenLayers, pass: 0, messages: nil)
-        return lines
-    }
 }
 
 /// Inkling's template renders an assistant tool-call turn (`reasoning_content` + `<|message_model|>NAME

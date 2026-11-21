@@ -144,11 +144,6 @@ func runInkling2ParityProbe(modelPath: String) async throws {
                 worstKL = max(worstKL, kl(lb, la))
                 if la.argMax().item(Int.self) != lb.argMax().item(Int.self) { mism += 1 }
             }
-            if env["BENCH_INKLING2_LAYERDIFF"] == "1", let im = model as? Inkling2LoopModel {
-                for line in im.inklingDebugCompareDecode(token: gold[0], cache: cB.map { $0.copy() }) {
-                    print("[INK2L] " + line)
-                }
-            }
             _ = cA
             print(String(format: "[INK2] fast-vs-general teacher-forced 24 steps: max KL %.3e, argmax mismatches %d", worstKL, mism))
         }
@@ -214,13 +209,6 @@ func runInkling2TimingProbe(modelPath: String) async throws {
     print(String(format: "[INK2T] pipelined decode tok/s runs=%@ median=%.1f", rates.map { String(format: "%.1f", $0) }.joined(separator: ","), med(rates)))
 }
 
-func runInkling2MicroProbe(modelPath: String) async throws {
-    let context = try await MLXLMCommon.loadModel(
-        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
-        loadConfiguration: .default)
-    guard let m = context.model as? Inkling2LoopModel else { print("[INK2M] not inkling"); return }
-    for line in m.inklingMicrobench() { print("[INK2M] " + line) }
-}
 
 /// BENCH_INKLING2_TEMPLATE=1: the app's prompt path (UserInput(chat:tools:additionalContext:) ->
 /// processor -> chat template -> tokenizer) against transformers' apply_chat_template renders
@@ -282,55 +270,6 @@ func runInkling2TemplateProbe(modelPath: String) async throws {
         }
     }
     print("[INK2TPL] \(fails == 0 ? "ALL MATCH" : "\(fails) FAILED")")
-}
-
-/// BENCH_INKLING2_DSPARK=1: greedy DSpark (native drafter) vs plain greedy decode on the parity
-/// prompts: acceptance per round, emitted-token agreement, and wall tok/s for both.
-func runInkling2DSparkProbe(modelPath: String) async throws {
-    let env = ProcessInfo.processInfo.environment
-    let ref = try JSONSerialization.jsonObject(
-        with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_REF"]!))) as! [String: [String: Any]]
-    let maxNew = Int(env["BENCH_INKLING2_NEW"] ?? "192") ?? 192
-    let widths = (env["BENCH_INKLING2_WIDTHS"] ?? "7").split(separator: ",").compactMap { Int($0) }
-    let context = try await MLXLMCommon.loadModel(
-        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
-        loadConfiguration: .default)
-    guard let m = context.model as? Inkling2LoopModel, m.dsparkAvailable else {
-        print("[INK2D] drafter not available"); return
-    }
-    for name in ["short", "long"] {
-        guard let ids = ref[name]?["ids"] as? [Int] else { continue }
-        // plain greedy (fast decode path)
-        var cache = m.newCache(parameters: nil)
-        var s = 0
-        var last = MLXArray(0)
-        let arr = MLXArray(ids.map { Int32($0) }).reshaped([1, -1])
-        while s < ids.count { let e = min(s + 512, ids.count); last = m(arr[0..., s ..< e], cache: cache)[0, -1]; eval(last); s = e }
-        var plain = [last.argMax().item(Int.self)]
-        let t0 = CFAbsoluteTimeGetCurrent()
-        while plain.count < maxNew {
-            let lg = m(MLXArray([Int32(plain.last!)]).reshaped([1, 1]), cache: cache)[0, -1]
-            plain.append(lg.argMax().item(Int.self))
-        }
-        let plainTps = Double(maxNew - 1) / (CFAbsoluteTimeGetCurrent() - t0)
-        for w in widths {
-            cache = m.newCache(parameters: nil)
-            let (sess, _) = m.dsparkPrefill(ids, cache: cache)
-            var out = [sess.anchor]
-            let t1 = CFAbsoluteTimeGetCurrent()
-            while out.count < maxNew { out += m.dsparkRound(sess, cache: cache, width: w) }
-            let dt = CFAbsoluteTimeGetCurrent() - t1
-            var agree = 0
-            for (a, b) in zip(out, plain) { if a == b { agree += 1 } else { break } }
-            print(String(format: "[INK2D] %@ w=%d rounds=%d accepted/round=%.2f emitted/round=%.2f tok/s=%.1f (plain %.1f) agree=%d/%d",
-                         name, w, sess.rounds, Double(sess.accepted) / Double(max(sess.rounds, 1)),
-                         Double(out.count - 1) / Double(max(sess.rounds, 1)), Double(out.count - 1) / dt, plainTps, agree, maxNew))
-            let r = Double(max(sess.rounds, 1)) / 1000
-            print(String(format: "[INK2D] %@ w=%d ms/round: block %.1f walk %.1f verify %.1f commit %.1f",
-                         name, w, sess.timing[0] / r, sess.timing[1] / r, sess.timing[2] / r, sess.timing[3] / r))
-            print("[INK2D] \(name) text: " + context.tokenizer.decode(tokenIds: Array(out.prefix(80)), skipSpecialTokens: false).replacingOccurrences(of: "\n", with: "⏎"))
-        }
-    }
 }
 
 /// BENCH_INKLING2_DSPARK_ITER=1: the production TokenIterator route with `draftStrategy = .dspark(bundle)`
