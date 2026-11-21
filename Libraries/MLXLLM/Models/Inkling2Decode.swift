@@ -534,7 +534,11 @@ extension Inkling2DecoderLayer {
                 else { return false }
             }
         }
+        // Kernel scratch bounds: router selection holds <= 256 experts and <= 16 picks; the
+        // depth kernels size their source arrays from the block-state count.
+        let router = mlp.gate
         return a.hd % 32 == 0 && a.hd <= 128 && a.dRel <= 32 && a.nq <= 64
+            && router.weight.dim(0) <= 256 && router.topK <= 16 && router.topK >= 1
     }
 
     private func prepareDecodeWeights() {
