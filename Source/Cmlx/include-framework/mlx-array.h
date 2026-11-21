@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -11,6 +12,7 @@
 
 #include <Cmlx/mlx-allocator.h>
 #include <Cmlx/mlx-api.h>
+#include <Cmlx/mlx-backend-cpu-simd/saturating_cast.h>
 #include <Cmlx/mlx-dtype.h>
 #include <Cmlx/mlx-event.h>
 #include <Cmlx/mlx-small_vector.h>
@@ -598,52 +600,63 @@ T array::item() {
     throw std::invalid_argument("item can only be called on arrays of size 1.");
   }
   eval();
-  return *data<T>();
+  // Use memcpy to read unaligned data.
+  T value;
+  std::memcpy(&value, data<void>(), sizeof(T));
+  return value;
 }
 
 template <typename T>
 T array::item() const {
-  if (size() != 1) {
-    throw std::invalid_argument("item can only be called on arrays of size 1.");
-  }
   if (status() == Status::unscheduled) {
     throw std::invalid_argument(
         "item() const can only be called on evaled arrays");
   }
-  const_cast<array*>(this)->eval();
-  return *data<T>();
+  return const_cast<array*>(this)->item<T>();
 }
 
 template <typename It>
 void array::init(It src) {
   set_data(allocator::malloc(size() * size_of(dtype())));
+  // A float or complex value converts to an integer type as in astype.
+  auto copy_to_int = [&](auto* dst) {
+    using T = std::remove_pointer_t<decltype(dst)>;
+    using V = typename std::iterator_traits<It>::value_type;
+    if constexpr (std::is_integral_v<V>) {
+      std::copy(src, src + size(), dst);
+    } else {
+      std::transform(src, src + size(), dst, [](const V& v) {
+        return simd::saturating_cast<T>(v);
+      });
+    }
+  };
   switch (dtype()) {
     case bool_:
       std::copy(src, src + size(), data<bool>());
       break;
     case uint8:
-      std::copy(src, src + size(), data<uint8_t>());
+      copy_to_int(data<uint8_t>());
       break;
     case uint16:
-      std::copy(src, src + size(), data<uint16_t>());
+      copy_to_int(data<uint16_t>());
       break;
     case uint32:
-      std::copy(src, src + size(), data<uint32_t>());
+      copy_to_int(data<uint32_t>());
       break;
     case uint64:
-      std::copy(src, src + size(), data<uint64_t>());
+      copy_to_int(data<uint64_t>());
       break;
     case int8:
-      std::copy(src, src + size(), data<int8_t>());
+      copy_to_int(data<int8_t>());
       break;
     case int16:
-      std::copy(src, src + size(), data<int16_t>());
+      copy_to_int(data<int16_t>());
       break;
     case int32:
-      std::copy(src, src + size(), data<int32_t>());
+      copy_to_int(data<int32_t>());
       break;
     case int64:
-      std::copy(src, src + size(), data<int64_t>());
+      copy_to_int(data<int64_t>());
       break;
     case float16:
       std::copy(src, src + size(), data<float16_t>());

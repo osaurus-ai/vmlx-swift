@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <utility>
 
 #include <fcntl.h>
@@ -31,6 +33,13 @@ namespace mlx::core {
 namespace io {
 
 ThreadPool& thread_pool();
+
+// Calls `write` with a temporary path next to `file`, then renames that file
+// over `file`. If `write` throws, an existing `file` is left unchanged. A
+// symlink at `file` is followed, and the replaced file keeps its permissions.
+void write_and_replace(
+    const std::string& file,
+    const std::function<void(const std::string&)>& write);
 
 class Reader {
  public:
@@ -63,9 +72,7 @@ class Writer {
 
 class ParallelFileReader : public Reader {
  public:
-  explicit ParallelFileReader(std::string file_path)
-      : fd_(open(file_path.c_str(), O_RDONLY | O_BINARY)),
-        label_(std::move(file_path)) {}
+  explicit ParallelFileReader(std::string file_path);
 
   ~ParallelFileReader() override {
     close(fd_);
