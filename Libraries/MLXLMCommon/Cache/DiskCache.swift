@@ -3838,7 +3838,30 @@ public final class DiskCache: @unchecked Sendable {
     /// ``isUnpublishedPayloadName(_:)`` (or the companion store's
     /// equivalent), which also require that the name be one of ours.
     static func isUnpublishedName(_ name: String) -> Bool {
-        name.contains(".partial-") && name.hasSuffix(".safetensors")
+        let base = strippingMLXSaveTemp(name)
+        return base.contains(".partial-") && base.hasSuffix(".safetensors")
+    }
+
+    /// MLX's `save` / `save_safetensors` write `<target>.tmp<decimal u32>`
+    /// beside the target and rename it over the target when the write is
+    /// done (ml-explore/mlx#4773). A process killed in the middle of a save
+    /// leaves that file behind. For our temp names the target is itself a
+    /// `.partial-` name, so the leftover is
+    /// `<stem>.partial-<tag>.safetensors.tmp<digits>`: an unpublished write
+    /// like any other, and swept the same way.
+    static let mlxSaveTempInfix = ".tmp"
+
+    /// `name` without a trailing `.tmp<1-10 decimal digits>` that MLX's save
+    /// adds to its target; `name` unchanged when it has none.
+    static func strippingMLXSaveTemp(_ name: String) -> Substring {
+        guard let infix = name.range(of: mlxSaveTempInfix, options: .backwards) else {
+            return Substring(name)
+        }
+        let digits = name[infix.upperBound...]
+        guard (1...10).contains(digits.utf8.count),
+              digits.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") })
+        else { return Substring(name) }
+        return name[..<infix.lowerBound]
     }
 
     static let payloadSuffix = ".safetensors"
@@ -3883,9 +3906,12 @@ public final class DiskCache: @unchecked Sendable {
     /// returns the stem, or nil when `name` is not exactly that: one
     /// `.partial-` infix, then a tag of ``partialTagLength`` hex digits (a
     /// UUID's first eight; uppercase as Foundation prints them, either case
-    /// accepted), then the suffix. The caller decides whether the stem is
-    /// one of its own.
-    static func unpublishedStem(ofName name: String) -> Substring? {
+    /// accepted), then the suffix, optionally followed by the `.tmp<digits>`
+    /// that MLX's save writes first (``strippingMLXSaveTemp(_:)``). The
+    /// caller decides whether the stem is one of its own.
+    static func unpublishedStem(ofName fullName: String) -> Substring? {
+        // MLX's own temp of one of our temp files is still that write.
+        let name = strippingMLXSaveTemp(fullName)
         guard name.hasSuffix(payloadSuffix) else { return nil }
         let body = name.dropLast(payloadSuffix.count)
         guard let infix = body.range(of: partialInfix) else { return nil }
