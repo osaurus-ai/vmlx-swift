@@ -126,6 +126,14 @@ private class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCaptureM
     var supportsCapturingPrefixCommitRecording: Bool { true }
 }
 
+private final class RecordingKVDFlash2Target: RecordingDFlash2Target,
+    ToolCallTurnBoundaryModel, @unchecked Sendable
+{
+    override func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [KVCacheSimple()]
+    }
+}
+
 private final class RecordingMediaDFlash2Target: RecordingDFlash2Target,
     DFlash2MediaPrefillModel, PrefixCacheInvariantModel, @unchecked Sendable
 {
@@ -230,6 +238,73 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         var p = GenerateParameters(maxTokens: 2, temperature: 0)
         p.prefillStepSize = 4
         return p
+    }
+
+    /// A consumer can stop inside an already verified block. Only returned tokens belong to history.
+    func testAllKVToolBoundaryTrimsUnreturnedTokensAndRestoresOnlySuffix() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingKVDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let coordinator = makeCoordinator(usePagedCache: false)
+        coordinator.setHybrid(false)
+        let prompt = turn1User + genPromptSuffix
+        var settings = parameters()
+        settings.maxTokens = 12
+        var first = try DFlash2TokenIterator(
+            input: input(prompt), target: target, drafter: makeDrafter(), blockSize: nil,
+            parameters: settings, cacheCoordinator: coordinator)
+        var returned: [Int] = []
+        for _ in 0 ..< 5 { returned.append(try XCTUnwrap(first.next())) }
+        XCTAssertTrue(first.storesToolCallTurnBoundary)
+        XCTAssertGreaterThan(target.lastOffsets[0], prompt.count + 1,
+                             "exercise rows committed past the consumer's tool-call end")
+        let visible = Array(returned.prefix(1))
+        first.noteEndedOnToolCall()
+        first.storeCacheAfterGeneration(generatedTokenIds: visible, includeGeneratedBoundary: true)
+        XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+        let salt = computeCacheSalt(for: input(prompt), parameters: settings)
+        guard case .hit(let matched, _, _, _, _, let arrays) = coordinator.fetch(
+            tokens: prompt + visible + [41, 42], mediaSalt: salt)
+        else { return XCTFail("tool-call boundary was not persisted") }
+        XCTAssertEqual(matched, prompt.count + visible.count)
+        let stored = try XCTUnwrap(arrays)
+        var restored: [KVCache] = [KVCacheSimple()]
+        XCTAssertEqual(restoreFromDiskArrays(stored, into: &restored), matched)
+        let context = try XCTUnwrap(DFlash2PrefixContext.restore(
+            from: stored, boundary: matched, layerIDs: [0], featureWidth: hiddenSize, limit: nil))
+        XCTAssertEqual(context.end, matched)
+        XCTAssertEqual(context.hidden.dim(1), matched)
+        target.resetRecording()
+        let suffix = [41, 42] + genPromptSuffix
+        _ = try DFlash2TokenIterator(
+            input: input(prompt + visible + suffix), target: target,
+            drafter: makeDrafter(), blockSize: nil, parameters: settings,
+            cacheCoordinator: coordinator)
+        XCTAssertEqual(target.forwarded, suffix)
+    }
+
+    func testPostAnswerKeepsPromptEntryOnlyPastCheapSuffixBoundary() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        for count in [512, 513] {
+            let target = RecordingKVDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+            let coordinator = makeCoordinator(usePagedCache: false)
+            coordinator.setHybrid(false)
+            var settings = parameters()
+            settings.maxTokens = 12
+            var iterator = try DFlash2TokenIterator(
+                input: input(Array(repeating: 11, count: count)), target: target,
+                drafter: makeDrafter(), blockSize: nil, parameters: settings,
+                cacheCoordinator: coordinator)
+            var generated: [Int] = []
+            for _ in 0 ..< 5 { generated.append(try XCTUnwrap(iterator.next())) }
+            iterator.storeCacheAfterGeneration(generatedTokenIds: generated, includeGeneratedBoundary: true)
+            XCTAssertTrue(coordinator.waitForPendingDiskWrites())
+            let entries = try XCTUnwrap(coordinator.diskCache).quotaEntries()
+            XCTAssertTrue(entries.contains { $0.isPostAnswer }, "completed answer must be reusable")
+            XCTAssertEqual(entries.contains { $0.tokenCount == count }, count == 513,
+                           "only a prompt suffix longer than 512 rows needs a separate prompt entry")
+        }
     }
 
     func testSSDStoresOwnTheChatBeforeAnyCacheHit() throws {
