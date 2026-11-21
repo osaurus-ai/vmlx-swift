@@ -154,6 +154,12 @@ public struct ReasoningParser: Sendable {
     private var harmonyChannelShouldStripName: Bool = false
     private var harmonyChannelNameBuffer: String = ""
 
+    /// Inkling (`inkling2*`) channel state. Every message opens with
+    /// `<|message_model|>`, an optional header (the tool name), then ONE
+    /// channel token; there is no closer per channel, only `<|end_message|>`.
+    private enum InklingChannel: Sendable { case neutral, header, thinking, text, tool }
+    private var inklingChannel: InklingChannel = .neutral
+
     /// Read-only access to the current parser state — true when the
     /// stream is currently inside a `<think>…</think>` block (or the
     /// family-specific equivalent). Useful at end-of-stream to detect
@@ -213,12 +219,25 @@ public struct ReasoningParser: Sendable {
         if isHarmonyChannelParser {
             return drainHarmonyChannel()
         }
+        if isInklingChannelParser {
+            return drainInklingChannel()
+        }
         return drain()
     }
 
     /// Call once when the stream ends. Flushes any buffered partial text
     /// as `.content` (so we never silently drop tokens).
     public mutating func flush() -> [ReasoningSegment] {
+        if isInklingChannelParser {
+            var out = drainInklingChannel(allowPartialTagAtEnd: false)
+            if !buffer.isEmpty {
+                appendInkling(buffer, into: &out)
+                buffer.removeAll(keepingCapacity: false)
+            }
+            inklingChannel = .neutral
+            insideReasoning = false
+            return out
+        }
         if isHarmonyChannelParser {
             var out = drainHarmonyChannel(allowPartialTagAtEnd: false)
             if !buffer.isEmpty {
@@ -408,6 +427,105 @@ public struct ReasoningParser: Sendable {
         }
 
         return out
+    }
+
+    // MARK: Inkling channels
+
+    static let inklingMessageModel = "<|message_model|>"
+    static let inklingThinking = "<|content_thinking|>"
+    static let inklingText = "<|content_text|>"
+    static let inklingToolJSON = "<|content_invoke_tool_json|>"
+    static let inklingToolText = "<|content_invoke_tool_text|>"
+    static let inklingToolError = "<|content_tool_error|>"
+    static let inklingEndMessage = "<|end_message|>"
+    static let inklingEndSampling = "<|content_model_end_sampling|>"
+    static let inklingMarkers = [
+        inklingMessageModel, inklingThinking, inklingText, inklingToolJSON, inklingToolText,
+        inklingToolError, inklingEndMessage, inklingEndSampling,
+    ]
+
+    private var isInklingChannelParser: Bool {
+        startTag == Self.inklingThinking && endTag == Self.inklingEndMessage
+    }
+
+    /// Route Inkling's channel-switched turn:
+    ///
+    ///   <|message_model|><|content_thinking|>REASONING<|end_message|>
+    ///   <|message_model|><|content_text|>ANSWER<|end_message|>
+    ///   <|message_model|>NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>
+    ///   <|content_model_end_sampling|>
+    ///
+    /// Thinking goes to `.reasoning`, text to `.content`. The `NAME` header is
+    /// protocol (the JSON repeats the name) and is consumed. A tool message is
+    /// re-emitted to `.content` as `<|content_invoke_tool_json|>JSON<|end_message|>`
+    /// so the Inkling tool parser receives a complete, unambiguous envelope;
+    /// every other marker is consumed. Text before any marker is visible
+    /// content (never reasoning).
+    private mutating func drainInklingChannel(allowPartialTagAtEnd: Bool = true)
+        -> [ReasoningSegment]
+    {
+        var out: [ReasoningSegment] = []
+        while !buffer.isEmpty {
+            guard let (range, tag) = firstRange(of: Self.inklingMarkers, in: buffer) else {
+                // No complete marker: emit what cannot be the start of one.
+                var hold = 0
+                if allowPartialTagAtEnd {
+                    for marker in Self.inklingMarkers {
+                        for length in stride(from: min(marker.count - 1, buffer.count), to: 0, by: -1)
+                        where buffer.hasSuffix(String(marker.prefix(length))) {
+                            hold = max(hold, length)
+                            break
+                        }
+                    }
+                }
+                let cut = buffer.index(buffer.endIndex, offsetBy: -hold)
+                appendInkling(String(buffer[..<cut]), into: &out)
+                buffer = String(buffer[cut...])
+                break
+            }
+            appendInkling(String(buffer[..<range.lowerBound]), into: &out)
+            buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            switch tag {
+            case Self.inklingMessageModel:
+                inklingChannel = .header
+            case Self.inklingThinking:
+                inklingChannel = .thinking
+            case Self.inklingText, Self.inklingToolText, Self.inklingToolError:
+                inklingChannel = .text
+            case Self.inklingToolJSON:
+                inklingChannel = .tool
+                out.append(.content(Self.inklingToolJSON))
+            case Self.inklingEndMessage:
+                if inklingChannel == .tool {
+                    out.append(.content(Self.inklingEndMessage))
+                }
+                inklingChannel = .neutral
+            default:  // end of sampling
+                inklingChannel = .neutral
+            }
+            insideReasoning = inklingChannel == .thinking
+        }
+        return out
+    }
+
+    private func appendInkling(_ text: String, into out: inout [ReasoningSegment]) {
+        guard !text.isEmpty else { return }
+        switch inklingChannel {
+        case .header:
+            return  // tool-name header: protocol, consumed
+        case .thinking:
+            if case .reasoning(let prev)? = out.last {
+                out[out.count - 1] = .reasoning(prev + text)
+            } else {
+                out.append(.reasoning(text))
+            }
+        case .neutral, .text, .tool:
+            if case .content(let prev)? = out.last {
+                out[out.count - 1] = .content(prev + text)
+            } else {
+                out.append(.content(text))
+            }
+        }
     }
 
     private mutating func appendHarmonyChannelText(
@@ -1195,6 +1313,14 @@ extension ReasoningParser {
                 endTagAliases: ["</ifm|think_fast>", "</ifm|think_faster>"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
+        case "inkling", "inkling2", "inkling2_loop", "inkling_channels":
+            // Channel-switched (see `drainInklingChannel`). The model opens every
+            // turn itself; the template has no generation prompt.
+            return ReasoningParser(
+                startTag: Self.inklingThinking,
+                endTag: Self.inklingEndMessage,
+                startInReasoning: false,
+                stripStrayTags: false)
         case "muse_glimmer", "muse-glimmer", "muse", "atem":
             // Muse Glimmer's turn is a recipient-channel envelope, observed
             // live off the real bundle:
@@ -1449,6 +1575,9 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
     let compact = normalized.replacingOccurrences(of: "_", with: "")
 
     if compact == "k2horizon" { return "k2_horizon" }
+
+    // Inkling-2 (`inkling2`, `inkling2_loop`): channel tokens, no think tags.
+    if compact.hasPrefix("inkling") { return "inkling" }
 
     // Ripple-65B (`ricursive`): plain `<think>`/`</think>` text tokens that the model opens itself (the template ends at
     // the assistant header). The parser starts in

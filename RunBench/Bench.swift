@@ -666,6 +666,10 @@ struct Bench {
             try await runRippleTimingProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_INKLING2_PARITY"] ?? "0") == "1" {
+            try await runInkling2ParityProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_RIPPLE_PARITY"] ?? "0") == "1" {
             try await runRippleParityProbe(modelPath: modelPath)
             return
