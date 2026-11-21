@@ -5811,6 +5811,48 @@ public func generateTokenTask(
     )
 }
 
+/// `VMLX_DECODE_CPU_TRACE=1`: every 128 `next()` calls, log the wall time and the calling
+/// thread's CPU time per call plus the thread's QoS class. CPU close to wall means the step is
+/// bound by graph construction / command encoding on that core rather than by the GPU (a decode
+/// thread placed on efficiency cores shows several times the CPU per step of a performance core).
+struct DecodeCPUTrace {
+    static let enabled = ProcessInfo.processInfo.environment["VMLX_DECODE_CPU_TRACE"] == "1"
+    private var calls = 0
+    private var wall = 0.0
+    private var cpu = 0.0
+
+    static func threadCPUms() -> Double {
+        var ts = timespec()
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)
+        return Double(ts.tv_sec) * 1000 + Double(ts.tv_nsec) / 1e6
+    }
+
+    mutating func record(wallMs: Double, cpuMs: Double) {
+        calls += 1
+        wall += wallMs
+        cpu += cpuMs
+        guard calls == 128 else { return }
+        var name = "n/a"
+        #if canImport(Darwin)
+            switch qos_class_self() {
+            case QOS_CLASS_USER_INTERACTIVE: name = "user-interactive"
+            case QOS_CLASS_USER_INITIATED: name = "user-initiated"
+            case QOS_CLASS_DEFAULT: name = "default"
+            case QOS_CLASS_UTILITY: name = "utility"
+            case QOS_CLASS_BACKGROUND: name = "background"
+            default: name = "unspecified"
+            }
+        #endif
+        fputs(
+            String(
+                format: "[vmlx][decode-cpu] calls=%d wall=%.2f ms/call cpu=%.2f ms/call qos=%@\n",
+                calls, wall / Double(calls), cpu / Double(calls), name), stderr)
+        calls = 0
+        wall = 0
+        cpu = 0
+    }
+}
+
 private func generateLoopTask<Handler: TokenLoopHandler>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
@@ -5918,11 +5960,21 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             // The prompt is resident now; keep MLX's scheduling limit above it (SchedulingMemoryFloor).
             SchedulingMemoryFloor.observe()
+            var cpuTrace = DecodeCPUTrace()
             while true {
                 let nextToken: Int?
                 SchedulingMemoryFloor.observe()
                 do {
-                    nextToken = try MLX.withError { iterator.next() }
+                    if DecodeCPUTrace.enabled {
+                        let w0 = Date.timeIntervalSinceReferenceDate
+                        let c0 = DecodeCPUTrace.threadCPUms()
+                        nextToken = try MLX.withError { iterator.next() }
+                        cpuTrace.record(
+                            wallMs: (Date.timeIntervalSinceReferenceDate - w0) * 1000,
+                            cpuMs: DecodeCPUTrace.threadCPUms() - c0)
+                    } else {
+                        nextToken = try MLX.withError { iterator.next() }
+                    }
                 } catch {
                     decodeFailure = GenerationFailure(
                         stage: .decoding, cause: "MLX error during decode: \(error.localizedDescription)")

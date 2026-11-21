@@ -196,96 +196,6 @@ enum Inkling2VerifyKernels {
             np[c] = s0; np[P + c] = s1; np[2 * P + c] = s2;
             """,
         header: header)
-
-    /// Message gate input, rows g-major: r = g * T + t. base = x[t * NX + (NX == 1 ? 0 : g)],
-    /// msg = msgs[t * MS + mrow + g]. meta = [mrow, NX, T, MS]. Template ELEMS, TG.
-    static let gateInT = MLXFast.metalKernel(
-        name: "inkling2_ver_gate_in",
-        inputNames: ["x", "msgs", "eps", "meta"],
-        outputNames: ["out"],
-        source: """
-            uint r = threadgroup_position_in_grid.x;
-            uint tid = thread_position_in_threadgroup.x;
-            uint lane = thread_index_in_simdgroup;
-            uint sg = simdgroup_index_in_threadgroup;
-            constexpr int NSG = TG / 32;
-            int H = x_shape[1];
-            int T = meta[2];
-            int g = r / T, t = r % T;
-            int xr = t * meta[1] + (meta[1] == 1 ? 0 : g);
-            int mr = t * meta[3] + meta[0] + g;
-            float hv[ELEMS], mv[ELEMS];
-            float a = 0.f, b = 0.f;
-            for (int e = 0; e < ELEMS; ++e) {
-                int j = tid + e * TG;
-                hv[e] = j < H ? x[(size_t)xr * H + j] : 0.f;
-                mv[e] = j < H ? msgs[(size_t)mr * H + j] : 0.f;
-                a += hv[e] * hv[e]; b += mv[e] * mv[e];
-            }
-            threadgroup float ra[NSG], rb[NSG];
-            a = simd_sum(a); b = simd_sum(b);
-            if (lane == 0) { ra[sg] = a; rb[sg] = b; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float A = 0.f, B = 0.f;
-            for (int k = 0; k < NSG; ++k) { A += ra[k]; B += rb[k]; }
-            float ia = rsqrt(A / float(H) + eps[0]);
-            float ib = rsqrt(B / float(H) + eps[0]);
-            for (int e = 0; e < ELEMS; ++e) {
-                int j = tid + e * TG;
-                if (j < H) {
-                    ink_store(out, (size_t)r * 2 * H + j, hv[e] * ia);
-                    ink_store(out, (size_t)r * 2 * H + H + j, mv[e] * ib);
-                }
-            }
-            """,
-        header: header)
-
-    /// Message gate output + the gate row's weighted RMSNorm, rows g-major like `gateInT`.
-    /// `nw` [G, H]. Outputs out [G*T, H] (model dtype) and out32 (fp32 of it).
-    static let gateOutT = MLXFast.metalKernel(
-        name: "inkling2_ver_gate_out",
-        inputNames: ["fg", "x", "msgs", "nw", "ne", "meta"],
-        outputNames: ["out", "out32"],
-        source: """
-            uint r = threadgroup_position_in_grid.x;
-            uint tid = thread_position_in_threadgroup.x;
-            uint lane = thread_index_in_simdgroup;
-            uint sg = simdgroup_index_in_threadgroup;
-            constexpr int NSG = TG / 32;
-            int H = x_shape[1];
-            int T = meta[2];
-            int g = r / T, t = r % T;
-            int xr = t * meta[1] + (meta[1] == 1 ? 0 : g);
-            int mr = t * meta[3] + meta[0] + g;
-            float y[ELEMS];
-            float sq = 0.f;
-            for (int e = 0; e < ELEMS; ++e) {
-                int j = tid + e * TG;
-                float v = 0.f;
-                if (j < H) {
-                    float f = tanh(fg[(size_t)r * 2 * H + j]);
-                    float a = tanh(fg[(size_t)r * 2 * H + H + j]);
-                    v = (1.f - f) * x[(size_t)xr * H + j] + a * msgs[(size_t)mr * H + j];
-                }
-                y[e] = v;
-                sq += v * v;
-            }
-            threadgroup float red[NSG];
-            sq = simd_sum(sq);
-            if (lane == 0) red[sg] = sq;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float tt = 0.f;
-            for (int k = 0; k < NSG; ++k) tt += red[k];
-            float n = rsqrt(tt / float(H) + ne[0]);
-            for (int e = 0; e < ELEMS; ++e) {
-                int j = tid + e * TG;
-                if (j < H) {
-                    ink_store(out, (size_t)r * H + j, (y[e] * n) * nw[(size_t)g * H + j]);
-                    out32[(size_t)r * H + j] = float(out[(size_t)r * H + j]);
-                }
-            }
-            """,
-        header: header)
 }
 
 extension Inkling2DecoderLayer {
@@ -296,7 +206,7 @@ extension Inkling2DecoderLayer {
         _ h: MLXArray, stack: MLXArray?, kv: KVCacheSimple, conv: MambaCache,
         messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?
     ) -> (MLXArray, MLXArray?) {
-        prepareDecodeWeightsForMultiRow()
+        prepareDecodeWeights()
         let w = decodeWeights
         let a = selfAttn
         let H = hidden
@@ -310,7 +220,7 @@ extension Inkling2DecoderLayer {
         let tg = 768
         let elems = (H + tg - 1) / tg
         let S0 = stack?.dim(2) ?? 0
-        let st0 = stack?.reshaped([T, S0, H]) ?? MLXArray.zeros([1, 1, H], dtype: f32)
+        let st0 = stack?.reshaped([T, S0, H]) ?? w.zeroState!.reshaped([1, 1, H])
         let L4 = messages?.dim(2) ?? 0
         let msgs = messages?.reshaped([-1, H])
         let nqa = isSliding ? 1 : 3
@@ -324,7 +234,7 @@ extension Inkling2DecoderLayer {
         } else if msgs == nil {
             let out = Inkling2DecodeKernels.depth(
                 [
-                    st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                    st0, hT, w.attnQuery!, w.attnNorm!,
                     w.normEps!,
                 ],
                 template: [
@@ -343,7 +253,7 @@ extension Inkling2DecoderLayer {
         } else {
             let xr = Inkling2DecodeKernels.depth(
                 [
-                    st0, hT, attentionInput!.query.asType(f32).reshaped([nqa, H]), w.attnNorm!,
+                    st0, hT, w.attnQuery!, w.attnNorm!,
                     w.normEps!,
                 ],
                 template: [
@@ -353,18 +263,11 @@ extension Inkling2DecoderLayer {
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, nqa, H]],
                 outputDTypes: [f32])[0].reshaped([T * nqa, H])
             let meta = MLXArray([Int32(4 * loopIndex), Int32(nqa), Int32(T), Int32(L4)])
-            let gin = Inkling2VerifyKernels.gateInT(
-                [xr, msgs!, w.gateEps!, meta], template: [("ELEMS", elems), ("TG", tg)],
-                grid: (3 * T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[3 * T, 2 * H]],
-                outputDTypes: [w.qkvDown!.dtype])[0]
-            let d = MLX.matmul(gin.reshaped([3, T, 2 * H]), w.qkvDown!).asType(f32)  // [3, T, rank]
-            let fg = MLX.matmul(d, w.qkvFG!).reshaped([3 * T, 2 * H])
-            let g = Inkling2VerifyKernels.gateOutT(
-                [fg, xr, msgs!, w.gateNorm!, w.normEps!, meta],
-                template: [("ELEMS", elems), ("TG", tg)],
-                grid: (3 * T * tg, 1, 1), threadGroup: (tg, 1, 1),
-                outputShapes: [[3 * T, H], [3 * T, H]],
-                outputDTypes: [dtype, f32])[0].reshaped([3, T, H])
+            let g = Inkling2DecodeKernels.messageGates(
+                x: xr, msgs: msgs!, down: w.qkvDown!, fg: w.qkvFG!, norm: w.gateNorm!,
+                normEps: w.normEps!, gateEps: w.gateEps!, meta: meta, gates: 3, rows: T,
+                dtype: dtype
+            ).0.reshaped([3, T, H])
             rowsQ = g[0]
             rowsK = g[1]
             rowsV = g[2]
@@ -467,12 +370,12 @@ extension Inkling2DecoderLayer {
             o.reshaped([1, T, H]), packed: packed.reshaped([1, 3, P]), offset: 2 * C, res: h,
             mode: isBlockBoundary ? 0 : 1, outDType: f32)
         let S1 = states?.dim(2) ?? 0
-        let st1 = states?.reshaped([T, S1, H]) ?? MLXArray.zeros([1, 1, H], dtype: f32)
+        let st1 = states?.reshaped([T, S1, H]) ?? w.zeroState!.reshaped([1, 1, H])
         let res2 = residual.reshaped([T, H])
         var xm32: MLXArray
         if let msgs {
             let mraw = Inkling2DecodeKernels.depth(
-                [st1, res2, mlpInput.query.asType(f32).reshaped([1, H]), w.mlpNorm!, w.normEps!],
+                [st1, res2, w.mlpQuery!, w.mlpNorm!, w.normEps!],
                 template: [
                     ("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 0), ("ELEMS", elems),
                     ("TG", tg),
@@ -480,21 +383,15 @@ extension Inkling2DecoderLayer {
                 grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, 1, H]],
                 outputDTypes: [f32])[0].reshaped([T, H])
             let meta = MLXArray([Int32(4 * loopIndex + 3), Int32(1), Int32(T), Int32(L4)])
-            let gin = Inkling2VerifyKernels.gateInT(
-                [mraw, msgs, w.gateEps!, meta], template: [("ELEMS", elems), ("TG", tg)],
-                grid: (T * tg, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[T, 2 * H]],
-                outputDTypes: [w.mlpDown!.dtype])[0]
-            let d = MLX.matmul(gin.reshaped([1, T, 2 * H]), w.mlpDown!).asType(f32)
-            let fg = MLX.matmul(d, w.mlpFG!).reshaped([T, 2 * H])
             xm32 =
-                Inkling2VerifyKernels.gateOutT(
-                    [fg, mraw, msgs, w.mlpNorm!.reshaped([1, H]), w.normEps!, meta],
-                    template: [("ELEMS", elems), ("TG", tg)], grid: (T * tg, 1, 1),
-                    threadGroup: (tg, 1, 1),
-                    outputShapes: [[T, H], [T, H]], outputDTypes: [dtype, f32])[1]
+                Inkling2DecodeKernels.messageGates(
+                    x: mraw, msgs: msgs, down: w.mlpDown!, fg: w.mlpFG!, norm: w.mlpNorm!,
+                    normEps: w.normEps!, gateEps: w.gateEps!, meta: meta, gates: 1, rows: T,
+                    dtype: dtype
+                ).1
         } else {
             let xm = Inkling2DecodeKernels.depth(
-                [st1, res2, mlpInput.query.asType(f32).reshaped([1, H]), w.mlpNorm!, w.normEps!],
+                [st1, res2, w.mlpQuery!, w.mlpNorm!, w.normEps!],
                 template: [
                     ("NS", S1 + 1), ("HASP", 1), ("NQ", 1), ("NORM", 1), ("ELEMS", elems),
                     ("TG", tg),
@@ -547,13 +444,5 @@ extension Inkling2DecoderLayer {
         conv[0] = fin[1].reshaped([1, 3, P])
         conv.offset += T
         return (fin[0].reshaped([1, T, H]), states)
-    }
-
-    /// `decodeStep`'s weights plus the MLP norm row the multi-row path reads.
-    func prepareDecodeWeightsForMultiRow() {
-        prepareDecodeWeights()
-        if decodeWeights.mlpNorm == nil {
-            decodeWeights.mlpNorm = postAttnLN.weight.asType(f32).reshaped([1, hidden])
-        }
     }
 }

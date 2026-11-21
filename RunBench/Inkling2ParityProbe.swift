@@ -455,3 +455,122 @@ func runInkling2VerifyTimeProbe(modelPath: String) async throws {
         print(String(format: "[VT] T=%d S=%d median=%.2f ms", T, cache[0].offset, m))
     }
 }
+
+/// BENCH_INKLING2_CTXSWEEP="64,1024,2048,4096": AR decode tok/s (greedy, TokenIterator route) after a
+/// prompt of each length (the reference long prompt tiled), to separate context-dependent decode cost
+/// from fixed per-token cost. BENCH_INKLING2_NEW decode tokens per row.
+func runInkling2ContextSweepProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let ref =
+        try JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_REF"]!)))
+        as! [String: [String: Any]]
+    let base = ref["long"]!["ids"] as! [Int]
+    let lengths = (env["BENCH_INKLING2_CTXSWEEP"] ?? "64,2048").split(separator: ",").compactMap {
+        Int($0)
+    }
+    let maxNew = Int(env["BENCH_INKLING2_NEW"] ?? "160") ?? 160
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    for (i, n) in (lengths + lengths).enumerated() {
+        var ids: [Int] = []
+        while ids.count < n { ids += base }
+        ids = Array(ids.prefix(n))
+        var p = GenerateParameters(maxTokens: maxNew, temperature: 0)
+        if env["BENCH_INKLING2_SWEEP_DSPARK"] == "1" {
+            p.draftStrategy = .dspark(drafterPath: URL(fileURLWithPath: modelPath))
+        }
+        var info: GenerateCompletionInfo?
+        for await g in try MLXLMCommon.generate(
+            input: LMInput(tokens: MLXArray(ids.map { Int32($0) })), parameters: p, context: context
+        ) {
+            if case .info(let x) = g { info = x }
+        }
+        guard let info else { continue }
+        let tps = Double(max(0, info.generationTokenCount - 1)) / max(info.generateTime, 1e-9)
+        print(
+            String(
+                format:
+                    "[CTX] pass=%d n=%d gen=%d decode tok/s=%.1f ms/tok=%.2f prefill tok/s=%.0f",
+                i < lengths.count ? 1 : 2, n, info.generationTokenCount, tps, 1000 / tps,
+                info.promptTokensPerSecond))
+    }
+}
+
+/// BENCH_INKLING2_CPUPROF=1: per decode step after a `VT_N`-token prompt (default 2048), the wall and
+/// calling-thread CPU time of building the graph and of evaluating it (synchronous), median of 64
+/// steps. eval CPU close to eval wall = the step is bound by encoding, not by the GPU.
+func runInkling2CPUProfileProbe(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let ref =
+        try JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: env["BENCH_INKLING2_REF"]!)))
+        as! [String: [String: Any]]
+    let base = ref["long"]!["ids"] as! [Int]
+    let n = Int(env["VT_N"] ?? "2048") ?? 2048
+    var ids0: [Int] = []
+    while ids0.count < n { ids0 += base }
+    ids0 = Array(ids0.prefix(n))
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let model = context.model
+    let ids = MLXArray(ids0.map { Int32($0) })[.newAxis]
+    let cache = model.newCache(parameters: nil)
+    var s = 0
+    while s < n {
+        let e = min(s + 512, n)
+        eval(model(ids[0..., s ..< e], cache: cache))
+        s = e
+    }
+    func cpu() -> Double {
+        var ts = timespec()
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)
+        return Double(ts.tv_sec) * 1000 + Double(ts.tv_nsec) / 1e6
+    }
+    func now() -> Double { CFAbsoluteTimeGetCurrent() * 1000 }
+    var tok = MLXArray([Int32(ids0.last!)]).reshaped([1, 1])
+    var bw: [Double] = []
+    var bc: [Double] = []
+    var ew: [Double] = []
+    var ec: [Double] = []
+    var pipe: [Double] = []
+    for step in 0 ..< 80 {
+        let w0 = now()
+        let c0 = cpu()
+        let logits = model(tok, cache: cache)
+        let next = argMax(logits[0..., -1, 0...], axis: -1).reshaped([1, 1])
+        let w1 = now()
+        let c1 = cpu()
+        eval(next)
+        let w2 = now()
+        let c2 = cpu()
+        tok = next
+        if step >= 16 {
+            bw.append(w1 - w0)
+            bc.append(c1 - c0)
+            ew.append(w2 - w1)
+            ec.append(c2 - c1)
+        }
+    }
+    // pipelined (as TokenIterator): build + asyncEval step t+1 before waiting on step t
+    var prev = tok
+    var t0 = now()
+    for step in 0 ..< 80 {
+        let logits = model(prev, cache: cache)
+        let next = argMax(logits[0..., -1, 0...], axis: -1).reshaped([1, 1])
+        asyncEval(next)
+        _ = prev.item(Int32.self)
+        prev = next
+        let t = now()
+        if step >= 16 { pipe.append(t - t0) }
+        t0 = t
+    }
+    func med(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+    print(
+        String(
+            format:
+                "[CPUPROF] n=%d build wall=%.2f cpu=%.2f | eval wall=%.2f cpu=%.2f | sync total=%.2f ms | pipelined=%.2f ms/tok",
+            n, med(bw), med(bc), med(ew), med(ec), med(bw) + med(ew), med(pipe)))
+}
