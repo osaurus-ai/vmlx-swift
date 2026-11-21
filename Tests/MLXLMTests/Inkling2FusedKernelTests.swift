@@ -87,4 +87,48 @@ final class Inkling2FusedKernelTests: XCTestCase {
     func testDecodeQKVGatesMatchReference() { check(gates: 3, rows: 1, hidden: 512, rank: 64) }
     func testVerifyQKVGatesMatchReference() { check(gates: 3, rows: 5, hidden: 512, rank: 64) }
     func testMLPGateMatchesReference() { check(gates: 1, rows: 3, hidden: 2304, rank: 64) }
+
+    /// The batch-1 NVFP4 expert kernels against MLX's own `gatherQuantizedMM` (mode .nvfp4) plus
+    /// the reference activation; T = 2 rows x 8 picks, picks repeat an expert across rows.
+    func testNVFP4ExpertKernelsMatchMLXGather() {
+        let (E, H, I, K, T) = (16, 256, 128, 8, 2)
+        let wgu = values([E, 2 * I, H], seed: 11, scale: 0.05)
+        let wd = values([E, H, I], seed: 12, scale: 0.05)
+        let qgu = MLX.quantized(wgu, groupSize: 16, bits: 4, mode: .nvfp4)
+        let qd = MLX.quantized(wd, groupSize: 16, bits: 4, mode: .nvfp4)
+        let x = values([T, H], seed: 13, scale: 1.0)
+        let inds = MLXArray([0, 3, 5, 7, 9, 11, 13, 15, 3, 2, 4, 6, 8, 10, 12, 14] as [UInt32])
+            .reshaped([T, K])
+        let es = (1 + values([E], seed: 14, scale: 0.2)).asType(.float32)
+        let caps = MLXArray([Float(4), Float(25)])
+        let (act, down) = Inkling2DecodeKernels.nvfp4Experts(
+            x32: x, inds: inds, gateUpCodes: qgu.wq, gateUpScales: qgu.scales, downCodes: qd.wq,
+            downScales: qd.scales, gateUpExpertScale: es, caps: caps, topK: K)
+
+        let gu = MLX.gatherQuantizedMM(
+            x.reshaped([T, 1, 1, H]), qgu.wq, scales: qgu.scales, biases: nil, rhsIndices: inds,
+            transpose: true, groupSize: 16, bits: 4, mode: .nvfp4
+        ).reshaped([T * K, 2 * I])
+        let s = es[inds.reshaped([T * K])].reshaped([T * K, 1])
+        let g = gu[0..., .stride(from: 0, to: 2 * I, by: 2)] * s
+        let u = gu[0..., .stride(from: 1, to: 2 * I, by: 2)] * s
+        let refAct = ((MLX.tanh(g / 4) * 4) * MLX.sigmoid(g) * (MLX.tanh(u / 25) * 25))
+            .asType(.bfloat16).asType(.float32)
+        let refDown = MLX.gatherQuantizedMM(
+            act.reshaped([T, K, 1, I]), qd.wq, scales: qd.scales, biases: nil, rhsIndices: inds,
+            transpose: true, groupSize: 16, bits: 4, mode: .nvfp4
+        ).reshaped([T * K, H])
+        eval(act, down, refAct, refDown)
+        XCTAssertGreaterThan(MLX.abs(refAct).mean().item(Float.self), 0.01)
+        XCTAssertGreaterThan(MLX.abs(refDown).mean().item(Float.self), 0.01)
+        // activation: fp32 accumulation order differs from MLX's, then one bf16 rounding
+        let actDiff = MLX.abs(act - refAct)
+        let actBad = (actDiff .> (MLX.abs(refAct) * 0.008 + 1e-6)).sum().item(Int.self)
+        let downRel = (MLX.abs(down - refDown).max() / MLX.abs(refDown).max()).item(Float.self)
+        print(
+            "[Inkling2FusedKernelTests] nvfp4 experts: act beyond 1 bf16 step \(actBad)/\(T * K * I), "
+                + "down max rel \(downRel)")
+        XCTAssertEqual(actBad, 0)
+        XCTAssertLessThan(downRel, 1e-5)
+    }
 }

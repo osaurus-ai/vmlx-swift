@@ -553,6 +553,148 @@ enum Inkling2DecodeKernels {
             """,
         header: header)
 
+    // MARK: routed experts (NVFP4), batch-1 gathers
+
+    static let nvfp4Header =
+        header + """
+            inline float ink_e4m3(uint b) {
+                uint e = (b >> 3) & 0xF, m = b & 7;
+                float v = e == 0 ? float(m) * 0.001953125f : (1.f + float(m) * 0.125f) * exp2(float(int(e) - 7));
+                return (b & 0x80) ? -v : v;
+            }
+            // one 16-value NVFP4 group (two packed words, even element in the low nibble) . x[0 ..< 16]
+            inline float ink_fp4_dot16(uint2 w, const device float* x, threadgroup const float* lut) {
+                float4 xa = *(const device float4*)(x), xb = *(const device float4*)(x + 4);
+                float4 xc = *(const device float4*)(x + 8), xd = *(const device float4*)(x + 12);
+                float p = lut[w.x & 0xF] * xa.x + lut[(w.x >> 4) & 0xF] * xa.y
+                    + lut[(w.x >> 8) & 0xF] * xa.z + lut[(w.x >> 12) & 0xF] * xa.w;
+                p += lut[(w.x >> 16) & 0xF] * xb.x + lut[(w.x >> 20) & 0xF] * xb.y
+                    + lut[(w.x >> 24) & 0xF] * xb.z + lut[(w.x >> 28) & 0xF] * xb.w;
+                p += lut[w.y & 0xF] * xc.x + lut[(w.y >> 4) & 0xF] * xc.y
+                    + lut[(w.y >> 8) & 0xF] * xc.z + lut[(w.y >> 12) & 0xF] * xc.w;
+                p += lut[(w.y >> 16) & 0xF] * xd.x + lut[(w.y >> 20) & 0xF] * xd.y
+                    + lut[(w.y >> 24) & 0xF] * xd.z + lut[(w.y >> 28) & 0xF] * xd.w;
+                return p;
+            }
+            """
+
+    /// Routed gate/up (row-interleaved: row 2i = gate_i, 2i + 1 = up_i) for each (row, pick) n:
+    /// both rows of pair i in one simdgroup (16 lanes each, one 16-value group per lane step),
+    /// then the activation `softcap(g) * sigmoid(g) * softcap(u)` with the per-expert NVFP4 scale,
+    /// rounded to bf16 like `moeActivation`. x [T, H] fp32 (row n / KPER); idx [T * KPER].
+    /// Grid (I / NSG * 32 * NSG, T * KPER). Output [T * KPER, I] fp32.
+    static let moeGateUpAct = MLXFast.metalKernel(
+        name: "inkling2_moe_gate_up_act",
+        inputNames: ["x", "codes", "scales", "idx", "es", "caps"],
+        outputNames: ["out"],
+        source: """
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint tid = thread_position_in_threadgroup.x;
+            uint n = threadgroup_position_in_grid.y;
+            threadgroup float lut[16];
+            if (tid < 16) {
+                uint m_ = tid & 7, e_ = m_ >> 1, f_ = m_ & 1;
+                float v_ = e_ == 0 ? 0.5f * float(f_) : (1.f + 0.5f * float(f_)) * float(1 << (e_ - 1));
+                lut[tid] = (tid & 8) ? -v_ : v_;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int N2 = codes_shape[1];
+            int I = N2 / 2;
+            int Kin = codes_shape[2] * 8;
+            int pair = threadgroup_position_in_grid.x * NSG + sg;
+            uint sub = lane / 16, sl = lane % 16;
+            int row = 2 * pair + sub;
+            uint e = idx[n];
+            const device uint32_t* cw = codes + ((size_t)e * N2 + row) * (Kin / 8);
+            const device uint8_t* sw = scales + ((size_t)e * N2 + row) * (Kin / 16);
+            const device float* xr = x + (size_t)(n / KPER) * Kin;
+            float acc = 0.f;
+            for (int g = sl; g < Kin / 16; g += 16)
+                acc += ink_e4m3(sw[g]) * ink_fp4_dot16(*(const device uint2*)(cw + 2 * g), xr + g * 16, lut);
+            for (uint o = 8; o > 0; o >>= 1) acc += simd_shuffle_xor(acc, o);
+            float up = simd_shuffle(acc, 16);
+            if (lane == 0 && pair < I) {
+                float s = es[e];
+                float gg = acc * s, u = up * s;
+                float gc = caps[0], uc = caps[1];
+                float a = (tanh(gg / gc) * gc) * (1.f / (1.f + exp(-gg))) * (tanh(u / uc) * uc);
+                out[(size_t)n * I + pair] = float(bfloat16_t(a));
+            }
+            """,
+        header: nvfp4Header)
+
+    /// Routed down projection per pick n: out[n, j] = act[n] . W_{idx[n]}[j] (NVFP4, without the
+    /// per-expert scale, which `final` applies). 8 lanes per row. Grid (H / (4 * NSG) * 32 * NSG, N).
+    static let moeDown = MLXFast.metalKernel(
+        name: "inkling2_moe_down",
+        inputNames: ["x", "codes", "scales", "idx"],
+        outputNames: ["out"],
+        source: """
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint tid = thread_position_in_threadgroup.x;
+            uint n = threadgroup_position_in_grid.y;
+            threadgroup float lut[16];
+            if (tid < 16) {
+                uint m_ = tid & 7, e_ = m_ >> 1, f_ = m_ & 1;
+                float v_ = e_ == 0 ? 0.5f * float(f_) : (1.f + 0.5f * float(f_)) * float(1 << (e_ - 1));
+                lut[tid] = (tid & 8) ? -v_ : v_;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int N = codes_shape[1];
+            int Kin = codes_shape[2] * 8;
+            uint sub = lane / 8, sl = lane % 8;
+            int row = (threadgroup_position_in_grid.x * NSG + sg) * 4 + sub;
+            uint e = idx[n];
+            const device uint32_t* cw = codes + ((size_t)e * N + row) * (Kin / 8);
+            const device uint8_t* sw = scales + ((size_t)e * N + row) * (Kin / 16);
+            const device float* xr = x + (size_t)n * Kin;
+            float acc = 0.f;
+            if (row < N) {
+                for (int g = sl; g < Kin / 16; g += 8)
+                    acc += ink_e4m3(sw[g]) * ink_fp4_dot16(*(const device uint2*)(cw + 2 * g), xr + g * 16, lut);
+            }
+            for (uint o = 4; o > 0; o >>= 1) acc += simd_shuffle_xor(acc, o);
+            if (sl == 0 && row < N) out[(size_t)n * N + row] = acc;
+            """,
+        header: nvfp4Header)
+
+    /// NVFP4 experts for T rows x k picks: `(act [T*k, I], down [T*k, H])`, both fp32.
+    static func nvfp4Experts(
+        x32: MLXArray, inds: MLXArray, mlp: Inkling2SwitchMLP, topK: Int
+    ) -> (MLXArray, MLXArray) {
+        nvfp4Experts(
+            x32: x32, inds: inds, gateUpCodes: mlp.gateUp.codes,
+            gateUpScales: mlp.gateUp.blockScales, downCodes: mlp.down.codes,
+            downScales: mlp.down.blockScales, gateUpExpertScale: mlp.gateUp.expertScale,
+            caps: mlp.caps, topK: topK)
+    }
+
+    static func nvfp4Experts(
+        x32: MLXArray, inds: MLXArray, gateUpCodes: MLXArray, gateUpScales: MLXArray,
+        downCodes: MLXArray, downScales: MLXArray, gateUpExpertScale: MLXArray, caps: MLXArray,
+        topK: Int
+    ) -> (MLXArray, MLXArray) {
+        let n = inds.size
+        let I = gateUpCodes.dim(1) / 2
+        let H = downCodes.dim(1)
+        let nsg = 4
+        let flat = inds.reshaped([n])
+        let act = moeGateUpAct(
+            [x32, gateUpCodes, gateUpScales, flat, gateUpExpertScale, caps],
+            template: [("NSG", nsg), ("KPER", topK)],
+            grid: ((I + nsg - 1) / nsg * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[n, I]], outputDTypes: [f32])[0]
+        let rowsPerTG = 4 * nsg
+        let down = moeDown(
+            [act, downCodes, downScales, flat], template: [("NSG", nsg)],
+            grid: ((H + rowsPerTG - 1) / rowsPerTG * 32 * nsg, n, 1),
+            threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[n, H]], outputDTypes: [f32])[0]
+        return (act, down)
+    }
+
     /// The three gate kernels for G gates x T rows. Returns `(out [G*T, H] model dtype, out32 fp32)`.
     static func messageGates(
         x: MLXArray, msgs: MLXArray, down: MLXArray, fg: MLXArray, norm: MLXArray,
@@ -642,6 +784,8 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var midMeta: MLXArray?
     var finalMeta: MLXArray?
     var loopIndex = -1
+    /// Both expert projections NVFP4 with the layout the batch-1 kernels read.
+    var nativeFP4Experts = false
     var ready = false
     private var zeroSinkCache: MLXArray?
 
@@ -715,6 +859,11 @@ extension Inkling2DecoderLayer {
             w.mlpFG = MLX.contiguous(fg(mg).expandedDimensions(axis: 0))
             w.gateEps = MLXArray([qg.eps])
         }
+        let sw = mlp.switchMLP
+        w.nativeFP4Experts =
+            sw.gateUp.isNVFP4 && sw.down.isNVFP4 && sw.inter % 16 == 0 && H % 16 == 0
+            && sw.gateUp.codes.dim(1) == 2 * sw.inter && sw.down.codes.dim(1) == H
+            && ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
         w.routerT = mlp.gate.weight.asType(f32).T
         w.ones = MLXArray.ones([mlp.switchMLP.gateUp.expertScale.dim(0)], dtype: f32)
         w.downOnes = w.ones
@@ -919,15 +1068,20 @@ extension Inkling2DecoderLayer {
         let inds = sel[0]
         let sw = mlp.switchMLP
         let k = router.topK
-        let gu = sw.gateUp(x32.reshaped([1, 1, 1, H]), inds, sorted: false)  // [1, k, 1, 2I]
-        let act = Inkling2Kernels.moeActivation(
-            [
-                gu.reshaped([k, 2 * sw.inter]), inds.reshaped([k]),
-                sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
-            ],
-            grid: (sw.inter, k, 1), threadGroup: (min(256, sw.inter), 1, 1),
-            outputShapes: [[k, sw.inter]], outputDTypes: [f32])[0]
-        let down = sw.down(act.reshaped([1, k, 1, sw.inter]), inds, sorted: false)  // [1, k, 1, H]
+        let down: MLXArray
+        if w.nativeFP4Experts {
+            down = Inkling2DecodeKernels.nvfp4Experts(x32: x32, inds: inds, mlp: sw, topK: k).1
+        } else {
+            let gu = sw.gateUp(x32.reshaped([1, 1, 1, H]), inds, sorted: false)  // [1, k, 1, 2I]
+            let act = Inkling2Kernels.moeActivation(
+                [
+                    gu.reshaped([k, 2 * sw.inter]), inds.reshaped([k]),
+                    sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
+                ],
+                grid: (sw.inter, k, 1), threadGroup: (min(256, sw.inter), 1, 1),
+                outputShapes: [[k, sw.inter]], outputDTypes: [f32])[0]
+            down = sw.down(act.reshaped([1, k, 1, sw.inter]), inds, sorted: false)  // [1, k, 1, H]
+        }
         let fin = Inkling2DecodeKernels.final(
             [
                 down.reshaped([k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,

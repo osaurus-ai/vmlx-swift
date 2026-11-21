@@ -414,15 +414,20 @@ extension Inkling2DecoderLayer {
         // Per-row expert gathers: measured fastest at T = 8 on M5 Max (gate/up 326 us vs 636 for a
         // grouped one-read-per-expert kernel and ~800 sorted): rows in a verify block rarely share
         // experts, so the gather is already at bandwidth.
-        let gu = sw.gateUp(xm32.reshaped([T, 1, 1, H]), inds, sorted: false)  // [T, k, 1, 2I]
-        let act = Inkling2Kernels.moeActivation(
-            [
-                gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
-                sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
-            ],
-            grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
-            outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
-        let down = sw.down(act.reshaped([T, k, 1, sw.inter]), inds, sorted: false)  // [T, k, 1, H]
+        let down: MLXArray
+        if w.nativeFP4Experts {
+            down = Inkling2DecodeKernels.nvfp4Experts(x32: xm32, inds: inds, mlp: sw, topK: k).1
+        } else {
+            let gu = sw.gateUp(xm32.reshaped([T, 1, 1, H]), inds, sorted: false)  // [T, k, 1, 2I]
+            let act = Inkling2Kernels.moeActivation(
+                [
+                    gu.reshaped([T * k, 2 * sw.inter]), inds.reshaped([T * k]),
+                    sw.gateUp.isNVFP4 ? sw.gateUp.expertScale : w.ones!, sw.caps,
+                ],
+                grid: (sw.inter, T * k, 1), threadGroup: (min(256, sw.inter), 1, 1),
+                outputShapes: [[T * k, sw.inter]], outputDTypes: [f32])[0]
+            down = sw.down(act.reshaped([T, k, 1, sw.inter]), inds, sorted: false)  // [T, k, 1, H]
+        }
         let fin = Inkling2VerifyKernels.finalT(
             [
                 down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,
