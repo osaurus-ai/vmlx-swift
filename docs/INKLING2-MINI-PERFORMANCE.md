@@ -165,6 +165,14 @@ the tool-result continuation restores at exactly that boundary and only prefills
 (Changing the reasoning-effort level re-prefills: the template renders the effort line before the
 history.)
 
+The 40 sliding-window visits (layers other than 5, 11, 17, 23; the loop layers once per pass) keep only their window:
+`TemporalWindowKVCache` holds the last `window - 1 + 64` rows in temporal order under a logical position, and stored
+prefix entries carry exactly those rows, so a stored entry grows by 32 KiB per token instead of 192 KiB (plus a fixed
+~170 MiB of windows). M5 Ultra, JANGH2, app-route agentic cache loop at 7.7k-11.2k tokens against the full-history
+control (`VMLX_INKLING_WINDOWED_KV=0`): identical greedy text and reuse, SSD 4.21 vs 15.47 GB, largest entry 532 MB vs
+2.10 GB, peak MLX memory 12.4 vs 16.0 GiB. In a dev-built Osaurus on an M5 Max, four chat turns at ~2-4.6k tokens left
+1.8 GB of entries (240-358 MB each) where the full-history runtime had left 6.2 GB (350-830 MB each).
+
 ## 6. Running inside an app
 
 `VMLX_DECODE_CPU_TRACE=1` logs, every 128 decode steps, the wall time and the decode thread's CPU
@@ -253,3 +261,9 @@ per layer visit, each of which now runs within 1.3-2x of its own bandwidth or la
 Tried and dropped: a split-key decode attention with the mask, sink and gate folded into the combine (slower than
 MLX's fused SDPA at 64 and 2k context), padding the rotated x in threadgroup memory against bank conflicts and a
 fused gate+up dot loop (no change).
+
+Also measured and dropped (M5 Ultra, 3 interleaved runs, bit-identical outputs): computing the gate inputs' RMS scales
+once (in the depth / mid kernels and once per pass for the message rows) so the gate down projection becomes a wider
+plain GEMV (102.8-106.1 tok/s against 107.1: the extra reduction in the single-threadgroup kernels costs more than
+the per-group norm it removes), and a router GEMV with one output per threadgroup reading the BF16 weight in MLX's
+exact accumulation order (106.4 against 107.1).

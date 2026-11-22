@@ -292,8 +292,14 @@ func runCacheReuseLoopBench(modelPath: String) async throws {
     }
     _ = coordinator?.waitForPendingDiskWrites()
     let diskStats = coordinator?.snapshotStats().diskStats
+    // Bytes on SSD for every entry the warm phases stored (the directory is removed at the end).
+    let entryFiles = (try? FileManager.default.contentsOfDirectory(
+        at: diskDir, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+    let entrySizes = entryFiles.filter { $0.pathExtension == "safetensors" }
+        .compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }
     emit("CL_DISK", ["arm": arm, "hits": diskStats?.hits ?? -1, "misses": diskStats?.misses ?? -1,
-        "stores": diskStats?.stores ?? -1])
+        "stores": diskStats?.stores ?? -1, "entries": entrySizes.count, "bytes": entrySizes.reduce(0, +),
+        "largest_entry_bytes": entrySizes.max() ?? 0])
     if phases.contains("controls") {
         var same = 0
         for request in requests {

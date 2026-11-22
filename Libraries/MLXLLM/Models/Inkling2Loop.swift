@@ -24,12 +24,15 @@
 //     `message_input` from the previous pass, mixed in by rank-64 gates. Layers 18..23 continue
 //     from the last pass. Every pass owns its own KV + conv state for the loop layers.
 //
-// Cache layout (96 entries): `[0, 48)` are `KVCacheSimple`, one per (layer, pass) slot
-// (`cacheSlot(layer:pass:)`); `[48, 96)` are single-slot `MambaCache`s holding that slot's four
-// short-conv states packed as one fp32 `[B, K-1, 2*kvDim + 2*hidden]` array. Both are classes
-// the cache coordinator already stores, trims, pages and serialises (the Qwen 3.5 hybrid
-// layout), so prefix / paged / SSD caching needs no Inkling-specific cache code. Sliding layers
-// keep their full KV history in the simple cache and attend to its last `window - 1 + T` rows.
+// Cache layout (96 entries): `[0, 48)` hold one KV cache per (layer, pass) slot
+// (`cacheSlot(layer:pass:)`): `KVCacheSimple` (full history) for the full-attention visits and
+// `TemporalWindowKVCache` (logical position, only the last window + rollback rows held, temporal
+// order for the relative bias) for the sliding ones; `[48, 96)` are single-slot `MambaCache`s
+// holding that slot's four short-conv states packed as one fp32 `[B, K-1, 2*kvDim + 2*hidden]`
+// array. The coordinator stores the windowed slots as model-owned disk state, so a stored prefix
+// costs the window, not the history, per sliding visit. Attention takes the last
+// `window - 1 + T` rows `update` returns and derives key positions from the logical offset.
+// VMLX_INKLING_WINDOWED_KV=0 keeps every slot a full-history `KVCacheSimple` (A/B control arm).
 
 import Foundation
 import MLX
@@ -688,7 +691,7 @@ final class Inkling2Attention: Module {
     /// r `[B, T, nq, dRel]`, sinks `[B, T, nq]`. Returns `[B, T, nq * hd]`.
     func attend(
         q qIn: MLXArray, k: MLXArray, v: MLXArray, r rIn: MLXArray, sinks: MLXArray,
-        kv: KVCacheSimple?
+        kv: (any KVCache)?
     ) -> MLXArray {
         let (B, T) = (qIn.dim(0), qIn.dim(2))
         var q = qIn
@@ -1234,7 +1237,7 @@ final class Inkling2DecoderLayer: Module {
     /// stack the caller continues with (this layer's input appended at a block boundary).
     /// `messages` `[B, T, 4, H]` (q, k, v, mlp) only in loop passes after the first.
     func callAsFunction(
-        _ h: MLXArray, stack: MLXArray?, kv: KVCacheSimple?, conv: MambaCache?,
+        _ h: MLXArray, stack: MLXArray?, kv: (any KVCache)?, conv: MambaCache?,
         messages: MLXArray?, ones: MLXArray, recorder: Inkling2ConvRecorder? = nil
     ) -> (MLXArray, MLXArray?) {
         let dtype = h.dtype
@@ -1416,8 +1419,8 @@ public final class Inkling2LoopModelInner: Module {
                 cache.count == 2 * slots,
                 "inkling2_loop: expected \(2 * slots) cache entries, got \(cache.count)")
         }
-        func kv(_ layer: Int, _ pass: Int) -> KVCacheSimple? {
-            cache.map { $0[args.cacheSlot(layer: layer, pass: pass)] as! KVCacheSimple }
+        func kv(_ layer: Int, _ pass: Int) -> (any KVCache)? {
+            cache.map { $0[args.cacheSlot(layer: layer, pass: pass)] }
         }
         func conv(_ layer: Int, _ pass: Int) -> MambaCache? {
             cache.map { $0[slots + args.cacheSlot(layer: layer, pass: pass)] as! MambaCache }
@@ -1599,8 +1602,14 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let slots = args.numCacheSlots
+        let windowed = ProcessInfo.processInfo.environment["VMLX_INKLING_WINDOWED_KV"] != "0"
         var cache =
-            (0 ..< slots).map { _ in KVCacheSimple() as KVCache }
+            (0 ..< slots).map { slot -> KVCache in
+                let layer = args.sourceLayer(ofSlot: slot)
+                guard windowed, args.isSliding(layer) else { return KVCacheSimple() }
+                let h = args.heads(layer)
+                return TemporalWindowKVCache(window: args.slidingWindowSize, heads: h.kv, headDim: h.dim)
+            }
             + (0 ..< slots).map { _ in MambaCache(slots: 1) as KVCache }
         if parameters?.draftStrategy?.usesDSpark == true, dsparkAvailable, let d = drafter {
             // dSpark: the drafter's context KV per draft layer + the last row's target features.
