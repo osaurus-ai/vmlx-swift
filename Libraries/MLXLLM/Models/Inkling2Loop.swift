@@ -782,36 +782,82 @@ final class Inkling2Attention: Module {
 
 // MARK: - MoE
 
-/// Routed experts kept in the source checkpoint's own encoding, run by `gatherQuantizedMM`.
+/// Routed experts kept in the bundle's own encoding, run by `gatherQuantizedMM`.
 ///
-/// * NVFP4 (ModelOpt): MLX `mode: .nvfp4` (packed e2m1, even element in the low nibble, e4m3
-///   per-16 scales). This MLX has no per-expert `global_scale` on `gather_qmm`, so the
-///   per-expert factor `amax / outer_scale_denominator` is applied to the OUTPUT rows instead:
-///   `x @ (W_e * s_e)^T == s_e * (x @ W_e^T)` for a scalar `s_e`.
-/// * MXFP8: `mode: .mxfp8` (e4m3 codes, ue8m0 per-32 scales), no extra factor.
+/// * NVFP4 (ModelOpt or MLX): `mode: .nvfp4` (packed e2m1, even element in the low nibble, e4m3
+///   per-16 scales). `gather_qmm` has no per-expert global scale, so the per-expert factor
+///   (`amax / outer_scale_denominator`, MLX `global_scale / 2688`, ModelOpt `weight_scale_2`) is
+///   applied to the OUTPUT rows: `x @ (W_e * s_e)^T == s_e * (x @ W_e^T)` for a scalar `s_e`.
+/// * MXFP8 / MXFP4: `mode: .mxfp8` / `.mxfp4` (ue8m0 per-32 scales), no extra factor.
+/// * Affine (community MLX conversions, any bits / group size): `mode: .affine` with `biases`.
 ///
-/// Parameter names avoid `weight` / `scales` so the generic loader never re-wraps this module
-/// as an affine `QuantizedSwitchLinear`.
+/// The format is read off the loaded tensors (scale dtype and the packed widths against the
+/// input width), never off a config value that a converter may have left stale. Parameter names
+/// avoid `weight` / `scales` so the generic loader never re-wraps this module as a
+/// `QuantizedSwitchLinear`.
 final class Inkling2NativeSwitchLinear: Module {
     var codes: MLXArray
     @ParameterInfo(key: "block_scales") var blockScales: MLXArray
     @ParameterInfo(key: "expert_scale") var expertScale: MLXArray
+    /// Affine experts' per-group biases; an empty placeholder for FP8/FP4 experts (`update()` cannot
+    /// set an array onto a nil parameter, so the slot always holds an array).
+    @ParameterInfo(key: "affine_biases") var affineBiases: MLXArray
+    let inputDims: Int
 
     init(inputDims: Int, outputDims: Int, experts: Int) {
+        self.inputDims = inputDims
         codes = MLXArray.zeros([experts, outputDims, inputDims / 8], dtype: .uint32)
         _blockScales.wrappedValue = MLXArray.zeros(
             [experts, outputDims, inputDims / 16], dtype: .uint8)
         _expertScale.wrappedValue = MLXArray.ones([experts], dtype: f32)
+        _affineBiases.wrappedValue = MLXArray.zeros([0], dtype: .bfloat16)
     }
 
-    var isNVFP4: Bool { codes.dim(-1) / blockScales.dim(-1) == 2 }
+    struct Format: Equatable {
+        let mode: QuantizationMode
+        let bits: Int
+        let groupSize: Int
+    }
+
+    var format: Format { Self.format(codes: codes, scales: blockScales, inputDims: inputDims) }
+
+    /// The quantization of a packed `[..., out, in * bits / 32]` uint32 matrix with per-group
+    /// `scales`: a uint8 scale is an FP8 block scale (NVFP4 per 16 / MXFP4 per 32 with 4-bit codes,
+    /// MXFP8 per 32 with 8-bit codes); a float scale is affine (bits and group from the widths).
+    static func format(codes: MLXArray, scales: MLXArray, inputDims: Int) -> Format {
+        let packed = codes.dim(-1)
+        let groups = scales.dim(-1)
+        let bits = packed * 32 / max(inputDims, 1)
+        let group = inputDims / max(groups, 1)
+        if scales.dtype == .uint8 {
+            if bits == 8 { return Format(mode: .mxfp8, bits: 8, groupSize: 32) }
+            return group == 16
+                ? Format(mode: .nvfp4, bits: 4, groupSize: 16)
+                : Format(mode: .mxfp4, bits: 4, groupSize: 32)
+        }
+        return Format(mode: .affine, bits: bits, groupSize: group)
+    }
+
+    var isNVFP4: Bool { format.mode == .nvfp4 }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray {
-        let nv = isNVFP4
+        let f = format
+        if f.mode == .affine, x.dtype != blockScales.dtype {
+            // MLX's affine gather has no kernel for fp32 activations with half-precision scales and
+            // falls back to a far slower path (measured 699 vs 301 us for k = 8 on M5 Max): run it
+            // in the scale dtype and hand the caller its own dtype back. FP8/FP4 experts keep fp32.
+            return MLX.gatherQuantizedMM(
+                x.asType(blockScales.dtype), codes, scales: blockScales,
+                biases: affineBiases.size > 0 ? affineBiases : nil,
+                rhsIndices: indices, transpose: true,
+                groupSize: f.groupSize, bits: f.bits, mode: .affine, sortedIndices: sorted
+            ).asType(x.dtype)
+        }
         return MLX.gatherQuantizedMM(
-            x, codes, scales: blockScales, biases: nil, rhsIndices: indices, transpose: true,
-            groupSize: nv ? 16 : 32, bits: nv ? 4 : 8, mode: nv ? .nvfp4 : .mxfp8,
-            sortedIndices: sorted)
+            x, codes, scales: blockScales,
+            biases: f.mode == .affine && affineBiases.size > 0 ? affineBiases : nil,
+            rhsIndices: indices, transpose: true,
+            groupSize: f.groupSize, bits: f.bits, mode: f.mode, sortedIndices: sorted)
     }
 }
 
@@ -1592,8 +1638,20 @@ public final class Inkling2LoopModel: Module, LLMModel {
 
     // MARK: weights
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    public func sanitize(weights rawWeights: [String: MLXArray]) -> [String: MLXArray] {
         var out: [String: MLXArray] = [:]
+        // Community conversions: the mlx-vlm tree (`language_model.model.*`), quantized dense
+        // layers, and routed experts in HF (`experts.gate_up_proj`, gate half then up half) or
+        // mlx-vlm (`switch_mlp.{gate,up,down}_proj`) form. All of them are brought to this
+        // model's tree here, so every later path (fused decode, verify, dSpark) sees one layout.
+        let expected = expectedParameterShapes()
+        let tree = Self.isFusedProjectionLayout(rawWeights)
+            ? Self.convertingFusedProjectionLayout(
+                rawWeights, expected: expected, loopCore: args.loopStart ..< args.loopEnd)
+            : rawWeights
+        let weights = Self.dequantizingDenseLayers(
+            Self.normalizingLayoutKeys(tree), expected: expected)
+        var communityExperts: [String: [String: MLXArray]] = [:]
         let qKey = "model.llm.middle_cycle_cross_pass_queries"
         let kvKey = "model.llm.middle_cycle_cross_pass_kv_queries"
         if let q = weights[qKey], let kvq = weights[kvKey] {
@@ -1649,6 +1707,10 @@ public final class Inkling2LoopModel: Module, LLMModel {
                 continue
             }
             var n = Inkling2LoopModel.mapKey(key)
+            if let (base, leg, leaf) = Self.communityExpertKey(n) {
+                communityExperts[base + "|" + leg, default: [:]][leaf] = value
+                continue
+            }
             var v = value
             if n.hasSuffix("sconv.weight_proj") { n += ".weight" }
             if n.hasSuffix("_sconv.weight") || n.hasSuffix("_convolution.weight") {
@@ -1675,7 +1737,346 @@ public final class Inkling2LoopModel: Module, LLMModel {
             }
             out[n] = v
         }
+        for (k, v) in Self.canonicalExperts(communityExperts) { out[k] = v }
         return out
+    }
+
+    /// Parameter shapes of this (placeholder) module tree, keyed like `sanitize`'s output.
+    private func expectedParameterShapes() -> [String: [Int]] {
+        var shapes: [String: [Int]] = [:]
+        for (k, v) in parameters().flattened() { shapes[k] = v.shape }
+        return shapes
+    }
+
+    /// The fused-projection layout: `model.layers.N.mlp.router_weight` with fused
+    /// `attn.in_proj` / `loop_down` / `loop_gain_forget` tensors.
+    static func isFusedProjectionLayout(_ weights: [String: MLXArray]) -> Bool {
+        weights.keys.contains { $0.hasPrefix("model.layers.") && $0.hasSuffix(".mlp.router_weight") }
+    }
+
+    /// The fused-projection layout back to this model's tree. Its packing is a set of exact
+    /// reshapes and row concatenations of the source tensors:
+    /// * sliding layers: `attn.in_proj` = rows [q, k, v, r, gate, sink]; global layers:
+    ///   `attn.q_proj` = [q, r, gate, sink], `attn.{k,v}_proj` = [k|v, {k,v}_sconv.weight_proj],
+    ///   `attn.{k,v}_static` = the static taps. Quantized ones are dequantized first (quantization
+    ///   is per row, so a row split of the dequantized matrix is exact); every row count comes from
+    ///   this model's own parameter shapes.
+    /// * `attn.{k,v}_conv`, `attn_conv`, `mlp_conv`: `[C, K]` taps (this tree holds `[K, C]`).
+    /// * `loop_down` `[4, 2, H, r]` and `loop_gain_forget` `[4, r, 2H]` over (attn, k, v, mlp):
+    ///   `down_weight` `[r, 2H]`, `gain_weight` / `forget_weight` `[H, r]` per message gate.
+    /// * `loop_message.query` `[4, H]` per core layer, already in this model's (q, k, v, mlp) order.
+    /// * experts `mlp.experts.{w13,w2}` (`w13` rows in source order, NVFP4 `global_scale` in MLX's
+    ///   amax convention) -> the mlx-lm names, handled with the other community experts.
+    static func convertingFusedProjectionLayout(
+        _ weights: [String: MLXArray], expected: [String: [Int]], loopCore: Range<Int>
+    ) -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        var messageQueries: [Int: MLXArray] = [:]
+        func rows(_ name: String) -> Int? { expected[name]?.first }
+        func dense(_ base: String, inputs: Int) -> MLXArray? {
+            guard let w = weights[base + ".weight"] else { return nil }
+            guard let scales = weights[base + ".scales"] else { return w }
+            let f = Inkling2NativeSwitchLinear.format(codes: w, scales: scales, inputDims: inputs)
+            return MLX.dequantized(
+                w, scales: scales, biases: f.mode == .affine ? weights[base + ".biases"] : nil,
+                groupSize: f.groupSize, bits: f.bits, mode: f.mode,
+                globalScale: f.mode == .nvfp4
+                    ? weights[base + ".global_scale"]?.reshaped([1]).asType(.float32) : nil,
+                dtype: scales.dtype == .uint8 ? .bfloat16 : scales.dtype)
+        }
+        func split(_ m: MLXArray, _ parts: [(String, Int?)]) {
+            var start = 0
+            for (name, count) in parts {
+                guard let count else {
+                    RuntimeDiagnostics.write(Data(
+                        "[vmlx][inkling2/load] fused-projection split: no parameter \(name)\n".utf8))
+                    return
+                }
+                out[name] = m[start ..< start + count]
+                start += count
+            }
+            if start != m.dim(0) {
+                RuntimeDiagnostics.write(Data(
+                    "[vmlx][inkling2/load] fused-projection split covers \(start) of \(m.dim(0)) rows for \(parts.first?.0 ?? "?")\n".utf8))
+            }
+        }
+        func taps(_ v: MLXArray, _ name: String) -> MLXArray {
+            // `[C, K]` -> this tree's `[K, C]`.
+            if let shape = expected[name], v.ndim == 2, v.shape != shape, v.shape.reversed() == shape {
+                return v.transposed(1, 0)
+            }
+            return v
+        }
+        var consumed = Set<String>()
+        for key in weights.keys where key.hasPrefix("model.layers.") {
+            let parts = key.split(separator: ".", maxSplits: 3).map(String.init)
+            guard parts.count == 4, let idx = Int(parts[2]) else { continue }
+            let pre = "model.layers.\(idx)."
+            let sa = pre + "self_attn."
+            let rest = parts[3]
+            let hidden = expected[sa + "q_proj.weight"]?.last ?? 0
+            switch rest {
+            case "attn.in_proj.weight":
+                if let m = dense(pre + "attn.in_proj", inputs: hidden) {
+                    split(m, ["q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj"].map {
+                        (sa + $0 + ".weight", rows(sa + $0 + ".weight"))
+                    })
+                }
+            case "attn.q_proj.weight":
+                if let m = dense(pre + "attn.q_proj", inputs: hidden) {
+                    split(m, ["q_proj", "r_proj", "gate_proj", "sink_proj"].map {
+                        (sa + $0 + ".weight", rows(sa + $0 + ".weight"))
+                    })
+                }
+            case "attn.k_proj.weight", "attn.v_proj.weight":
+                let n = rest.hasPrefix("attn.k") ? "k" : "v"
+                if let m = dense(pre + "attn.\(n)_proj", inputs: hidden) {
+                    split(m, [
+                        (sa + "\(n)_proj.weight", rows(sa + "\(n)_proj.weight")),
+                        (sa + "\(n)_sconv.weight_proj.weight", rows(sa + "\(n)_sconv.weight_proj.weight")),
+                    ])
+                }
+            case "attn.o_proj.weight":
+                let name = sa + "o_proj.weight"
+                if let m = dense(pre + "attn.o_proj", inputs: expected[name]?.last ?? 0) { out[name] = m }
+            case "attn.k_static", "attn.v_static":
+                out[sa + (rest == "attn.k_static" ? "k" : "v") + "_sconv.static_weight"] = weights[key]
+            case "attn.k_conv", "attn.v_conv":
+                let name = sa + (rest == "attn.k_conv" ? "k" : "v") + "_sconv.weight"
+                out[name] = taps(weights[key]!, name)
+            case "attn_conv", "mlp_conv":
+                let name = pre + (rest == "attn_conv" ? "post_attention" : "post_mlp") + "_convolution.weight"
+                out[name] = taps(weights[key]!, name)
+            case "attn.q_scale": out[sa + "q_l2_clip.scale"] = weights[key]
+            case "attn.r_scale": out[sa + "rel_l2_clip.scale"] = weights[key]
+            case "attn.rel_proj": out[sa + "rel_logits_proj.proj"] = weights[key]
+            case "mlp.router_weight": out[pre + "mlp.gate.weight"] = weights[key]
+            case "mlp.router_bias": out[pre + "mlp.gate.e_score_correction_bias"] = weights[key]
+            case "attn_input.query", "mlp_input.query":
+                let name = pre + (rest == "attn_input.query" ? "attention_input" : "mlp_input") + ".query"
+                let v = weights[key]!
+                out[name] = expected[name].map { v.reshaped($0) } ?? v
+            case "loop_message.query":
+                messageQueries[idx] = weights[key]
+            case "loop_down":
+                // [4, 2, H, r] -> per gate [r, 2H].
+                let v = weights[key]!
+                for (i, g) in ["q", "k", "v", "mlp"].enumerated() {
+                    let d = v[i]  // [2, H, r]
+                    out[pre + "\(g)_message_gate.down_proj.weight"] =
+                        d.transposed(2, 0, 1).reshaped([d.dim(2), 2 * d.dim(1)])
+                }
+            case "loop_gain_forget":
+                // [4, r, 2H] -> gain / forget `[H, r]`.
+                let v = weights[key]!
+                for (i, g) in ["q", "k", "v", "mlp"].enumerated() {
+                    let h = v.dim(2) / 2
+                    out[pre + "\(g)_message_gate.message_gate_proj.weight"] = v[i][0..., ..<h].T
+                    out[pre + "\(g)_message_gate.forget_gate_proj.weight"] = v[i][0..., h...].T
+                }
+            default:
+                if rest.hasPrefix("mlp.experts.w13.") {
+                    out[pre + "mlp.experts.gate_up_proj." + rest.dropFirst("mlp.experts.w13.".count)] = weights[key]
+                } else if rest.hasPrefix("mlp.experts.w2.") {
+                    out[pre + "mlp.experts.down_proj." + rest.dropFirst("mlp.experts.w2.".count)] = weights[key]
+                } else if rest.hasPrefix("attn.") && (rest.hasSuffix(".scales") || rest.hasSuffix(".biases")
+                    || rest.hasSuffix(".global_scale"))
+                {
+                    // consumed with its matrix
+                } else {
+                    out[key] = weights[key]  // norms: attn_norm, mlp_norm, {q,k,v}_input_norm
+                }
+            }
+            consumed.insert(key)
+        }
+        for (key, value) in weights where !consumed.contains(key) {
+            switch key {
+            case "model.embed.weight", "model.embed.scales", "model.embed.biases":
+                if key == "model.embed.weight" {
+                    let name = "model.embed_tokens.weight"
+                    out[name] = dense("model.embed", inputs: expected[name]?.last ?? 0)
+                }
+            case "model.final_input.query":
+                out[key] = expected[key].map { value.reshaped($0) } ?? value
+            default:
+                out[key] = value  // lm_head.*, model.embed_norm, model.norm, mtp / vision
+            }
+        }
+        if !messageQueries.isEmpty {
+            let ordered = loopCore.compactMap { messageQueries[$0] }
+            if ordered.count == loopCore.count {
+                out["model.message_input.query"] = MLX.stacked(ordered, axis: 0)
+            }
+        }
+        return out
+    }
+
+    /// Key prefixes of other runtimes' trees -> this model's checkpoint-style prefixes.
+    static func normalizingLayoutKeys(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        out.reserveCapacity(weights.count)
+        for (key, value) in weights {
+            var k = key
+            if k.hasPrefix("language_model.model.") {
+                k = "model." + k.dropFirst("language_model.model.".count)
+            } else if k.hasPrefix("language_model.lm_head") {
+                k = String(k.dropFirst("language_model.".count))
+            }
+            out[k] = value
+        }
+        return out
+    }
+
+    /// Dense layers (tree-path suffixes) the runtime runs quantized as `QuantizedLinear` /
+    /// `QuantizedEmbedding`: the attention-input projections the fused decode / verify paths
+    /// read as quantized GEMVs, the output projection, the embedding and the unembedding. Every
+    /// other quantized dense layer (sink, dynamic-tap projections) is dequantized at load.
+    static let runtimeQuantizedDenseLayers: [String] = [
+        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.r_proj",
+        "self_attn.gate_proj", "self_attn.o_proj", "embed_tokens", "lm_head",
+    ]
+
+    /// Quantized dense layers (`X.weight` + `X.scales` [+ `X.biases`, `X.global_scale`]) are
+    /// dequantized to the model dtype at load (unless listed in `runtimeQuantizedDenseLayers`):
+    /// the fused decode path reads these weights directly, and the values are exactly the ones
+    /// the bundle encodes. Bits and group size
+    /// come from this model's own shape for the layer (never from a converter's config, which
+    /// can be stale), the mode from the scale dtype. Routed experts and the vision tower are
+    /// left as they are.
+    static func dequantizingDenseLayers(
+        _ weights: [String: MLXArray], expected: [String: [Int]]
+    ) -> [String: MLXArray] {
+        var out = weights
+        for key in weights.keys where key.hasSuffix(".scales") {
+            let base = String(key.dropLast(".scales".count))
+            if base.contains(".experts.") || base.contains(".switch_mlp.")
+                || base.hasPrefix("model.visual") || base.hasPrefix("model.vision_tower")
+                || base.hasPrefix("vision_tower") || base.hasPrefix("model.audio")
+            {
+                continue
+            }
+            guard let w = weights[base + ".weight"], let scales = weights[key] else { continue }
+            let tree = Inkling2LoopModel.mapKey(base + ".weight")
+            let treeBase = String(tree.dropLast(".weight".count))
+            if runtimeQuantizedDenseLayers.contains(where: { treeBase.hasSuffix($0) }) { continue }
+            guard let shape = expected[tree], let inputs = shape.last, inputs > 0 else {
+                RuntimeDiagnostics.write(Data(
+                    "[vmlx][inkling2/load] quantized \(base) has no matching parameter; left as stored\n".utf8))
+                continue
+            }
+            let f = Inkling2NativeSwitchLinear.format(codes: w, scales: scales, inputDims: inputs)
+            let dtype: DType = scales.dtype == .uint8 ? .bfloat16 : scales.dtype
+            let global = weights[base + ".global_scale"] ?? weights[base + ".weight_global_scale"]
+            var v = MLX.dequantized(
+                w, scales: scales, biases: f.mode == .affine ? weights[base + ".biases"] : nil,
+                groupSize: f.groupSize, bits: f.bits, mode: f.mode,
+                globalScale: f.mode == .nvfp4 ? global?.reshaped([1]).asType(.float32) : nil,
+                dtype: dtype)
+            if f.mode == .nvfp4, global == nil, let s2 = weights[base + ".weight_scale_2"] {
+                v = (v.asType(.float32) * s2.asType(.float32).reshaped([1])).asType(dtype)
+            }
+            out[base + ".weight"] = v
+            for aux in [".scales", ".biases", ".global_scale", ".weight_global_scale", ".weight_scale_2"] {
+                out.removeValue(forKey: base + aux)
+            }
+        }
+        return out
+    }
+
+    /// `(…mlp., leg, leaf)` for a community routed-expert tensor (tree-mapped key): HF
+    /// `experts.{gate_up_proj,down_proj}` or mlx-vlm `switch_mlp.{gate_proj,up_proj,down_proj}`.
+    static func communityExpertKey(_ key: String) -> (String, String, String)? {
+        let leaves = ["weight", "scales", "biases", "global_scale", "weight_global_scale", "weight_scale_2"]
+        for (infix, legs) in [
+            (".mlp.experts.", ["gate_up_proj", "down_proj"]),
+            (".mlp.switch_mlp.", ["gate_proj", "up_proj", "down_proj"]),
+        ] {
+            guard let r = key.range(of: infix) else { continue }
+            let rest = key[r.upperBound...]
+            for leg in legs where rest.hasPrefix(leg + ".") {
+                let leaf = String(rest.dropFirst(leg.count + 1))
+                guard leaves.contains(leaf) else { return nil }
+                let style = infix == ".mlp.experts." ? "hf_" : "vlm_"
+                return (String(key[..<r.lowerBound]) + ".mlp.", style + leg, leaf)
+            }
+        }
+        return nil
+    }
+
+    /// Community expert legs -> this model's `switch_mlp.{gate_up_proj,down_proj}` parameters
+    /// (`codes`, `block_scales`, `expert_scale`, `affine_biases`). gate/up rows end up
+    /// ROW-INTERLEAVED like the official `w13` (row 2i = gate_i, row 2i+1 = up_i). The mlx-lm port
+    /// (ml-explore/mlx-lm#2086, every `model.language_model.*` MLX bundle) renames `w13` to
+    /// `gate_up_proj` and keeps its row order (it splits with `[0::2]` / `[1::2]`), so that tensor
+    /// is used as stored; mlx-vlm splits gate and up into two tensors, re-interleaved here.
+    /// (Transformers' own `gate_up_proj` is gate half then up half, but it is only ever saved
+    /// unquantized, which this module does not load.) Row permutations are exact for any per-row
+    /// quantization.
+    static func canonicalExperts(_ parts: [String: [String: MLXArray]]) -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        var layers = Set<String>()
+        for key in parts.keys { layers.insert(String(key.split(separator: "|")[0])) }
+        func leg(_ base: String, _ name: String) -> [String: MLXArray]? { parts[base + "|" + name] }
+        func interleave(_ g: MLXArray, _ u: MLXArray) -> MLXArray {
+            let (e, i) = (g.dim(0), g.dim(1))
+            return MLX.contiguous(
+                MLX.stacked([g, u], axis: 2).reshaped([e, 2 * i] + Array(g.shape.dropFirst(2))))
+        }
+        func factor(_ p: [String: MLXArray], experts: Int) -> MLXArray? {
+            if let g = p["global_scale"] ?? p["weight_global_scale"] {
+                return (g.asType(.float32) / Float(448 * 6)).reshaped([-1])
+                    * MLXArray.ones([experts], dtype: .float32)
+            }
+            if let s2 = p["weight_scale_2"] {
+                return s2.asType(.float32).reshaped([-1]) * MLXArray.ones([experts], dtype: .float32)
+            }
+            return nil
+        }
+        func emit(_ prefix: String, codes: MLXArray, scales: MLXArray, biases: MLXArray?,
+                  factor f: MLXArray?) {
+            let isFloatScale = scales.dtype != .uint8
+            out[prefix + "codes"] = codes.dtype == .uint32 ? codes : MLX.contiguous(codes).view(dtype: .uint32)
+            out[prefix + "block_scales"] = scales
+            out[prefix + "expert_scale"] = f ?? MLXArray.ones([codes.dim(0)], dtype: .float32)
+            if isFloatScale, let biases { out[prefix + "affine_biases"] = biases }
+        }
+        for base in layers {
+            let target = base + "switch_mlp."
+            if let gu = leg(base, "hf_gate_up_proj") {
+                guard let w = gu["weight"], let s = gu["scales"] else {
+                    Self.unsupportedExperts(base, "unquantized HF gate_up_proj"); continue
+                }
+                emit(target + "gate_up_proj.", codes: w, scales: s, biases: gu["biases"],
+                     factor: factor(gu, experts: w.dim(0)))
+            } else if let g = leg(base, "vlm_gate_proj"), let u = leg(base, "vlm_up_proj") {
+                guard let gw = g["weight"], let gs = g["scales"], let uw = u["weight"], let us = u["scales"]
+                else { Self.unsupportedExperts(base, "unquantized switch_mlp gate/up"); continue }
+                let fg = factor(g, experts: gw.dim(0))
+                let fu = factor(u, experts: uw.dim(0))
+                if let fg, let fu, MLX.abs(fg - fu).max().item(Float.self) > 0 {
+                    // One per-expert factor serves both halves of the fused gate/up gather.
+                    Self.unsupportedExperts(base, "gate and up carry different per-expert scales")
+                    continue
+                }
+                var biases: MLXArray? = nil
+                if let gb = g["biases"], let ub = u["biases"] { biases = interleave(gb, ub) }
+                emit(target + "gate_up_proj.", codes: interleave(gw, uw), scales: interleave(gs, us),
+                     biases: biases, factor: fg ?? fu)
+            }
+            if let d = leg(base, "hf_down_proj") ?? leg(base, "vlm_down_proj") {
+                guard let w = d["weight"], let s = d["scales"] else {
+                    Self.unsupportedExperts(base, "unquantized down_proj"); continue
+                }
+                emit(target + "down_proj.", codes: w, scales: s, biases: d["biases"],
+                     factor: factor(d, experts: w.dim(0)))
+            }
+        }
+        return out
+    }
+
+    private static func unsupportedExperts(_ base: String, _ why: String) {
+        RuntimeDiagnostics.write(Data(
+            "[vmlx][inkling2/load] routed experts at \(base) not loaded: \(why)\n".utf8))
     }
 
     private static let renames: [(String, String)] = [
@@ -1702,6 +2103,14 @@ public final class Inkling2LoopModel: Module, LLMModel {
         (".mlp_sconv.", ".post_mlp_convolution."),
         ("sconv.static_w.", "sconv.static_weight."),
         (".mlp.gate.bias.", ".mlp.gate.e_score_correction_bias."),
+        // mlx-vlm tree names (language_model.model.* bundles).
+        (".mlp.gate_weight.", ".mlp.gate.weight."),
+        (".mlp.e_score_correction_bias.", ".mlp.gate.e_score_correction_bias."),
+        (".self_attn.q_scale.", ".self_attn.q_l2_clip.scale."),
+        (".self_attn.rel_scale.", ".self_attn.rel_l2_clip.scale."),
+        (".self_attn.rel_proj.", ".self_attn.rel_logits_proj.proj."),
+        ("_sconv.conv.weight.", "_sconv.weight."),
+        ("_convolution.conv.weight.", "_convolution.weight."),
         (".attn.", ".self_attn."),
     ]
 
@@ -1724,6 +2133,7 @@ public final class Inkling2LoopModel: Module, LLMModel {
             return "model.layers.\(i).mlp_input.query"
         }
         if n == "model.attn_res.output_query" { return "model.final_input.query" }
+        if n == "model.message_queries" { return "model.message_input.query" }
         n += "."
         for (a, b) in renames {
             n = n.replacingOccurrences(of: a, with: b)
