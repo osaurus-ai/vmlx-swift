@@ -482,30 +482,48 @@ enum Inkling2DecodeKernels {
         inputNames: ["d", "fgw", "x", "msgs", "meta"],
         outputNames: ["y"],
         source: """
-            uint j = thread_position_in_grid.x;
-            uint r = threadgroup_position_in_grid.y;
+            // 128 columns per threadgroup (32 lanes x 4 adjacent columns); its NSG simdgroups split the rank and
+            // reduce through threadgroup memory (many more threads in flight than one thread per 4 columns).
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
             uint tid = thread_position_in_threadgroup.x;
+            uint r = threadgroup_position_in_grid.y;
             constexpr int R = RANK;
             int H = x_shape[1];
             int T = meta[2];
             int g = r / T, t = r % T;
             threadgroup float dv[R];
-            for (int k = tid; k < R; k += (int)threads_per_threadgroup.x) dv[k] = d[(size_t)r * R + k];
+            threadgroup float part[NSG][2][128];
+            for (int k = tid; k < R; k += 32 * NSG) dv[k] = d[(size_t)r * R + k];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            int j0 = j * 4;
-            if (j0 >= H) return;
-            int xr = t * meta[1] + (meta[1] == 1 ? 0 : g);
-            int mr = t * meta[3] + meta[0] + g;
-            const device auto* wf = fgw + (size_t)g * 2 * R * H + j0;
+            int c0 = threadgroup_position_in_grid.x * 128 + lane * 4;
+            const device auto* wf = fgw + (size_t)g * 2 * R * H + c0;
             const device auto* wg = wf + (size_t)R * H;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            for (int k = 0; k < R; ++k) {
-                float dk = dv[k];
-                const device auto* p = wf + (size_t)k * H;
-                const device auto* q = wg + (size_t)k * H;
-                f0 += dk * float(p[0]); f1 += dk * float(p[1]); f2 += dk * float(p[2]); f3 += dk * float(p[3]);
-                a0 += dk * float(q[0]); a1 += dk * float(q[1]); a2 += dk * float(q[2]); a3 += dk * float(q[3]);
+            if (c0 < H) {
+                for (int k = sg; k < R; k += NSG) {
+                    float dk = dv[k];
+                    const device auto* p = wf + (size_t)k * H;
+                    const device auto* q = wg + (size_t)k * H;
+                    f0 += dk * float(p[0]); f1 += dk * float(p[1]); f2 += dk * float(p[2]); f3 += dk * float(p[3]);
+                    a0 += dk * float(q[0]); a1 += dk * float(q[1]); a2 += dk * float(q[2]); a3 += dk * float(q[3]);
+                }
             }
+            part[sg][0][lane * 4 + 0] = f0; part[sg][0][lane * 4 + 1] = f1;
+            part[sg][0][lane * 4 + 2] = f2; part[sg][0][lane * 4 + 3] = f3;
+            part[sg][1][lane * 4 + 0] = a0; part[sg][1][lane * 4 + 1] = a1;
+            part[sg][1][lane * 4 + 2] = a2; part[sg][1][lane * 4 + 3] = a3;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg != 0 || c0 >= H) return;
+            for (int s2 = 1; s2 < NSG; ++s2) {
+                f0 += part[s2][0][lane * 4 + 0]; f1 += part[s2][0][lane * 4 + 1];
+                f2 += part[s2][0][lane * 4 + 2]; f3 += part[s2][0][lane * 4 + 3];
+                a0 += part[s2][1][lane * 4 + 0]; a1 += part[s2][1][lane * 4 + 1];
+                a2 += part[s2][1][lane * 4 + 2]; a3 += part[s2][1][lane * 4 + 3];
+            }
+            int j0 = c0;
+            int xr = t * meta[1] + (meta[1] == 1 ? 0 : g);
+            int mr = t * meta[3] + meta[0] + g;
             const device float* xb = x + (size_t)xr * H + j0;
             const device float* mb = msgs + (size_t)mr * H + j0;
             device float* yo = y + (size_t)r * H + j0;
@@ -857,10 +875,10 @@ enum Inkling2DecodeKernels {
             [x, msgs, down, gateEps, meta], template: [("HH", H), ("TG", tgD), ("OPS", ops)],
             grid: (nch * tgD, n, 1), threadGroup: (tgD, 1, 1),
             outputShapes: [[n, rank]], outputDTypes: [f32])[0]
-        let tgM = 192
+        let nsgM = 8
         let y = gateMix(
-            [d, fg, x, msgs, meta], template: [("RANK", rank)],
-            grid: ((H / 4 + tgM - 1) / tgM * tgM, n, 1), threadGroup: (tgM, 1, 1),
+            [d, fg, x, msgs, meta], template: [("RANK", rank), ("NSG", nsgM)],
+            grid: ((H + 127) / 128 * 32 * nsgM, n, 1), threadGroup: (32 * nsgM, 1, 1),
             outputShapes: [[n, H]], outputDTypes: [f32])[0]
         let tg = 768
         let o = gateNorm(
@@ -979,12 +997,20 @@ struct Inkling2JANGHDecodeBanks {
     let caps: MLXArray
     let inter: Int
 
-    static func make(_ l: JANGHRoutedExpertLayer, hidden: Int, caps: MLXArray) -> Self? {
+    /// nil (the generic JANGH route) unless every bank has exactly the geometry the kernels index with raw pointers:
+    /// gate / up `[E, I, H * bits / 32]` + `[E, I]`, down `[E, H, I * bits / 32]` + `[E, H]`, `2^bits` levels, and the
+    /// router selects among exactly E experts (expert ids index the banks unchecked inside the kernels).
+    static func make(_ l: JANGHRoutedExpertLayer, hidden: Int, routerExperts: Int, caps: MLXArray) -> Self? {
         let (g, u, d) = (l.gateBank, l.upBank, l.downBank)
         guard ProcessInfo.processInfo.environment["VMLX_INKLING2_JANGH_GENERIC"] != "1",
-            [g, u, d].allSatisfy({ $0.hadamard32 && (2 ... 3).contains($0.bits) }),
-            g.scales.shape == u.scales.shape, g.scales.dim(0) == d.scales.dim(0), d.scales.dim(1) == hidden,
-            hidden % 32 == 0, g.scales.dim(1) % 32 == 0
+            [g, u, d].allSatisfy({ $0.hadamard32 && (2 ... 3).contains($0.bits) && $0.levels.count == 1 << $0.bits }),
+            g.scales.ndim == 2, hidden > 0, hidden % 32 == 0
+        else { return nil }
+        let (E, I) = (g.scales.dim(0), g.scales.dim(1))
+        guard E == routerExperts, I > 0, I % 32 == 0,
+            g.packed.shape == [E, I, hidden * g.bits / 32], u.packed.shape == [E, I, hidden * u.bits / 32],
+            u.scales.shape == [E, I], d.packed.shape == [E, hidden, I * d.bits / 32], d.scales.shape == [E, hidden],
+            [g, u, d].allSatisfy({ $0.packed.dtype == .uint32 && $0.scales.dtype == .float16 })
         else { return nil }
         return Self(
             gate: g, up: u, down: d, gateLevels: MLXArray(g.levels), upLevels: MLXArray(u.levels),
@@ -1137,7 +1163,8 @@ extension Inkling2DecoderLayer {
             w.singleSlot = MLXArray.zeros([1, 1], dtype: .uint32)
             w.unitWeight = MLXArray.ones([1, 1], dtype: f32)
             if let jx = mlp.janghExperts {
-                w.jangh = Inkling2JANGHDecodeBanks.make(jx, hidden: H, caps: mlp.softcaps)
+                w.jangh = Inkling2JANGHDecodeBanks.make(
+                    jx, hidden: H, routerExperts: mlp.gate.weight.dim(0), caps: mlp.softcaps)
             }
         }
         w.routerT = mlp.gate.weight.asType(f32).T
