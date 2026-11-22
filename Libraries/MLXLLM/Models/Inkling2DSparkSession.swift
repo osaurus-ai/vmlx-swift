@@ -40,9 +40,9 @@ extension Inkling2LoopModel {
 
     /// The trunk over a cache that may carry draft state: plain forward, or capture + draft-context
     /// maintenance (+ verify recording when a verify is pending). Returns the final normed hidden.
-    func trunk(_ ids: MLXArray, cache: [KVCache]?) -> MLXArray {
+    func trunk(_ ids: MLXArray, cache: [KVCache]?, embeddings: MLXArray? = nil) -> MLXArray {
         guard let cache, cacheHasDraftState(cache), let d = drafter else {
-            return model(ids, cache: cache)
+            return model.forward(ids, cache: cache, capture: nil, recorder: nil, embeddings: embeddings)
         }
         d.prepare(lmHeadWeight: denseUnembedWeight())
         let slots = 2 * args.numCacheSlots
@@ -51,7 +51,8 @@ extension Inkling2LoopModel {
         let feat = cache[slots + d.cfg.layers] as! MambaCache
         let cap = Inkling2Capture(ids: d.cfg.targetLayerIds)
         let pending = pendingVerify
-        let hidden = model.forward(ids, cache: target, capture: cap, recorder: pending?.recorder)
+        let hidden = model.forward(
+            ids, cache: target, capture: cap, recorder: pending?.recorder, embeddings: embeddings)
         let caps = cap.stacked().asType(.bfloat16)  // [T, 4, H]
         let T = caps.dim(0)
         d.writeContext(caps, pos0: ctx[0].offset, caches: ctx)

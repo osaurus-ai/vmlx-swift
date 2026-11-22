@@ -1417,6 +1417,9 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// MiniMax-M3 / M3.1 with its vision stack built: image items in their turn, expanded to image runs, patches in
     /// `LMInput.image` (`MiniMaxM3Vision.swift`). nil for every other model.
     let miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration?
+    /// Inkling-2 with its vision tower built: image parts in their message, each placeholder expanded
+    /// to one per 40 px tile, tiles in `LMInput.image` (`Inkling2Vision.swift`). nil otherwise.
+    let inkling2Vision: Inkling2VisionConfiguration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
@@ -1426,7 +1429,8 @@ struct LLMUserInputProcessor: UserInputProcessor {
         templateReadsEnableThinking: Bool = false,
         k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil,
         deepseekV41Vision: DeepseekV41VisionConfiguration? = nil,
-        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil
+        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil,
+        inkling2Vision: Inkling2VisionConfiguration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1437,6 +1441,7 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.k2ReasoningDeclaration = k2ReasoningDeclaration
         self.deepseekV41Vision = deepseekV41Vision
         self.miniMaxM3Vision = miniMaxM3Vision
+        self.inkling2Vision = inkling2Vision
     }
 
     func prepare(input: UserInput) throws -> LMInput {
@@ -1479,6 +1484,19 @@ struct LLMUserInputProcessor: UserInputProcessor {
                 chat: chat, looseImages: input.images, generated: messages)
             if !anchored.images.isEmpty {
                 return try deepseekV41ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
+        if let vision = inkling2Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = Inkling2VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try inkling2ImageInput(
                     input: input, messages: anchored.messages, images: anchored.images,
                     additionalContext: additionalContext, vision: vision)
             }
@@ -1578,6 +1596,38 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// chat template path as text (an image turn and its text continuation share one prompt format and cache
     /// boundaries), preprocess each image as the bundle's processor does, expand every image token into
     /// `start, image x (t h w / 4), end`, and remap the cache boundaries into the expanded token space.
+    /// Inkling-2: the template renders each image part as one `<|unused_200054|>`; it expands to one
+    /// placeholder per tile, and the cache boundaries are remapped into the expanded token space.
+    private func inkling2ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: Inkling2VisionConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: input.tools,
+            additionalContext: additionalContext, promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map { try Inkling2ImagePreprocessor.process($0, tile: vision.tileSize) }
+        let expansion = try Inkling2VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId, counts: processed.map(\.tokenCount))
+        RuntimeReceipts.emit(
+            "inkling2vision stage=preprocess images=\(processed.count) grids="
+                + processed.map { "\($0.rows)x\($0.cols)" }.joined(separator: ",")
+                + " image_tokens=\(processed.reduce(0) { $0 + $1.tokenCount })"
+                + " prompt_tokens=\(expansion.tokens.count)")
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: Inkling2ImagePreprocessor.processedImage(processed),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: Inkling2VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: Inkling2VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
+    }
+
     private func miniMaxM3ImageInput(
         input: UserInput, messages: [Message], images: [UserInput.Image],
         additionalContext: [String: any Sendable]?, vision: MiniMaxM3VisionPromptConfiguration
@@ -2360,7 +2410,8 @@ public final class LLMModelFactory: ModelFactory {
                 MiniMaxM3VisionPromptConfiguration(
                     processor: MiniMaxM3ImageProcessorConfiguration.load(directory: modelDirectory),
                     imageTokenId: $0.imageTokenId)
-            })
+            },
+            inkling2Vision: (model as? Inkling2LoopModel)?.vision?.config)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
