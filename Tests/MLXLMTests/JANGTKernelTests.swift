@@ -170,6 +170,9 @@ final class JANGTKernelTests: XCTestCase {
         switch activation {
         case .silu: return Float(g / (1 + Foundation.exp(-g)) * u)
         case .oai(let alpha): return Float(g / (1 + Foundation.exp(-Double(alpha) * g)) * (u + 1))
+        case .inkling(let gc, let uc):
+            let (c, d) = (Double(gc), Double(uc))
+            return Float(Foundation.tanh(g / c) * c / (1 + Foundation.exp(-g)) * (Foundation.tanh(u / d) * d))
         }
     }
 
@@ -243,7 +246,13 @@ final class JANGTKernelTests: XCTestCase {
                                            up: u, limit: limit, activation: .silu, outputDType: .float32)
             let control = relL2(silu.asArray(Float.self), hWant)
             print("JANGT K=\(k) \(activation) control (SiLU kernel): rel-L2 \(control)")
-            XCTAssertGreaterThan(control, 10 * 1e-2, "SiLU control K=\(k)")
+            if case .inkling = activation {
+                // softcap(g, 4) ~ g and softcap(u, 25) ~ u at these magnitudes, so Inkling sits close to SiLU here: the
+                // control is relative (SiLU must miss the reference by 10x the Inkling kernel's own error).
+                XCTAssertGreaterThan(control, 10 * hErr, "SiLU control K=\(k) (relative)")
+            } else {
+                XCTAssertGreaterThan(control, 10 * 1e-2, "SiLU control K=\(k)")
+            }
         }
 
         let svDN = down.columnScales! * down.signs.expandedDimensions(axis: 0)
@@ -408,6 +417,11 @@ final class JANGTKernelTests: XCTestCase {
         try runGateUpAndDown(k: 2.5, limit: 0, largeHidden: false, activation: .oai(alpha: 1.702))
     }
     func testPrefillTilesMatchCPUReferenceK2OAI() throws { try runPrefill(k: 2, activation: .oai(alpha: 1.702)) }
+
+    // Inkling-2 (softcap(g, 4) * sigmoid(g) * softcap(u, 25)), no limit: the expression through the trellis kernels.
+    func testKernelsMatchCPUReferenceK2Inkling() throws {
+        try runGateUpAndDown(k: 2, limit: 0, largeHidden: false, activation: .inkling(gateCap: 4, upCap: 25))
+    }
     func testPrefillTilesMatchCPUReferenceK25OAI() throws { try runPrefill(k: 2.5, activation: .oai(alpha: 1.702)) }
 
     /// `.silu` must generate exactly the kernel source the existing families compiled before the variants existed.

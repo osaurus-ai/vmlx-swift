@@ -106,7 +106,7 @@ final class JANGHRoutedPrefillTests: XCTestCase {
     }
     private func reference(_ input: [Float], ids: [UInt32], scores: [Float], banks: [Bank],
                            dtype: DType, inputRotation: Bool, outputRotation: Bool,
-                           backend: JANGHPrefillKernel.Backend) -> [Float] {
+                           backend: JANGHPrefillKernel.Backend, activation: JANGTActivation = .silu) -> [Float] {
         let tokens = input.count / width, prefill = ids.count >= 64
         let effective = JANGHPrefillKernel.resolvedBackend(dtype: dtype, requested: backend)
         var result: [Float] = []
@@ -123,6 +123,10 @@ final class JANGHRoutedPrefillTests: XCTestCase {
                     g = g.map { round($0, dtype: dtype) }; u = u.map { round($0, dtype: dtype) }
                 }
                 var hidden = (0 ..< width).map { i -> Float in
+                    if case .inkling(let gc, let uc) = activation {
+                        let (gate, up, c, d) = (Double(g[i]), Double(u[i]), Double(gc), Double(uc))
+                        return Float(tanh(gate / c) * c / (1 + exp(-gate)) * (tanh(up / d) * d))
+                    }
                     let gate = min(g[i], 0.7), up = min(max(u[i], -0.7), 0.7)
                     return Float(Double(gate) / (1 + exp(-Double(gate))) * Double(up))
                 }
@@ -169,6 +173,49 @@ final class JANGHRoutedPrefillTests: XCTestCase {
                             for i in got.indices {
                                 XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
                                     "\(backend) \(dtype) \(shape) rotations\(inputRotation)/\(outputRotation) element\(i)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inkling-2's activation (no limit) through the routed block: decode kernels (< 64 routed pairs) and the expert-
+    /// sorted prefill tiles (>= 64), every backend and dtype, against the CPU reference.
+    func testInklingActivationDecodeAndPrefillMatchCPUReference() throws {
+        try MLXMetalTestLock.withLock {
+            let inkling = JANGTActivation.inkling(gateCap: 4, upCap: 25)
+            for (inputRotation, outputRotation) in [(true, true), (false, false)] {
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: dir) }
+                let (owner, banks) = try fixture(dir, inputRotation: inputRotation, outputRotation: outputRotation)
+                let block = try JANGHRoutedDecodeBlock(
+                    banks: owner, parentModule: parent, activationLimit: nil, activation: inkling)
+                let backends: [JANGHPrefillKernel.Backend] =
+                    JANGHPrefillKernel.nativeBackend == .nax ? [.steel, .nax] : [.steel]
+                for backend in backends {
+                    for dtype in [DType.float32, .bfloat16] {
+                        for shape in [[1, 1, width], [1, 7, width], [1, 9, width]] {
+                            let count = shape[0] * shape[1]
+                            let values = (0 ..< count * width).map {
+                                round(Float(($0 * 11 + $0 / width) % 31 - 15) / 4, dtype: dtype)
+                            }
+                            let pattern: [UInt32] = [2, 0, 2, 1, 0, 1, 2, 0]
+                            let ids = (0 ..< count * routes).map { pattern[($0 + $0 / routes) % routes] }
+                            let scores = (0 ..< count * routes).map { Float(($0 * 3) % 13 - 6) / 16 }
+                            let actual = try block.routed(MLXArray(values, shape).asType(dtype),
+                                indices: MLXArray(ids, [shape[0], shape[1], routes]),
+                                scores: MLXArray(scores, [shape[0], shape[1], routes]), outputDType: dtype,
+                                backend: backend)
+                            let expected = reference(values, ids: ids, scores: scores, banks: banks, dtype: dtype,
+                                inputRotation: inputRotation, outputRotation: outputRotation, backend: backend,
+                                activation: inkling)
+                            let got = actual.asType(.float32).asArray(Float.self)
+                            let tolerance: Float = dtype == .float32 ? 0.0001 : 0.012
+                            for i in got.indices {
+                                XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
+                                    "inkling \(backend) \(dtype) \(shape) rot\(inputRotation)/\(outputRotation) [\(i)]")
                             }
                         }
                     }

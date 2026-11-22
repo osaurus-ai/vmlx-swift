@@ -19,7 +19,7 @@ final class JANGHFusedGateUpKernelTests: XCTestCase {
     private func makeKernel(
         _ g: Int, _ u: Int, inputRotation: String = "hadamard32",
         outputRotation: JANGHFormatContract.Rotation = .none,
-        upAlpha: Double? = nil
+        upAlpha: Double? = nil, activation: JANGTActivation = .silu
     ) throws
         -> JANGHFusedGateUpKernel
     {
@@ -50,7 +50,67 @@ final class JANGHFusedGateUpKernelTests: XCTestCase {
             configuration: JSONSerialization.data(withJSONObject: config))
         return try JANGHFusedGateUpKernel(
             contract: contract, gateModule: module + ".gate_proj",
-            upModule: module + ".up_proj", outputRotation: outputRotation)
+            upModule: module + ".up_proj", outputRotation: outputRotation, activation: activation)
+    }
+
+    /// Inkling-2's activation fused into the decode epilogue: softcap(g, 4) * sigmoid(g) * softcap(u, 25) of the raw
+    /// (unclamped) projections, then the optional H32 output rotation. Control: the SiLU kernel on the same inputs
+    /// differs, so an ignored variant fails.
+    func testInklingActivationMatchesCPUReference() throws {
+        try MLXMetalTestLock.withLock {
+            let inkling = JANGTActivation.inkling(gateCap: 4, upCap: 25)
+            for (gb, ub) in [(2, 2), (3, 3), (2, 3)] {
+                for rotated in [false, true] {
+                    for dtype in [DType.float32, .bfloat16] {
+                        let k = 96
+                        let n = rotated ? 32 : 9
+                        let op = try makeKernel(
+                            gb, ub, outputRotation: rotated ? .hadamard32 : .none, activation: inkling)
+                        let silu = try makeKernel(gb, ub, outputRotation: rotated ? .hadamard32 : .none)
+                        let raw = (0 ..< 2 * k).map { Float(($0 * 17) % 53 - 26) / 11 }
+                        let input = MLXArray(raw, [2, k]).asType(dtype)
+                        let rounded = input.asType(.float32).asArray(Float.self)
+                        let xRows = [h32(Array(rounded[0 ..< k])), h32(Array(rounded[k ..< 2 * k]))]
+                        let prepared = try op.prepareInputForFusedDecode(input)
+                        let (gp, gc) = bank(bits: gb, k: k, n: n, seed: 1)
+                        let (up, uc) = bank(bits: ub, k: k, n: n, seed: 3)
+                        let gs = (0 ..< 2 * n).map { Float16(Float($0 % 5 + 1) / 2) }
+                        let us = (0 ..< 2 * n).map { Float16(Float($0 % 7 + 1) * 2) }
+                        let routes: [UInt32] = [1, 0, 0, 1]
+                        func run(_ kernel: JANGHFusedGateUpKernel) throws -> [Float] {
+                            try kernel.activatePreparedInput(
+                                prepared, gatePacked: gp, gateScales: MLXArray(gs, [2, n]),
+                                upPacked: up, upScales: MLXArray(us, [2, n]),
+                                indices: MLXArray(routes), limit: nil
+                            ).asArray(Float.self)
+                        }
+                        let actual = try run(op)
+                        let control = try run(silu)
+                        var maxDiff: Float = 0
+                        for dispatch in 0 ..< 4 {
+                            var hidden: [Float] = []
+                            for r in 0 ..< n {
+                                let row = Int(routes[dispatch]) * n + r
+                                let g = Double(dot(xRows[dispatch / 2], codes: gc, bits: gb, row: row,
+                                                   scale: Float(gs[row])))
+                                let u = Double(dot(xRows[dispatch / 2], codes: uc, bits: ub, row: row,
+                                                   scale: Float(us[row])))
+                                hidden.append(Float(tanh(g / 4) * 4 / (1 + exp(-g)) * (tanh(u / 25) * 25)))
+                            }
+                            let expected = rotated ? h32(hidden) : hidden
+                            for r in 0 ..< n {
+                                XCTAssertEqual(
+                                    actual[dispatch * n + r], expected[r],
+                                    accuracy: max(0.002, abs(expected[r]) * 0.001),
+                                    "inkling gate=\(gb) up=\(ub) dtype=\(dtype) rotated=\(rotated)")
+                                maxDiff = max(maxDiff, abs(actual[dispatch * n + r] - control[dispatch * n + r]))
+                            }
+                        }
+                        XCTAssertGreaterThan(maxDiff, 0.05, "control: SiLU and Inkling epilogues must differ")
+                    }
+                }
+            }
+        }
     }
 
     private func pack(_ codes: [UInt32], bits: Int) -> [UInt32] {
