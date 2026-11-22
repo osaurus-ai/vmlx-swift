@@ -1095,7 +1095,7 @@ private func restoreFromV2Arrays(
             if totalTokens == 0 {
                 totalTokens = keys.dim(2)
             }
-            restoreKVLayer(keys: keys, values: values, into: cache[i])
+            guard restoreKVLayer(keys: keys, values: values, into: cache[i]) else { return 0 }
 
         case .qsaKV(let comp):
             var keys = comp.keys
@@ -1260,7 +1260,7 @@ private func restoreFromV2Arrays(
                     if totalTokens == 0 {
                         totalTokens = keys.dim(2)
                     }
-                    restoreKVLayer(keys: keys, values: values, into: list[subIndex])
+                    guard restoreKVLayer(keys: keys, values: values, into: list[subIndex]) else { return 0 }
 
                 case .mamba(let comp):
                     guard restoreMambaLayer(comp, into: list[subIndex])
@@ -1393,7 +1393,7 @@ private func restoreFromLegacyArrays(
             totalTokens = restoredKeys.dim(2)
         }
 
-        restoreKVLayer(keys: restoredKeys, values: restoredValues, into: cache[cacheLayerIdx])
+        guard restoreKVLayer(keys: restoredKeys, values: restoredValues, into: cache[cacheLayerIdx]) else { return 0 }
     }
 
     return totalTokens
@@ -1402,11 +1402,15 @@ private func restoreFromLegacyArrays(
 /// Helper: restore a pair of KV tensors into whatever KV-bearing cache
 /// class `layer` happens to be. Mirrors the behavior of the original
 /// legacy path but factored out so both v1 and v2 restores share it.
+/// Seats a plain K/V record. Returns false (and leaves the layer untouched) when the target cannot hold it as the
+/// full history from position 0: the caller refuses the whole entry and re-prefills instead of restoring a layer
+/// that silently kept nothing.
+@discardableResult
 private func restoreKVLayer(
     keys restoredKeys: MLXArray,
     values restoredValues: MLXArray,
     into layer: any KVCache
-) {
+) -> Bool {
     if layer is QSAKVCache {
         // A 2-array seat into a QSA cache erases the indexer lane and
         // diverges the sparse selector (osaurus#2525). The v2 `.standard`
@@ -1416,10 +1420,11 @@ private func restoreKVLayer(
         // the layer stays empty rather than becoming inconsistent.
         RuntimeDiagnostics.write(Data(
             "[disk cache] restoreKVLayer REFUSED: 2-array record for a QSAKVCache (would drop the indexer lane).\n".utf8))
-        return
+        return false
     }
     if let simple = layer as? KVCacheSimple {
         simple.state = [restoredKeys, restoredValues]
+        return true
     } else if let quantizedCache = layer as? QuantizedKVCache {
         let qKeys = quantized(
             restoredKeys, groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
@@ -1431,17 +1436,19 @@ private func restoreKVLayer(
         if let biases = qValues.biases { stateArrays.append(biases) }
         quantizedCache.state = stateArrays
         quantizedCache.offset = restoredKeys.dim(2)
+        return true
     } else if let tq = layer as? TurboQuantKVCache {
         // Same restoreFromDecodedKV path as paged-cache restore — avoid
         // compounding quantization on cross-turn round trips.
         tq.restoreFromDecodedKV(
             keys: restoredKeys, values: restoredValues,
             sourceOffset: restoredKeys.dim(2))
+        return true
     } else if let cacheList = layer as? CacheList {
         for i in 0..<cacheList.count {
             if let simple = cacheList[i] as? KVCacheSimple {
                 simple.state = [restoredKeys, restoredValues]
-                return
+                return true
             }
             if let quantizedCache = cacheList[i] as? QuantizedKVCache {
                 let qKeys = quantized(
@@ -1455,16 +1462,19 @@ private func restoreKVLayer(
                 if let biases = qValues.biases { stateArrays.append(biases) }
                 quantizedCache.state = stateArrays
                 quantizedCache.offset = restoredKeys.dim(2)
-                return
+                return true
             }
             if let tq = cacheList[i] as? TurboQuantKVCache {
                 tq.restoreFromDecodedKV(
                     keys: restoredKeys, values: restoredValues,
                     sourceOffset: restoredKeys.dim(2))
-                return
+                return true
             }
         }
     }
+    RuntimeDiagnostics.write(Data(
+        "[disk cache] restoreKVLayer REFUSED: 2-array record for a \(type(of: layer)) layer.\n".utf8))
+    return false
 }
 
 /// Helper: restore quantized-KV state into a `QuantizedKVCache` layer.

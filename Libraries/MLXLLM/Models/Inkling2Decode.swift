@@ -1273,7 +1273,7 @@ extension Inkling2DecoderLayer {
     /// One token (B = 1, T = 1). `stack` `[1, 1, S, H]` fp32; `messages` `[1, 1, 4 * loopLayers, H]`
     /// with this layer's rows at `4 * loopIndex`. Returns `(h, stack')`.
     func decodeStep(
-        _ h: MLXArray, stack: MLXArray?, kv: KVCacheSimple, conv: MambaCache,
+        _ h: MLXArray, stack: MLXArray?, kv: any KVCache, conv: MambaCache,
         messages: MLXArray?, loopIndex: Int, ones: MLXArray, scalars: Inkling2StepScalars
     ) -> (MLXArray, MLXArray?) {
         prepareDecodeWeights()

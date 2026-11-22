@@ -203,7 +203,7 @@ extension Inkling2DecoderLayer {
     /// T rows (B = 1) through the fused path. `stack` `[1, T, S, H]`; `messages` `[1, T, 4L, H]`.
     /// With a recorder, every conv's pre-conv inputs are kept for rewinding.
     func multiRowStep(
-        _ h: MLXArray, stack: MLXArray?, kv: KVCacheSimple, conv: MambaCache,
+        _ h: MLXArray, stack: MLXArray?, kv: any KVCache, conv: MambaCache,
         messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?
     ) -> (MLXArray, MLXArray?) {
         prepareDecodeWeights()

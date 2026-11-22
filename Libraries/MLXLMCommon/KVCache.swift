@@ -2091,8 +2091,10 @@ public func savePromptCache(
     // Ordinary layouts retain Python-compatible names. Extended recurrent
     // records use a distinct class tag so older readers reject rather than
     // silently seating a partial state into their default two-slot cache.
-    let cacheClasses = cache.map { cache -> String in
+    let cacheClasses = try cache.map { cache -> String in
         switch cache {
+        case is TemporalWindowKVCache:
+            return "VmlxTemporalWindowKVCacheV1"  // metaState [identifier, offset]; older readers reject the tag
         case is ChunkedKVCache:
             return "ChunkedKVCache"  // Must precede KVCacheSimple because of inheritance
         case is KVCacheSimple:
@@ -2107,6 +2109,10 @@ public func savePromptCache(
             return "ArraysCache"
         case is CacheList:
             return "CacheList"
+        case let custom as any DiskCacheStateProviding:
+            // A model-owned state written under the basic tag cannot be loaded back (its metaState is not a basic
+            // cache's): refuse here instead of writing a file whose load traps.
+            throw KVCacheError(message: "Cannot save \(custom.diskCacheStateIdentifier) cache state as a prompt cache")
         default:
             return "KVCache"  // Default fallback
         }
@@ -2228,6 +2234,20 @@ public func loadPromptCache(
             for (slot, state) in zip(occupied, cacheData[i]) { mamba[slot] = state }
             mamba.offset = offset
             caches.append(mamba)
+            continue
+        case "VmlxTemporalWindowKVCacheV1":
+            let info = i < cacheInfo.count ? cacheInfo[i] : []
+            let prefix = "temporal-window-kv-v1-window-"
+            guard info.count == 2, info[0].hasPrefix(prefix), let window = Int(info[0].dropFirst(prefix.count)),
+                window > 0, let offset = Int(info[1])
+            else { throw KVCacheError(message: "Invalid windowed cache metadata \(info)") }
+            let windowed = TemporalWindowKVCache(window: window)
+            guard (offset == 0 && cacheData[i].isEmpty)
+                || windowed.restoreDiskCacheState(cacheData[i], metadata: info, offset: offset)
+            else {
+                throw KVCacheError(message: "Windowed cache rows do not cover position \(offset)")
+            }
+            caches.append(windowed)
             continue
         case "ArraysCache":
             // Size doesn't matter here as it's only needed to initialize the `cache` container inside

@@ -147,7 +147,16 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         else { return false }
         let drop = pending.rows - keep
         if drop > 0 {
-            for c in cache where c is KVCacheSimple { c.trim(drop) }
+            // Every attention slot (target visits, then the drafter's context) rolls back the rejected rows. A
+            // windowed slot holds every row the verify appended, so this is exact for any width; a shortfall
+            // would leave slots at different positions, so it is reported and the caller restores the checkpoint.
+            let d = model.drafter!
+            let attention = Array(0 ..< model.args.numCacheSlots)
+                + Array((2 * model.args.numCacheSlots) ..< (2 * model.args.numCacheSlots + d.cfg.layers))
+            for i in attention where cache[i].trim(drop) != drop {
+                model.pendingVerify = nil
+                return false
+            }
         }
         pending.recorder.rewind(keep: keep)
         let d = model.drafter!
