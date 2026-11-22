@@ -942,8 +942,11 @@ final class Inkling2MoE: Module {
     /// A JANGH bundle's mapped codebook banks for this layer (no parameters: the generic loader never sees the
     /// `tq2_*` tensors). Gate/up run with Inkling's softcapped activation fused into the epilogue.
     @ModuleInfo(key: "jangh_experts") var janghExperts: JANGHRoutedExpertLayer?
+    /// `[mlp_gate_softcap, mlp_up_softcap]` fp32 (the batch-1 JANGH kernels' activation constants).
+    let softcaps: MLXArray
 
     init(_ args: Inkling2LoopConfiguration, jangh: JANGHRoutedExpertLayer? = nil) {
+        softcaps = MLXArray([args.mlpGateSoftcap, args.mlpUpSoftcap])
         _gate.wrappedValue = Inkling2Router(args)
         if let jangh {
             _janghExperts.wrappedValue = jangh

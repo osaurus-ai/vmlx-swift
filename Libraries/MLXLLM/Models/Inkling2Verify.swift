@@ -283,7 +283,7 @@ extension Inkling2DecoderLayer {
         if let qp = w.quant {
             // Affine projections: qa = [q | r | gate | sink] (the plain sink appended, as the mask reads it at
             // 2nQ + nR), ka / va from the quantized k / v rows (+ the plain dynamic-tap rows after them).
-            qa = MLX.concatenated([qp(rowsQ, qp.qrg), MLX.matmul(rowsQ, qp.sink.T)], axis: -1)
+            qa = MLX.concatenated([qp(rowsQ, qp.qrg), MLX.matmul(rowsQ, qp.sink)], axis: -1)
             if rowsK == nil {
                 let kv = qp(rowsQ, qp.kv)  // [T, 2C]
                 ka = kv
@@ -293,8 +293,8 @@ extension Inkling2DecoderLayer {
                 var kk = qp(rowsK!, qp.k)
                 var vv = qp(rowsV!, qp.v)
                 if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
-                    kk = MLX.concatenated([kk, MLX.matmul(rowsK!, kt.T)], axis: -1)
-                    vv = MLX.concatenated([vv, MLX.matmul(rowsV!, vt.T)], axis: -1)
+                    kk = MLX.concatenated([kk, MLX.matmul(rowsK!, kt)], axis: -1)
+                    vv = MLX.concatenated([vv, MLX.matmul(rowsV!, vt)], axis: -1)
                 }
                 ka = kk
                 va = vv
@@ -435,10 +435,14 @@ extension Inkling2DecoderLayer {
         let k = router.topK
         if let jx = mlp.janghExperts {
             // JANGH: the router-weighted sum per row (decode kernels, F32), combined by the final kernel as one slot.
-            let sum = jx.decodeWeightedSum(xm32, indices: inds, scores: sel[1])  // [T, H]
+            let perPick = w.jangh.map {
+                Inkling2DecodeKernels.janghExperts(x32: xm32, inds: inds, banks: $0, topK: k)  // [T * k, H]
+            }
+            let sum = perPick ?? jx.decodeWeightedSum(xm32, indices: inds, scores: sel[1])  // [T, H]
             let fin = Inkling2VerifyKernels.finalT(
                 [
-                    sum, MLXArray.zeros([T, 1], dtype: .uint32), w.ones!, MLXArray.ones([T, 1], dtype: f32),
+                    sum, perPick != nil ? inds : MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
+                    perPick != nil ? sel[1] : MLXArray.ones([T, 1], dtype: f32),
                     packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
                     MLXArray([Int32(2 * C), Int32(H)]),
                 ],

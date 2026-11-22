@@ -163,7 +163,7 @@ enum Inkling2DecodeKernels {
             uint lane = thread_index_in_simdgroup;
             constexpr int C = NKV * D;
             constexpr int EL = D / 32;
-            int P = packed_shape[1];
+            int P = PP;
             int S = sarr[0];
             int NB = sarr[1];
             int E = proj_shape[1];
@@ -281,7 +281,7 @@ enum Inkling2DecodeKernels {
             constexpr int NSG = TG / 32;
             constexpr int S = NS - 1;
             int H = query_shape[1];
-            int P = packed_shape[1];
+            int P = PP;
             int off = meta[0];
             float v[NS][ELEMS];
             float ss[NS];
@@ -385,7 +385,7 @@ enum Inkling2DecodeKernels {
         outputNames: ["hout", "np"],
         source: """
             uint c = thread_position_in_grid.x;
-            int P = packed_shape[1];
+            int P = PP;
             int C2 = meta[0];
             int H = meta[1];
             int K = inds_shape[1];
@@ -696,6 +696,151 @@ enum Inkling2DecodeKernels {
         return (act, down)
     }
 
+    // MARK: JANGH (codebook) routed experts, batch 1 / verify rows
+
+    static let jhHeader =
+        header + """
+            // 32 codebook codes (one aligned chunk of B words, LSB-first bitstream) . x[0 ..< 32]
+            template <int B>
+            inline float ink_jh_dot32(const device uint32_t* w, threadgroup const float* x, threadgroup const float* lut) {
+                uint wd[B];
+                for (int i = 0; i < B; ++i) wd[i] = w[i];
+                float p = 0.f;
+                _Pragma("clang loop unroll(full)")
+                for (int j = 0; j < 32; ++j) {
+                    const int bit = j * B, wi = bit >> 5, off = bit & 31;
+                    uint c = wd[wi] >> off;
+                    if (off + B > 32) c |= wd[wi + 1] << (32 - off);
+                    p += lut[c & ((1u << B) - 1u)] * x[j];
+                }
+                return p;
+            }
+            template <int B>
+            inline float ink_jh_dot32d(const device uint32_t* w, const device float* x, threadgroup const float* lut) {
+                uint wd[B];
+                for (int i = 0; i < B; ++i) wd[i] = w[i];
+                float p = 0.f;
+                _Pragma("clang loop unroll(full)")
+                for (int j = 0; j < 32; ++j) {
+                    const int bit = j * B, wi = bit >> 5, off = bit & 31;
+                    uint c = wd[wi] >> off;
+                    if (off + B > 32) c |= wd[wi + 1] << (32 - off);
+                    p += lut[c & ((1u << B) - 1u)] * x[j];
+                }
+                return p;
+            }
+            // in-simdgroup H32 butterfly (lane i holds element i of a 32-block), normalized
+            inline float ink_h32(float v, uint lane) {
+                for (ushort st = 1; st < 32; st <<= 1) {
+                    float o = simd_shuffle_xor(v, st);
+                    v = (lane & st) ? o - v : v + o;
+                }
+                return v * 0.17677669529663687f;
+            }
+            """
+
+    /// JANGH routed gate/up for each (row, pick) n: x row (n / KPER) rotated to H32 in threadgroup memory, then 32
+    /// consecutive intermediate rows per threadgroup (NSG simdgroups x 4 rows, 8 lanes per row), gate and up dots in
+    /// the same lanes (codebook levels from a table), `softcap(g) * sigmoid(g) * softcap(u)` with the row scales,
+    /// rounded to bf16 (the reference's dtype round before the down projection), H32-rotated back over the 32 rows
+    /// (the down projection's input basis). x [T, H] fp32; idx [T * KPER]. Grid (I / 32 * 32 * NSG, T * KPER).
+    /// Output [T * KPER, I] fp32.
+    static let jhGateUpAct = MLXFast.metalKernel(
+        name: "inkling2_jh_gate_up_act",
+        inputNames: ["x", "gp", "gs", "up", "us", "idx", "lg", "lu", "caps"],
+        outputNames: ["out"],
+        source: """
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint tid = thread_position_in_threadgroup.x;
+            uint n = threadgroup_position_in_grid.y;
+            uint rb = threadgroup_position_in_grid.x;
+            threadgroup float xs[HH];
+            threadgroup float tg_lut[16];
+            threadgroup float hs[32];
+            if (tid < (1u << BG)) tg_lut[tid] = lg[tid];
+            if (tid >= 8 && tid < 8 + (1u << BU)) tg_lut[tid] = lu[tid - 8];
+            const device float* xrow = x + (size_t)(n / KPER) * HH;
+            for (uint b = sg; b < HH / 32; b += NSG) xs[b * 32 + lane] = ink_h32(xrow[b * 32 + lane], lane);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int I = gs_shape[1];
+            uint p = sg * 4 + lane / 8, sl = lane % 8;
+            int row = rb * 32 + p;
+            uint e = idx[n];
+            const device uint32_t* gw = gp + ((size_t)e * I + row) * (HH * BG / 32);
+            const device uint32_t* uw = up + ((size_t)e * I + row) * (HH * BU / 32);
+            float ag = 0.f, au = 0.f;
+            for (int c = sl; c < HH / 32; c += 8) {
+                ag += ink_jh_dot32<BG>(gw + c * BG, xs + c * 32, tg_lut);
+                au += ink_jh_dot32<BU>(uw + c * BU, xs + c * 32, tg_lut + 8);
+            }
+            for (uint o = 4; o > 0; o >>= 1) { ag += simd_shuffle_xor(ag, o); au += simd_shuffle_xor(au, o); }
+            if (sl == 0) {
+                float gg = ag * float(gs[(size_t)e * I + row]), u = au * float(us[(size_t)e * I + row]);
+                float gc = caps[0], uc = caps[1];
+                float a = (tanh(gg / gc) * gc) * (1.f / (1.f + exp(-gg))) * (tanh(u / uc) * uc);
+                hs[p] = float(bfloat16_t(a));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) out[(size_t)n * I + rb * 32 + lane] = ink_h32(hs[lane], lane);
+            """,
+        header: jhHeader)
+
+    /// JANGH routed down per pick n: out[n, j] = scale_{e}[j] * (act[n] . W_e[j]) with the activation already in the
+    /// down projection's (H32) basis (the final kernel applies the route weights). 4 lanes per output row,
+    /// NSG simdgroups x 8 rows per threadgroup. Grid (H / (8 * NSG) * 32 * NSG, N). Output [N, H] fp32.
+    static let jhDown = MLXFast.metalKernel(
+        name: "inkling2_jh_down",
+        inputNames: ["act", "dp", "ds", "idx", "ld"],
+        outputNames: ["out"],
+        source: """
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint tid = thread_position_in_threadgroup.x;
+            uint n = threadgroup_position_in_grid.y;
+            threadgroup float tg_lut[8];
+            if (tid < (1u << BD)) tg_lut[tid] = ld[tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int H = ds_shape[1];
+            uint sl = lane % 4;
+            int row = (threadgroup_position_in_grid.x * NSG + sg) * 8 + lane / 4;
+            float acc = 0.f;
+            uint e = idx[n];
+            if (row < H) {
+                const device uint32_t* dw = dp + ((size_t)e * H + row) * (II * BD / 32);
+                const device float* a = act + (size_t)n * II;
+                for (int c = sl; c < II / 32; c += 4) acc += ink_jh_dot32d<BD>(dw + c * BD, a + c * 32, tg_lut);
+            }
+            acc += simd_shuffle_xor(acc, 2);
+            acc += simd_shuffle_xor(acc, 1);
+            if (sl == 0 && row < H) out[(size_t)n * H + row] = acc * float(ds[(size_t)e * H + row]);
+            """,
+        header: jhHeader)
+
+    /// JANGH experts for T rows x k picks → per-pick down outputs `[T * k, H]` fp32 (row scales applied; the final
+    /// kernel combines them with the route weights).
+    static func janghExperts(
+        x32: MLXArray, inds: MLXArray, banks: Inkling2JANGHDecodeBanks, topK: Int
+    ) -> MLXArray {
+        let T = x32.dim(0)
+        let H = x32.dim(1)
+        let I = banks.inter
+        let n = T * topK
+        let nsg = 8
+        let act = jhGateUpAct(
+            [x32, banks.gate.packed, banks.gate.scales, banks.up.packed, banks.up.scales, inds,
+             banks.gateLevels, banks.upLevels, banks.caps],
+            template: [("HH", H), ("BG", banks.gate.bits), ("BU", banks.up.bits), ("KPER", topK), ("NSG", nsg)],
+            grid: (I / 32 * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[n, I]], outputDTypes: [f32])[0]
+        let rows = 8 * nsg
+        return jhDown(
+            [act, banks.down.packed, banks.down.scales, inds, banks.downLevels],
+            template: [("II", I), ("BD", banks.down.bits), ("NSG", nsg)],
+            grid: ((H + rows - 1) / rows * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[n, H]], outputDTypes: [f32])[0]
+    }
+
     /// The three gate kernels for G gates x T rows. Returns `(out [G*T, H] model dtype, out32 fp32)`.
     static func messageGates(
         x: MLXArray, msgs: MLXArray, down: MLXArray, fg: MLXArray, norm: MLXArray,
@@ -760,6 +905,8 @@ struct Inkling2QuantizedProjections {
     let kv: Packed
     let k: Packed
     let v: Packed
+    /// Plain projections as transposed VIEWS of the `[N, H]` weights, evaluated once: no per-call Transpose node, and
+    /// MLX's GEMV keeps its fast transposed-weight kernel (a contiguous `[H, N]` copy is much slower).
     let sink: MLXArray
     let kTaps: MLXArray?
     let vTaps: MLXArray?
@@ -795,15 +942,15 @@ struct Inkling2QuantizedProjections {
         var vTaps: MLXArray? = nil
         if let kd = a.kSconv as? Inkling2DynamicShortConv, let vd = a.vSconv as? Inkling2DynamicShortConv {
             guard type(of: kd.weightProj) == Linear.self, type(of: vd.weightProj) == Linear.self else { return nil }
-            kTaps = kd.weightProj.weight
-            vTaps = vd.weightProj.weight
+            kTaps = kd.weightProj.weight.T
+            vTaps = vd.weightProj.weight.T
         }
         let (nq, hd, dRel) = (a.nq, a.hd, a.dRel)
         let (nQ, C) = (nq * hd, a.nkv * hd)
         _ = dRel
         return Self(
             qrg: cat([qs[0], qs[1], qs[2]]), kv: cat([qs[3], qs[4]]), k: one(qs[3]), v: one(qs[4]),
-            sink: a.sinkProj.weight, kTaps: kTaps, vTaps: vTaps, groupSize: q0.groupSize, bits: q0.bits,
+            sink: a.sinkProj.weight.T, kTaps: kTaps, vTaps: vTaps, groupSize: q0.groupSize, bits: q0.bits,
             mode: q0.mode,
             imetaX: MLXArray([0, Int32(nQ), 0, 0, Int32(C), 0]),
             imeta3: MLXArray([0, Int32(nQ), 0, 0, 0, 0]))
@@ -818,6 +965,30 @@ struct Inkling2QuantizedProjections {
     var arrays: [MLXArray] {
         [qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
             + [sink] + [kTaps, vTaps].compactMap { $0 }
+    }
+}
+
+/// A JANGH layer's banks for the Inkling batch-1 kernels (H32 input bases, widths 2...4, 32-aligned sizes).
+struct Inkling2JANGHDecodeBanks {
+    let gate: JANGHRoutedExpertLayer.CodebookBank
+    let up: JANGHRoutedExpertLayer.CodebookBank
+    let down: JANGHRoutedExpertLayer.CodebookBank
+    let gateLevels: MLXArray
+    let upLevels: MLXArray
+    let downLevels: MLXArray
+    let caps: MLXArray
+    let inter: Int
+
+    static func make(_ l: JANGHRoutedExpertLayer, hidden: Int, caps: MLXArray) -> Self? {
+        let (g, u, d) = (l.gateBank, l.upBank, l.downBank)
+        guard ProcessInfo.processInfo.environment["VMLX_INKLING2_JANGH_GENERIC"] != "1",
+            [g, u, d].allSatisfy({ $0.hadamard32 && (2 ... 3).contains($0.bits) }),
+            g.scales.shape == u.scales.shape, g.scales.dim(0) == d.scales.dim(0), d.scales.dim(1) == hidden,
+            hidden % 32 == 0, g.scales.dim(1) % 32 == 0
+        else { return nil }
+        return Self(
+            gate: g, up: u, down: d, gateLevels: MLXArray(g.levels), upLevels: MLXArray(u.levels),
+            downLevels: MLXArray(d.levels), caps: caps, inter: g.scales.dim(1))
     }
 }
 
@@ -859,6 +1030,14 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var midMeta: MLXArray?
     var finalMeta: MLXArray?
     var loopIndex = -1
+    private var zeroConvCache: MLXArray?
+    /// A fresh layer's conv state `[1, 3, P]` (zeros, one constant per layer).
+    func zeroConv(_ P: Int) -> MLXArray {
+        if let z = zeroConvCache, z.dim(2) == P { return z }
+        let z = MLXArray.zeros([1, 3, P], dtype: .float32)
+        zeroConvCache = z
+        return z
+    }
     /// Both expert projections NVFP4 with the layout the batch-1 kernels read.
     var nativeFP4Experts = false
     /// Affine-quantized attention-input projections (a JANG bundle), else nil (plain weights above).
@@ -866,6 +1045,8 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     /// A JANGH layer's routed sum arrives pre-weighted: the final kernel combines one slot (expert 0, weight 1).
     var singleSlot: MLXArray?
     var unitWeight: MLXArray?
+    /// The layer's JANGH banks for the Inkling batch-1 kernels (nil: the generic JANGH decode route).
+    var jangh: Inkling2JANGHDecodeBanks?
     var ready = false
     private var zeroSinkCache: MLXArray?
 
@@ -955,6 +1136,9 @@ extension Inkling2DecoderLayer {
         } else {
             w.singleSlot = MLXArray.zeros([1, 1], dtype: .uint32)
             w.unitWeight = MLXArray.ones([1, 1], dtype: f32)
+            if let jx = mlp.janghExperts {
+                w.jangh = Inkling2JANGHDecodeBanks.make(jx, hidden: H, caps: mlp.softcaps)
+            }
         }
         w.routerT = mlp.gate.weight.asType(f32).T
         w.ones = MLXArray.ones([mlp.gate.weight.dim(0)], dtype: f32)
@@ -1021,15 +1205,17 @@ extension Inkling2DecoderLayer {
         let (nq, nkv, hd, dRel) = (a.nq, a.nkv, a.hd, a.dRel)
         let C = nkv * hd
         let P = 2 * C + 2 * H
-        let packed = (conv[0] ?? MLXArray.zeros([1, 3, P], dtype: f32)).reshaped([3, P])
-        let h1 = h.reshaped([1, H])
+        // Kernels index their inputs linearly: arrays pass in their stored shapes (no Reshape nodes) and outputs are
+        // declared in the shape their consumer takes. The conv state stays [1, 3, P] (P is a kernel constant).
+        let packed = conv[0] ?? w.zeroConv(P)
+        let h1 = h
         let tg = 768
         let elems = (H + tg - 1) / tg
         let S0 = stack?.dim(2) ?? 0
-        let st0 = stack?.reshaped([S0, H]) ?? w.zeroState!
-        let msgs = messages?.reshaped([-1, H])
+        let st0 = stack ?? w.zeroState!
+        let msgs = messages
         let nqa = isSliding ? 1 : 3
-        let metas = msgs.map { gateMetas(loopIndex: loopIndex, messageRows: $0.dim(0)) }
+        let metas = msgs.map { gateMetas(loopIndex: loopIndex, messageRows: $0.size / H) }
 
         // 1. attention inputs: rows [1 | 3, H] in the model dtype
         var rows: MLXArray
@@ -1077,26 +1263,26 @@ extension Inkling2DecoderLayer {
         let imeta: MLXArray
         if let qp = w.quant {
             if rows.dim(0) == 1 {
-                y = qp(rows, qp.qrg).reshaped([-1])
-                ka = qp(rows, qp.kv).reshaped([-1])
+                y = qp(rows, qp.qrg)
+                ka = qp(rows, qp.kv)
                 va = ka
                 imeta = w.qkvIMetaX!
-                sinks = MLX.matmul(rows, qp.sink.T).reshaped([-1])
+                sinks = MLX.matmul(rows, qp.sink).reshaped([nq])
             } else {
                 let r0 = rows[0 ..< 1]
                 let r1 = rows[1 ..< 2]
                 let r2 = rows[2 ..< 3]
-                y = qp(r0, qp.qrg).reshaped([-1])
-                ka = qp(r1, qp.k).reshaped([-1])
-                va = qp(r2, qp.v).reshaped([-1])
+                y = qp(r0, qp.qrg)
+                ka = qp(r1, qp.k)
+                va = qp(r2, qp.v)
                 imeta = w.qkvIMeta3!
-                sinks = MLX.matmul(r0, qp.sink.T).reshaped([-1])
+                sinks = MLX.matmul(r0, qp.sink).reshaped([nq])
             }
             kda = ka
             vda = va
             if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
-                kda = MLX.matmul(rows[1 ..< 2], kt.T).reshaped([-1])
-                vda = MLX.matmul(rows[2 ..< 3], vt.T).reshaped([-1])
+                kda = MLX.matmul(rows[1 ..< 2], kt)
+                vda = MLX.matmul(rows[2 ..< 3], vt)
             }
         } else {
             if rows.dim(0) == 1 {
@@ -1138,57 +1324,55 @@ extension Inkling2DecoderLayer {
                 a.relLogits.proj, fmeta, imeta, scalars.ints([S, nb]),
             ],
             template: [
-                ("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1),
+                ("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1), ("PP", P),
             ],
             grid: ((nq + 2 * nkv + nq * nb) * 32, 1, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[nQ], [C], [C], [nq * S], [3, 2 * C]],
+            outputShapes: [[1, nq, 1, hd], [1, nkv, 1, hd], [1, nkv, 1, hd], [1, nq, 1, S], [3, 2 * C]],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
 
         // 3. attention
-        var (keys, values) = kv.update(
-            keys: outs[1].reshaped([1, nkv, 1, hd]), values: outs[2].reshaped([1, nkv, 1, hd]))
+        var (keys, values) = kv.update(keys: outs[1], values: outs[2])
         let total = keys.dim(2)
         if total > S {
             keys = keys[0..., 0..., (total - S)..., 0...]
             values = values[0..., 0..., (total - S)..., 0...]
         }
         let attn = MLXFast.scaledDotProductAttention(
-            queries: outs[0].reshaped([1, nq, 1, hd]), keys: keys, values: values, scale: a.scale,
-            mask: .array(outs[3].reshaped([1, nq, 1, S])),
+            queries: outs[0], keys: keys, values: values, scale: a.scale, mask: .array(outs[3]),
             sinks: sinks)
         let gated = Inkling2DecodeKernels.sigmoidGate(
-            [attn.reshaped([nQ]), y, w.sigMeta!], grid: (nQ, 1, 1),
-            threadGroup: (256, 1, 1), outputShapes: [[nQ]], outputDTypes: [dtype])[0]
-        let o = a.oProj(gated.reshaped([1, nQ]))
+            [attn, y, w.sigMeta!], grid: (nQ, 1, 1),
+            threadGroup: (256, 1, 1), outputShapes: [[1, nQ]], outputDTypes: [dtype])[0]
+        let o = a.oProj(gated)
 
         // 4. residual + MLP input
         let states = isBlockBoundary ? inklingAppendState(stack, h) : stack
         let S1 = states?.dim(2) ?? 0
-        let st1 = states?.reshaped([S1, H]) ?? w.zeroState!
+        let st1 = states ?? w.zeroState!
         let norm = msgs == nil
         let midOut = Inkling2DecodeKernels.mid(
             [
-                o.reshaped([H]), h1.reshaped([H]), packed, postAttnConv.weight, st1,
+                o, h1, packed, postAttnConv.weight, st1,
                 w.mlpQuery!, w.mlpNorm!, w.normEps!, w.midMeta!,
             ],
             template: [
                 ("NS", S1 + 1), ("ELEMS", elems), ("TG", tg), ("NORM", norm ? 1 : 0),
-                ("BOUNDARY", isBlockBoundary ? 1 : 0),
+                ("BOUNDARY", isBlockBoundary ? 1 : 0), ("PP", P),
             ],
             grid: (tg, 1, 1), threadGroup: (tg, 1, 1),
-            outputShapes: [[H], [H], [H], [3, H]], outputDTypes: [dtype, f32, f32, f32])
+            outputShapes: [[H], [1, H], [H], [3, H]], outputDTypes: [dtype, f32, f32, f32])
         var xm32 = midOut[1]
         if let msgs {
             xm32 =
                 Inkling2DecodeKernels.messageGates(
-                    x: xm32.reshaped([1, H]), msgs: msgs, down: w.mlpDown!, fg: w.mlpFG!,
+                    x: xm32, msgs: msgs, down: w.mlpDown!, fg: w.mlpFG!,
                     norm: w.mlpNorm!, normEps: w.normEps!, gateEps: w.gateEps!, meta: metas!.1,
                     gates: 1, rows: 1, dtype: dtype
                 ).1
         }
 
         // 5. MoE
-        let x32 = xm32.reshaped([1, H])
+        let x32 = xm32
         let router = mlp.gate
         let logits = MLX.matmul(x32, w.routerT!)
         let sel = Inkling2Kernels.routerSelect(
@@ -1199,17 +1383,23 @@ extension Inkling2DecoderLayer {
         let k = router.topK
         if let jx = mlp.janghExperts {
             // JANGH: H32 rotate + fused gate/up (softcapped activation, H32 output) + router-weighted down, F32.
-            let sum = jx.decodeWeightedSum(x32, indices: inds, scores: sel[1])
+            // Per-pick outputs (combined by `final` with the route weights) or the generic route's weighted sum.
+            let perPick = w.jangh.map {
+                Inkling2DecodeKernels.janghExperts(x32: x32, inds: inds, banks: $0, topK: k)
+            }
+            let sum = perPick ?? jx.decodeWeightedSum(x32, indices: inds, scores: sel[1])
+            let slotted = perPick != nil
             let fin = Inkling2DecodeKernels.final(
                 [
-                    sum, w.singleSlot!, w.ones!, w.unitWeight!,
+                    sum, slotted ? inds : w.singleSlot!, w.ones!, slotted ? sel[1] : w.unitWeight!,
                     packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
                 ],
-                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[H], [3, P]],
+                template: [("PP", P)],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[1, 1, H], [1, 3, P]],
                 outputDTypes: [dtype, f32])
-            conv[0] = fin[1].reshaped([1, 3, P])
+            conv[0] = fin[1]
             conv.offset += 1
-            return (fin[0].reshaped([1, 1, H]), states)
+            return (fin[0], states)
         }
         let sw = mlp.switchMLP!
         let down: MLXArray
@@ -1232,10 +1422,11 @@ extension Inkling2DecoderLayer {
                 sel[1],
                 packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
             ],
-            grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[H], [3, P]],
+            template: [("PP", P)],
+            grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[1, 1, H], [1, 3, P]],
             outputDTypes: [dtype, f32])
-        conv[0] = fin[1].reshaped([1, 3, P])
+        conv[0] = fin[1]
         conv.offset += 1
-        return (fin[0].reshaped([1, 1, H]), states)
+        return (fin[0], states)
     }
 }

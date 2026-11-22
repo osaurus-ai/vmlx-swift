@@ -13,6 +13,22 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
+    /// One routed projection's mapped codebook bank, for model-specific fused kernels (read only).
+    public struct CodebookBank: @unchecked Sendable {
+        /// `[E, N, K * bits / 32]` UInt32, LSB-first bitstream per row.
+        public let packed: MLXArray
+        /// `[E, N]` Float16 row scales.
+        public let scales: MLXArray
+        public let bits: Int
+        /// The `2^bits` codebook levels (F32, as the manifest stores them).
+        public let levels: [Float]
+        /// The projection reads its input in the H32 basis.
+        public let hadamard32: Bool
+    }
+    public let gateBank: CodebookBank
+    public let upBank: CodebookBank
+    public let downBank: CodebookBank
+
     init(banks: JANGHMappedBanks, parentModule: String, inputDimensions: Int,
          activationLimit: Float?, activation: JANGTActivation = .silu) throws {
         let gate = try banks.projection(parentModule + ".gate_proj")
@@ -24,6 +40,16 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
               down.scales.dim(1) == inputDimensions else {
             throw JANGHFormatContract.ValidationError.invalid("JANGH routed architecture geometry mismatch")
         }
+        func bank(_ p: JANGHMappedBanks.Projection, _ role: String) throws -> CodebookBank {
+            guard let spec = banks.contract.projections[parentModule + "." + role],
+                let book = banks.contract.codebooks[spec.bits]
+            else { throw JANGHFormatContract.ValidationError.invalid("JANGH routed bank without codebook") }
+            return CodebookBank(packed: p.packed, scales: p.scales, bits: spec.bits,
+                                levels: book.levels.map { Float($0) }, hadamard32: spec.rotation == .hadamard32)
+        }
+        gateBank = try bank(gate, "gate_proj")
+        upBank = try bank(up, "up_proj")
+        downBank = try bank(down, "down_proj")
         let projections = [gate, up, down]
         supplementalWeightBytes = projections.reduce(0) { $0 + $1.packed.nbytes + $1.scales.nbytes }
         // The sidecar scales have one entry per expert/output row. Count the
