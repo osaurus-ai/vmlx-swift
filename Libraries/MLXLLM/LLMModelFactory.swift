@@ -156,7 +156,15 @@ public enum LLMTypeRegistry {
             },
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
-            "inkling2_loop": create(Inkling2LoopConfiguration.self, Inkling2LoopModel.init),
+            "inkling2_loop": { data, requesting in
+                // The vision tower is built only when the bundle declares one and the request
+                // includes the vision lane (or names no lanes).
+                var args = try JSONDecoder.json5().decode(Inkling2LoopConfiguration.self, from: data)
+                let lanes = try Set.resolveForConstruction(
+                    requested: requesting, constructible: args.vision == nil ? [.text] : [.text, .vision])
+                if !lanes.contains(.vision) { args.vision = nil }
+                return Inkling2LoopModel(args)
+            },
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
             "minimax_m2": { data, _ in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,

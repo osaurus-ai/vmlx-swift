@@ -1542,7 +1542,7 @@ public final class Inkling2ConvRecorder: @unchecked Sendable {
 
 // MARK: - Model
 
-public final class Inkling2LoopModel: Module, LLMModel {
+public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     public let vocabularySize: Int
     let args: Inkling2LoopConfiguration
     public let model: Inkling2LoopModelInner
