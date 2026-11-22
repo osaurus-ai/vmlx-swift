@@ -49,13 +49,15 @@ struct Inkling2LoopJANGHPreparation {
     }
 
     func construct(requesting: Set<ModelRuntimeRequestModality>?) throws -> Inkling2LoopModel {
-        // The vision tower (BF16 as released, `vision_tower.*`) is built whenever the config declares one, exactly as
-        // the non-JANGH dispatch; only the routed experts differ.
-        _ = try Set.resolveForConstruction(
-            requested: requesting, constructible: configuration.vision == nil ? [.text] : [.text, .vision])
+        // Lanes resolve exactly as the non-JANGH dispatch: the vision tower (BF16 as released, `vision_tower.*`) is
+        // built only when the config declares one and the request includes the vision lane (or names none); only the
+        // routed experts differ.
+        var args = configuration
+        let lanes = try Set.resolveForConstruction(
+            requested: requesting, constructible: args.vision == nil ? [.text] : [.text, .vision])
+        if !lanes.contains(.vision) { args.vision = nil }
         let routed = try banks.makeCodebookRoutedExperts(
-            activation: .inkling(gateCap: configuration.mlpGateSoftcap, upCap: configuration.mlpUpSoftcap))
-        return try Inkling2LoopModel(
-            configuration, routedExperts: routed, excludedTensorNames: banks.excludedTensorNames)
+            activation: .inkling(gateCap: args.mlpGateSoftcap, upCap: args.mlpUpSoftcap))
+        return try Inkling2LoopModel(args, routedExperts: routed, excludedTensorNames: banks.excludedTensorNames)
     }
 }
