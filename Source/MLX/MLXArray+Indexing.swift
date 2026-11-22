@@ -908,8 +908,12 @@ func updateSlice(
         return nil
     }
 
-    // Remove leading singletons dimensions from the update
-    var update = update.leadingSingletonDimensionsRemoved(stream: stream)
+    // Leading singleton dimensions of the update are ignored. They are dropped by SHAPE arithmetic only: the update
+    // array is reshaped at most once, at the end, and only when its shape differs from the one the slice update
+    // needs (a same-shape append, e.g. a KV cache row, adds no Reshape nodes to the graph).
+    let original = update
+    let trimmed = Array(update.shape.trimmingPrefix { $0 == 1 })
+    let squeezedShape = trimmed.isEmpty ? [1] : trimmed
 
     // Build slice update params
     var starts = [Int32](repeating: 0, count: ndim)
@@ -923,6 +927,9 @@ func updateSlice(
         ends[0] = slice.end(size)
         strides[0] = slice.stride
 
+        // Broadcasting ignores leading singletons, so the update goes in unchanged unless it has more dimensions
+        // than the source.
+        let update = original.ndim <= ndim ? original : original.reshaped(squeezedShape, stream: stream)
         var result = mlx_array_new()
         mlx_slice_update(
             &result,
@@ -937,17 +944,17 @@ func updateSlice(
     // If no non-None indices return the broadcasted update
     let nonNewAxisOperationCount = countNonNewAxisOperations(operations)
     if nonNewAxisOperationCount == 0 {
-        return broadcast(update, to: src.shape)
+        return broadcast(original.reshaped(squeezedShape, stream: stream), to: src.shape)
     }
 
     // Process entries
     var updateReshape = [Int](repeating: 0, count: src.ndim)
     var axis = src.ndim - 1
-    var updateAxis = update.ndim - 1
+    var updateAxis = squeezedShape.count - 1
 
     while axis >= nonNewAxisOperationCount {
         if updateAxis >= 0 {
-            updateReshape[axis] = update.dim(updateAxis)
+            updateReshape[axis] = squeezedShape[updateAxis]
             updateAxis -= 1
         } else {
             updateReshape[axis] = 1
@@ -977,7 +984,7 @@ func updateSlice(
             strides[axis] = slice.stride
 
             if updateAxis >= 0 {
-                updateReshape[axis] = update.dim(updateAxis)
+                updateReshape[axis] = squeezedShape[updateAxis]
                 updateAxis -= 1
             } else {
                 updateReshape[axis] = 1
@@ -989,7 +996,7 @@ func updateSlice(
         }
     }
 
-    update = reshaped(update, updateReshape)
+    let update = original.shape == updateReshape ? original : reshaped(original, updateReshape)
 
     var result = mlx_array_new()
     mlx_slice_update(
