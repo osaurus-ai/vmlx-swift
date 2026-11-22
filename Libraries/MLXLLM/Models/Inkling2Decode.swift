@@ -910,7 +910,7 @@ enum Inkling2DecodeKernels {
     ) -> (MLXArray, MLXArray) {
         let H = x.dim(-1)
         let rank = down.dim(1)
-        let tgD = 256
+        let tgD = 512  // measured on M5 Ultra: 256 / 512 / 1024 -> 103.3 / 104.5 / 104.9 tok/s
         let ops = 1
         let nch = (rank + (tgD / 32) * ops - 1) / ((tgD / 32) * ops)
         let n = gates * rows
