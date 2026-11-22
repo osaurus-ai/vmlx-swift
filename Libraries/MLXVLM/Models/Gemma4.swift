@@ -1715,7 +1715,10 @@ public struct Gemma4Processor: UserInputProcessor {
                 // Preserve the stored RGB domain through resize and rescale.
                 // ICC gamut conversion and an extra tone curve change the
                 // pixels relative to the reference's plain RGB conversion.
-                return MediaProcessing.asMLXArrayUnmanaged(resized)
+                // The reference resizes RGB bytes before converting to float
+                // and rescaling. Materialize the same byte-domain input
+                // before the model and the cache see the pixel tensor.
+                return MediaProcessing.asMLXArrayUnmanagedRGB8(resized)
             }
             // Store per-image dimensions in frames so prepare() can extract each
             // image at its original size (before padding for batch storage).
