@@ -13,7 +13,7 @@ import MLXLMCommon
 /// - routed experts `model.layers.L.mlp.switch_mlp.{gate,up,down}_proj` are `{"mode": "jangtq2", "bits": 2|3,
 ///   "rotation": "hadamard32"}` codebook banks (`tq2_packed`, `tq2_scales`) on all 24 layers, gate and up with the
 ///   same width per layer, separate (not row-interleaved like the checkpoint's `w13`);
-/// - `vision_tower.*` (dropped by this text-only runtime) and `mtp_drafter.*` (the native dSpark drafter, BF16).
+/// - `vision_tower.*` (the vision tower, BF16 as released) and `mtp_drafter.*` (the native dSpark drafter, BF16).
 ///
 /// The routed activation is the model's (`mlp_gate_softcap`, `mlp_up_softcap` from the config), never the bundle's:
 /// `h = softcap(g, 4) * sigmoid(g) * softcap(u, 25)`, fused into the JANGH gate/up epilogues.
@@ -49,8 +49,10 @@ struct Inkling2LoopJANGHPreparation {
     }
 
     func construct(requesting: Set<ModelRuntimeRequestModality>?) throws -> Inkling2LoopModel {
-        // Text only (the vision tower is not part of this runtime), exactly as the non-JANGH dispatch.
-        _ = try Set.resolveForConstruction(requested: requesting, constructible: [.text])
+        // The vision tower (BF16 as released, `vision_tower.*`) is built whenever the config declares one, exactly as
+        // the non-JANGH dispatch; only the routed experts differ.
+        _ = try Set.resolveForConstruction(
+            requested: requesting, constructible: configuration.vision == nil ? [.text] : [.text, .vision])
         let routed = try banks.makeCodebookRoutedExperts(
             activation: .inkling(gateCap: configuration.mlpGateSoftcap, upCap: configuration.mlpUpSoftcap))
         return try Inkling2LoopModel(
