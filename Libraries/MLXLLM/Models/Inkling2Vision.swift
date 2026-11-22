@@ -246,7 +246,7 @@ public final class Inkling2VisionModel: Module {
 
     /// Features of one image: `tiles` `[rows * cols, tile, tile, C]` (normalized pixels, tile-major)
     /// -> `[rows * cols, textHidden]`.
-    func features(tiles: MLXArray, rows: Int, cols: Int) -> MLXArray {
+    public func features(tiles: MLXArray, rows: Int, cols: Int) -> MLXArray {
         let c = config
         let (m, p, H) = (c.mergeSize, c.patchSize, c.hiddenSize)
         let count = rows * cols
