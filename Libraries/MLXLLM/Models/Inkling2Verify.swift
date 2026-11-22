@@ -280,7 +280,30 @@ extension Inkling2DecoderLayer {
         let ka: MLXArray
         let va: MLXArray
         var imeta: [Int32]
-        if rowsK == nil {
+        if let qp = w.quant {
+            // Affine projections: qa = [q | r | gate | sink] (the plain sink appended, as the mask reads it at
+            // 2nQ + nR), ka / va from the quantized k / v rows (+ the plain dynamic-tap rows after them).
+            qa = MLX.concatenated([qp(rowsQ, qp.qrg), MLX.matmul(rowsQ, qp.sink)], axis: -1)
+            if rowsK == nil {
+                let kv = qp(rowsQ, qp.kv)  // [T, 2C]
+                ka = kv
+                va = kv
+                imeta = [0, Int32(nQ), 0, 0, Int32(C), 0, Int32(qa.dim(1)), Int32(2 * C), Int32(2 * C)]
+            } else {
+                var kk = qp(rowsK!, qp.k)
+                var vv = qp(rowsV!, qp.v)
+                if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
+                    kk = MLX.concatenated([kk, MLX.matmul(rowsK!, kt)], axis: -1)
+                    vv = MLX.concatenated([vv, MLX.matmul(rowsV!, vt)], axis: -1)
+                }
+                ka = kk
+                va = vv
+                imeta = [
+                    0, Int32(nQ), 0, Int32(C), 0, Int32(C), Int32(qa.dim(1)), Int32(ka.dim(1)),
+                    Int32(va.dim(1)),
+                ]
+            }
+        } else if rowsK == nil {
             let y = MLX.matmul(rowsQ, w.xFused!.T)  // [T, N]
             qa = y
             ka = y
@@ -409,8 +432,36 @@ extension Inkling2DecoderLayer {
             threadGroup: (128, 1, 1), outputShapes: [[T, router.topK], [T, router.topK]],
             outputDTypes: [.uint32, f32])
         let inds = sel[0]
-        let sw = mlp.switchMLP
         let k = router.topK
+        if let jx = mlp.janghExperts {
+            // JANGH: the router-weighted sum per row (decode kernels, F32), combined by the final kernel as one slot.
+            let perPick = w.jangh.map {
+                Inkling2DecodeKernels.janghExperts(x32: xm32, inds: inds, banks: $0, topK: k).down  // [T * k, H]
+            }
+            let sum = perPick ?? jx.decodeWeightedSum(xm32, indices: inds, scores: sel[1])  // [T, H]
+            let fin = Inkling2VerifyKernels.finalT(
+                [
+                    sum, perPick != nil ? inds : MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
+                    perPick != nil ? sel[1] : MLXArray.ones([T, 1], dtype: f32),
+                    packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
+                    MLXArray([Int32(2 * C), Int32(H)]),
+                ],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
+                outputDTypes: [dtype, f32, f32])
+            if let recorder {
+                let kRaw = ka[0..., Int(imeta[2]) ..< (Int(imeta[2]) + C)].asType(f32)
+                let vRaw = va[0..., Int(imeta[4]) ..< (Int(imeta[4]) + C)].asType(f32)
+                recorder.record(
+                    conv: conv, oldState: packed.reshaped([1, 3, P]),
+                    inputs: MLX.concatenated([kRaw, vRaw, o.asType(f32), fin[2]], axis: -1).reshaped([
+                        1, T, P,
+                    ]))
+            }
+            conv[0] = fin[1].reshaped([1, 3, P])
+            conv.offset += T
+            return (fin[0].reshaped([1, T, H]), states)
+        }
+        let sw = mlp.switchMLP!
         // Per-row expert gathers: measured fastest at T = 8 on M5 Max (gate/up 326 us vs 636 for a
         // grouped one-read-per-expert kernel and ~800 sorted): rows in a verify block rarely share
         // experts, so the gather is already at bandwidth.

@@ -40,18 +40,19 @@ extension Inkling2LoopModel {
 
     /// The trunk over a cache that may carry draft state: plain forward, or capture + draft-context
     /// maintenance (+ verify recording when a verify is pending). Returns the final normed hidden.
-    func trunk(_ ids: MLXArray, cache: [KVCache]?) -> MLXArray {
+    func trunk(_ ids: MLXArray, cache: [KVCache]?, embeddings: MLXArray? = nil) -> MLXArray {
         guard let cache, cacheHasDraftState(cache), let d = drafter else {
-            return model(ids, cache: cache)
+            return model.forward(ids, cache: cache, capture: nil, recorder: nil, embeddings: embeddings)
         }
-        d.prepare(lmHeadWeight: lmHead.weight)
+        d.prepare(lmHeadWeight: denseUnembedWeight())
         let slots = 2 * args.numCacheSlots
         let target = Array(cache[0 ..< slots])
         let ctx = (0 ..< d.cfg.layers).map { cache[slots + $0] as! KVCacheSimple }
         let feat = cache[slots + d.cfg.layers] as! MambaCache
         let cap = Inkling2Capture(ids: d.cfg.targetLayerIds)
         let pending = pendingVerify
-        let hidden = model.forward(ids, cache: target, capture: cap, recorder: pending?.recorder)
+        let hidden = model.forward(
+            ids, cache: target, capture: cap, recorder: pending?.recorder, embeddings: embeddings)
         let caps = cap.stacked().asType(.bfloat16)  // [T, 4, H]
         let T = caps.dim(0)
         d.writeContext(caps, pos0: ctx[0].offset, caches: ctx)
@@ -111,7 +112,7 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         let d = model.drafter!
         return Array(
             d.walk(
-                h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
+                h: h, unembed: { model.lmHead($0) }, anchor: seed, fRnn: fRnn,
                 steps: min(count, d.cfg.blockSize - 1)))
     }
 
@@ -127,7 +128,7 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         let (h, fRnn) = block(seed: seed, cache: cache)
         let d = model.drafter!
         return d.walk(
-            h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
+            h: h, unembed: { model.lmHead($0) }, anchor: seed, fRnn: fRnn,
             steps: min(count, d.cfg.blockSize - 1), noise: noise,
             inverseTemperature: inverseTemperature)
     }

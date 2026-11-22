@@ -143,6 +143,7 @@ public enum JANGTFastDecode {
         case .oai(let alpha):
             return "_oai" + "\(alpha)".replacingOccurrences(of: ".", with: "p").replacingOccurrences(of: "-", with: "m")
                 + lim
+        case .inkling: return activation.nameTag + lim
         }
     }
 

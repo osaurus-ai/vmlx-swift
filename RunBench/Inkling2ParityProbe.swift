@@ -15,6 +15,10 @@ import VMLXTokenizers
 
 func runInkling2ParityProbe(modelPath: String) async throws {
     let env = ProcessInfo.processInfo.environment
+    if let visionRef = env["BENCH_INKLING2_VISION_REF"] {
+        try await runInkling2VisionParity(modelPath: modelPath, refPath: visionRef)
+        return
+    }
     guard let refPath = env["BENCH_INKLING2_REF"] else {
         print("[INK2] BENCH_INKLING2_REF is required")
         exit(2)
@@ -637,5 +641,43 @@ func runInkling2AppPathProbe(modelPath: String) async throws {
                 format: "[APPPATH] run=%d cache=%@ prompt=%d restored=%d gen=%d decode tok/s=%.1f",
                 r + 1, cacheOn ? "on" : "off", info.promptTokenCount, restored,
                 info.generationTokenCount, info.tokensPerSecond))
+    }
+}
+
+
+/// BENCH_INKLING2_VISION_REF=<safetensors>: the vision tower's features for stored tiles against a
+/// reference (`<name>.tiles` [N, 40, 40, 3], `<name>.grid` [rows, cols], `<name>.features`
+/// [N, text_hidden] fp32). Reports max |d|, relative RMS error and the minimum per-tile cosine.
+func runInkling2VisionParity(modelPath: String, refPath: String) async throws {
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    guard let model = context.model as? Inkling2LoopModel, let vision = model.vision else {
+        print("[INK2V] INVALID: no vision tower built")
+        exit(2)
+    }
+    if ProcessInfo.processInfo.environment["BENCH_INKLING2_VISION_F32"] == "1" {
+        // Precision isolation: the whole tower in fp32 (pair with MLX_ENABLE_TF32=0 and an fp32 reference).
+        try vision.update(
+            parameters: vision.parameters().mapValues { $0.asType(.float32) }, verify: .none)
+    }
+    let ref = try MLX.loadArrays(url: URL(fileURLWithPath: refPath))
+    let names = Set(ref.keys.compactMap { $0.split(separator: ".").first.map(String.init) }).sorted()
+    for name in names {
+        guard let tiles = ref["\(name).tiles"], let grid = ref["\(name).grid"],
+            let want = ref["\(name).features"]
+        else { continue }
+        let g = grid.asArray(Int32.self)
+        let got = vision.features(tiles: tiles, rows: Int(g[0]), cols: Int(g[1])).asType(.float32)
+        let d = got - want
+        let maxAbs = MLX.abs(d).max().item(Float.self)
+        let rel = (MLX.sqrt(MLX.mean(d * d)) / MLX.sqrt(MLX.mean(want * want))).item(Float.self)
+        let cos = (MLX.sum(got * want, axis: -1)
+            / (MLX.sqrt(MLX.sum(got * got, axis: -1)) * MLX.sqrt(MLX.sum(want * want, axis: -1)) + 1e-12))
+            .min().item(Float.self)
+        let mag = MLX.abs(want).mean().item(Float.self)
+        print(String(
+            format: "[INK2V] %@ grid=%dx%d tiles=%d ref_mean_abs=%.4f max_abs_diff=%.4f rel_rms=%.2e min_cos=%.6f",
+            name, Int(g[0]), Int(g[1]), want.dim(0), mag, maxAbs, rel, cos))
     }
 }
