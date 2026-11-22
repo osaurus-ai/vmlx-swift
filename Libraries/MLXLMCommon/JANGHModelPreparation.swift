@@ -264,6 +264,20 @@ public final class JANGHModelPreparation {
         }
     }
 
+    /// Codebook-only routed stacks with a model activation (Inkling-2: softcapped gate/up): every routed projection
+    /// must be a `jangtq2` codebook bank (no trellis), and each layer runs the JANGH decode kernels with the variant
+    /// fused into the gate/up epilogue (decode and prefill tiles alike).
+    public func makeCodebookRoutedExperts(activation: JANGTActivation) throws -> [Int: JANGHRoutedExpertLayer] {
+        guard relu2Layout == nil, source.contract.trellis.isEmpty else {
+            throw JANGHFormatContract.ValidationError.invalid("codebook routed experts require jangtq2 banks only")
+        }
+        let banks = try mapBanks()
+        return try moduleByLayer.mapValues {
+            try JANGHRoutedExpertLayer(banks: banks, parentModule: $0, inputDimensions: hiddenSize,
+                                       activationLimit: nil, activation: activation)
+        }
+    }
+
     static func selectedDiagnosticCacheBytes(environment: [String: String]) throws -> Int {
         guard let raw = environment["VMLX_JANGH_SELECTED_CACHE_MIB"] else { return 128 * 1024 * 1024 }
         guard let mib = Int(raw), mib >= 0, mib <= 16 * 1024 else {

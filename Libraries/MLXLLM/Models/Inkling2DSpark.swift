@@ -157,10 +157,11 @@ public final class Inkling2DSparkDrafter: Module {
     }
 
     /// Build the folded Markov output head against the target's unembedding (once).
-    func prepare(lmHeadWeight: MLXArray) {
+    /// `lmHeadWeight` is evaluated only on the first call (a quantized head dequantizes once, transiently).
+    func prepare(lmHeadWeight: @autoclosure () -> MLXArray) {
         guard derived.foldWeight == nil else { return }
         derived.fuseAlpha = MLX.softmax(fuseWeight.asType(f32), axis: -1).asType(.bfloat16)
-        let wu = lmHeadWeight.asType(f32)
+        let wu = lmHeadWeight().asType(f32)
         derived.foldWeight = MLX.matmul(wu, markovHead.hiddenOut.weight.asType(f32)).asType(
             .bfloat16)
         derived.foldBias = MLX.matmul(wu, markovHead.hiddenOut.bias!.asType(f32)).asType(.bfloat16)
@@ -250,13 +251,13 @@ public final class Inkling2DSparkDrafter: Module {
     /// `fRnn` [H]. Greedy (argmax) unless `noise` [>= steps, unpadded vocab] is given: then step i
     /// proposes argmax(v * inverseTemperature + noise[i]) (coupled sampled drafting).
     func walk(
-        h: MLXArray, lmHeadWeight: MLXArray, anchor: Int, fRnn: MLXArray, steps: Int? = nil,
+        h: MLXArray, unembed: (MLXArray) -> MLXArray, anchor: Int, fRnn: MLXArray, steps: Int? = nil,
         noise: MLXArray? = nil, inverseTemperature: Float = 1
     ) -> [Int] {
         let mh = markovHead
         let R = cfg.markovRank
         let n = min(steps ?? (cfg.blockSize - 1), cfg.blockSize - 1)
-        let base = MLX.matmul(h[0 ..< n], lmHeadWeight.T)  // [n, V] bf16
+        let base = unembed(h[0 ..< n])  // [n, V] bf16 (the target's head: plain or affine)
         var state = MLXArray.zeros([R], dtype: .bfloat16)
         // `prev` stays on the GPU: argmax -> embedding gather, one evaluation for the whole walk.
         var prev = MLXArray([Int32(anchor)])

@@ -937,18 +937,31 @@ final class Inkling2Router: Module {
 
 final class Inkling2MoE: Module {
     @ModuleInfo(key: "gate") var gate: Inkling2Router
-    @ModuleInfo(key: "switch_mlp") var switchMLP: Inkling2SwitchMLP
+    /// The checkpoint's native NVFP4 / MXFP8 experts; nil for a JANGH bundle.
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Inkling2SwitchMLP?
+    /// A JANGH bundle's mapped codebook banks for this layer (no parameters: the generic loader never sees the
+    /// `tq2_*` tensors). Gate/up run with Inkling's softcapped activation fused into the epilogue.
+    @ModuleInfo(key: "jangh_experts") var janghExperts: JANGHRoutedExpertLayer?
 
-    init(_ args: Inkling2LoopConfiguration) {
+    init(_ args: Inkling2LoopConfiguration, jangh: JANGHRoutedExpertLayer? = nil) {
         _gate.wrappedValue = Inkling2Router(args)
-        _switchMLP.wrappedValue = Inkling2SwitchMLP(args)
+        if let jangh {
+            _janghExperts.wrappedValue = jangh
+        } else {
+            _switchMLP.wrappedValue = Inkling2SwitchMLP(args)
+        }
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (B, T, H) = (x.dim(0), x.dim(1), x.dim(2))
         let flat = x.reshaped([-1, H])
         let (inds, w) = gate(flat)
-        return switchMLP(flat, inds, w).reshaped([B, T, H])
+        if let janghExperts {
+            // Reference: (expert_out * weight_fp32) summed in fp32, cast to the input dtype.
+            return janghExperts.callRouted(flat, indices: inds.asType(.uint32), scores: w)
+                .reshaped([B, T, H])
+        }
+        return switchMLP!(flat, inds, w).reshaped([B, T, H])
     }
 }
 
@@ -1114,7 +1127,7 @@ final class Inkling2DecoderLayer: Module {
     private let attnNormBox = Inkling2DerivedBox()
     private let mlpNormBox = Inkling2DerivedBox()
 
-    init(_ args: Inkling2LoopConfiguration, index: Int) {
+    init(_ args: Inkling2LoopConfiguration, index: Int, jangh: JANGHRoutedExpertLayer? = nil) {
         self.index = index
         isSliding = args.isSliding(index)
         isBlockBoundary = args.isBlockBoundary(index)
@@ -1129,7 +1142,7 @@ final class Inkling2DecoderLayer: Module {
         }
         _mlpInput.wrappedValue = Inkling2BlockAttentionResidual(hidden: H, queries: 1)
         _selfAttn.wrappedValue = Inkling2Attention(args, layer: index)
-        _mlp.wrappedValue = Inkling2MoE(args)
+        _mlp.wrappedValue = Inkling2MoE(args, jangh: jangh)
         let eps = args.rmsNormEps
         if isSliding {
             _inputLN.wrappedValue = Inkling2RMSNorm(H, eps: eps)
@@ -1297,12 +1310,14 @@ public final class Inkling2LoopModelInner: Module {
     /// fp32 ones: the weight of every unweighted RMSNorm (largest width used is `hidden`).
     let ones: MLXArray
 
-    init(_ args: Inkling2LoopConfiguration) {
+    init(_ args: Inkling2LoopConfiguration, routedExperts: [Int: JANGHRoutedExpertLayer] = [:]) {
         self.args = args
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
         _embedNorm.wrappedValue = Inkling2RMSNorm(args.hiddenSize, eps: args.rmsNormEps)
-        layers = (0 ..< args.numHiddenLayers).map { Inkling2DecoderLayer(args, index: $0) }
+        layers = (0 ..< args.numHiddenLayers).map {
+            Inkling2DecoderLayer(args, index: $0, jangh: routedExperts[$0])
+        }
         _norm.wrappedValue = Inkling2RMSNorm(args.hiddenSize, eps: args.rmsNormEps)
         _finalInput.wrappedValue = Inkling2BlockAttentionResidual(
             hidden: args.hiddenSize, queries: 1)
@@ -1475,12 +1490,37 @@ public final class Inkling2LoopModel: Module, LLMModel {
     /// A dSpark verify in flight (set by the draft session around one target forward).
     var pendingVerify: Inkling2PendingVerify?
 
+    /// Tensors the generic loader must skip: a JANGH bundle's routed codebook banks (mapped by the preparation).
+    let customTensorNames: Set<String>
+
     public init(_ args: Inkling2LoopConfiguration) {
         self.args = args
         vocabularySize = args.vocabSize
+        customTensorNames = []
         model = Inkling2LoopModelInner(args)
         if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
         // `embed` and `unembed` are separate tensors in the checkpoint, never tied.
+        _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+    }
+
+    /// A JANGH bundle: every layer's routed experts are the admitted mapped codebook banks (`routedExperts`, keyed by
+    /// layer, all layers) and `excludedTensorNames` are exactly those banks' tensors.
+    init(
+        _ args: Inkling2LoopConfiguration, routedExperts: [Int: JANGHRoutedExpertLayer],
+        excludedTensorNames: Set<String>
+    ) throws {
+        let layers = Set(0 ..< args.numHiddenLayers)
+        guard Set(routedExperts.keys) == layers,
+            JANGHModelPreparation.isCanonicalRoutedExclusionSet(excludedTensorNames, routedLayers: layers)
+        else {
+            throw Inkling2LoopJANGHPreparation.PreparationError.invalid(
+                "Inkling-2 JANGH: routed banks \(routedExperts.keys.sorted()) do not cover layers 0..<\(args.numHiddenLayers)")
+        }
+        self.args = args
+        vocabularySize = args.vocabSize
+        customTensorNames = excludedTensorNames
+        model = Inkling2LoopModelInner(args, routedExperts: routedExperts)
+        if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
 
@@ -1697,6 +1737,22 @@ public final class Inkling2LoopModel: Module, LLMModel {
         }
         return n
     }
+}
+
+extension Inkling2LoopModel {
+    /// The unembedding as a dense `[V, H]` matrix: the weight itself, or an affine head dequantized (transient).
+    func denseUnembedWeight() -> MLXArray {
+        if let q = lmHead as? QuantizedLinear {
+            return MLX.dequantized(
+                q.weight, scales: q.scales, biases: q.biases, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+        }
+        return lmHead.weight
+    }
+}
+
+extension Inkling2LoopModel: SafetensorsLoadKeyExcluding {
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool { customTensorNames.contains(key) }
+    public var requiresExactTensorMmapBuffers: Bool { !customTensorNames.isEmpty }
 }
 
 extension Inkling2LoopModel: LoRAModel {

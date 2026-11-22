@@ -44,7 +44,7 @@ extension Inkling2LoopModel {
         guard let cache, cacheHasDraftState(cache), let d = drafter else {
             return model(ids, cache: cache)
         }
-        d.prepare(lmHeadWeight: lmHead.weight)
+        d.prepare(lmHeadWeight: denseUnembedWeight())
         let slots = 2 * args.numCacheSlots
         let target = Array(cache[0 ..< slots])
         let ctx = (0 ..< d.cfg.layers).map { cache[slots + $0] as! KVCacheSimple }
@@ -111,7 +111,7 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         let d = model.drafter!
         return Array(
             d.walk(
-                h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
+                h: h, unembed: { model.lmHead($0) }, anchor: seed, fRnn: fRnn,
                 steps: min(count, d.cfg.blockSize - 1)))
     }
 
@@ -127,7 +127,7 @@ final class Inkling2DSparkDraftSession: DSparkDraftSession, @unchecked Sendable 
         let (h, fRnn) = block(seed: seed, cache: cache)
         let d = model.drafter!
         return d.walk(
-            h: h, lmHeadWeight: model.lmHead.weight, anchor: seed, fRnn: fRnn,
+            h: h, unembed: { model.lmHead($0) }, anchor: seed, fRnn: fRnn,
             steps: min(count, d.cfg.blockSize - 1), noise: noise,
             inverseTemperature: inverseTemperature)
     }

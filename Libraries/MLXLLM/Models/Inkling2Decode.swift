@@ -154,7 +154,7 @@ enum Inkling2DecodeKernels {
     static let qkv = MLXFast.metalKernel(
         name: "inkling2_dec_qkv",
         inputNames: [
-            "qa", "ka", "va", "kw", "vw", "packed", "qscale", "rscale", "proj", "fmeta", "imeta",
+            "qa", "ka", "va", "kda", "vda", "kw", "vw", "packed", "qscale", "rscale", "proj", "fmeta", "imeta",
             "sarr",
         ],
         outputNames: ["qo", "ko", "vo", "bias", "kvst"],
@@ -210,6 +210,7 @@ enum Inkling2DecodeKernels {
                 bool isK = head < (uint)(NQ + NKV);
                 int h = isK ? head - NQ : head - NQ - NKV;
                 const device auto* src = isK ? ka : va;
+                const device auto* dsrc = isK ? kda : vda;
                 int off = isK ? imeta[2] : imeta[4];
                 int doff = isK ? imeta[3] : imeta[5];
                 const device float* w = isK ? kw : vw;
@@ -221,8 +222,8 @@ enum Inkling2DecodeKernels {
                     float s0 = packed[col0 + c], s1 = packed[P + col0 + c], s2 = packed[2 * P + col0 + c];
                     float o;
                     if (DYN) {
-                        float d0 = float(src[doff + h * 4 + 0]), d1 = float(src[doff + h * 4 + 1]);
-                        float d2 = float(src[doff + h * 4 + 2]), d3 = float(src[doff + h * 4 + 3]);
+                        float d0 = float(dsrc[doff + h * 4 + 0]), d1 = float(dsrc[doff + h * 4 + 1]);
+                        float d2 = float(dsrc[doff + h * 4 + 2]), d3 = float(dsrc[doff + h * 4 + 3]);
                         float a = xt * (w[c] + d0);
                         a = a + s2 * (w[C + c] + d1);
                         a = a + s1 * (w[2 * C + c] + d2);
@@ -746,6 +747,80 @@ final class Inkling2StepScalars {
     }
 }
 
+/// Affine-quantized x-fed projections of one layer, concatenated by rows where they share an input:
+/// `[q | r | gate]`, `[k | v]` (one input row), `k`, `v`; the plain sink projection and dynamic-conv tap
+/// projections (BF16 as released) apart.
+struct Inkling2QuantizedProjections {
+    struct Packed {
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray?
+    }
+    let qrg: Packed
+    let kv: Packed
+    let k: Packed
+    let v: Packed
+    let sink: MLXArray
+    let kTaps: MLXArray?
+    let vTaps: MLXArray?
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+    /// qkv kernel offsets `[q, r, k, k taps, v, v taps]`: one input row (`qa` = [q|r|gate], `ka` = `va` = [k|v])
+    /// and three rows (separate arrays, taps in their own arrays).
+    let imetaX: MLXArray
+    let imeta3: MLXArray
+
+    /// All five x-fed projections share one affine format, the sink stays a plain `Linear`.
+    static func make(_ a: Inkling2Attention) -> Self? {
+        let parts: [Linear] = [a.qProj, a.rProj, a.gateProj, a.kProj, a.vProj]
+        guard let q0 = parts[0] as? QuantizedLinear, type(of: a.sinkProj) == Linear.self,
+            a.sinkProj.bias == nil
+        else { return nil }
+        let qs = parts.compactMap { $0 as? QuantizedLinear }
+        guard qs.count == parts.count,
+            qs.allSatisfy({
+                $0.bits == q0.bits && $0.groupSize == q0.groupSize && $0.mode == q0.mode
+                    && ($0.biases == nil) == (q0.biases == nil) && $0.bias == nil
+            })
+        else { return nil }
+        func cat(_ ls: [QuantizedLinear]) -> Packed {
+            Packed(
+                weight: MLX.concatenated(ls.map(\.weight), axis: 0),
+                scales: MLX.concatenated(ls.map(\.scales), axis: 0),
+                biases: q0.biases == nil ? nil : MLX.concatenated(ls.map { $0.biases! }, axis: 0))
+        }
+        func one(_ l: QuantizedLinear) -> Packed { Packed(weight: l.weight, scales: l.scales, biases: l.biases) }
+        var kTaps: MLXArray? = nil
+        var vTaps: MLXArray? = nil
+        if let kd = a.kSconv as? Inkling2DynamicShortConv, let vd = a.vSconv as? Inkling2DynamicShortConv {
+            guard type(of: kd.weightProj) == Linear.self, type(of: vd.weightProj) == Linear.self else { return nil }
+            kTaps = kd.weightProj.weight
+            vTaps = vd.weightProj.weight
+        }
+        let (nq, hd, dRel) = (a.nq, a.hd, a.dRel)
+        let (nQ, C) = (nq * hd, a.nkv * hd)
+        _ = dRel
+        return Self(
+            qrg: cat([qs[0], qs[1], qs[2]]), kv: cat([qs[3], qs[4]]), k: one(qs[3]), v: one(qs[4]),
+            sink: a.sinkProj.weight, kTaps: kTaps, vTaps: vTaps, groupSize: q0.groupSize, bits: q0.bits,
+            mode: q0.mode,
+            imetaX: MLXArray([0, Int32(nQ), 0, 0, Int32(C), 0]),
+            imeta3: MLXArray([0, Int32(nQ), 0, 0, 0, 0]))
+    }
+
+    func callAsFunction(_ x: MLXArray, _ p: Packed) -> MLXArray {
+        MLX.quantizedMM(
+            x, p.weight, scales: p.scales, biases: p.biases, transpose: true, groupSize: groupSize,
+            bits: bits, mode: mode)
+    }
+
+    var arrays: [MLXArray] {
+        [qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
+            + [sink] + [kTaps, vTaps].compactMap { $0 }
+    }
+}
+
 /// Per-layer weights re-laid-out for the decode path (built on first use, outside the module's
 /// parameter tree).
 final class Inkling2DecodeWeights: @unchecked Sendable {
@@ -786,6 +861,11 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var loopIndex = -1
     /// Both expert projections NVFP4 with the layout the batch-1 kernels read.
     var nativeFP4Experts = false
+    /// Affine-quantized attention-input projections (a JANG bundle), else nil (plain weights above).
+    var quant: Inkling2QuantizedProjections?
+    /// A JANGH layer's routed sum arrives pre-weighted: the final kernel combines one slot (expert 0, weight 1).
+    var singleSlot: MLXArray?
+    var unitWeight: MLXArray?
     var ready = false
     private var zeroSinkCache: MLXArray?
 
@@ -804,9 +884,13 @@ extension Inkling2DecoderLayer {
     func supportsDecodeStep() -> Bool {
         let a = selfAttn
         let plain: [Linear] = [a.qProj, a.rProj, a.gateProj, a.sinkProj, a.kProj, a.vProj]
-        guard plain.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil }) else {
+        guard plain.allSatisfy({ type(of: $0) == Linear.self && $0.bias == nil })
+            || Inkling2QuantizedProjections.make(a) != nil
+        else {
             return false
         }
+        // Routed experts: the checkpoint's own encoding or a JANGH bundle's codebook banks.
+        guard mlp.switchMLP != nil || mlp.janghExperts != nil else { return false }
         if let gates = [qGate, kGate, vGate, mlpGate] as? [Inkling2MessageGate] {
             for g in gates {
                 guard type(of: g.downProj) == Linear.self, type(of: g.forgetProj) == Linear.self,
@@ -827,18 +911,22 @@ extension Inkling2DecoderLayer {
         guard !w.ready else { return }
         let a = selfAttn
         let H = hidden
-        let qParts = [a.qProj.weight, a.rProj.weight, a.gateProj.weight, a.sinkProj.weight]
-        if isSliding {
-            w.xFused = MLX.concatenated(qParts + [a.kProj.weight, a.vProj.weight], axis: 0)
-            w.kFused = a.kProj.weight
-            w.vFused = a.vProj.weight
+        if let qp = Inkling2QuantizedProjections.make(a) {
+            w.quant = qp
         } else {
-            let kd = (a.kSconv as! Inkling2DynamicShortConv).weightProj.weight
-            let vd = (a.vSconv as! Inkling2DynamicShortConv).weightProj.weight
-            w.kFused = MLX.concatenated([a.kProj.weight, kd.asType(a.kProj.weight.dtype)], axis: 0)
-            w.vFused = MLX.concatenated([a.vProj.weight, vd.asType(a.vProj.weight.dtype)], axis: 0)
+            let qParts = [a.qProj.weight, a.rProj.weight, a.gateProj.weight, a.sinkProj.weight]
+            if isSliding {
+                w.xFused = MLX.concatenated(qParts + [a.kProj.weight, a.vProj.weight], axis: 0)
+                w.kFused = a.kProj.weight
+                w.vFused = a.vProj.weight
+            } else {
+                let kd = (a.kSconv as! Inkling2DynamicShortConv).weightProj.weight
+                let vd = (a.vSconv as! Inkling2DynamicShortConv).weightProj.weight
+                w.kFused = MLX.concatenated([a.kProj.weight, kd.asType(a.kProj.weight.dtype)], axis: 0)
+                w.vFused = MLX.concatenated([a.vProj.weight, vd.asType(a.vProj.weight.dtype)], axis: 0)
+            }
+            w.qFused = MLX.concatenated(qParts, axis: 0)
         }
-        w.qFused = MLX.concatenated(qParts, axis: 0)
         let norms: [Inkling2RMSNorm] = isSliding ? [inputLN!] : [qInputLN!, kInputLN!, vInputLN!]
         w.attnNorm = MLX.stacked(norms.map { $0.weight.asType(f32) }, axis: 0)
         // Gate rows always come as q, k, v: sliding layers use input_layernorm for all three.
@@ -859,13 +947,17 @@ extension Inkling2DecoderLayer {
             w.mlpFG = MLX.contiguous(fg(mg).expandedDimensions(axis: 0))
             w.gateEps = MLXArray([qg.eps])
         }
-        let sw = mlp.switchMLP
-        w.nativeFP4Experts =
-            sw.gateUp.isNVFP4 && sw.down.isNVFP4 && sw.inter % 16 == 0 && H % 16 == 0
-            && sw.gateUp.codes.dim(1) == 2 * sw.inter && sw.down.codes.dim(1) == H
-            && ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        if let sw = mlp.switchMLP {
+            w.nativeFP4Experts =
+                sw.gateUp.isNVFP4 && sw.down.isNVFP4 && sw.inter % 16 == 0 && H % 16 == 0
+                && sw.gateUp.codes.dim(1) == 2 * sw.inter && sw.down.codes.dim(1) == H
+                && ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        } else {
+            w.singleSlot = MLXArray.zeros([1, 1], dtype: .uint32)
+            w.unitWeight = MLXArray.ones([1, 1], dtype: f32)
+        }
         w.routerT = mlp.gate.weight.asType(f32).T
-        w.ones = MLXArray.ones([mlp.switchMLP.gateUp.expertScale.dim(0)], dtype: f32)
+        w.ones = MLXArray.ones([mlp.gate.weight.dim(0)], dtype: f32)
         w.downOnes = w.ones
         let nqa = isSliding ? 1 : 3
         if let attentionInput {
@@ -878,12 +970,17 @@ extension Inkling2DecoderLayer {
         let base = 2 * nQ + nR + nq
         w.qkvFMeta = MLXArray([a.qkClip, a.relClip, a.eps, 1])
         w.qkvIMetaX = MLXArray([0, Int32(nQ), Int32(base), 0, Int32(base + C), 0])
-        // Three input rows: [q-fused | k-fused | v-fused] outputs laid end to end.
-        let nQF = w.qFused!.dim(0)
-        let nKF = w.kFused!.dim(0)
-        w.qkvIMeta3 = MLXArray([
-            0, Int32(nQ), Int32(nQF), Int32(nQF + C), Int32(nQF + nKF), Int32(nQF + nKF + C),
-        ])
+        if let qp = w.quant {
+            w.qkvIMetaX = qp.imetaX
+            w.qkvIMeta3 = qp.imeta3
+        } else {
+            // Three input rows: [q-fused | k-fused | v-fused] outputs laid end to end.
+            let nQF = w.qFused!.dim(0)
+            let nKF = w.kFused!.dim(0)
+            w.qkvIMeta3 = MLXArray([
+                0, Int32(nQ), Int32(nQF), Int32(nQF + C), Int32(nQF + nKF), Int32(nQF + nKF + C),
+            ])
+        }
         w.sigMeta = MLXArray([Int32(nQ + nR)])
         w.midMeta = MLXArray([Int32(2 * C)])
         w.finalMeta = MLXArray([Int32(2 * C), Int32(H)])
@@ -891,8 +988,8 @@ extension Inkling2DecoderLayer {
             [
                 w.xFused, w.qFused, w.kFused, w.vFused, w.attnNorm, w.gateNorm,
                 w.qkvDown, w.qkvFG, w.mlpDown, w.mlpFG, w.routerT, w.ones, w.mlpNorm, w.attnQuery,
-                w.mlpQuery, w.zeroState,
-            ].compactMap { $0 })
+                w.mlpQuery, w.zeroState, w.singleSlot, w.unitWeight,
+            ].compactMap { $0 } + (w.quant?.arrays ?? []))
         w.ready = true
     }
 
@@ -970,18 +1067,52 @@ extension Inkling2DecoderLayer {
         // (q-fused / k-fused / v-fused for three input rows), read by the kernel at offsets
         let nQ = nq * hd
         let nR = nq * dRel
+        // y = the q-side source (q | r | gate at 0, nQ, nQ + nR); ka / va (+ dynamic taps kda / vda) the k / v sides.
         let y: MLXArray
+        var ka: MLXArray
+        var va: MLXArray
+        var kda: MLXArray
+        var vda: MLXArray
+        let sinks: MLXArray
         let imeta: MLXArray
-        if rows.dim(0) == 1 {
-            y = MLX.matmul(rows, w.xFused!.T).reshaped([-1])
-            imeta = w.qkvIMetaX!
+        if let qp = w.quant {
+            if rows.dim(0) == 1 {
+                y = qp(rows, qp.qrg).reshaped([-1])
+                ka = qp(rows, qp.kv).reshaped([-1])
+                va = ka
+                imeta = w.qkvIMetaX!
+                sinks = MLX.matmul(rows, qp.sink.T).reshaped([-1])
+            } else {
+                let r0 = rows[0 ..< 1]
+                let r1 = rows[1 ..< 2]
+                let r2 = rows[2 ..< 3]
+                y = qp(r0, qp.qrg).reshaped([-1])
+                ka = qp(r1, qp.k).reshaped([-1])
+                va = qp(r2, qp.v).reshaped([-1])
+                imeta = w.qkvIMeta3!
+                sinks = MLX.matmul(r0, qp.sink.T).reshaped([-1])
+            }
+            kda = ka
+            vda = va
+            if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
+                kda = MLX.matmul(rows[1 ..< 2], kt.T).reshaped([-1])
+                vda = MLX.matmul(rows[2 ..< 3], vt.T).reshaped([-1])
+            }
         } else {
-            y = MLX.concatenated([
-                MLX.matmul(rows[0 ..< 1], w.qFused!.T).reshaped([-1]),
-                MLX.matmul(rows[1 ..< 2], w.kFused!.T).reshaped([-1]),
-                MLX.matmul(rows[2 ..< 3], w.vFused!.T).reshaped([-1]),
-            ])
-            imeta = w.qkvIMeta3!
+            if rows.dim(0) == 1 {
+                y = MLX.matmul(rows, w.xFused!.T).reshaped([-1])
+                imeta = w.qkvIMetaX!
+            } else {
+                y = MLX.concatenated([
+                    MLX.matmul(rows[0 ..< 1], w.qFused!.T).reshaped([-1]),
+                    MLX.matmul(rows[1 ..< 2], w.kFused!.T).reshaped([-1]),
+                    MLX.matmul(rows[2 ..< 3], w.vFused!.T).reshaped([-1]),
+                ])
+                imeta = w.qkvIMeta3!
+            }
+            (ka, va, kda, vda) = (y, y, y, y)
+            let sinkOff = 2 * nq * hd + nq * dRel
+            sinks = y[sinkOff ..< (sinkOff + nq)]
         }
         let seen = kv.offset
         let S = a.window.map { min(seen + 1, $0) } ?? (seen + 1)
@@ -1003,7 +1134,7 @@ extension Inkling2DecoderLayer {
         }
         let outs = Inkling2DecodeKernels.qkv(
             [
-                y, y, y, kwStatic, vwStatic, packed, a.qL2Clip.scale, a.relL2Clip.scale,
+                y, ka, va, kda, vda, kwStatic, vwStatic, packed, a.qL2Clip.scale, a.relL2Clip.scale,
                 a.relLogits.proj, fmeta, imeta, scalars.ints([S, nb]),
             ],
             template: [
@@ -1021,11 +1152,10 @@ extension Inkling2DecoderLayer {
             keys = keys[0..., 0..., (total - S)..., 0...]
             values = values[0..., 0..., (total - S)..., 0...]
         }
-        let sinkOff = 2 * nQ + nR
         let attn = MLXFast.scaledDotProductAttention(
             queries: outs[0].reshaped([1, nq, 1, hd]), keys: keys, values: values, scale: a.scale,
             mask: .array(outs[3].reshaped([1, nq, 1, S])),
-            sinks: y[sinkOff ..< (sinkOff + nq)])
+            sinks: sinks)
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [attn.reshaped([nQ]), y, w.sigMeta!], grid: (nQ, 1, 1),
             threadGroup: (256, 1, 1), outputShapes: [[nQ]], outputDTypes: [dtype])[0]
@@ -1066,8 +1196,22 @@ extension Inkling2DecoderLayer {
             threadGroup: (128, 1, 1), outputShapes: [[1, router.topK], [1, router.topK]],
             outputDTypes: [.uint32, f32])
         let inds = sel[0]
-        let sw = mlp.switchMLP
         let k = router.topK
+        if let jx = mlp.janghExperts {
+            // JANGH: H32 rotate + fused gate/up (softcapped activation, H32 output) + router-weighted down, F32.
+            let sum = jx.decodeWeightedSum(x32, indices: inds, scores: sel[1])
+            let fin = Inkling2DecodeKernels.final(
+                [
+                    sum, w.singleSlot!, w.ones!, w.unitWeight!,
+                    packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
+                ],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[H], [3, P]],
+                outputDTypes: [dtype, f32])
+            conv[0] = fin[1].reshaped([1, 3, P])
+            conv.offset += 1
+            return (fin[0].reshaped([1, 1, H]), states)
+        }
+        let sw = mlp.switchMLP!
         let down: MLXArray
         if w.nativeFP4Experts {
             down = Inkling2DecodeKernels.nvfp4Experts(x32: x32, inds: inds, mlp: sw, topK: k).1

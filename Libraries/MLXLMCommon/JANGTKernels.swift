@@ -154,6 +154,9 @@ public enum JANGTActivation: Sendable, Equatable {
     case silu
     /// SwiGLU-OAI: h = g' * sigmoid(alpha * g') * (u' + 1). MiniMax-M3 / M3.1 (alpha 1.702, limit 7).
     case oai(alpha: Float)
+    /// Inkling-2 (`inkling2` / `inkling2_loop`): h = softcap(g, gateCap) * sigmoid(g) * softcap(u, upCap) with
+    /// softcap(x, c) = tanh(x / c) * c; the sigmoid sees the RAW gate. Inkling-2-Mini: caps 4 and 25, no limit.
+    case inkling(gateCap: Float, upCap: Float)
 
     /// Metal float expression of h from the (already clamped) `g` / `u`. `.silu` is the exact expression the kernels
     /// carried before the variants existed, so their generated source is unchanged; `.oai` writes alpha by its float32
@@ -164,6 +167,10 @@ public enum JANGTActivation: Sendable, Equatable {
             return "(\(g) / (1.0f + metal::fast::exp(-\(g)))) * \(u)"
         case .oai(let alpha):
             return "(\(g) / (1.0f + metal::fast::exp(-(as_type<float>(\(alpha.bitPattern)u) * \(g))))) * (\(u) + 1.0f)"
+        case .inkling(let gc, let uc):
+            let gcs = "as_type<float>(\(gc.bitPattern)u)", ucs = "as_type<float>(\(uc.bitPattern)u)"
+            return "(metal::precise::tanh(\(g) / \(gcs)) * \(gcs)) * (1.0f / (1.0f + metal::precise::exp(-\(g))))"
+                + " * (metal::precise::tanh(\(u) / \(ucs)) * \(ucs))"
         }
     }
 
@@ -173,6 +180,8 @@ public enum JANGTActivation: Sendable, Equatable {
         switch self {
         case .silu: return ""
         case .oai(let alpha): return "_oai\(String(alpha.bitPattern, radix: 16))"
+        case .inkling(let gc, let uc):
+            return "_ink\(String(gc.bitPattern, radix: 16))_\(String(uc.bitPattern, radix: 16))"
         }
     }
 
@@ -186,6 +195,7 @@ public enum JANGTActivation: Sendable, Equatable {
         switch self {
         case .silu: return g * sigmoid(g) * u
         case .oai(let alpha): return g * sigmoid(alpha * g) * (u + 1)
+        case .inkling(let gc, let uc): return tanh(g / gc) * gc * sigmoid(g) * (tanh(u / uc) * uc)
         }
     }
 }
