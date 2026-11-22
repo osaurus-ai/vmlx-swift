@@ -197,3 +197,59 @@ template and system prompt, ~2.5k-token prompt with tools, sampling at the bundl
   ~5 ms draft).
 * Quantized dense / unembed weights: 8-bit dense measured ~2.6 ms per token less GPU time
   (attention-input GEMV 79 -> 50 us, unembed 1.79 -> 1.04 ms); a model-quality trade-off, not done.
+
+## 8. JANGH bundles (`OsaurusAI/Inkling-2-Mini-JANGH2`)
+
+The JANGH2 bundle keeps the model's control path as released and changes three weight families: routed experts
+are JANGH codebook banks (2 / 3 bits, Hadamard-32 rows, fp16 row scales; 3-bit on the looped layers' down
+projections and six gate/up stacks), the attention-input / output projections, embeddings and unembed are affine
+8-bit (group 64), and the sinks, message gates, convs, router and norms stay as released. A token streams ~2.95 GB
+instead of ~5.5 GB.
+
+### What runs
+
+| piece | path |
+|---|---|
+| routed experts, decode | `inkling2_jh_gate_up_act`: the x row rotated to H32 in threadgroup memory, the router's top-k selection (same arithmetic and tie order as `routerSelect`), gate and up codebook dots per row, `softcap(g) * sigmoid(g) * softcap(u)`, bf16 round, H32 output rotation; `inkling2_jh_down`: per-pick down rows. The final combine applies the route weights. |
+| routed experts, prefill / long verify | `JANGHRoutedExpertLayer` with `JANGTActivation.inkling` (generic JANGH decode kernels and expert-sorted NAX tiles) |
+| q / r / gate / k / v | one affine GEMV over `[q|r|gate|k|v]` on one-row visits; per-row GEMVs on three-row (full / message-gated) visits; the plain sink and dynamic-tap projections as transposed views |
+| o_proj, embed, unembed | MLX affine kernels |
+
+### Measured (M5 Ultra, 64-token context unless stated)
+
+| step | pipelined decode |
+|---|---:|
+| generic JANGH decode route | 74.9 tok/s |
+| + batch-1 JANGH expert kernels (per-pick down) | 92.6 |
+| + no-op Reshape / per-call Transpose removed from the step (2537 -> 1543 graph nodes) | 96.2 |
+| + router selection inside the gate/up kernel, one GEMV for one-row visits | 105.0 |
+| (native checkpoint on the same machine) | 81.0 |
+
+App route (`TokenIterator` + batch engine + prefix cache, 2.3k-token prompt, M5 Ultra): 90 tok/s before the node
+reductions (10.9 ms wall / 6.4 ms decode-thread CPU per step), 98.9 tok/s after (9.97 ms wall / 6.1 ms CPU). The
+decode thread's CPU (~4.6 us per graph node) is now ~60% of the step: below ~6 ms of GPU per token it becomes the
+limit, so further speed needs fewer graph nodes as much as faster kernels. dSpark at 2.7k context: verify 1 / 4 / 8
+rows = 11.1 / 20.4 / 26.7 ms; greedy code 129.5 vs 102.4 tok/s AR, prose at parity (the governor stays AR).
+
+In a dev-built Osaurus on an M5 Max (the app's own prompt and tools, the bundle's sampling, driven through the GUI):
+prose answers 71.9-72.7 tok/s, code turns 66.4-67.6 tok/s, tool-result continuations at 3-7k context 58.5-68.0 tok/s.
+
+### Per-token budget (M5 Ultra, dependent chains over the 48 layer visits)
+
+| component | ms / token |
+|---|---:|
+| attention-input GEMVs (q/r/gate/k/v + sink) | ~1.6 |
+| o_proj | 0.45 |
+| router GEMV | 0.57 |
+| routed experts (gate/up 1.1 + down 0.6) | 1.75 |
+| message gates (24 visits x q/k/v + mlp) | 1.3 |
+| depth / qkv / KV append + SDPA (1k window) / sigmoid / mid / final | 0.3 / 0.3 / 0.85 / 0.1 / 0.6 / 0.36 |
+| unembed | 0.7 |
+
+Bandwidth ceilings measured on the same machine: streaming read 1.1 TB/s, BF16 GEMV 850 GB/s, MLX affine 8-bit
+GEMV 700 GB/s. The weight bytes alone cost ~3.5-4 ms per token; the rest is the dependent chain of 10-12 kernels
+per layer visit, each of which now runs within 1.3-2x of its own bandwidth or latency floor.
+
+Tried and dropped: a split-key decode attention with the mask, sink and gate folded into the combine (slower than
+MLX's fused SDPA at 64 and 2k context), padding the rotated x in threadgroup memory against bank conflicts and a
+fused gate+up dot loop (no change).
