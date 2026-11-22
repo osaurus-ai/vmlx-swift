@@ -1928,9 +1928,13 @@ public final class Inkling2LoopModel: Module, LLMModel {
     }
 
     /// Dense layers (tree-path suffixes) the runtime runs quantized as `QuantizedLinear` /
-    /// `QuantizedEmbedding`. Every other quantized dense layer is dequantized at load. Empty
-    /// while the fused decode / verify paths read dense weights as plain matrices.
-    static let runtimeQuantizedDenseLayers: [String] = []
+    /// `QuantizedEmbedding`: the attention-input projections the fused decode / verify paths
+    /// read as quantized GEMVs, the output projection, the embedding and the unembedding. Every
+    /// other quantized dense layer (sink, dynamic-tap projections) is dequantized at load.
+    static let runtimeQuantizedDenseLayers: [String] = [
+        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.r_proj",
+        "self_attn.gate_proj", "self_attn.o_proj", "embed_tokens", "lm_head",
+    ]
 
     /// Quantized dense layers (`X.weight` + `X.scales` [+ `X.biases`, `X.global_scale`]) are
     /// dequantized to the model dtype at load (unless listed in `runtimeQuantizedDenseLayers`):

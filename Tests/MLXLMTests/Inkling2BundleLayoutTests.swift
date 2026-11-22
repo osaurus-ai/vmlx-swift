@@ -127,10 +127,10 @@ struct Inkling2BundleLayoutTests {
         MLXRandom.seed(3)
         let w = MLXRandom.normal([8, H]).asType(.bfloat16)
         let (q, sc, bi) = MLX.quantized(w, groupSize: 32, bits: 4)
-        let key = "model.language_model.layers.0.self_attn.q_proj"
+        let key = "model.language_model.layers.0.self_attn.sink_proj"
         let out = Inkling2LoopModel.dequantizingDenseLayers(
             [key + ".weight": q, key + ".scales": sc, key + ".biases": bi!],
-            expected: ["model.layers.0.self_attn.q_proj.weight": [8, H]])
+            expected: ["model.layers.0.self_attn.sink_proj.weight": [8, H]])
         let got = try! #require(out[key + ".weight"])
         let ref = MLX.dequantized(q, scales: sc, biases: bi, groupSize: 32, bits: 4, dtype: .bfloat16)
         #expect(got.dtype == .bfloat16)
