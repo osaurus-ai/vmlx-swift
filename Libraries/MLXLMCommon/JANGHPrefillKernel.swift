@@ -14,13 +14,17 @@ final class JANGHPrefillKernel {
     private let codebookHeader: String
     private var kernels: [String: MLXFast.MLXFastKernel] = [:]
     private let lock = NSLock()
+    /// The fused gate/up epilogue's activation (NAX `tq_act` and the steel fallback). `.silu` keeps every existing
+    /// kernel source and cache key unchanged.
+    private let activation: JANGTActivation
     private let rotation = JANGHRowRotation()
 
     init(
         contract: JANGHFormatContract, module: String, upModule: String? = nil,
-        enableDenseSmallTile: Bool = false
+        enableDenseSmallTile: Bool = false, activation: JANGTActivation = .silu
     ) throws {
         self.enableDenseSmallTile = enableDenseSmallTile
+        self.activation = activation
         guard let projection = contract.projections[module],
             upModule == nil || contract.projections[upModule!] != nil
         else { throw JANGHFormatContract.ValidationError.invalid("missing prefill projection") }
@@ -96,7 +100,7 @@ final class JANGHPrefillKernel {
         let type = dtype == .bfloat16 ? "bfloat16_t" : dtype == .float16 ? "half" : "float"
         let key =
             "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
-            + (tileRows == 64 ? "" : "_m\(tileRows)")
+            + (tileRows == 64 ? "" : "_m\(tileRows)") + (fused ? activation.nameTag : "")
         lock.lock()
         defer { lock.unlock() }
         if let value = kernels[key] { return value }
@@ -114,7 +118,8 @@ final class JANGHPrefillKernel {
                 name: "jangh_prefill_" + key,
                 inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"],
                 outputNames: ["y"], source: source,
-                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader + JANGHPrefillSource.nax,
+                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader
+                    + JANGHPrefillSource.nax(activation: activation),
                 ensureRowContiguous: false)
         } else {
             let source = """
@@ -248,7 +253,8 @@ final class JANGHPrefillKernel {
             var up = single(upPacked, upScales, upBits).asType(.float32)
             gate = gate.asType(.float32)
             if let limit { gate = minimum(gate, limit); up = clip(up, min: -limit, max: limit) }
-            gate = (gate * sigmoid(gate) * up).asType(input.dtype)
+            gate = (activation == .silu ? gate * sigmoid(gate) * up
+                : activation(gate: gate, up: up, limit: 0)).asType(input.dtype)
         }
         if rotateOutput {
             gate = try rotation(gate, outputDType: input.dtype)
