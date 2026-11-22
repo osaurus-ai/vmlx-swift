@@ -436,7 +436,7 @@ extension Inkling2DecoderLayer {
         if let jx = mlp.janghExperts {
             // JANGH: the router-weighted sum per row (decode kernels, F32), combined by the final kernel as one slot.
             let perPick = w.jangh.map {
-                Inkling2DecodeKernels.janghExperts(x32: xm32, inds: inds, banks: $0, topK: k)  // [T * k, H]
+                Inkling2DecodeKernels.janghExperts(x32: xm32, inds: inds, banks: $0, topK: k).down  // [T * k, H]
             }
             let sum = perPick ?? jx.decodeWeightedSum(xm32, indices: inds, scores: sel[1])  // [T, H]
             let fin = Inkling2VerifyKernels.finalT(

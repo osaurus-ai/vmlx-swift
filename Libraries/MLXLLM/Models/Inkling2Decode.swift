@@ -763,10 +763,13 @@ enum Inkling2DecodeKernels {
     /// rounded to bf16 (the reference's dtype round before the down projection), H32-rotated back over the 32 rows
     /// (the down projection's input basis). x [T, H] fp32; idx [T * KPER]. Grid (I / 32 * 32 * NSG, T * KPER).
     /// Output [T * KPER, I] fp32.
+    /// SELECT = 1 folds the router's selection in (the `routerSelect` kernel's exact arithmetic and tie order:
+    /// sigmoid scores, + bias for the ranking, rank = number of experts that beat it, lower index first): every
+    /// threadgroup ranks the row's E logits itself and threadgroup (0, slot 0) writes the row's picks / weights.
     static let jhGateUpAct = MLXFast.metalKernel(
         name: "inkling2_jh_gate_up_act",
-        inputNames: ["x", "gp", "gs", "up", "us", "idx", "lg", "lu", "caps"],
-        outputNames: ["out"],
+        inputNames: ["x", "gp", "gs", "up", "us", "idx", "lg", "lu", "caps", "logits", "rbias", "rscale"],
+        outputNames: ["out", "sel_inds", "sel_w"],
         source: """
             uint lane = thread_index_in_simdgroup;
             uint sg = simdgroup_index_in_threadgroup;
@@ -780,11 +783,39 @@ enum Inkling2DecodeKernels {
             if (tid >= 8 && tid < 8 + (1u << BU)) tg_lut[tid] = lu[tid - 8];
             const device float* xrow = x + (size_t)(n / KPER) * HH;
             for (uint b = sg; b < HH / 32; b += NSG) xs[b * 32 + lane] = ink_h32(xrow[b * 32 + lane], lane);
+            threadgroup uint picks[16];
+            if (SELECT) {
+                threadgroup float sc_[256];
+                threadgroup float sel_[256];
+                uint t_ = n / KPER;
+                for (int q = tid; q < EE; q += 32 * NSG) {
+                    float v = 1.f / (1.f + exp(-logits[(size_t)t_ * EE + q]));
+                    sc_[q] = v;
+                    sel_[q] = v + rbias[q];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int q = tid; q < EE; q += 32 * NSG) {
+                    float v = sel_[q];
+                    int rank = 0;
+                    for (int o = 0; o < EE; ++o) {
+                        float u = sel_[o];
+                        rank += (u > v || (u == v && o < q)) ? 1 : 0;
+                    }
+                    if (rank < KPER) picks[rank] = q;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (rb == 0 && n % KPER == 0 && tid < (uint)KPER) {
+                    float total = 0.f;
+                    for (int k = 0; k < KPER; ++k) total += sc_[picks[k]];
+                    sel_inds[(size_t)t_ * KPER + tid] = picks[tid];
+                    sel_w[(size_t)t_ * KPER + tid] = sc_[picks[tid]] / (total + 1e-20f) * rscale[0];
+                }
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const int I = gs_shape[1];
             uint p = sg * 4 + lane / 8, sl = lane % 8;
             int row = rb * 32 + p;
-            uint e = idx[n];
+            uint e = SELECT ? picks[n % KPER] : idx[n];
             const device uint32_t* gw = gp + ((size_t)e * I + row) * (HH * BG / 32);
             const device uint32_t* uw = up + ((size_t)e * I + row) * (HH * BU / 32);
             float ag = 0.f, au = 0.f;
@@ -836,27 +867,39 @@ enum Inkling2DecodeKernels {
         header: jhHeader)
 
     /// JANGH experts for T rows x k picks → per-pick down outputs `[T * k, H]` fp32 (row scales applied; the final
-    /// kernel combines them with the route weights).
+    /// kernel combines them with the route weights). With `router` (the row's router logits `[T, E]`, the selection
+    /// bias, the route scale), the selection happens inside the gate/up kernel and its picks / weights come back
+    /// (`inds` is then ignored).
     static func janghExperts(
-        x32: MLXArray, inds: MLXArray, banks: Inkling2JANGHDecodeBanks, topK: Int
-    ) -> MLXArray {
+        x32: MLXArray, inds: MLXArray?, banks: Inkling2JANGHDecodeBanks, topK: Int,
+        router: (logits: MLXArray, bias: MLXArray, scale: MLXArray)? = nil
+    ) -> (down: MLXArray, inds: MLXArray, weights: MLXArray?) {
         let T = x32.dim(0)
         let H = x32.dim(1)
         let I = banks.inter
         let n = T * topK
         let nsg = 8
-        let act = jhGateUpAct(
-            [x32, banks.gate.packed, banks.gate.scales, banks.up.packed, banks.up.scales, inds,
-             banks.gateLevels, banks.upLevels, banks.caps],
-            template: [("HH", H), ("BG", banks.gate.bits), ("BU", banks.up.bits), ("KPER", topK), ("NSG", nsg)],
+        let E = banks.gate.scales.dim(0)
+        let ph = banks.placeholder
+        let g = jhGateUpAct(
+            [x32, banks.gate.packed, banks.gate.scales, banks.up.packed, banks.up.scales, inds ?? ph.u32,
+             banks.gateLevels, banks.upLevels, banks.caps, router?.logits ?? ph.f32, router?.bias ?? ph.f32,
+             router?.scale ?? ph.f32],
+            template: [
+                ("HH", H), ("BG", banks.gate.bits), ("BU", banks.up.bits), ("KPER", topK), ("NSG", nsg),
+                ("SELECT", router != nil ? 1 : 0), ("EE", E),
+            ],
             grid: (I / 32 * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
-            outputShapes: [[n, I]], outputDTypes: [f32])[0]
+            outputShapes: [[n, I], [T, topK], [T, topK]], outputDTypes: [f32, .uint32, f32])
+        let act = g[0]
+        let picks = router != nil ? g[1] : inds!
         let rows = 8 * nsg
-        return jhDown(
-            [act, banks.down.packed, banks.down.scales, inds, banks.downLevels],
+        let down = jhDown(
+            [act, banks.down.packed, banks.down.scales, picks, banks.downLevels],
             template: [("II", I), ("BD", banks.down.bits), ("NSG", nsg)],
             grid: ((H + rows - 1) / rows * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
             outputShapes: [[n, H]], outputDTypes: [f32])[0]
+        return (down, picks, router != nil ? g[2] : nil)
     }
 
     /// The three gate kernels for G gates x T rows. Returns `(out [G*T, H] model dtype, out32 fp32)`.
@@ -919,6 +962,8 @@ struct Inkling2QuantizedProjections {
         let scales: MLXArray
         let biases: MLXArray?
     }
+    /// `[q | r | gate | k | v]` rows concatenated once; the others are row-slice VIEWS of it (no second copy).
+    let all: Packed
     let qrg: Packed
     let kv: Packed
     let k: Packed
@@ -931,8 +976,8 @@ struct Inkling2QuantizedProjections {
     let groupSize: Int
     let bits: Int
     let mode: QuantizationMode
-    /// qkv kernel offsets `[q, r, k, k taps, v, v taps]`: one input row (`qa` = [q|r|gate], `ka` = `va` = [k|v])
-    /// and three rows (separate arrays, taps in their own arrays).
+    /// qkv kernel offsets `[q, r, k, k taps, v, v taps]`: one input row (`qa` = `ka` = `va` = [q|r|gate|k|v], one
+    /// GEMV) and three rows (separate arrays, taps in their own arrays).
     let imetaX: MLXArray
     let imeta3: MLXArray
 
@@ -955,7 +1000,10 @@ struct Inkling2QuantizedProjections {
                 scales: MLX.concatenated(ls.map(\.scales), axis: 0),
                 biases: q0.biases == nil ? nil : MLX.concatenated(ls.map { $0.biases! }, axis: 0))
         }
-        func one(_ l: QuantizedLinear) -> Packed { Packed(weight: l.weight, scales: l.scales, biases: l.biases) }
+        let all = cat(qs)
+        func rows(_ r: Range<Int>) -> Packed {
+            Packed(weight: all.weight[r], scales: all.scales[r], biases: all.biases.map { $0[r] })
+        }
         var kTaps: MLXArray? = nil
         var vTaps: MLXArray? = nil
         if let kd = a.kSconv as? Inkling2DynamicShortConv, let vd = a.vSconv as? Inkling2DynamicShortConv {
@@ -965,12 +1013,13 @@ struct Inkling2QuantizedProjections {
         }
         let (nq, hd, dRel) = (a.nq, a.hd, a.dRel)
         let (nQ, C) = (nq * hd, a.nkv * hd)
-        _ = dRel
+        let nQRG = 2 * nQ + nq * dRel
         return Self(
-            qrg: cat([qs[0], qs[1], qs[2]]), kv: cat([qs[3], qs[4]]), k: one(qs[3]), v: one(qs[4]),
+            all: all, qrg: rows(0 ..< nQRG), kv: rows(nQRG ..< nQRG + 2 * C), k: rows(nQRG ..< nQRG + C),
+            v: rows(nQRG + C ..< nQRG + 2 * C),
             sink: a.sinkProj.weight.T, kTaps: kTaps, vTaps: vTaps, groupSize: q0.groupSize, bits: q0.bits,
             mode: q0.mode,
-            imetaX: MLXArray([0, Int32(nQ), 0, 0, Int32(C), 0]),
+            imetaX: MLXArray([0, Int32(nQ), Int32(nQRG), 0, Int32(nQRG + C), 0]),
             imeta3: MLXArray([0, Int32(nQ), 0, 0, 0, 0]))
     }
 
@@ -981,7 +1030,7 @@ struct Inkling2QuantizedProjections {
     }
 
     var arrays: [MLXArray] {
-        [qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
+        [all, qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
             + [sink] + [kTaps, vTaps].compactMap { $0 }
     }
 }
@@ -996,6 +1045,8 @@ struct Inkling2JANGHDecodeBanks {
     let downLevels: MLXArray
     let caps: MLXArray
     let inter: Int
+    /// Tiny unused inputs for the kernel's disabled branch (one array of each dtype, built once).
+    let placeholder: (u32: MLXArray, f32: MLXArray)
 
     /// nil (the generic JANGH route) unless every bank has exactly the geometry the kernels index with raw pointers:
     /// gate / up `[E, I, H * bits / 32]` + `[E, I]`, down `[E, H, I * bits / 32]` + `[E, H]`, `2^bits` levels, and the
@@ -1014,7 +1065,8 @@ struct Inkling2JANGHDecodeBanks {
         else { return nil }
         return Self(
             gate: g, up: u, down: d, gateLevels: MLXArray(g.levels), upLevels: MLXArray(u.levels),
-            downLevels: MLXArray(d.levels), caps: caps, inter: g.scales.dim(1))
+            downLevels: MLXArray(d.levels), caps: caps, inter: g.scales.dim(1),
+            placeholder: (MLXArray.zeros([1], dtype: .uint32), MLXArray.zeros([1], dtype: .float32)))
     }
 }
 
@@ -1290,9 +1342,9 @@ extension Inkling2DecoderLayer {
         let imeta: MLXArray
         if let qp = w.quant {
             if rows.dim(0) == 1 {
-                y = qp(rows, qp.qrg)
-                ka = qp(rows, qp.kv)
-                va = ka
+                y = qp(rows, qp.all)
+                ka = y
+                va = y
                 imeta = w.qkvIMetaX!
                 sinks = MLX.matmul(rows, qp.sink).reshaped([nq])
             } else {
@@ -1402,17 +1454,35 @@ extension Inkling2DecoderLayer {
         let x32 = xm32
         let router = mlp.gate
         let logits = MLX.matmul(x32, w.routerT!)
+        let k = router.topK
+        if let jx = mlp.janghExperts, let banks = w.jangh {
+            // Router GEMV, then the JANGH gate/up kernel ranks the logits itself (no selection dispatch).
+            let ex = Inkling2DecodeKernels.janghExperts(
+                x32: x32, inds: nil, banks: banks, topK: k,
+                router: (logits, router.bias, router.scaleArray))
+            _ = jx
+            let fin = Inkling2DecodeKernels.final(
+                [
+                    ex.down, ex.inds, w.ones!, ex.weights!,
+                    packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
+                ],
+                template: [("PP", P)],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[1, 1, H], [1, 3, P]],
+                outputDTypes: [dtype, f32])
+            conv[0] = fin[1]
+            conv.offset += 1
+            return (fin[0], states)
+        }
         let sel = Inkling2Kernels.routerSelect(
             [logits, router.bias, router.meta, router.scaleArray], grid: (128, 1, 1),
             threadGroup: (128, 1, 1), outputShapes: [[1, router.topK], [1, router.topK]],
             outputDTypes: [.uint32, f32])
         let inds = sel[0]
-        let k = router.topK
         if let jx = mlp.janghExperts {
             // JANGH: H32 rotate + fused gate/up (softcapped activation, H32 output) + router-weighted down, F32.
             // Per-pick outputs (combined by `final` with the route weights) or the generic route's weighted sum.
             let perPick = w.jangh.map {
-                Inkling2DecodeKernels.janghExperts(x32: x32, inds: inds, banks: $0, topK: k)
+                Inkling2DecodeKernels.janghExperts(x32: x32, inds: inds, banks: $0, topK: k).down
             }
             let sum = perPick ?? jx.decodeWeightedSum(x32, indices: inds, scores: sel[1])
             let slotted = perPick != nil
