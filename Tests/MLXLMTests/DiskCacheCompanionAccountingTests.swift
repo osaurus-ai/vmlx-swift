@@ -3323,6 +3323,63 @@ struct DiskCacheCompanionAccountingTests {
         }
     }
 
+    /// MLX's save writes `<target>.tmp<digits>` and renames it over the
+    /// target (ml-explore/mlx#4773), so a process killed mid-save leaves
+    /// `<hash>.partial-<tag>.safetensors.tmp<digits>`. The open sweep treats
+    /// it as the dead partial it belongs to: removed once old enough, kept
+    /// while young, and never matched for anybody else's name.
+    @Test func openSweepRemovesADeadMLXSaveTempOfOurPartial() throws {
+        try MLXMetalTestLock.withLock {
+            let root = Self.makeRoot("open-sweep-mlx-save-temp")
+            defer { try? FileManager.default.removeItem(at: root) }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+            let deadName = "8899aabbccddeeff0011223344556677.partial-1A2B3C4D.safetensors.tmp3735928559"
+            let youngName = "00112233445566778899aabbccddeeff.partial-0a1b2c3d.safetensors.tmp7"
+            let keepNames = [
+                // Somebody else's partial, with MLX's temp suffix.
+                "random.partial-abcdefgh.safetensors.tmp12",
+                // Not digits after `.tmp`.
+                "8899aabbccddeeff0011223344556677.partial-1A2B3C4D.safetensors.tmpx",
+                // More than a u32's ten digits.
+                "8899aabbccddeeff0011223344556677.partial-1A2B3C4D.safetensors.tmp12345678901",
+                // A temp of a final name: this cache never saves to one directly.
+                "8899aabbccddeeff0011223344556677.safetensors.tmp12",
+            ]
+            #expect(DiskCache.isUnpublishedPayloadName(deadName))
+            #expect(DiskCache.isUnpublishedName(deadName))
+            #expect(!DiskCache.isPublishedPayloadName(deadName))
+            for name in keepNames { #expect(!DiskCache.isUnpublishedPayloadName(name), "\(name)") }
+            #expect(SSMCompanionDiskStore.isUnpublishedTensorName(
+                "ssm-" + String(repeating: "ab", count: 32) + ".partial-1A2B3C4D.safetensors.tmp42"))
+
+            let dead = root.appendingPathComponent(deadName)
+            try Data(repeating: 0xEE, count: 40_003).write(to: dead)
+            try Self.age(dead, by: Self.elevenMinutes)
+            let young = root.appendingPathComponent(youngName)
+            try Data(repeating: 0xEE, count: 40_003).write(to: young)
+            for name in keepNames {
+                let url = root.appendingPathComponent(name)
+                try Data(repeating: 0x31, count: 4_099).write(to: url)
+                try Self.age(url, by: Self.elevenMinutes)
+            }
+
+            _ = DiskCache(cacheDir: root, maxSizeBytes: 1 << 30, modelKey: "open-sweep-mlx-save-temp")
+
+            #expect(
+                !FileManager.default.fileExists(atPath: dead.path),
+                "the open sweep left a dead MLX save temp of this cache's partial")
+            #expect(
+                FileManager.default.fileExists(atPath: young.path),
+                "the open sweep removed a save temp that may still be in flight")
+            for name in keepNames {
+                #expect(
+                    FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path),
+                    "the open sweep removed \(name), which is not this cache's")
+            }
+        }
+    }
+
     /// The companion directory: `clear()`, the sweep at open and the quota
     /// listing act on regular files named `ssm-<key>.…` with a real key, and
     /// on nothing else that happens to start with `ssm-`.
