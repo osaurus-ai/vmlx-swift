@@ -108,6 +108,8 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
         case textConfig = "text_config"
         case eosTokenId = "eos_token_id"
         case mtpConfig = "mtp_config"
+        case visionConfig = "vision_config"
+        case imageTokenId = "image_token_id"
     }
 
     struct MTPConfig: Codable {
@@ -146,6 +148,9 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
     /// The native DSpark drafter (`mtp_config` + `mtp.safetensors`), when the bundle declares one
     /// with the `rnn_hidden` Markov head this runtime implements.
     var dspark: Inkling2DSparkConfig?
+    /// The vision tower (`vision_config`), nil for a text-only bundle or construction
+    /// (`VMLX_INKLING2_VL=0`).
+    public var vision: Inkling2VisionConfiguration?
 
     struct LoopConfig: Codable {
         var coreStart: Int?
@@ -231,6 +236,13 @@ public struct Inkling2LoopConfiguration: Codable, Sendable {
             d.softcap = finalLogitSoftcapping ?? 30
             d.targetLayerIds = m.targetLayerIds ?? [5, 23, 41, 48]
             dspark = d
+        }
+        if Inkling2VisionConfiguration.enabled,
+            var v = try? outer.decodeIfPresent(Inkling2VisionConfiguration.self, forKey: .visionConfig)
+        {
+            v.textHiddenSize = hiddenSize
+            if let id = try? outer.decodeIfPresent(Int.self, forKey: .imageTokenId) { v.imageTokenId = id }
+            vision = v
         }
         if let one = try? outer.decodeIfPresent(Int.self, forKey: .eosTokenId) {
             eosTokenId = [one]
@@ -1392,9 +1404,11 @@ public final class Inkling2LoopModelInner: Module {
     /// `recorder`: speculative verify bookkeeping (conv inputs per slot).
     func forward(
         _ ids: MLXArray, cache: [KVCache]?, capture: Inkling2Capture?,
-        recorder: Inkling2ConvRecorder?
+        recorder: Inkling2ConvRecorder?, embeddings: MLXArray? = nil
     ) -> MLXArray {
-        var h = embed(ids)
+        // `embeddings`: the prompt's input rows when they are not plain token embeddings (image
+        // features spliced in); `ids` still gives the shape.
+        var h = embeddings ?? embed(ids)
         let dtype = h.dtype
         let slots = args.numCacheSlots
         if let cache {
@@ -1534,6 +1548,11 @@ public final class Inkling2LoopModel: Module, LLMModel {
     public let model: Inkling2LoopModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
     @ModuleInfo(key: "mtp_drafter") var drafter: Inkling2DSparkDrafter?
+    /// Image input (`Inkling2Vision.swift`); nil for a text-only bundle or construction.
+    @ModuleInfo(key: "vision_tower") public var vision: Inkling2VisionModel?
+
+    /// Lanes this instance carries: the vision lane exists only when the tower was built.
+    public var modalities: Set<ModelRuntimeRequestModality> { vision == nil ? [.text] : [.text, .vision] }
     /// Set by `sanitize` when the bundle actually ships the drafter's tensors.
     public private(set) var hasDrafterWeights = false
     /// A dSpark verify in flight (set by the draft session around one target forward).
@@ -1548,6 +1567,7 @@ public final class Inkling2LoopModel: Module, LLMModel {
         customTensorNames = []
         model = Inkling2LoopModelInner(args)
         if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
+        if let v = args.vision { _vision.wrappedValue = Inkling2VisionModel(v) }
         // `embed` and `unembed` are separate tensors in the checkpoint, never tied.
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -1570,6 +1590,7 @@ public final class Inkling2LoopModel: Module, LLMModel {
         customTensorNames = excludedTensorNames
         model = Inkling2LoopModelInner(args, routedExperts: routedExperts)
         if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
+        if let v = args.vision { _vision.wrappedValue = Inkling2VisionModel(v) }
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
 
@@ -1613,19 +1634,48 @@ public final class Inkling2LoopModel: Module, LLMModel {
         let ids =
             input.text.tokens.ndim == 1
             ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
+        // Image rows: the prompt's embeddings with the image features spliced in (nil for text, or
+        // when every image is inside the restored cache prefix).
+        let embeddings = try imageEmbeddings(ids: ids, image: input.image)
         let n = ids.dim(1)
         let step = max(windowSize ?? 512, 1)
         var offset = 0
         while n - offset > step {
             try Task.checkCancellation()
-            _ = trunk(ids[0..., offset ..< (offset + step)], cache: cache)
+            _ = trunk(
+                ids[0..., offset ..< (offset + step)], cache: cache,
+                embeddings: embeddings?[0..., offset ..< (offset + step), 0...])
             MLX.eval(cache)
             offset += step
             PrefillProgressReporter.reportCompletedUnits(offset)
             MLX.Memory.clearCache()
         }
-        let h = trunk(ids[0..., offset...], cache: cache)
+        let h = trunk(ids[0..., offset...], cache: cache, embeddings: embeddings?[0..., offset..., 0...])
         return .logits(LMOutput(logits: logits(h[0..., (h.dim(1) - 1)..., 0...])))
+    }
+
+    /// `[1, T, H]` input rows for a prompt carrying image placeholders: embed + embed_norm for every
+    /// token, the image tiles' projected features at the placeholders (reference `masked_scatter`).
+    /// The placeholders in `ids` are the trailing ones of the request's images; a leading image may
+    /// be partly inside the restored prefix, in which case only its remaining tiles are used.
+    func imageEmbeddings(ids: MLXArray, image: LMInput.ProcessedImage?) throws -> MLXArray? {
+        guard let image, let vision, let frames = image.frames, !frames.isEmpty else { return nil }
+        let tokens = ids.reshaped([-1]).asType(.int32).asArray(Int32.self).map(Int.init)
+        let spans = try Inkling2VisionLayout.spans(
+            tokens: tokens, imageTokenId: vision.config.imageTokenId,
+            grids: frames.map { (rows: $0.h, cols: $0.w) })
+        guard !spans.isEmpty else { return nil }
+        var h = model.embed(ids)
+        for span in spans {
+            let count = span.rows * span.cols
+            let tiles = image.pixels[span.tileStart ..< (span.tileStart + count)]
+            var feats = vision.features(tiles: tiles, rows: span.rows, cols: span.cols)
+            if span.skippedTiles > 0 { feats = feats[span.skippedTiles...] }
+            h[0..., span.start ..< (span.start + span.length), 0...] = feats.asType(h.dtype)
+                .expandedDimensions(axis: 0)
+            MLX.eval(h)
+        }
+        return h
     }
 
     /// The checkpoint's fp32 tensors (attention-residual / message queries, router bias, the
@@ -1666,14 +1716,13 @@ public final class Inkling2LoopModel: Module, LLMModel {
         for (key, value) in weights {
             if key == qKey || key == kvKey { continue }
             if auxSuffixes.contains(where: { key.hasSuffix($0) }) { continue }
-            // Vision tower (text-only runtime), the native drafter (`mtp.safetensors`: keys
-            // outside `model.`), audio: not part of this module tree.
-            if key.hasPrefix("model.visual.") || key.hasPrefix("model.vision_tower.")
-                || key.hasPrefix("vision_tower.") || key.hasPrefix("visual.")
-                || key.hasPrefix("model.audio")
-            {
+            // Vision tower: every layout -> `vision_tower.*` of this tree (dropped for a text-only
+            // construction). Audio: not part of this module tree.
+            if let name = Self.visionKey(key) {
+                if vision != nil { out[name] = value }
                 continue
             }
+            if key.hasPrefix("model.audio") { continue }
             if key.hasPrefix("mtp_drafter.")
                 || !(key.hasPrefix("model.") || key.hasPrefix("lm_head"))
             {
@@ -1746,6 +1795,37 @@ public final class Inkling2LoopModel: Module, LLMModel {
         var shapes: [String: [Int]] = [:]
         for (k, v) in parameters().flattened() { shapes[k] = v.shape }
         return shapes
+    }
+
+    /// A vision-tower tensor of any bundle layout -> its `vision_tower.*` name in this tree, nil
+    /// for any other tensor. Official `model.visual.backbone.*` + `model.visual.proj_{in,out}`;
+    /// mlx-lm `model.vision_tower.*` (`merger.linear_{1,2}`); mlx-vlm `vision_tower.*`
+    /// (`proj_{in,out}`); `vision_tower.backbone.*`.
+    static func visionKey(_ key: String) -> String? {
+        var k: Substring
+        if key.hasPrefix("model.visual.") {
+            k = key.dropFirst("model.visual.".count)
+        } else if key.hasPrefix("model.vision_tower.") {
+            k = key.dropFirst("model.vision_tower.".count)
+        } else if key.hasPrefix("vision_tower.") {
+            k = key.dropFirst("vision_tower.".count)
+        } else if key.hasPrefix("visual.") {
+            k = key.dropFirst("visual.".count)
+        } else {
+            return nil
+        }
+        if k.hasPrefix("backbone.") { k = k.dropFirst("backbone.".count) }
+        var n = "." + String(k) + "."
+        for (a, b) in [
+            (".proj_in.", ".merger.linear_1."), (".proj_out.", ".merger.linear_2."),
+            (".ln_pre.", ".pre_layernorm."), (".ln_1.", ".layernorm_before."), (".ln_2.", ".layernorm_after."),
+            (".ls_1.gamma.", ".lambda_1."), (".ls_2.gamma.", ".lambda_2."),
+            (".mlp.c_fc.", ".mlp.fc1."), (".mlp.c_proj.", ".mlp.fc2."),
+            (".embeddings.position_embedding.weight.", ".embeddings.position_embedding."),
+        ] {
+            n = n.replacingOccurrences(of: a, with: b)
+        }
+        return "vision_tower" + n.dropLast()
     }
 
     /// The fused-projection layout: `model.layers.N.mlp.router_weight` with fused
