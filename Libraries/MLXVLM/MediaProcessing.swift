@@ -220,7 +220,8 @@ public enum MediaProcessing {
     static func asMLXArrayUnmanagedRGB8(_ image: CIImage) -> MLXArray {
         let (data, width, height) = renderUnmanaged(image, format: .RGBA8, bytesPerPixel: 4)
         let array = MLXArray(data, [height, width, 4], type: UInt8.self)[0..., 0..., ..<3]
-        return (array.asType(.float32) / 255).reshaped(1, height, width, 3).transposed(0, 3, 1, 2)
+        let normalized = array.asType(.float32) / 255
+        return normalized.reshaped(1, height, width, 3).transposed(0, 3, 1, 2)
     }
 
     private static func renderUnmanaged(

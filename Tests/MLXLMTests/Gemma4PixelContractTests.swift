@@ -54,7 +54,8 @@ struct Gemma4PixelContractTests {
             let image = foreground.composited(over: background)
             let colorSpace = try #require(CGColorSpace(name: CGColorSpace.sRGB))
             let encoder = CIContext(options: [.useSoftwareRenderer: true])
-            let png = try #require(encoder.pngRepresentation(of: image, format: .RGBA8, colorSpace: colorSpace))
+            let png = try #require(
+                encoder.pngRepresentation(of: image, format: .RGBA8, colorSpace: colorSpace))
             let config = try JSONDecoder().decode(
                 Gemma4ProcessorConfiguration.self,
                 from: Data(
@@ -75,14 +76,16 @@ struct Gemma4PixelContractTests {
             encoder.clearCaches()
             let decodedAgain = try #require(CIImage(data: png))
             let second = try await processor.prepare(
-                input: UserInput(prompt: .text("What color is this?"), images: [.ciImage(decodedAgain)]))
+                input: UserInput(
+                    prompt: .text("What color is this?"), images: [.ciImage(decodedAgain)]))
             let pixels = try #require(first.image?.pixels)
             #expect(pixels.shape == [1, 3, 768, 768])
             #expect(pixels.asData().data == expected.asData().data)
-            #expect(pixels.asArray(Float.self).allSatisfy { value in
+            let samplesAreOnByteGrid = pixels.asArray(Float.self).allSatisfy { value in
                 let sample = value * 255
                 return abs(sample - sample.rounded()) < 0.0001
-            })
+            }
+            #expect(samplesAreOnByteGrid)
             #expect(computeMediaSalt(for: first) == computeMediaSalt(for: second))
         }
     }
