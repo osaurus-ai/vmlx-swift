@@ -47,6 +47,11 @@ struct JANGHFormatContract: Sendable {
     /// JANGT trellis projections ("mode": "jangt") and their code width K, keyed like `projections`. A routed layer
     /// may mix the two formats per group (gate/up share one format and width; down may differ).
     let trellis: [String: Double]
+    /// Routed projections kept in the source checkpoint's own NVFP4 / MXFP8 bytes inside a stack that has custom
+    /// roles (Inkling-2-Mini JANGHT), keyed like `projections`. Empty unless the caller names the architecture's
+    /// routed projections that may carry them (`nativeRoutedCandidates`); the host model runs them, not the custom-bank
+    /// kernels.
+    let native: [String: JANGHNativeRoutedFormat]
     private static let supportedBits: Set<Int> = [2, 3, 4, 6, 8]
     static let swigluRoles = ["gate_proj", "up_proj", "down_proj"]
     static let relu2Roles = ["fc1", "fc2"]
@@ -56,7 +61,7 @@ struct JANGHFormatContract: Sendable {
         projections[parent + ".fc1"] != nil && projections[parent + ".fc2"] != nil
     }
 
-    init(configuration data: Data) throws {
+    init(configuration data: Data, nativeRoutedCandidates: Set<String> = []) throws {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let quantization = root["quantization"] as? [String: Any]
         else { throw ValidationError.invalid("missing JANGH metadata") }
@@ -131,6 +136,22 @@ struct JANGHFormatContract: Sendable {
         guard !modules.isEmpty || !trellisModules.isEmpty else {
             throw ValidationError.invalid("no JANGH projections")
         }
+        // Native routed roles: only at the routed projections the architecture names, only with the exact entry of
+        // the format. A caller that names none keeps the previous contract (a mixed stack is refused as incomplete).
+        var nativeModules: [String: JANGHNativeRoutedFormat] = [:]
+        if !nativeRoutedCandidates.isEmpty {
+            for (name, raw) in quantization {
+                guard nativeRoutedCandidates.contains(name), let entry = raw as? [String: Any],
+                    let mode = entry["mode"] as? String, let format = JANGHNativeRoutedFormat(rawValue: mode),
+                    Self.swigluRoles.contains(String(name.split(separator: ".").last ?? ""))
+                else { continue }
+                guard Set(entry.keys) == ["mode", "group_size", "bits"],
+                    let group = entry["group_size"] as? NSNumber, let bits = entry["bits"] as? NSNumber,
+                    group.doubleValue == Double(format.groupSize), bits.doubleValue == Double(format.bits)
+                else { throw ValidationError.invalid("unsupported native routed projection \(name)") }
+                nativeModules[name] = format
+            }
+        }
         let denseK2 = root["model_type"] as? String == "k2_horizon"
             && root["mlp_layout"] as? String == "dense_jangh_down"
         guard !denseK2 || trellisModules.isEmpty else {
@@ -139,9 +160,10 @@ struct JANGHFormatContract: Sendable {
         for name in trellisModules.keys {
             let parent = String(name[..<name.lastIndex(of: ".")!])
             let roles = ["gate_proj", "up_proj", "down_proj"].map { parent + "." + $0 }
-            guard roles.allSatisfy({ modules[$0] != nil || trellisModules[$0] != nil }),
+            guard roles.allSatisfy({ modules[$0] != nil || trellisModules[$0] != nil || nativeModules[$0] != nil }),
                 (trellisModules[roles[0]] != nil) == (trellisModules[roles[1]] != nil),
-                trellisModules[roles[0]] == trellisModules[roles[1]]
+                trellisModules[roles[0]] == trellisModules[roles[1]],
+                nativeModules[roles[0]] == nativeModules[roles[1]]
             else { throw ValidationError.invalid("incomplete or incompatible JANGT expert \(parent)") }
         }
         for name in modules.keys {
@@ -172,9 +194,17 @@ struct JANGHFormatContract: Sendable {
             if trellisModules[parent + ".gate_proj"] != nil {
                 continue // gate/up are trellis; the JANGT loop above checked the whole triple.
             }
+            if let gate = nativeModules[parent + ".gate_proj"] {
+                // Native gate/up feeding this codebook down: one native format for both.
+                guard nativeModules[parent + ".up_proj"] == gate, role == "down_proj" else {
+                    throw ValidationError.invalid("incomplete or incompatible JANGH expert \(parent)")
+                }
+                continue
+            }
             guard let gate = modules[parent + ".gate_proj"],
                 let up = modules[parent + ".up_proj"],
-                modules[parent + ".down_proj"] != nil || trellisModules[parent + ".down_proj"] != nil,
+                modules[parent + ".down_proj"] != nil || trellisModules[parent + ".down_proj"] != nil
+                    || nativeModules[parent + ".down_proj"] != nil,
                 gate.rotation == up.rotation
             else {
                 throw ValidationError.invalid("incomplete or incompatible JANGH expert \(parent)")
@@ -183,6 +213,7 @@ struct JANGHFormatContract: Sendable {
         codebooks = books
         projections = modules
         trellis = trellisModules
+        native = nativeModules
     }
 
     /// Cross-check the bundle's safetensor headers against architecture dimensions.
@@ -200,4 +231,18 @@ struct JANGHFormatContract: Sendable {
             scalesShape == [experts, outputDimensions]
         else { throw ValidationError.invalid("JANGH tensor header mismatch for \(module)") }
     }
+}
+
+/// A routed projection stored in the source checkpoint's own block-scaled float format (Inkling-2-Mini JANGHT native
+/// units): `weight` uint32 codes `(E, N, kin * bits / 32)`, `scales` uint8 `(E, N, kin / group)` (e4m3 for NVFP4,
+/// e8m0 for MXFP8), and for NVFP4 a per-expert `global_scale` float32 `(E,)` (MLX semantics: the dequantized value
+/// is `e2m1 * e4m3(s) * global_scale / 2688`).
+public enum JANGHNativeRoutedFormat: String, Sendable, Equatable {
+    case nvfp4
+    case mxfp8
+
+    public var groupSize: Int { self == .nvfp4 ? 16 : 32 }
+    public var bits: Int { self == .nvfp4 ? 4 : 8 }
+    /// Tensor suffixes of one native projection, exactly.
+    var suffixes: [String] { self == .nvfp4 ? [".weight", ".scales", ".global_scale"] : [".weight", ".scales"] }
 }
