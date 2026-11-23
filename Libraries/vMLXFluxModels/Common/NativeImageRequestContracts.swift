@@ -11,9 +11,8 @@ enum NativeImageRequestContracts {
         samplers: ["euler"], schedulers: ["flux-flow"], defaultSampler: "euler", defaultScheduler: "flux-flow")
     static let zImage = FluxModelLimits(
         dimensionMultiple: 16, minDimension: 16, minimumSteps: 1,
-        supportsNegativePrompt: true, supportsEditNegativePrompt: false,
+        supportsNegativePrompt: false, supportsEditNegativePrompt: false, ignoresNegativePrompt: true,
         supportsStrength: false, supportsMask: false, maxSourceImages: 0, supportedFormats: [.png],
-        negativePromptRequiresGuidanceAbove: 0,
         samplers: ["euler"], schedulers: ["z-image-linear"], defaultSampler: "euler", defaultScheduler: "z-image-linear")
     static let qwenImage = FluxModelLimits(
         dimensionMultiple: 16, minDimension: 16, minimumSteps: 1,

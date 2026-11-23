@@ -25,18 +25,20 @@ final class ImageFamilyContractTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.1)
     }
 
-    func testGuidanceSemanticsMatchImplementedNegativeConditioning() throws {
+    func testGuidanceSemanticsKeepDistilledAndCFGModelsDistinct() throws {
         VMLXFluxModels.registerAll()
         let root = FileManager.default.temporaryDirectory
         let z = try XCTUnwrap(ModelRegistry.lookup(name: "z-image-turbo")?.limits)(root)
         let qwen = try XCTUnwrap(ModelRegistry.lookup(name: "qwen-image")?.limits)(root)
         let flux = try XCTUnwrap(ModelRegistry.lookup(name: "flux1-schnell")?.limits)(root)
         var request = ImageGenRequest(prompt: "cube", negativePrompt: "blue", guidance: 0.5, outputDir: root)
-        try z.validate(request) // Z-Image uses conditional + guidance*(conditional-negative).
+        XCTAssertFalse(z.supportsNegativePrompt)
+        XCTAssertTrue(z.ignoresNegativePrompt)
+        try z.validate(request) // Turbo accepts but ignores unsupported legacy options, as mflux does.
         try qwen.validate(request) // Qwen always executes both branches.
         XCTAssertThrowsError(try flux.validate(request))
         request.guidance = 0
-        XCTAssertThrowsError(try z.validate(request))
+        try z.validate(request)
         try qwen.validate(request)
         XCTAssertEqual(try JSONDecoder().decode(FluxModelLimits.self, from: JSONEncoder().encode(qwen)), qwen)
     }
