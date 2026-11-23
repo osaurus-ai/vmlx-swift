@@ -32,7 +32,7 @@ final class ZImageTurboContractTests: XCTestCase {
             try limits.validate(request)
         }
         XCTAssertEqual(entry.defaultGuidance, 0)
-        XCTAssertEqual(entry.defaultSteps, 4) // Existing step default is a separate audit.
+        XCTAssertEqual(entry.defaultSteps, 4)  // Existing step default is a separate audit.
         request.guidance = .nan
         XCTAssertThrowsError(try limits.validate(request))
     }
@@ -43,7 +43,8 @@ final class ZImageTurboContractTests: XCTestCase {
         func limits(_ name: String) throws -> FluxModelLimits {
             try XCTUnwrap(ModelRegistry.lookup(name: name)?.limits)(missing)
         }
-        let request = ImageGenRequest(prompt: "cube", negativePrompt: "blue",
+        let request = ImageGenRequest(
+            prompt: "cube", negativePrompt: "blue",
             guidance: 0.5, outputDir: missing)
         try limits("qwen-image").validate(request)
         XCTAssertThrowsError(try limits("flux1-schnell").validate(request))
