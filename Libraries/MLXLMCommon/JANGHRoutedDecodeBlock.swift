@@ -16,7 +16,8 @@ final class JANGHRoutedDecodeBlock {
     private let inputRotation: JANGHFormatContract.Rotation
     private let rowRotation = JANGHRowRotation()
 
-    init(banks: JANGHMappedBanks, parentModule: String, activationLimit: Float?) throws {
+    init(banks: JANGHMappedBanks, parentModule: String, activationLimit: Float?,
+         activation: JANGTActivation = .silu) throws {
         if let activationLimit, !activationLimit.isFinite || activationLimit <= 0 {
             throw JANGHFormatContract.ValidationError.invalid("invalid JANGH activation limit")
         }
@@ -26,11 +27,12 @@ final class JANGHRoutedDecodeBlock {
         downKernel = try JANGHWeightedDownKernel(contract: banks.contract, module: parentModule + ".down_proj")
         gateUpKernel = try JANGHFusedGateUpKernel(
             contract: banks.contract, gateModule: parentModule + ".gate_proj",
-            upModule: parentModule + ".up_proj", outputRotation: downKernel.inputRotation)
+            upModule: parentModule + ".up_proj", outputRotation: downKernel.inputRotation,
+            activation: activation)
         limit = activationLimit
         prefillGateUp = try JANGHPrefillKernel(
             contract: banks.contract, module: parentModule + ".gate_proj",
-            upModule: parentModule + ".up_proj")
+            upModule: parentModule + ".up_proj", activation: activation)
         prefillDown = try JANGHPrefillKernel(
             contract: banks.contract, module: parentModule + ".down_proj")
         inputRotation = banks.contract.projections[parentModule + ".gate_proj"]!.rotation

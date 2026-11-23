@@ -42,6 +42,14 @@ struct TQBlockLoader {
 };
 
 """#
+    /// `nax` with the fused epilogue's activation: `.silu` returns the source unchanged.
+    static func nax(activation: JANGTActivation) -> String {
+        guard activation != .silu else { return nax }
+        let silu = "return (g / (1.0f + metal::fast::exp(-g))) * u;"
+        precondition(nax.components(separatedBy: silu).count == 2, "tq_act epilogue moved")
+        return nax.replacingOccurrences(of: silu, with: "return \(activation.metalValue());")
+    }
+
     static let nax = #"""
 
         using namespace mlx::steel;

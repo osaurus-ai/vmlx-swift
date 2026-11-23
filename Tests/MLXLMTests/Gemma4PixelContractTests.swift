@@ -44,6 +44,52 @@ struct Gemma4PixelContractTests {
             processorClass: "Gemma4Processor", colorSpace: colorSpace, alpha: alpha)
     }
 
+    @Test("Resized Gemma vision inputs use stable pixel bytes")
+    func resizedVisionInputKeepsExactMediaIdentity() async throws {
+        try await MLXMetalTestLock.withLock {
+            let bounds = CGRect(x: 0, y: 0, width: 280, height: 280)
+            let background = CIImage(color: CIColor(red: 1, green: 0, blue: 0)).cropped(to: bounds)
+            let foreground = CIImage(color: CIColor(red: 1, green: 1, blue: 1))
+                .cropped(to: CGRect(x: 61, y: 87, width: 94, height: 106))
+            let image = foreground.composited(over: background)
+            let colorSpace = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+            let encoder = CIContext(options: [.useSoftwareRenderer: true])
+            let png = try #require(
+                encoder.pngRepresentation(of: image, format: .RGBA8, colorSpace: colorSpace))
+            let config = try JSONDecoder().decode(
+                Gemma4ProcessorConfiguration.self,
+                from: Data(
+                    """
+                    {"processor_class":"Gemma4Processor","image_processor":{
+                    "image_processor_type":"Gemma4ImageProcessor","max_soft_tokens":256,
+                    "patch_size":16,"pooling_kernel_size":3},"image_seq_length":256}
+                    """.utf8))
+            let processor = Gemma4Processor(config, tokenizer: ImageTokenizer())
+            let decoded = try #require(CIImage(data: png))
+            let white = CIImage(color: CIColor(red: 1, green: 1, blue: 1)).cropped(to: bounds)
+            let reference = MediaProcessing.resampleBicubic(
+                decoded.composited(over: white), to: CGSize(width: 768, height: 768))
+            let expected = MediaProcessing.asMLXArrayUnmanagedRGB8(reference)
+
+            let first = try await processor.prepare(
+                input: UserInput(prompt: .text("What color is this?"), images: [.ciImage(decoded)]))
+            encoder.clearCaches()
+            let decodedAgain = try #require(CIImage(data: png))
+            let second = try await processor.prepare(
+                input: UserInput(
+                    prompt: .text("What color is this?"), images: [.ciImage(decodedAgain)]))
+            let pixels = try #require(first.image?.pixels)
+            #expect(pixels.shape == [1, 3, 768, 768])
+            #expect(pixels.asData().data == expected.asData().data)
+            let samplesAreOnByteGrid = pixels.asArray(Float.self).allSatisfy { value in
+                let sample = value * 255
+                return abs(sample - sample.rounded()) < 0.0001
+            }
+            #expect(samplesAreOnByteGrid)
+            #expect(computeMediaSalt(for: first) == computeMediaSalt(for: second))
+        }
+    }
+
     private func checkStoredRGB(
         processorClass: String, colorSpace: String, alpha: UInt8
     ) async throws {

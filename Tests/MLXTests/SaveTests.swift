@@ -62,8 +62,9 @@ final class SaveTests: XCTestCase {
         // Keys must match the loader's layer pattern, or the zero checks go blind.
         let keepKey = "layers.44.input_layernorm.weight"
         let dropKey = "layers.44.mlp.switch_mlp.gate_proj.weight"
-        // A dtype-aligned layout (`MLX.save` does not pad its header), so the
-        // retired mapped loader would have mapped the kept tensor.
+        // A dtype-aligned layout, written by hand so it does not depend on how
+        // `MLX.save` lays out its header: the retired mapped loader would have
+        // mapped the kept tensor.
         try writeSparseFloat32Safetensors(
             at: safetensorsPath,
             firstKey: keepKey,

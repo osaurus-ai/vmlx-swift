@@ -116,14 +116,17 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
                     of: "</arg_value>", range: valueStart.upperBound ..< text.endIndex)
             else { return nil }
 
-            let value = String(text[valueStart.upperBound ..< valueEnd.lowerBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawValue = String(text[valueStart.upperBound ..< valueEnd.lowerBound])
 
-            // GLM4: deserialize if NOT a string type in schema
-            if !isStringType(funcName: funcName, argName: key, tools: tools) {
-                arguments[key] = tryParseJSON(value) ?? value
+            // GLM4: deserialize if NOT a string type in schema. The template
+            // writes a string argument between the tags with no padding, so a
+            // declared string keeps its exact bytes: a leading newline that
+            // makes a blank line in an appended file is content, not layout.
+            if isStringType(funcName: funcName, argName: key, tools: tools) {
+                arguments[key] = rawValue
             } else {
-                arguments[key] = value
+                let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                arguments[key] = tryParseJSON(value) ?? value
             }
 
             searchRange = valueEnd.upperBound ..< text.endIndex

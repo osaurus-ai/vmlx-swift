@@ -243,6 +243,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// `<tool_calls><tool_call>f<tool_sep><arg_key>k</arg_key><arg_value>v</arg_value></tool_call></tool_calls>`.
     case hunyuan
 
+    /// Inkling-2 channel envelope:
+    /// `<|message_model|>f<|content_invoke_tool_json|>{"name":"f","args":{…}}<|end_message|>`.
+    case inkling
+
     // MARK: - Factory Methods
 
     /// Whether this format wraps tool calls in literal control markers that
@@ -306,6 +310,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return ATEMToolCallParser()
         case .hunyuan:
             return HunyuanToolCallParser()
+        case .inkling:
+            return InklingToolCallParser()
         }
     }
 
@@ -321,7 +327,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             // Feeding it to the shared processor both executes examples and
             // contaminates its buffer before the real content-channel call.
             return false
-        case .dsml, .dsmlV41, .minicpm5, .k2Horizon:
+        case .dsml, .dsmlV41, .minicpm5, .k2Horizon, .inkling:
             // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
@@ -554,6 +560,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .kimiK2
         }
 
+        // Inkling-2 (`inkling2`, `inkling2_loop`): JSON body in a channel message.
+        if compact.hasPrefix("inkling") {
+            return .inkling
+        }
+
         // DeepSeek-V4 — `DSML` markup format. Per
         // `jang/research/DSV-FAMILY-RUNTIME-GUIDE.md` §24 the
         // `jang_config.chat.tool_calling.parser = "dsml"` stamp is
@@ -770,6 +781,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
         case "k2_horizon", "k2horizon":
             return .k2Horizon
+        case "inkling2", "inkling2_loop", "inkling_json":
+            return .inkling
         case "kimi", "kimik2", "kimi_k2":
             return .kimiK2
         // DSV4 DSML — authoritative stamp from

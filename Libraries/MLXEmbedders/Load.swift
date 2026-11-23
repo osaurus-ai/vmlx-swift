@@ -24,6 +24,12 @@ public enum EmbedderError: LocalizedError {
     /// The configuration file exists but contains invalid JSON or missing required fields.
     case configurationDecodingError(String, String, DecodingError)
 
+    /// The configuration asks to quantize a layer in a way that MLX cannot apply.
+    /// - Parameters:
+    ///     - layer: The path of the layer.
+    ///     - reason: Why MLX would refuse it.
+    case unsupportedQuantization(String, String)
+
     /// A human-readable description of the error.
     public var errorDescription: String? {
         switch self {
@@ -34,6 +40,8 @@ public enum EmbedderError: LocalizedError {
         case .configurationDecodingError(let file, let modelName, let decodingError):
             let errorDetail = extractDecodingErrorDetail(decodingError)
             return "Failed to parse \(file) for model '\(modelName)': \(errorDetail)"
+        case .unsupportedQuantization(let layer, let reason):
+            return "Cannot quantize '\(layer)': \(reason)"
         }
     }
 
@@ -55,7 +63,11 @@ public enum EmbedderError: LocalizedError {
                 return "Invalid JSON"
             } else {
                 let path = context.codingPath.map { $0.stringValue }.joined(separator: ".")
-                return "Invalid data at '\(path)'"
+                // A model can refuse a value on purpose, for example ModernBERT an activation it does
+                // not implement. The reason is in debugDescription; without it the message reads like
+                // a corrupt file.
+                let reason = context.debugDescription.isEmpty ? "" : ": \(context.debugDescription)"
+                return "Invalid data at '\(path)'\(reason)"
             }
         @unknown default:
             return error.localizedDescription
@@ -193,6 +205,22 @@ func loadSynchronous(modelDirectory: URL, modelName: String) throws -> Embedding
     weights = CPUPrecisionPolicy.applyOnLoad(weights)
 
     if let perLayerQuantization = baseConfig.perLayerQuantization {
+        // MLX raises on a quantization it cannot apply, and the default error handler ends the
+        // process. So check each layer that will be quantized first, and throw instead.
+        for (path, module) in model.leafModules().flattened()
+        where module is Quantizable && !(module is Quantized) {
+            guard weights["\(path).scales"] != nil,
+                let quantization = perLayerQuantization.quantization(layer: path)
+            else { continue }
+            let (groupSize, bits, mode) = quantization.asTuple
+            let columns =
+                (module as? Linear)?.weight.dim(-1) ?? (module as? Embedding)?.weight.dim(-1)
+            if let reason = quantizationProblem(
+                groupSize: groupSize, bits: bits, mode: mode, columns: columns)
+            {
+                throw EmbedderError.unsupportedQuantization(path, reason)
+            }
+        }
         quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
                 return perLayerQuantization.quantization(layer: path)?.asTuple
@@ -208,6 +236,36 @@ func loadSynchronous(modelDirectory: URL, modelName: String) throws -> Embedding
     eval(model)
 
     return model
+}
+
+/// Why MLX's quantize would refuse these parameters, or nil when it accepts them. The rules are those
+/// of `affine_quantize`, `fp_quantize` and `quantize` in mlx/ops.cpp; a test compares them with MLX.
+///
+/// - Parameters:
+///   - columns: The width of the weight that is quantized, when it is known.
+func quantizationProblem(
+    groupSize: Int, bits: Int, mode: QuantizationMode, columns: Int?
+) -> String? {
+    switch mode {
+    case .affine:
+        guard [32, 64, 128].contains(groupSize) else {
+            return "affine quantization supports the group sizes 32, 64 and 128, not \(groupSize)"
+        }
+        guard (1 ... 8).contains(bits), bits != 7 else {
+            return "affine quantization supports 1 to 6 and 8 bits, not \(bits)"
+        }
+    case .mxfp4, .mxfp8, .nvfp4:
+        let expectedGroupSize = mode == .nvfp4 ? 16 : 32
+        let expectedBits = mode == .mxfp8 ? 8 : 4
+        guard groupSize == expectedGroupSize, bits == expectedBits else {
+            return "\(mode.rawValue) quantization needs group size \(expectedGroupSize) and "
+                + "\(expectedBits) bits, not group size \(groupSize) and \(bits) bits"
+        }
+    }
+    if let columns, columns % groupSize != 0 {
+        return "the width \(columns) is not a multiple of the group size \(groupSize)"
+    }
+    return nil
 }
 
 /// Asynchronously loads a `ModelContainer` for thread-safe model access.

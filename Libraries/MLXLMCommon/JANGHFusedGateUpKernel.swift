@@ -21,7 +21,7 @@ final class JANGHFusedGateUpKernel {
 
     init(
         contract: JANGHFormatContract, gateModule: String, upModule: String,
-        outputRotation: JANGHFormatContract.Rotation
+        outputRotation: JANGHFormatContract.Rotation, activation: JANGTActivation = .silu
     ) throws {
         guard let gate = contract.projections[gateModule], let up = contract.projections[upModule],
             gate.rotation == up.rotation,
@@ -37,7 +37,7 @@ final class JANGHFusedGateUpKernel {
         let description =
             "jangh-fused-gu-v2-word|\(gate.bits)|\(up.bits)|\(gate.rotation.rawValue)|"
             + "\(outputRotation.rawValue)|\(gateBook.alpha.bitPattern)|\(gateBook.beta.bitPattern)|"
-            + "\(upBook.alpha.bitPattern)|\(upBook.beta.bitPattern)"
+            + "\(upBook.alpha.bitPattern)|\(upBook.beta.bitPattern)" + activation.nameTag
         identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
             .joined()
         func projection(_ name: String, bits: Int, book: JANGHFormatContract.Codebook) -> String {
@@ -92,7 +92,7 @@ final class JANGHFusedGateUpKernel {
                     u *= float(scales_u[size_t(expert) * N + row0 + r]);
                     float limit = limit_value[0];
                     if (limit > 0.0f) { g = metal::min(g, limit); u = metal::clamp(u, -limit, limit); }
-                    float h = (g / (1.0f + metal::fast::exp(-g))) * u;
+                    float h = \(activation.metalValue());
                     if (ROT_OUT) hidden[sg * 4u + r] = h;
                     else out[size_t(dispatch) * N + row0 + r] = h;
                 }

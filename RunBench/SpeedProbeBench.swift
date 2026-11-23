@@ -288,16 +288,25 @@ func runSpeedProbe(modelPath: String) async throws {
                     "What is the background color of this image and which digit is shown? Then write two sentences about that color.",
                 images: [.ciImage(image)])
             input.additionalContext = ["enable_thinking": false]
+            // BENCH_SPEED_IMAGE_EFFORT: a declared reasoning-effort level (e.g. `none` for Inkling-2,
+            // whose reasoning is an effort ladder rather than an on/off kwarg).
+            if let effort = env["BENCH_SPEED_IMAGE_EFFORT"] {
+                input.additionalContext?["reasoning_effort"] = effort
+            }
             let t0 = CFAbsoluteTimeGetCurrent()
             let prepared = try await ctx.processor.prepare(input: input)
             nonisolated(unsafe) let send = prepared
-            let stream = await engine.generate(input: send, parameters: params(120))
+            let stream = await engine.generate(
+                input: send, parameters: params(Int(env["BENCH_SPEED_IMAGE_TOKENS"] ?? "") ?? 120))
             var text = ""
+            var reasoning = ""
             var tokens = 0
             var genTime = 0.0
             var first: Double?
             for await ev in stream {
                 switch ev {
+                case .reasoning(let r):
+                    reasoning += r
                 case .chunk(let c):
                     if first == nil { first = CFAbsoluteTimeGetCurrent() }
                     text += c
@@ -309,9 +318,9 @@ func runSpeedProbe(modelPath: String) async throws {
             }
             print(
                 String(
-                    format: "[BENCH_SPEED_IMAGE] %@ tokens=%d decode_tok_s=%.2f ttft=%.2f text=%@",
+                    format: "[BENCH_SPEED_IMAGE] %@ tokens=%d decode_tok_s=%.2f ttft=%.2f reasoning_chars=%d text=%@",
                     URL(fileURLWithPath: path).lastPathComponent, tokens,
-                    genTime > 0 ? Double(tokens) / genTime : 0, (first ?? t0) - t0,
+                    genTime > 0 ? Double(tokens) / genTime : 0, (first ?? t0) - t0, reasoning.count,
                     String(reflecting: String(text.prefix(160)))))
         }
         // Two-turn conversation: image turn, then a text follow-up with the image in history.

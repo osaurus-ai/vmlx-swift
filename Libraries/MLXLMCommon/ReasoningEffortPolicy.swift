@@ -111,6 +111,27 @@ public struct ReasoningCapability: Sendable, Equatable {
     public let templateKey: String?
     /// Where this capability came from. See ``Source``.
     public let source: Source
+    /// The exact chat-template kwargs for each level, for a model that declares them that way
+    /// (`capabilities.reasoning_modes`: Nemotron 3.5's `medium` is `enable_thinking` AND
+    /// `medium_effort`, which no single ``templateKey`` can express). When non-empty it is the
+    /// whole contract: ``applying(level:to:)`` sends `levelKwargs[level]` and nothing else, and
+    /// ``efforts`` only names the levels. Empty for every other capability.
+    public let levelKwargs: [Int: [String: TemplateValue]]
+
+    /// A declared chat-template kwarg value. Booleans and strings are the only kinds a mode
+    /// declaration may carry; anything else voids the declaration rather than being coerced.
+    public enum TemplateValue: Sendable, Equatable {
+        case bool(Bool)
+        case string(String)
+
+        /// The value as a template context holds it.
+        var contextValue: any Sendable {
+            switch self {
+            case .bool(let value): return value
+            case .string(let value): return value
+            }
+        }
+    }
 
     /// How much the rest of this value is worth trusting.
     ///
@@ -136,6 +157,7 @@ public struct ReasoningCapability: Sendable, Equatable {
         self.efforts = efforts
         self.offEffort = offEffort
         self.templateKey = templateKey
+        self.levelKwargs = [:]
         let thinkingLevels = efforts.isEmpty ? [1] : Array(1...efforts.count)
         self.levels = supportsDisabling ? [0] + thinkingLevels : thinkingLevels
         // A family may DEFAULT to not reasoning — Hunyuan 3's template falls back to `no_think` when
@@ -151,12 +173,14 @@ public struct ReasoningCapability: Sendable, Equatable {
         }
     }
 
-    private init(levels: [Int], defaultLevel: Int, source: Source = .inferred) {
+    private init(levels: [Int], defaultLevel: Int, efforts: [String] = [],
+                 levelKwargs: [Int: [String: TemplateValue]] = [:], source: Source = .inferred) {
         self.levels = levels
         self.defaultLevel = defaultLevel
-        self.efforts = []
+        self.efforts = efforts
         self.offEffort = nil
         self.templateKey = nil
+        self.levelKwargs = levelKwargs
         self.source = source
     }
 
@@ -336,7 +360,10 @@ public enum Hy3EffortPolicy: ReasoningEffortPolicy {
 ///
 /// WITHOUT THIS POLICY the family fell through to the "no effort scale" branch, because a bundle's
 /// effort vocabulary is only ever read from `jang_config.json` and neither `zai-org/GLM-5.3-Flash`
-/// nor its JANG conversion ships one — the declaration lives in the template, where nothing looked.
+/// nor its first JANG conversion shipped one — the declaration lived in the template, where
+/// nothing looked. (OsaurusAI's JANGH2 build does declare it, as the flat `chat.reasoning_efforts`
+/// `[low, high, max]` with default `max`, and this policy agrees with that declaration on the
+/// efforts, on the default and, since a flat list names no off, on there being none.)
 /// `ReasoningCapability.forModel(at:)` therefore reported `levels=[1] efforts=[] templateKey=nil`,
 /// `applying(level:)` returned an EMPTY context for the only level it admitted, no `reasoning_effort`
 /// was ever populated, and every request — including one for the LEAST reasoning — took the
@@ -399,6 +426,11 @@ public enum ReasoningCapabilityRegistry {
     ///   - modelType: `config.json`'s `model_type`.
     ///   - declaredEfforts: effort names from the bundle, if it declares any.
     ///   - declaredDefault: the bundle's default effort, if any.
+    ///   - declaredSupportsDisabling: whether the bundle's own scale includes an off. `nil` leaves
+    ///     it to `supportsThinking`, as the spellings that never say. A scale that LISTS its
+    ///     efforts (the flat `chat.reasoning_efforts`) says it outright: `false` when no entry is
+    ///     an off, `true` when one is.
+    ///   - declaredOffEffort: the effort VALUE that means off, for a scale that names one.
     ///   - supportsThinking: `capabilities.supports_thinking`, when the bundle states it.
     ///   - templateMentionsToggle: whether the chat template reads `enable_thinking`.
     ///   - reasoningSignal: evidence the model reasons even though nothing declares a control — a
@@ -411,18 +443,21 @@ public enum ReasoningCapabilityRegistry {
         supportsThinking: Bool? = nil,
         templateMentionsToggle: Bool = false,
         reasoningSignal: Bool = false,
-        declaredTemplateKey: String? = nil
+        declaredTemplateKey: String? = nil,
+        declaredSupportsDisabling: Bool? = nil,
+        declaredOffEffort: String? = nil
     ) -> ReasoningCapability {
         // 1. A family policy: the only source that also knows which template key to populate.
         if let p = policy(for: modelType) { return p.capability }
 
         // 2. The model's own declaration. Trusted over anything we could infer, and the reason a
         //    model that starts shipping a contract immediately supersedes our guess about it.
-        if declaredEfforts.count > 1 {
-            return ReasoningCapability(efforts: declaredEfforts, defaultEffort: declaredDefault,
-                                       supportsDisabling: supportsThinking != false,
-                                       templateKey: declaredTemplateKey,
-                                       source: .declared)
+        if declaredEfforts.count > 1 || (declaredEfforts.count == 1 && declaredOffEffort != nil) {
+            return ReasoningCapability(
+                efforts: declaredEfforts, defaultEffort: declaredDefault,
+                supportsDisabling: (declaredSupportsDisabling ?? true) && supportsThinking != false,
+                offEffort: declaredOffEffort, templateKey: declaredTemplateKey,
+                source: .declared)
         }
 
         // 3. No effort scale. Still one of three distinct things, and a caller must not be left to
@@ -453,7 +488,12 @@ extension ReasoningCapability {
     /// What this model on disk can do, from its own files.
     ///
     /// Three sources, because model authors have not converged on one:
-    ///   - `jang_config.json` → `chat.reasoning`, the closest thing to a declaration;
+    ///   - the JANG config, from `jang_config.json` or embedded in `config.json` and read through
+    ///     `JangLoader`: a `chat.reasoning` or top-level `reasoning` block (a two-mode contract
+    ///     first, then its effort list), or for a bundle without one the `chat` siblings that stand
+    ///     in for it (`reasoning_values` and its `reasoning_default`), then
+    ///     `capabilities.reasoning_modes`, then OsaurusAI's flat `reasoning_efforts` under `chat`
+    ///     and then under `capabilities`. The closest thing to a declaration;
     ///   - `config.json` → `capabilities.supports_thinking`, a blunt yes/no some bundles ship;
     ///   - `chat_template.jinja`, which is the ground truth about what the prompt can express.
     ///
@@ -465,53 +505,102 @@ extension ReasoningCapability {
         let modelType = (cfg?["model_type"] as? String)
             ?? ((cfg?["text_config"] as? [String: Any])?["model_type"] as? String)
 
-        // THE CONFIG LIVES IN TWO PLACES, and reading only one is how this went wrong. A bundle may
-        // ship `jang_config.json` beside its weights, or embed the same block inside `config.json`.
-        // `JangLoader.loadConfig` already resolved both — file first, then embedded — before this
-        // type existed; reading just the file here made a SECOND, weaker reader of one declaration,
-        // and every bundle using the embedded form looked like it declared nothing.
-        let jang = json(at: directory.appendingPathComponent("jang_config.json"))
-            ?? (json(at: directory.appendingPathComponent("config.json"))?["jang_config"]
-                as? [String: Any])
-        let chat = jang?["chat"] as? [String: Any]
-        // …and the block itself lives in two places too. The nested `chat.reasoning` is the older
-        // shape; newer bundles put it at the top level with different key names. Prefer whichever is
-        // present, nested first so no existing bundle changes meaning.
-        let reasoning = (chat?["reasoning"] as? [String: Any])
-            ?? (jang?["reasoning"] as? [String: Any])
+        // ONE READER, NOT TWO. The config lives in two places: a bundle may ship `jang_config.json`
+        // beside its weights, or embed the same block inside `config.json`. `JangLoader.loadConfig`
+        // already resolves both (file first, then embedded), parses the nested `chat.reasoning` and
+        // the top-level `reasoning` shapes, and hands back a typed value. Digging the raw JSON here
+        // made a second reader of exactly the same declaration, so every spelling and every flag had
+        // to be taught to both, and the two could disagree about one bundle.
+        //
+        // The loader THROWS for a bundle with no JANG config, which is a precondition and not a
+        // defect: `configNotFound` distinguishes "no JANG config" from "a config declaring nothing",
+        // and callers branch on `isJangModel` to keep that distinction. This function must answer for
+        // non-JANG bundles too, so it asks the loader only where the loader applies and falls back to
+        // its own evidence otherwise. That keeps the two CONTRACTS separate while removing the
+        // duplicated PARSING, which is where the drift was.
+        let jangConfig: JangConfig? = JangLoader.isJangModel(at: directory)
+            ? try? JangLoader.loadConfig(at: directory)
+            : nil
+        let chatCfg = jangConfig?.chat
+        let reasoningCfg = chatCfg?.reasoning
 
-        // Efforts, in the order the field names actually appear in the wild. `reasoning_effort_levels`
-        // is the canonical spelling; `reasoning_values` is a SIBLING of `chat.reasoning` that Muse
-        // Glimmer uses; and some bundles put the effort vocabulary in `modes`, which is only
-        // distinguishable from real on/off modes by the absence of an off-mode name. Reading just the
-        // first spelling is how a model declaring four levels was read as declaring none.
-        // NAMING, as it actually is. The nested block spells the vocabulary `reasoning_effort_levels`
-        // and its default `default_effort`; the top-level block spells them
-        // `supported_reasoning_efforts` and `default_reasoning_effort`, and adds a separate BOOLEAN
-        // `reasoning_effort_supported` whose name is one word-order away from the list's. Reading a
-        // bundle means accepting every spelling it might have been written with; picking one and
-        // ignoring the rest is what produced this bug.
-        var efforts = reasoning?["reasoning_effort_levels"] as? [String] ?? []
-        if efforts.count < 2, (reasoning?["reasoning_effort_supported"] as? Bool) != false,
-           let supported = reasoning?["supported_reasoning_efforts"] as? [String] {
-            efforts = supported
-        }
-        if efforts.count < 2, let declared = reasoning?["efforts"] as? [String] { efforts = declared }
-        if efforts.count < 2, let values = chat?["reasoning_values"] as? [String] { efforts = values }
-        if efforts.count < 2, let modes = reasoning?["modes"] as? [String],
-           !modes.contains(where: { offModeNames.contains($0.lowercased()) }) {
-            efforts = modes
+        // Two declarations are COMPLETE contracts rather than effort lists, and are resolved here
+        // in full: a reasoning block naming each mode's kwargs (`nativeThinkingModes`), and
+        // `capabilities.reasoning_modes` (`reasoningModes`). Neither fits the resolver's "an effort
+        // list of two or more" rung, and neither may be read as one.
+        var contract: ReasoningCapability?
+        var efforts: [String] = []
+        var declaredDefault: String?
+        var declaredSupportsDisabling: Bool?
+        var declaredOffEffort: String?
+
+        if let reasoningCfg {
+            // A block is the bundle's whole statement about efforts: one without a vocabulary means
+            // "no effort control", and a top-level `reasoning_effort_supported: false` says so
+            // outright, so the siblings below must not contradict either. The Osaurus app reads
+            // the two-mode contract FIRST, because the same block also lists its two effort values
+            // (`supported_reasoning_efforts: [low, high]`), and read as a plain list that would make
+            // `low` a thinking level when the template renders it as off.
+            contract = nativeThinkingModes(reasoningCfg)
+
+            // A block whose effort travels some other way than as a template kwarg has no effort
+            // control we can exercise, whichever spelling its vocabulary uses.
+            if contract == nil, transportIsChatTemplateKwarg(reasoningCfg.reasoningEffortTransport) {
+                // Effort vocabulary, in the order the spellings appear in the wild. The typed path
+                // carries `reasoning_effort_levels` and `supported_reasoning_efforts` in the same
+                // field; `reasoning_values` is a SIBLING of `chat.reasoning` that Muse Glimmer uses;
+                // and some bundles put the vocabulary in `modes`, distinguishable from real on/off
+                // modes only by the absence of an off-mode name.
+                efforts = (reasoningCfg.reasoningEffortLevels ?? []).compactMap { $0 }
+                if efforts.count < 2, let values = chatCfg?.reasoningValues { efforts = values }
+                if efforts.count < 2, let modes = reasoningCfg.modes,
+                   !modes.contains(where: { offModeNames.contains($0.lowercased()) }) {
+                    efforts = modes
+                }
+                // A block's own default first, then the sibling `chat.reasoning_default` that goes
+                // with `reasoning_values`: the order the config was read in before the loader owned
+                // the read.
+                declaredDefault = reasoningCfg.defaultEffort ?? reasoningCfg.defaultMode
+                    ?? chatCfg?.reasoningDefault
+            }
+        } else {
+            if let values = chatCfg?.reasoningValues { efforts = values }
+            declaredDefault = chatCfg?.reasoningDefault
+
+            // With NO reasoning block, the Osaurus app looks in three more places, in this order:
+            // `capabilities.reasoning_modes`, then the flat `reasoning_efforts` under `chat`, then
+            // under `capabilities`. They come after `reasoning_values`, which the app does not read,
+            // so a bundle that already read `reasoning_values` keeps meaning what it meant. A
+            // `reasoning_modes` table with any flaw declares nothing, and resolution moves on.
+            //
+            // A flat list is the model's whole scale, so it also says whether there is an off: only
+            // an entry that IS one (see `flatEffortScale`) gives the model a level 0. The resolver's
+            // usual "reasoning can be switched off unless `supports_thinking` says no" does not
+            // apply, or `[low, high, max]` would grow an off level. Conversely, `[off, high]`
+            // is a complete scale: the template takes the named effort for each of its two modes.
+            // The default travels with the declaration that supplied the vocabulary.
+            if efforts.count < 2 {
+                contract = reasoningModes(jangConfig?.capabilities?.reasoningModes,
+                                          thinkingDefault: chatCfg?.thinking?.defaultEnabled)
+                if contract == nil,
+                   let flat = firstFlatEffortScale(chat: chatCfg, capabilities: jangConfig?.capabilities) {
+                    efforts = flat.efforts
+                    declaredDefault = flat.defaultEffort
+                    declaredSupportsDisabling = flat.offEffort != nil
+                    declaredOffEffort = flat.offEffort
+                }
+            }
         }
 
-        let declaredDefault = (reasoning?["default_effort"] as? String)
-            ?? (reasoning?["default_reasoning_effort"] as? String)
-            ?? (reasoning?["default_mode"] as? String)
-            ?? (chat?["reasoning_default"] as? String)
+        // A family policy still outranks every declaration, as it does inside `capability(...)`.
+        if let contract {
+            return ReasoningCapabilityRegistry.policy(for: modelType)?.capability ?? contract
+        }
 
         // `supported: false` is a statement about reasoning; `supports_thinking` is the same statement
         // spelled differently in another file. Either one saying no is decisive.
         var supportsThinking: Bool?
-        if let r = reasoning?["supported"] as? Bool { supportsThinking = r }
+        if let r = reasoningCfg?.supported { supportsThinking = r }
         if let caps = cfg?["capabilities"] as? [String: Any],
            let s = caps["supports_thinking"] as? Bool {
             supportsThinking = (supportsThinking ?? true) && s
@@ -559,7 +648,145 @@ extension ReasoningCapability {
         return ReasoningCapabilityRegistry.capability(
             modelType: modelType, declaredEfforts: efforts, declaredDefault: declaredDefault,
             supportsThinking: supportsThinking, templateMentionsToggle: mentionsToggle,
-            reasoningSignal: signal, declaredTemplateKey: inferredKey)
+            reasoningSignal: signal, declaredTemplateKey: inferredKey,
+            declaredSupportsDisabling: declaredSupportsDisabling,
+            declaredOffEffort: declaredOffEffort)
+    }
+
+    /// A flat `chat.reasoning_efforts` list as Osaurus reads it (`DeclaredReasoningEffort`): each
+    /// entry trimmed and lowercased, the list refused whole if any entry is empty or repeated, and
+    /// an entry that names "off" taken out of the efforts and kept as the off effort.
+    ///
+    /// Refused rather than repaired because a repaired list is a vocabulary the bundle never wrote.
+    /// So is a list with two off names (the app would have two ways to say the same rail). The
+    /// default must be one of the entries, off included; anything else is no declared default.
+    static func flatEffortScale(
+        _ raw: [String], default rawDefault: String?
+    ) -> (efforts: [String], offEffort: String?, defaultEffort: String?)? {
+        let entries = raw.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        guard entries.allSatisfy({ !$0.isEmpty }), Set(entries).count == entries.count else {
+            return nil
+        }
+        let offs = entries.filter { offModeNames.contains($0) }
+        guard offs.count <= 1 else { return nil }
+        let declared = rawDefault?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return (entries.filter { !offModeNames.contains($0) }, offs.first,
+                declared.flatMap { entries.contains($0) ? $0 : nil })
+    }
+
+    /// The flat `reasoning_efforts` list from the first placement that HAS one, `chat` and then
+    /// `capabilities`, as the Osaurus app looks. That first list decides even when it declares
+    /// nothing usable (malformed, or its effort travels some other way than as a template
+    /// kwarg): the bundle made its statement there, and a second list elsewhere is not a fallback
+    /// for it. A value that is not a list of strings is no list, and the next placement is read.
+    static func firstFlatEffortScale(
+        chat: JangChatConfig?, capabilities: JangCapabilities?
+    ) -> (efforts: [String], offEffort: String?, defaultEffort: String?)? {
+        let placements: [(list: [String]?, defaultEffort: String?, transport: String?)] = [
+            (chat?.reasoningEfforts, chat?.reasoningEffortDefault, chat?.reasoningEffortTransport),
+            (capabilities?.reasoningEfforts, capabilities?.reasoningEffortDefault,
+             capabilities?.reasoningEffortTransport),
+        ]
+        guard let first = placements.first(where: { $0.list != nil }), let list = first.list,
+              transportIsChatTemplateKwarg(first.transport)
+        else { return nil }
+        return flatEffortScale(list, default: first.defaultEffort)
+    }
+
+    /// Whether a declared `reasoning_effort_transport` is one a chat template can receive. Any
+    /// value other than `chat_template_kwarg` (trimmed, lowercased) names a delivery this library
+    /// cannot make, so the effort control is treated as absent rather than sent the wrong way. An
+    /// absent key keeps the kwarg convention, which is how most bundles that declare efforts
+    /// expect them.
+    static func transportIsChatTemplateKwarg(_ declared: String?) -> Bool {
+        guard let declared else { return true }
+        return declared.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == "chat_template_kwarg"
+    }
+
+    /// The effort names the Osaurus app knows, weakest to strongest, across the conventions it meets
+    /// (OpenAI's o-series and GPT-5.x, Codex's `ultra`, the local families). A declared mode is
+    /// placed on this ladder by name, which is what orders its levels.
+    static let effortLadder = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+    /// A reasoning block that selects thinking with an effort VALUE for each of two modes, as
+    /// `OsaurusAI/Diplodocus-preview-JANG_6M` stamps it:
+    ///
+    ///     "template_flag": "reasoning_effort", "modes": ["think", "no_think"],
+    ///     "mode_kwargs": {"think": {"reasoning_effort": "high"},
+    ///                     "no_think": {"reasoning_effort": "low"}},
+    ///     "supported_reasoning_efforts": ["low", "high"], "default_mode": "think"
+    ///
+    /// That is off plus one thinking level, with off spelled `reasoning_effort = low`: its template
+    /// renders `low` as a closed, empty think block and never reads `enable_thinking`. The same
+    /// block's effort list, read alone, would be a two-level scale with `low` as a thinking level,
+    /// which is why this is checked first. Every condition is the Osaurus app's
+    /// (`DeclaredReasoningEffort.nativeThinkingModes`), and failing any one leaves the block to be
+    /// read as a plain list: a bare `[low, high]` does not by itself mean off and on.
+    static func nativeThinkingModes(_ reasoning: JangChatReasoning) -> ReasoningCapability? {
+        guard reasoning.templateFlag == "reasoning_effort",
+              transportIsChatTemplateKwarg(reasoning.reasoningEffortTransport),
+              let modes = reasoning.modes, Set(modes) == ["think", "no_think"], modes.count == 2,
+              let declared = reasoning.reasoningEffortLevels, !declared.contains(nil),
+              let on = reasoning.modeKwargs?["think"], on.count == 1,
+              let off = reasoning.modeKwargs?["no_think"], off.count == 1,
+              case .string(let onEffort)? = on["reasoning_effort"], effortLadder.contains(onEffort),
+              case .string(let offEffort)? = off["reasoning_effort"], offEffort != onEffort,
+              Set(declared.compactMap { $0 }) == [onEffort, offEffort],
+              let defaultMode = reasoning.defaultMode, modes.contains(defaultMode)
+        else { return nil }
+        return ReasoningCapability(
+            efforts: [onEffort], defaultEffort: defaultMode == "think" ? onEffort : offEffort,
+            supportsDisabling: true, offEffort: offEffort, templateKey: "reasoning_effort",
+            source: .declared)
+    }
+
+    /// `capabilities.reasoning_modes`: `{mode: {kwarg: bool | string}}`, as Nemotron 3.5 stamps it
+    /// (`on` = `enable_thinking`, `medium` = that plus `medium_effort`, `off` = `enable_thinking:
+    /// false`). Each mode is a level whose kwargs are sent verbatim (``levelKwargs``).
+    ///
+    /// Mode names are placed on ``effortLadder``: `on` is `high`, `off` is level 0, and any other
+    /// name must be on the ladder itself; thinking levels ascend by ladder rank. A name off the
+    /// ladder, a mode with no kwargs, two names for one level, or no thinking level at all voids
+    /// the whole table (as does a kwarg value that is not a boolean or string, which the loader
+    /// refuses): a partly understood contract must not be half applied.
+    ///
+    /// The default is off when `chat.thinking.default` is `false` and an off mode exists, else
+    /// `high` if declared, else the strongest. `false` with no off mode leaves no declared default,
+    /// which is the weakest thinking level here as everywhere else.
+    static func reasoningModes(
+        _ table: [String: [String: TemplateValue]]?, thinkingDefault: Bool?
+    ) -> ReasoningCapability? {
+        guard let table, !table.isEmpty else { return nil }
+        var off: [String: TemplateValue]?
+        var thinking: [String: [String: TemplateValue]] = [:]
+        for (name, kwargs) in table {
+            guard !kwargs.isEmpty else { return nil }
+            let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalized == "off" {
+                guard off == nil else { return nil }
+                off = kwargs
+                continue
+            }
+            let effort = normalized == "on" ? "high" : normalized
+            guard effortLadder.contains(effort), thinking[effort] == nil else { return nil }
+            thinking[effort] = kwargs
+        }
+        let efforts = effortLadder.filter { thinking[$0] != nil }
+        guard !efforts.isEmpty else { return nil }
+
+        var levelKwargs: [Int: [String: TemplateValue]] = [:]
+        if let off { levelKwargs[0] = off }
+        for (index, effort) in efforts.enumerated() { levelKwargs[index + 1] = thinking[effort] }
+        let defaultLevel: Int
+        if thinkingDefault == false {
+            defaultLevel = off == nil ? 1 : 0
+        } else {
+            defaultLevel = (efforts.firstIndex(of: "high") ?? efforts.count - 1) + 1
+        }
+        return ReasoningCapability(
+            levels: levelKwargs.keys.sorted(), defaultLevel: defaultLevel, efforts: efforts,
+            levelKwargs: levelKwargs, source: .declared)
     }
 
     /// Which chat-template variable carries the reasoning effort, read from the template itself.
@@ -602,9 +829,19 @@ extension ReasoningCapability {
     /// effort VALUE `no_think` — passing the wrong one leaves the model reasoning while the caller
     /// believes it asked otherwise. Returns nil when the level is not on this model's scale, so a
     /// caller cannot quietly request something it cannot have.
+    ///
+    /// A model that declares each level's kwargs (``levelKwargs``) gets exactly those, added to
+    /// `context`, and nothing this function would otherwise have inferred.
     public func applying(level: Int, to context: [String: any Sendable] = [:]) -> [String: any Sendable]? {
         guard levels.contains(level) else { return nil }
         var out = context
+        if !levelKwargs.isEmpty {
+            guard let kwargs = levelKwargs[level] else { return nil }
+            for (key, value) in kwargs { out[key] = value.contextValue }
+            return out
+        }
+        // Off as an effort VALUE means the template takes its whole instruction from that key.
+        let offIsAnEffort = offEffort != nil && templateKey != nil
         if level == 0 {
             if let offEffort, let templateKey { out[templateKey] = offEffort }
             else { out["enable_thinking"] = false }
@@ -612,8 +849,11 @@ extension ReasoningCapability {
         }
         if let templateKey, let name = effort(for: level) { out[templateKey] = name }
         // Only assert the boolean where it means something. A think-only model has no off state, so
-        // saying `enable_thinking = true` at it is noise a template may or may not understand.
-        if canDisableReasoning { out["enable_thinking"] = true }
+        // saying `enable_thinking = true` at it is noise a template may or may not understand. Nor
+        // where off is an effort value: such a model was never told `enable_thinking = false`, its
+        // contract is the effort key alone (Hunyuan 3's template ignores the boolean, Diplodocus's
+        // never reads it), and the Osaurus app sends that contract's kwargs and nothing besides.
+        if canDisableReasoning && !offIsAnEffort { out["enable_thinking"] = true }
         return out
     }
 

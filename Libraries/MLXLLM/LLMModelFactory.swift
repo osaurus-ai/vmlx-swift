@@ -156,6 +156,15 @@ public enum LLMTypeRegistry {
             },
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
+            "inkling2_loop": { data, requesting in
+                // The vision tower is built only when the bundle declares one and the request
+                // includes the vision lane (or names no lanes).
+                var args = try JSONDecoder.json5().decode(Inkling2LoopConfiguration.self, from: data)
+                let lanes = try Set.resolveForConstruction(
+                    requested: requesting, constructible: args.vision == nil ? [.text] : [.text, .vision])
+                if !lanes.contains(.vision) { args.vision = nil }
+                return Inkling2LoopModel(args)
+            },
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
             "minimax_m2": { data, _ in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
@@ -1416,6 +1425,9 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// MiniMax-M3 / M3.1 with its vision stack built: image items in their turn, expanded to image runs, patches in
     /// `LMInput.image` (`MiniMaxM3Vision.swift`). nil for every other model.
     let miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration?
+    /// Inkling-2 with its vision tower built: image parts in their message, each placeholder expanded
+    /// to one per 40 px tile, tiles in `LMInput.image` (`Inkling2Vision.swift`). nil otherwise.
+    let inkling2Vision: Inkling2VisionConfiguration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
@@ -1425,7 +1437,8 @@ struct LLMUserInputProcessor: UserInputProcessor {
         templateReadsEnableThinking: Bool = false,
         k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil,
         deepseekV41Vision: DeepseekV41VisionConfiguration? = nil,
-        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil
+        miniMaxM3Vision: MiniMaxM3VisionPromptConfiguration? = nil,
+        inkling2Vision: Inkling2VisionConfiguration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1436,6 +1449,7 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.k2ReasoningDeclaration = k2ReasoningDeclaration
         self.deepseekV41Vision = deepseekV41Vision
         self.miniMaxM3Vision = miniMaxM3Vision
+        self.inkling2Vision = inkling2Vision
     }
 
     func prepare(input: UserInput) throws -> LMInput {
@@ -1478,6 +1492,19 @@ struct LLMUserInputProcessor: UserInputProcessor {
                 chat: chat, looseImages: input.images, generated: messages)
             if !anchored.images.isEmpty {
                 return try deepseekV41ImageInput(
+                    input: input, messages: anchored.messages, images: anchored.images,
+                    additionalContext: additionalContext, vision: vision)
+            }
+        }
+        if let vision = inkling2Vision, !input.images.isEmpty {
+            let chat: [Chat.Message]? = {
+                if case .chat(let chat) = input.prompt { return chat }
+                return nil
+            }()
+            let anchored = Inkling2VisionPrompt.anchorImages(
+                chat: chat, looseImages: input.images, generated: messages)
+            if !anchored.images.isEmpty {
+                return try inkling2ImageInput(
                     input: input, messages: anchored.messages, images: anchored.images,
                     additionalContext: additionalContext, vision: vision)
             }
@@ -1577,6 +1604,38 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// chat template path as text (an image turn and its text continuation share one prompt format and cache
     /// boundaries), preprocess each image as the bundle's processor does, expand every image token into
     /// `start, image x (t h w / 4), end`, and remap the cache boundaries into the expanded token space.
+    /// Inkling-2: the template renders each image part as one `<|unused_200054|>`; it expands to one
+    /// placeholder per tile, and the cache boundaries are remapped into the expanded token space.
+    private func inkling2ImageInput(
+        input: UserInput, messages: [Message], images: [UserInput.Image],
+        additionalContext: [String: any Sendable]?, vision: Inkling2VisionConfiguration
+    ) throws -> LMInput {
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: additionalContext)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: input.tools,
+            additionalContext: additionalContext, promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
+        let processed = try images.map { try Inkling2ImagePreprocessor.process($0, tile: vision.tileSize) }
+        let expansion = try Inkling2VisionPrompt.expand(
+            tokens: promptTokens, imageTokenId: vision.imageTokenId, counts: processed.map(\.tokenCount))
+        RuntimeReceipts.emit(
+            "inkling2vision stage=preprocess images=\(processed.count) grids="
+                + processed.map { "\($0.rows)x\($0.cols)" }.joined(separator: ",")
+                + " image_tokens=\(processed.reduce(0) { $0 + $1.tokenCount })"
+                + " prompt_tokens=\(expansion.tokens.count)")
+        return LMInput(
+            text: .init(tokens: MLXArray(expansion.tokens), tokenIds: expansion.tokens),
+            image: Inkling2ImagePreprocessor.processedImage(processed),
+            mediaTokenIds: [vision.imageTokenId],
+            cacheScopeSalt: cacheScopeSalt(from: additionalContext),
+            cachePrefixTokenCounts: Inkling2VisionPrompt.remapBoundaries(
+                boundaries.all, rawToExpanded: expansion.rawToExpanded),
+            cacheStablePrefixTokenCounts: Inkling2VisionPrompt.remapBoundaries(
+                boundaries.stable, rawToExpanded: expansion.rawToExpanded),
+            toolSchemas: input.tools)
+    }
+
     private func miniMaxM3ImageInput(
         input: UserInput, messages: [Message], images: [UserInput.Image],
         additionalContext: [String: any Sendable]?, vision: MiniMaxM3VisionPromptConfiguration
@@ -1804,6 +1863,10 @@ public final class LLMModelFactory: ModelFactory {
         let miniMaxM3JANGHPreparation = try MiniMaxM3JANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let miniMaxM3JANGHPreparation { configData = miniMaxM3JANGHPreparation.ordinaryConfiguration }
+        // Inkling-2-Mini JANGH (codebook routed experts with the softcapped activation; affine 8-bit trunk).
+        let inklingJANGHPreparation = try Inkling2LoopJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let inklingJANGHPreparation { configData = inklingJANGHPreparation.ordinaryConfiguration }
 
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
@@ -1812,7 +1875,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, ricursiveJANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, ricursiveJANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, inklingJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -2012,7 +2075,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil {
+        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -2096,6 +2159,8 @@ public final class LLMModelFactory: ModelFactory {
                     configurationData: configData, requesting: configuration.requestedModalities)
             } else if let miniMaxM3JANGHPreparation {
                 model = try miniMaxM3JANGHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let inklingJANGHPreparation {
+                model = try inklingJANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: configData, modelType: baseConfig.modelType,
@@ -2103,7 +2168,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil { throw error }
+            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil || inklingJANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2294,7 +2359,7 @@ public final class LLMModelFactory: ModelFactory {
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
-                || miniMaxM3JANGHPreparation != nil
+                || miniMaxM3JANGHPreparation != nil || inklingJANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
@@ -2302,7 +2367,7 @@ public final class LLMModelFactory: ModelFactory {
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil
-                && miniMaxM3JANGHPreparation == nil ? jangConfig : nil,
+                && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
@@ -2353,7 +2418,8 @@ public final class LLMModelFactory: ModelFactory {
                 MiniMaxM3VisionPromptConfiguration(
                     processor: MiniMaxM3ImageProcessorConfiguration.load(directory: modelDirectory),
                     imageTokenId: $0.imageTokenId)
-            })
+            },
+            inkling2Vision: (model as? Inkling2LoopModel)?.vision?.config)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

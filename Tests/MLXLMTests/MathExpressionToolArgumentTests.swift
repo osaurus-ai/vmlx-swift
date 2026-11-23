@@ -68,6 +68,10 @@ struct MathExpressionToolArgumentTests {
             return "<zyphra_tool_call>\n<function=calculate>\n<parameter=expression>\n\(e)\n</parameter>\n</function>\n</zyphra_tool_call>"
         case .glm4:
             return "<tool_call>calculate<arg_key>expression</arg_key><arg_value>\(e)</arg_value></tool_call>"
+        case .inkling:
+            // The tool processor's view: the Inkling reasoning parser has already consumed the
+            // `<|message_model|>NAME` header.
+            return "<|content_invoke_tool_json|>{\"name\":\"calculate\",\"args\":\(jsonArgs)}<|end_message|>"
         case .hunyuan:
             return "<tool_calls>\n<tool_call>calculate<tool_sep>\n<arg_key>expression</arg_key><arg_value>\(jsonString(e))</arg_value>\n</tool_call>\n</tool_calls>"
         case .minimaxM2:

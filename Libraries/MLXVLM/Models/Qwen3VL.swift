@@ -65,13 +65,18 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             throw VLMError.imageProcessingFailure(
                 "Invalid video resize factors temporal=\(temporalFactor) spatial=\(factor)")
         }
-        if height < factor {
+        // As in the reference, a frame with a side smaller than `factor` is scaled up until both
+        // sides reach it (truncated, like Python's `int()`), and is not rejected.
+        guard height > 0, width > 0 else {
             throw VLMError.imageProcessingFailure(
-                "Height: \(height) must be larger than factor: \(factor)")
+                "Invalid video frame dimensions \(width) × \(height); both must be positive.")
         }
-        if width < factor {
-            throw VLMError.imageProcessingFailure(
-                "Width: \(width) must be larger than factor: \(factor)")
+        var height = height
+        var width = width
+        if height < factor || width < factor {
+            let scale = max(Double(factor) / Double(height), Double(factor) / Double(width))
+            height = Int(Double(height) * scale)
+            width = Int(Double(width) * scale)
         }
         if max(height, width) / min(height, width) > 200 {
             throw VLMError.imageProcessingFailure(

@@ -690,6 +690,16 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let types = [config["model_type"], text?["model_type"]].compactMap {
             ($0 as? String)?.lowercased().replacingOccurrences(of: "-", with: "_")
         }
+        // Inkling-2-Mini ships its dSpark drafter inside the bundle (`mtp_config` + `mtp.safetensors`,
+        // `rnn_hidden` Markov head); it loads with the model, so the drafter path is the bundle itself.
+        if types.contains("inkling2_loop") {
+            let mtp = config["mtp_config"] as? [String: Any]
+            guard let mtp, (mtp["markov_head_type"] as? String ?? "rnn_hidden") == "rnn_hidden",
+                FileManager.default.fileExists(
+                    atPath: bundleDirectory.appendingPathComponent("mtp.safetensors").path)
+            else { return nil }
+            return bundleDirectory
+        }
         guard types.contains(where: Self.dsparkModelTypes.contains) else { return nil }
         let local = bundleDirectory.appendingPathComponent("dspark", isDirectory: true)
         if types.contains(where: Self.miniMaxDSparkModelTypes.contains) {

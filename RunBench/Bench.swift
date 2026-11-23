@@ -666,6 +666,38 @@ struct Bench {
             try await runRippleTimingProbe(modelPath: modelPath)
             return
         }
+        if (env["BENCH_INKLING2_DSPARK_ITER"] ?? "0") == "1" {
+            try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_APPPATH"] ?? "0") == "1" {
+            try await runInkling2AppPathProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_CPUPROF"] ?? "0") == "1" {
+            try await runInkling2CPUProfileProbe(modelPath: modelPath)
+            return
+        }
+        if env["BENCH_INKLING2_CTXSWEEP"] != nil {
+            try await runInkling2ContextSweepProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_VT"] ?? "0") == "1" {
+            try await runInkling2VerifyTimeProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_TEMPLATE"] ?? "0") == "1" {
+            try await runInkling2TemplateProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_TIMING"] ?? "0") == "1" {
+            try await runInkling2TimingProbe(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_INKLING2_PARITY"] ?? "0") == "1" {
+            try await runInkling2ParityProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_RIPPLE_PARITY"] ?? "0") == "1" {
             try await runRippleParityProbe(modelPath: modelPath)
             return
