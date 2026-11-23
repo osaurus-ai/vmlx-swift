@@ -461,6 +461,31 @@ extension Inkling2DecoderLayer {
             conv.offset += T
             return (fin[0].reshaped([1, T, H]), states)
         }
+        if let mx = mlp.mixedExperts {
+            // JANGHT trellis / half-native layer: the router-weighted sum per row (fp32 rows: decode kernels),
+            // combined by the final kernel as one slot.
+            let fin = Inkling2VerifyKernels.finalT(
+                [
+                    mx(xm32, inds, sel[1]), MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
+                    MLXArray.ones([T, 1], dtype: f32),
+                    packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
+                    MLXArray([Int32(2 * C), Int32(H)]),
+                ],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
+                outputDTypes: [dtype, f32, f32])
+            if let recorder {
+                let kRaw = ka[0..., Int(imeta[2]) ..< (Int(imeta[2]) + C)].asType(f32)
+                let vRaw = va[0..., Int(imeta[4]) ..< (Int(imeta[4]) + C)].asType(f32)
+                recorder.record(
+                    conv: conv, oldState: packed.reshaped([1, 3, P]),
+                    inputs: MLX.concatenated([kRaw, vRaw, o.asType(f32), fin[2]], axis: -1).reshaped([
+                        1, T, P,
+                    ]))
+            }
+            conv[0] = fin[1].reshaped([1, 3, P])
+            conv.offset += T
+            return (fin[0].reshaped([1, T, H]), states)
+        }
         let sw = mlp.switchMLP!
         // Per-row expert gathers: measured fastest at T = 8 on M5 Max (gate/up 326 us vs 636 for a
         // grouped one-read-per-expert kernel and ~800 sorted): rows in a verify block rarely share
