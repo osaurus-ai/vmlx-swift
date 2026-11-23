@@ -159,6 +159,20 @@ public final class JANGHModelPreparation {
             try Self.validateNativeHeaders(module: module, format: format, dimensions: dimensions[module]!,
                                            metadata: metadata)
         }
+        // A native NVFP4 gate/up pair runs as one fused gather with ONE per-expert factor: gate and up must carry the
+        // same global_scale (the source's w13 factor). Checked on the tensor bytes here, so a bundle that breaks it is
+        // refused at load instead of having that layer's experts skipped.
+        for (module, format) in native where format == .nvfp4 && module.hasSuffix(".gate_proj") {
+            let parent = String(module.dropLast(".gate_proj".count))
+            let gate = try Self.readSmallTensor(directory: directory, metadata: metadata,
+                                                name: module + ".global_scale")
+            let up = try Self.readSmallTensor(directory: directory, metadata: metadata,
+                                              name: parent + ".up_proj.global_scale")
+            guard gate == up else {
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "native nvfp4 gate and up global_scale differ for \(parent) (the fused gate/up needs one factor)")
+            }
+        }
         // Mixed JANGHT layers: each projection is mapped by its own format (jangtq2 codebook or jangt trellis).
         let trellis = partition.contract.trellis
         let custom = dimensions.filter { native[$0.key] == nil }
@@ -329,6 +343,23 @@ public final class JANGHModelPreparation {
     /// Every routed projection is a `jangtq2` codebook bank (no trellis bank, no native projection).
     public var routedProjectionsAreAllCodebook: Bool {
         nativeRoutedModules.isEmpty && source.contract.trellis.isEmpty
+    }
+
+    /// The raw bytes of one small indexed tensor (at most 1 MiB), read at its header offsets.
+    static func readSmallTensor(directory: URL, metadata: JANGHHeaderAdapter.Snapshot, name: String) throws -> Data {
+        typealias Failure = JANGHFormatContract.ValidationError
+        guard let file = metadata.weightMap[name], let shard = metadata.shards[file],
+            let header = shard.tensors[name], header.end >= header.start, header.end - header.start <= 1 << 20
+        else { throw Failure.invalid("missing or oversized tensor \(name)") }
+        let handle = try FileHandle(
+            forReadingFrom: directory.resolvingSymlinksInPath().appendingPathComponent(file))
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(shard.dataStart + header.start))
+        let count = header.end - header.start
+        guard let data = try handle.read(upToCount: count), data.count == count else {
+            throw Failure.invalid("short read of tensor \(name)")
+        }
+        return data
     }
 
     /// One routed layer of a bundle that may mix custom banks with native projections (Inkling-2-Mini JANGHT).

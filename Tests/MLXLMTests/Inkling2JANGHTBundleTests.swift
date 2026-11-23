@@ -183,6 +183,20 @@ final class Inkling2JANGHTBundleTests: XCTestCase {
         })
     }
 
+    /// A native NVFP4 gate/up pair whose per-expert global scales differ cannot run as one fused gather: the load is
+    /// refused on the tensor contents (never a silently skipped layer). Equal scales (the fixture) are admitted above.
+    func testNVFP4GateUpWithDifferentGlobalScalesIsRefused() throws {
+        for layer in [1, 3] {
+            try assertRefused("L\(layer) gate/up global_scale differ", mutateTensors: {
+                let name = "model.layers.\(layer).mlp.switch_mlp.up_proj.global_scale"
+                let (dtype, shape, data) = $0[name]!
+                var values = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                values[5] *= 2
+                $0[name] = (dtype, shape, values.withUnsafeBytes { Data($0) })
+            })
+        }
+    }
+
     /// Other architectures keep the previous contract: a native projection inside a custom stack is refused.
     func testNativeProjectionsNeedTheArchitecturesConsent() throws {
         try MLXMetalTestLock.withLock {
