@@ -690,13 +690,21 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let types = [config["model_type"], text?["model_type"]].compactMap {
             ($0 as? String)?.lowercased().replacingOccurrences(of: "-", with: "_")
         }
-        // Inkling-2-Mini ships its dSpark drafter inside the bundle (`mtp_config` + `mtp.safetensors`,
-        // `rnn_hidden` Markov head); it loads with the model, so the drafter path is the bundle itself.
+        // Inkling's rnn_hidden drafter loads with the model. The original bundle stores it
+        // separately, and converted bundles can store its parameters in the main shards.
         if types.contains("inkling2_loop") {
-            let mtp = config["mtp_config"] as? [String: Any]
-            guard let mtp, (mtp["markov_head_type"] as? String ?? "rnn_hidden") == "rnn_hidden",
-                FileManager.default.fileExists(
-                    atPath: bundleDirectory.appendingPathComponent("mtp.safetensors").path)
+            guard let mtp = config["mtp_config"] as? [String: Any],
+                (mtp["markov_head_type"] as? String ?? "rnn_hidden") == "rnn_hidden"
+            else { return nil }
+            let separateWeights = FileManager.default.fileExists(
+                atPath: bundleDirectory.appendingPathComponent("mtp.safetensors").path)
+            if separateWeights { return bundleDirectory }
+            // This mixed-bank format ships the inline drafter. Legacy JANGH2
+            // can carry the same tensors before its verifier is qualified.
+            guard let trellis = config["jangt"] as? [String: Any],
+                trellis["code"] as? String == "v2_halfbits",
+                Self.hasInlineInklingDSpark(
+                directory: bundleDirectory, layers: mtp["num_hidden_layers"] as? Int ?? 3)
             else { return nil }
             return bundleDirectory
         }
@@ -713,6 +721,30 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 atPath: local.appendingPathComponent("dspark.safetensors").path)
         else { return nil }
         return local
+    }
+
+    private static func hasInlineInklingDSpark(directory: URL, layers: Int) -> Bool {
+        guard layers > 0, let names = try? MTPBundleInspector.loadableTensorNames(from: directory)
+        else { return false }
+        let tensors = Set(names.filter { $0.hasPrefix("mtp_drafter.") })
+        let head = [
+            "fuse_weight", "mask_embed", "norm.weight", "markov_head.dflare_norm.weight",
+            "markov_head.markov_w1.weight", "markov_head.rnn_proj.weight", "markov_head.rnn_proj.bias",
+            "markov_head.hidden_out.weight", "markov_head.hidden_out.bias",
+        ]
+        let layer = [
+            "dflare_norm", "input_layernorm", "post_attention_layernorm",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "self_attn.k_proj_ctx", "self_attn.v_proj_ctx",
+            "self_attn.q_norm", "self_attn.k_norm", "self_attn.k_norm_ctx",
+        ]
+        guard layers <= tensors.count / layer.count,
+            head.allSatisfy({ tensors.contains("mtp_drafter.\($0)") })
+        else { return false }
+        return (0 ..< layers).allSatisfy { index in
+            layer.allSatisfy { tensors.contains("mtp_drafter.layers.\(index).\($0).weight") }
+        }
     }
 
     /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.
