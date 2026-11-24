@@ -2,8 +2,8 @@
 //
 // Inkling-2-Mini multi-row step (B = 1, T rows): the speculative-verify / short-chunk path.
 // Same arithmetic as `decodeStep` (Inkling2Decode.swift) generalized to T rows: the short convs
-// walk the rows in order inside the kernels; attention takes an additive mask that carries the
-// causal / window structure, the relative bias and each row's sink (as an extra zero key).
+// walk the rows in order inside the kernels. Mixed-bank dSpark verification uses each row's native
+// attention sink and matches the single-token projection reductions.
 
 import Foundation
 import MLX
@@ -119,9 +119,9 @@ enum Inkling2VerifyKernels {
     /// valid = d >= 0 (and d < W if W > 0); value = bf16(r[t, h] . proj[:, d]) for d < E, 0 beyond,
     /// minus row t's sink logit for head h (qa at meta[3]); -inf when invalid.
     ///
-    /// The per-token sink is folded into the mask: attention runs with a zero native sink, and a
+    /// For short prefill the per-token sink is folded into the mask. Attention uses a zero native sink and a
     /// row-constant shift of every key's logit by -sink gives exp(s_j) / (exp(sink) + sum exp(s_i)),
-    /// the sink softmax, without a zero key concatenated in front of the whole cache each visit.
+    /// the sink softmax. Verify keeps the unshifted bias and passes each query's sink to attention.
     /// meta = [S, seen, kStart, sink off, qa row stride, W].
     static let maskT = MLXFast.metalKernel(
         name: "inkling2_ver_mask",
@@ -145,8 +145,12 @@ enum Inkling2VerifyKernels {
             if (d < E) {
                 for (int k = 0; k < DR; ++k) b += float(r[((size_t)t * NQ + h) * DR + k]) * float(proj[k * E + d]);
             }
-            float sink = float(qa[(size_t)t * qs + soff + h]);
-            ink_store(out, o, ink_round_as(out, b) - sink);
+            if constexpr (NATIVE_SINKS) {
+                ink_store(out, o, b);
+            } else {
+                float sink = float(qa[(size_t)t * qs + soff + h]);
+                ink_store(out, o, ink_round_as(out, b) - sink);
+            }
             """,
         header: header)
 
@@ -204,7 +208,8 @@ extension Inkling2DecoderLayer {
     /// With a recorder, every conv's pre-conv inputs are kept for rewinding.
     func multiRowStep(
         _ h: MLXArray, stack: MLXArray?, kv: any KVCache, conv: MambaCache,
-        messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?
+        messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?,
+        matchDecode: Bool
     ) -> (MLXArray, MLXArray?) {
         prepareDecodeWeights()
         let w = decodeWeights
@@ -273,6 +278,15 @@ extension Inkling2DecoderLayer {
             rowsV = g[2]
         }
 
+        // Preserve the single-vector reduction for sinks, dynamic conv taps, and routing.
+        func denseProject(_ x: MLXArray, _ weight: MLXArray) -> MLXArray {
+            if matchDecode {
+                return MLX.matmul(x.expandedDimensions(axis: 1), weight.expandedDimensions(axis: 0))
+                    .squeezed(axis: 1)
+            }
+            return MLX.matmul(x, weight)
+        }
+
         // 2. projections
         let nQ = nq * hd
         let nR = nq * dRel
@@ -281,20 +295,23 @@ extension Inkling2DecoderLayer {
         let va: MLXArray
         var imeta: [Int32]
         if let qp = w.quant {
+            func project(_ x: MLXArray, _ p: Inkling2QuantizedProjections.Packed) -> MLXArray {
+                matchDecode ? qp.verifyVectors(x, p) : qp(x, p)
+            }
             // Affine projections: qa = [q | r | gate | sink] (the plain sink appended, as the mask reads it at
             // 2nQ + nR), ka / va from the quantized k / v rows (+ the plain dynamic-tap rows after them).
-            qa = MLX.concatenated([qp(rowsQ, qp.qrg), MLX.matmul(rowsQ, qp.sink)], axis: -1)
+            qa = MLX.concatenated([project(rowsQ, qp.qrg), denseProject(rowsQ, qp.sink)], axis: -1)
             if rowsK == nil {
-                let kv = qp(rowsQ, qp.kv)  // [T, 2C]
+                let kv = project(rowsQ, qp.kv)  // [T, 2C]
                 ka = kv
                 va = kv
                 imeta = [0, Int32(nQ), 0, 0, Int32(C), 0, Int32(qa.dim(1)), Int32(2 * C), Int32(2 * C)]
             } else {
-                var kk = qp(rowsK!, qp.k)
-                var vv = qp(rowsV!, qp.v)
+                var kk = project(rowsK!, qp.k)
+                var vv = project(rowsV!, qp.v)
                 if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
-                    kk = MLX.concatenated([kk, MLX.matmul(rowsK!, kt)], axis: -1)
-                    vv = MLX.concatenated([vv, MLX.matmul(rowsV!, vt)], axis: -1)
+                    kk = MLX.concatenated([kk, denseProject(rowsK!, kt)], axis: -1)
+                    vv = MLX.concatenated([vv, denseProject(rowsV!, vt)], axis: -1)
                 }
                 ka = kk
                 va = vv
@@ -349,7 +366,7 @@ extension Inkling2DecoderLayer {
             outputShapes: [[T, nQ], [T, nR], [T, C], [T, C], [3, 2 * C]],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
 
-        // 3. attention: keys [visible window], mask with sink column
+        // 3. Attention over the visible keys. In ordinary short prefill the mask also carries the sink shift.
         var (keys, values) = kv.update(
             keys: outs[2].reshaped([1, T, nkv, hd]).transposed(0, 2, 1, 3),
             values: outs[3].reshaped([1, T, nkv, hd]).transposed(0, 2, 1, 3))
@@ -373,19 +390,53 @@ extension Inkling2DecoderLayer {
                     Int32(a.window ?? 0),
                 ]),
             ],
+            template: [("NATIVE_SINKS", matchDecode)],
             grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
             outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
-        let attn = MLXFast.scaledDotProductAttention(
-            queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
-            keys: keys, values: values, scale: a.scale,
-            mask: .array(mask.reshaped([1, nq, T, S])),
-            sinks: w.zeroSinks(nq: nq, dtype: dtype))
-        let merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+        let merged: MLXArray
+        if matchDecode {
+            merged = MLX.concatenated(
+                (0 ..< T).map { row in
+                    let end = seen + row + 1 - kStart
+                    let start = max(0, end - (a.window ?? end))
+                    let bias = mask[0..., row, start ..< end].reshaped([1, nq, 1, end - start])
+                    return MLXFast.scaledDotProductAttention(
+                        queries: outs[0][row].reshaped([1, nq, 1, hd]),
+                        keys: keys[0..., 0..., start ..< end, 0...],
+                        values: values[0..., 0..., start ..< end, 0...],
+                        scale: a.scale, mask: .array(bias),
+                        sinks: qa[row, sinkOff ..< (sinkOff + nq)]
+                    ).reshaped([1, nQ])
+                }, axis: 0)
+        } else {
+            let attn = MLXFast.scaledDotProductAttention(
+                queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
+                keys: keys, values: values, scale: a.scale,
+                mask: .array(mask.reshaped([1, nq, T, S])),
+                sinks: w.zeroSinks(nq: nq, dtype: dtype))
+            merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+        }
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [merged, qa[0..., (nQ + nR) ..< (2 * nQ + nR)], MLXArray([Int32(0)])],
             grid: (T * nQ, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, nQ]],
             outputDTypes: [dtype])[0]
-        let o = a.oProj(gated)  // [T, H]
+        let o: MLXArray
+        if !matchDecode {
+            o = a.oProj(gated)
+        } else if let linear = a.oProj as? QuantizedLinear,
+            type(of: linear) == QuantizedLinear.self, linear.bias == nil,
+            linear.scales.dtype == gated.dtype
+        {
+            o = MLX.quantizedMM(
+                gated.expandedDimensions(axis: 1), linear.weight.expandedDimensions(axis: 0),
+                scales: linear.scales.expandedDimensions(axis: 0),
+                biases: linear.biases?.expandedDimensions(axis: 0),
+                transpose: true,
+                groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode
+            ).squeezed(axis: 1)
+        } else {
+            o = MLX.concatenated((0 ..< T).map { a.oProj(gated[$0 ..< ($0 + 1)]) }, axis: 0)
+        }
 
         // 4. residual + MLP input
         let states = isBlockBoundary ? inklingAppendState(stack, h) : stack
@@ -426,7 +477,7 @@ extension Inkling2DecoderLayer {
 
         // 5. MoE
         let router = mlp.gate
-        let logits = MLX.matmul(xm32, w.routerT!)
+        let logits = denseProject(xm32, w.routerT!)
         let sel = Inkling2Kernels.routerSelect(
             [logits, router.bias, router.meta, router.scaleArray], grid: (T * 128, 1, 1),
             threadGroup: (128, 1, 1), outputShapes: [[T, router.topK], [T, router.topK]],

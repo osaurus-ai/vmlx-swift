@@ -1029,6 +1029,20 @@ struct Inkling2QuantizedProjections {
             bits: bits, mode: mode)
     }
 
+    /// Batch independent vectors while keeping M = 1 in the quantized matmul dispatch.
+    func verifyVectors(_ x: MLXArray, _ p: Packed) -> MLXArray {
+        if x.dtype != p.scales.dtype {
+            return MLX.concatenated(
+                (0 ..< x.dim(0)).map { self(x[$0 ..< ($0 + 1)], p) }, axis: 0)
+        }
+        return MLX.quantizedMM(
+            x.expandedDimensions(axis: 1), p.weight.expandedDimensions(axis: 0),
+            scales: p.scales.expandedDimensions(axis: 0),
+            biases: p.biases?.expandedDimensions(axis: 0),
+            transpose: true, groupSize: groupSize, bits: bits, mode: mode
+        ).squeezed(axis: 1)
+    }
+
     var arrays: [MLXArray] {
         [all, qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
             + [sink] + [kTaps, vTaps].compactMap { $0 }

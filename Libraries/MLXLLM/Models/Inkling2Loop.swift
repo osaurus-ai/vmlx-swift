@@ -1490,6 +1490,7 @@ public final class Inkling2LoopModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "embed_norm") var embedNorm: Inkling2RMSNorm
     let layers: [Inkling2DecoderLayer]
+    let usesMixedRoutedExperts: Bool
     @ModuleInfo(key: "norm") var norm: Inkling2RMSNorm
     @ModuleInfo(key: "final_input") var finalInput: Inkling2BlockAttentionResidual
     @ModuleInfo(key: "message_input") var messageInput: Inkling2MessageInput?
@@ -1502,6 +1503,7 @@ public final class Inkling2LoopModelInner: Module {
         mixedRoutedExperts: [Int: JANGHModelPreparation.MixedRoutedLayer] = [:]
     ) {
         self.args = args
+        usesMixedRoutedExperts = !mixedRoutedExperts.isEmpty
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
         _embedNorm.wrappedValue = Inkling2RMSNorm(args.hiddenSize, eps: args.rmsNormEps)
@@ -1561,6 +1563,7 @@ public final class Inkling2LoopModelInner: Module {
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) > 1
             && ids.dim(1) <= 16 && !Inkling2Runtime.forceGeneralDecode
             && decodeSupported
+        let matchDecode = recorder != nil && usesMixedRoutedExperts
         let scalars = Inkling2StepScalars()
         func visit(_ layer: Int, _ pass: Int) -> Int {
             if layer < args.loopStart { return layer }
@@ -1577,7 +1580,7 @@ public final class Inkling2LoopModelInner: Module {
                 if multiRow {
                     (h, stack) = layers[i].multiRowStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
-                        loopIndex: j, ones: ones, recorder: recorder)
+                        loopIndex: j, ones: ones, recorder: recorder, matchDecode: matchDecode)
                     continue
                 }
                 if let recorder {
@@ -1806,7 +1809,14 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(trunk(inputs, cache: cache))
+        let matchDecode = pendingVerify != nil && model.usesMixedRoutedExperts
+        let hidden = trunk(inputs, cache: cache)
+        if matchDecode, hidden.dim(1) > 1 {
+            // Each verifier row uses the same output projection as an ordinary decode token.
+            return MLX.concatenated(
+                (0 ..< hidden.dim(1)).map { logits(hidden[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
+        }
+        return logits(hidden)
     }
 
     /// Chunked text prefill. Non-final chunks run the trunk only (no 200k-vocab logits); the
