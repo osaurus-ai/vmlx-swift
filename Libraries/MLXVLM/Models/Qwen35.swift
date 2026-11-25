@@ -4150,17 +4150,16 @@ enum Qwen35Language {
             } else {
                 logits = headLogits(normed)
             }
-            // The hidden handed to the MTP head: post-final-norm for routed-MoE Qwen 3.5 (Ornith), the
-            // trunk's own pre-norm hidden otherwise. vmlx Python ec3618d6 measured the MoE head
-            // accepting more with the post-norm input (teacher-forced code 71.5 -> 76.6 %, live D1
-            // 71.0 -> 73.8 %). The logits are unchanged (one final norm either way).
+            // Prism's sidecar consumes the final normalized target state. The
+            // other Qwen 3.5 layouts retain their existing hidden-state contract.
             return NativeMTPForwardResult(
-                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
+                logits: logits, hiddenStates: mtpUsesPostNormHidden ? normed : hidden)
         }
 
-        static func mtpUsesPostNormHidden(_ config: Qwen35Configuration.TextConfiguration) -> Bool {
-            config.numExperts > 0
-                && ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"] != "pre"
+        private var mtpUsesPostNormHidden: Bool {
+            config.modelType == JangLoader.prismHadamardModelType
+                || (textConfig.numExperts > 0
+                    && ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"] != "pre")
         }
 
         func nativeMTPForward(
@@ -4192,7 +4191,7 @@ enum Qwen35Language {
                     seconds: Date.timeIntervalSinceReferenceDate - headStart)
                 return NativeMTPForwardResult(
                     logits: logits,
-                    hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
+                    hiddenStates: mtpUsesPostNormHidden ? normed : hidden)
             }
             let hidden = mtp.preNormHidden(
                 hiddenStates: hiddenStates,
@@ -4204,7 +4203,7 @@ enum Qwen35Language {
             // Chained drafts feed the head's post-`mtp.norm` output, matching the trunk hidden it was
             // seeded with (see `textOnlyForwardWithHidden`).
             return NativeMTPForwardResult(
-                logits: logits, hiddenStates: Self.mtpUsesPostNormHidden(textConfig) ? normed : hidden)
+                logits: logits, hiddenStates: mtpUsesPostNormHidden ? normed : hidden)
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
@@ -5061,11 +5060,13 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
 extension Qwen35: JangHadamardRuntimeModel {
     public func validateJangHadamardRuntime() throws {
         let text = config.textConfiguration
+        let prismSidecar = config.modelType == JangLoader.prismHadamardModelType
+            && text.mtpNumHiddenLayers == 1
         guard !text.tieWordEmbeddings, text.numExperts == 0,
-            text.mtpNumHiddenLayers == 0
+            text.mtpNumHiddenLayers == 0 || prismSidecar
         else {
             throw JangLoaderError.loadFailed(
-                "Hadamard Qwen3.5 requires an untied dense model without MTP")
+                "Hadamard Qwen3.5 requires an untied dense model with a supported draft layout")
         }
     }
 }
