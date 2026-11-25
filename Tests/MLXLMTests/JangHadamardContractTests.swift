@@ -108,6 +108,66 @@ struct JangHadamardFixture {
 
 @Suite("JANG Hadamard and packed ternary contracts")
 struct JangHadamardContractTests {
+    @Test("original Prism module declarations agree with the signed transform sidecar")
+    func prismPublishedBundle() throws {
+        var fixture = JangHadamardFixture()
+        fixture.jang = [:]
+        fixture.config = [
+            "model_type": JangLoader.prismHadamardModelType,
+            "schema_version": 2,
+            "base_model_type": "qwen3_5",
+            "tensor_namespace": "mlx-vlm-qwen3_5",
+            "gdn_activation_layout": "grouped",
+            "hadamard_config": "hadamard.json",
+            "components": ["text": true, "vision": true, "mtp": false],
+            "quantization": ["bits": 2, "group_size": 128, "mode": "affine"],
+            "modules": [
+                ["path": "model.projection", "block": 512, "embedding": false, "dtype": "float16"],
+                ["path": "model.embed_tokens", "block": 512, "embedding": true, "dtype": "float16"],
+            ],
+        ]
+        fixture.sidecar["prism.hadamard.weight_names"] = ["language_model.model.projection.weight"]
+        fixture.sidecar["prism.hadamard.inverse_weight_names"] =
+            ["language_model.model.embed_tokens.weight"]
+        try fixture.withDirectory { directory in
+            let loaded = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            let contract = try #require(loaded)
+            #expect(contract.supportsPrismV2MTP)
+            #expect(contract.forward == ["language_model.model.projection"])
+            #expect(contract.inverse == ["language_model.model.embed_tokens"])
+            #expect(contract.sidecarSigns[512] == JangHadamardFixture.signs)
+            var mismatched = fixture.sidecar
+            mismatched["prism.hadamard.weight_names"] = ["language_model.model.other.weight"]
+            try JSONSerialization.data(withJSONObject: mismatched)
+                .write(to: directory.appendingPathComponent("hadamard.json"))
+            #expect(throws: JangLoaderError.self) {
+                _ = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            }
+        }
+    }
+
+    @Test("Prism draft attachment requires a declared Qwen3.5 Hadamard repack", arguments: [false, true])
+    func prismDraftRepack(packed: Bool) throws {
+        var fixture = JangHadamardFixture(packed: packed)
+        var runtime = try #require(fixture.jang["runtime"] as? [String: Any])
+        runtime["prism_mtp_v2_sidecar"] = true
+        fixture.jang["runtime"] = runtime
+        fixture.jang["source_model"] = ["model_type": JangLoader.prismHadamardModelType]
+
+        try fixture.withDirectory { directory in
+            let contract = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            let attached = try #require(contract)
+            #expect(attached.supportsPrismV2MTP)
+            var incompatible = fixture.jang
+            incompatible["source_model"] = ["model_type": "qwen3_5"]
+            try JSONSerialization.data(withJSONObject: incompatible)
+                .write(to: directory.appendingPathComponent("jang_config.json"))
+            #expect(throws: JangLoaderError.self) {
+                _ = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            }
+        }
+    }
+
     @Test("converter contracts select exact module coverage", arguments: [false, true])
     func converterContract(packed: Bool) throws {
         try JangHadamardFixture(packed: packed).withDirectory { directory in

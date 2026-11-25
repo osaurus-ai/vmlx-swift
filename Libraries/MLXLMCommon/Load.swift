@@ -497,6 +497,10 @@ public func loadWeights(
             }
             allShardURLs = selected
         }
+        if hadamardContract?.supportsPrismV2MTP == true {
+            let draftPath = PrismNativeMTP.sidecar(at: modelDirectory).standardizedFileURL.path
+            allShardURLs.removeAll { $0.standardizedFileURL.path == draftPath }
+        }
         // Detect mixed `model-NNNNN-of-MMMMM.safetensors` sets: parse
         // the trailing `MMMMM` total and group by it. >1 distinct total
         // means we're looking at multiple shard sets in one directory.
@@ -779,7 +783,25 @@ public func loadWeights(
     {
         metadata[key] = value
     }
+    let loadPrismMTP = loadPreservedMTP && hadamardContract?.supportsPrismV2MTP == true
+        && FileManager.default.fileExists(atPath: PrismNativeMTP.sidecar(at: modelDirectory).path)
+    if loadPrismMTP {
+        for (name, weight) in try PrismNativeMTP.load(at: modelDirectory, model: model) {
+            guard weights.updateValue(weight, forKey: name) == nil else {
+                throw JangLoaderError.invalidConfig("duplicate Prism MTP tensor: \(name)")
+            }
+        }
+    }
     weights = model.sanitize(weights: weights, metadata: metadata)
+
+    // The Prism v2 runtime expects FP16 inference even though its source norms
+    // and GDN parameters are stored in FP32. Keep transform signs in FP32 for
+    // the FWHT and preserve the packed UInt32 weights.
+    if hadamardContract?.supportsPrismV2MTP == true {
+        for (name, array) in weights where array.dtype == .float32 && !name.hasSuffix(".signs") {
+            weights[name] = array.asType(.float16)
+        }
+    }
 
     // JANGTQ native: load the signs/codebook sidecar into the runtime cache
     // before model.update() so TurboQuantSwitchGLU has everything it needs
@@ -824,6 +846,9 @@ public func loadWeights(
     // Safe for JANGTQ-native: infer only walks `.scales` keys, so it picks
     // up the affine 8-bit attention / embed / lm_head and ignores the
     // tq_packed expert projections.
+    let perLayerQuantization = loadPrismMTP
+        ? PrismNativeMTP.quantization(extending: perLayerQuantization)
+        : perLayerQuantization
     let effectivePerLayerQuantization: BaseConfiguration.PerLayerQuantization?
     if let jangConfig {
         // Prefer config.json's explicit `quantization.group_size` over
@@ -1257,7 +1282,6 @@ public func loadWeights(
         let parameters = ModuleParameters.unflattened(weights)
         try model.update(parameters: parameters, verify: [.noUnusedKeys])
     }
-    try hadamardContract?.verifyLoaded(model: model)
 
     // `weights` is only a load/update staging dictionary. Drop it before
     // any post-load dtype materialization so quantized bundles do not keep
@@ -1288,9 +1312,8 @@ public func loadWeights(
         && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
             || shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory)
             || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(modelDirectory: modelDirectory))
-    // Prism's ternary QAT contract stores exact F16 scales and F32 norms,
-    // state projections and signs. Preserve that contract independent of
-    // mmap; recasting it is not the stock Qwen/JANG dtype policy.
+    // The JANG Hadamard conversion preserves stored tensor dtypes. Prism v2
+    // bundles have already received their declared FP16 policy above.
     let materialiseBFloat16 =
         hadamardContract == nil
         && !model.preservesCheckpointParameterDTypes
@@ -1349,9 +1372,12 @@ public func loadWeights(
 
     if let hadamardContract {
         try hadamardContract.verifyLoaded(model: model)
+        let dtypePolicy = hadamardContract.supportsPrismV2MTP
+            ? "parameter_dtype=float16"
+            : "stored_dtypes_preserved=true"
         LoadDiagnostics.write(Data(
             ("[Load] JANG Hadamard verified=\(hadamardContract.modulePaths.count) "
-                + "block=\(hadamardContract.blockSize) compute=float32 stored_dtypes_preserved=true\n").utf8))
+                + "block=\(hadamardContract.blockSize) compute=float32 \(dtypePolicy)\n").utf8))
     }
     // Always-on, one line per load: which dtype policy this load took and what
     // the parameters actually are afterwards. An f16-seeded activation stream
