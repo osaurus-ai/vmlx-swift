@@ -9,13 +9,16 @@ struct JANGHConfigurationPartition: Sendable {
     let contract: JANGHFormatContract
     let modelType: String
     let customModules: Set<String>
+    /// Routed projections in the source's native NVFP4 / MXFP8 encoding inside custom stacks (only when admitted).
+    /// The ordinary view skips them like the custom modules: the host architecture loads them itself.
+    let nativeModules: [String: JANGHNativeRoutedFormat]
     /// Both quantization aliases contain the same ordinary plan plus explicit skips.
     /// Unknown ordinary modes remain present for BaseConfiguration's strict decoder.
     let ordinaryConfiguration: Data
     /// Canonical root metadata consumed by the existing JANGH format validator.
     let customConfiguration: Data
 
-    init(configuration: Data, sidecar: Data? = nil) throws {
+    init(configuration: Data, sidecar: Data? = nil, nativeRoutedCandidates: Set<String> = []) throws {
         var root = try Self.object(configuration)
         guard let modelType = root["model_type"] as? String, !modelType.isEmpty else {
             throw Failure.invalid("missing model_type; no architecture alias is inferred")
@@ -223,7 +226,8 @@ struct JANGHConfigurationPartition: Sendable {
         canonical["quantization"] = plan
         canonical["quantization_config"] = plan
         let customConfiguration = try Self.encode(canonical)
-        let contract = try JANGHFormatContract(configuration: customConfiguration)
+        let contract = try JANGHFormatContract(
+            configuration: customConfiguration, nativeRoutedCandidates: nativeRoutedCandidates)
         let customModules = Set(contract.projections.keys).union(contract.trellis.keys)
         // This adapter admits only the checkpoint namespace audited for routed
         // JANGH banks. Other complete triples may be valid future formats, but
@@ -308,12 +312,14 @@ struct JANGHConfigurationPartition: Sendable {
         }
         var ordinary = plan
         for name in customModules { ordinary[name] = false }
+        for name in contract.native.keys { ordinary[name] = false }
         root["jangtq"] = header
         root["quantization"] = ordinary
         root["quantization_config"] = ordinary
         self.contract = contract
         self.modelType = modelType
         self.customModules = customModules
+        self.nativeModules = contract.native
         self.customConfiguration = customConfiguration
         self.ordinaryConfiguration = try Self.encode(root)
     }

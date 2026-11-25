@@ -15,6 +15,13 @@ import MLXLMCommon
 ///   same width per layer, separate (not row-interleaved like the checkpoint's `w13`);
 /// - `vision_tower.*` (the vision tower, BF16 as released) and `mtp_drafter.*` (the native dSpark drafter, BF16).
 ///
+/// JANGHT bundles (2026-11-23) choose a format per routed projection group and layer (gate/up share one; down may
+/// differ): a `jangtq2` codebook bank as above, a `jangt` trellis bank (`jt_*` tensors, top-level `jangt` header), or
+/// the source checkpoint's own bytes under runtime names, `{"mode": "nvfp4", "group_size": 16, "bits": 4}`
+/// (`weight`, `scales`, per-expert `global_scale`) or `{"mode": "mxfp8", "group_size": 32, "bits": 8}` (`weight`,
+/// `scales`). Native projections load through the model's own native experts (`Inkling2NativeSwitchLinear`); custom
+/// banks are mapped here. Any other entry, or a group whose gate and up differ, is refused.
+///
 /// The routed activation is the model's (`mlp_gate_softcap`, `mlp_up_softcap` from the config), never the bundle's:
 /// `h = softcap(g, 4) * sigmoid(g) * softcap(u, 25)`, fused into the JANGH gate/up epilogues.
 struct Inkling2LoopJANGHPreparation {
@@ -42,7 +49,8 @@ struct Inkling2LoopJANGHPreparation {
             layout: .init(
                 modelType: "inkling2_loop", hiddenSize: config.hiddenSize,
                 intermediateSize: config.intermediateSize, expertCount: config.nRoutedExperts,
-                sparseLayers: Set(0 ..< config.numHiddenLayers), routesPerToken: config.numExpertsPerTok))
+                sparseLayers: Set(0 ..< config.numHiddenLayers), routesPerToken: config.numExpertsPerTok,
+                admitsNativeRoutedProjections: true))
         // The ordinary plan must decode before any bank is mapped (JANGHModelPreparation contract).
         _ = try JSONDecoder.json5().decode(BaseConfiguration.self, from: banks.ordinaryConfiguration)
         return Self(configuration: config, banks: banks)
@@ -56,8 +64,15 @@ struct Inkling2LoopJANGHPreparation {
         let lanes = try Set.resolveForConstruction(
             requested: requesting, constructible: args.vision == nil ? [.text] : [.text, .vision])
         if !lanes.contains(.vision) { args.vision = nil }
-        let routed = try banks.makeCodebookRoutedExperts(
-            activation: .inkling(gateCap: args.mlpGateSoftcap, upCap: args.mlpUpSoftcap))
-        return try Inkling2LoopModel(args, routedExperts: routed, excludedTensorNames: banks.excludedTensorNames)
+        let activation = JANGTActivation.inkling(gateCap: args.mlpGateSoftcap, upCap: args.mlpUpSoftcap)
+        if banks.routedProjectionsAreAllCodebook {
+            // The JANGH2 bundle: every routed projection a codebook bank, constructed exactly as before.
+            return try Inkling2LoopModel(
+                args, routedExperts: try banks.makeCodebookRoutedExperts(activation: activation),
+                excludedTensorNames: banks.excludedTensorNames)
+        }
+        return try Inkling2LoopModel(
+            args, mixedRoutedExperts: try banks.makeMixedRoutedExperts(activation: activation),
+            nativeRoutedModules: banks.nativeRoutedModules, excludedTensorNames: banks.excludedTensorNames)
     }
 }

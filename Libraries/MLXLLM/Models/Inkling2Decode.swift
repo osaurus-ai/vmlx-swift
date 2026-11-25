@@ -1029,6 +1029,20 @@ struct Inkling2QuantizedProjections {
             bits: bits, mode: mode)
     }
 
+    /// Batch independent vectors while keeping M = 1 in the quantized matmul dispatch.
+    func verifyVectors(_ x: MLXArray, _ p: Packed) -> MLXArray {
+        if x.dtype != p.scales.dtype {
+            return MLX.concatenated(
+                (0 ..< x.dim(0)).map { self(x[$0 ..< ($0 + 1)], p) }, axis: 0)
+        }
+        return MLX.quantizedMM(
+            x.expandedDimensions(axis: 1), p.weight.expandedDimensions(axis: 0),
+            scales: p.scales.expandedDimensions(axis: 0),
+            biases: p.biases?.expandedDimensions(axis: 0),
+            transpose: true, groupSize: groupSize, bits: bits, mode: mode
+        ).squeezed(axis: 1)
+    }
+
     var arrays: [MLXArray] {
         [all, qrg, kv, k, v].flatMap { [$0.weight, $0.scales] + ($0.biases.map { [$0] } ?? []) }
             + [sink] + [kTaps, vTaps].compactMap { $0 }
@@ -1148,8 +1162,8 @@ extension Inkling2DecoderLayer {
         else {
             return false
         }
-        // Routed experts: the checkpoint's own encoding or a JANGH bundle's codebook banks.
-        guard mlp.switchMLP != nil || mlp.janghExperts != nil else { return false }
+        // Routed experts: the checkpoint's own encoding, a JANGH bundle's codebook banks, or a JANGHT layer's mix.
+        guard mlp.switchMLP != nil || mlp.janghExperts != nil || mlp.mixedExperts != nil else { return false }
         if let gates = [qGate, kGate, vGate, mlpGate] as? [Inkling2MessageGate] {
             for g in gates {
                 guard type(of: g.downProj) == Linear.self, type(of: g.forgetProj) == Linear.self,
@@ -1489,6 +1503,21 @@ extension Inkling2DecoderLayer {
             let fin = Inkling2DecodeKernels.final(
                 [
                     sum, slotted ? inds : w.singleSlot!, w.ones!, slotted ? sel[1] : w.unitWeight!,
+                    packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
+                ],
+                template: [("PP", P)],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[1, 1, H], [1, 3, P]],
+                outputDTypes: [dtype, f32])
+            conv[0] = fin[1]
+            conv.offset += 1
+            return (fin[0], states)
+        }
+        if let mx = mlp.mixedExperts {
+            // JANGHT trellis / half-native layer: the router-weighted sum (fp32 rows keep every custom group on its
+            // decode kernels), combined by the final kernel as one slot.
+            let fin = Inkling2DecodeKernels.final(
+                [
+                    mx(x32, inds, sel[1]), w.singleSlot!, w.ones!, w.unitWeight!,
                     packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
                 ],
                 template: [("PP", P)],

@@ -158,6 +158,54 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("Inkling detects a complete inline drafter and honors explicit Off")
+    func inlineInklingDrafterDiscovery() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = Data(
+            #"{"model_type":"inkling2_loop","jangt":{"code":"v2_halfbits"},"mtp_config":{"num_hidden_layers":1}}"#
+                .utf8)
+        let legacy = Data(#"{"model_type":"inkling2_loop","mtp_config":{"num_hidden_layers":1}}"#.utf8)
+        let shard = root.appendingPathComponent("model.safetensors")
+        let names = [
+            "fuse_weight", "mask_embed", "norm.weight", "markov_head.dflare_norm.weight",
+            "markov_head.markov_w1.weight", "markov_head.rnn_proj.weight", "markov_head.rnn_proj.bias",
+            "markov_head.hidden_out.weight", "markov_head.hidden_out.bias",
+            "layers.0.dflare_norm.weight", "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight", "layers.0.mlp.down_proj.weight",
+            "layers.0.self_attn.q_proj.weight", "layers.0.self_attn.k_proj.weight",
+            "layers.0.self_attn.v_proj.weight", "layers.0.self_attn.o_proj.weight",
+            "layers.0.self_attn.k_proj_ctx.weight", "layers.0.self_attn.v_proj_ctx.weight",
+            "layers.0.self_attn.q_norm.weight", "layers.0.self_attn.k_norm.weight",
+            "layers.0.self_attn.k_norm_ctx.weight",
+        ].map { "mtp_drafter.\($0)" }
+        func writeShard(_ tensorNames: [String]) throws {
+            let header = Dictionary(uniqueKeysWithValues: tensorNames.enumerated().map { index, name in
+                (name, ["dtype": "BF16", "shape": [1], "data_offsets": [index * 2, (index + 1) * 2]] as [String: Any])
+            })
+            let data = try JSONSerialization.data(withJSONObject: header)
+            var size = UInt64(data.count).littleEndian
+            var file = withUnsafeBytes(of: &size) { Data($0) }
+            file.append(data)
+            file.append(Data(count: tensorNames.count * 2))
+            try file.write(to: shard)
+        }
+
+        var settings = VMLXServerRuntimeSettings()
+        try writeShard(names)
+        #expect(settings.bundledDSparkDrafter(configData: legacy, bundleDirectory: root, environment: [:]) == nil)
+        #expect(settings.bundledDSparkDrafter(configData: config, bundleDirectory: root, environment: [:]) == root)
+        #expect(settings.resolvedMTPDraftStrategy(
+            configData: config, jangConfig: nil, status: nil, bundleDirectory: root)?.usesDSpark == true)
+        settings.mtp.mode = .off
+        #expect(settings.bundledDSparkDrafter(configData: config, bundleDirectory: root, environment: [:]) == nil)
+        settings.mtp.mode = .auto
+        try writeShard(Array(names.dropLast()))
+        #expect(settings.bundledDSparkDrafter(configData: config, bundleDirectory: root, environment: [:]) == nil)
+    }
+
     @Test("a bundled dflash2 drafter is used unless speculation is switched off")
     func bundledDFlash2DrafterDiscovery() throws {
         let root = FileManager.default.temporaryDirectory

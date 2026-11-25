@@ -957,6 +957,108 @@ final class Inkling2SwitchMLP: Module {
     }
 }
 
+/// A JANGHT layer's routed experts when some group is a trellis bank or one group stays native (Inkling-2-Mini
+/// JANGHT, 2026-11-23): the custom group(s) run the JANGT / JANGH kernels (`custom`, the model's softcapped
+/// activation), a native group runs exactly like `Inkling2SwitchMLP`'s (`gate_up_proj` row-interleaved gate/up, NVFP4
+/// per-expert factor applied by the activation / combine kernels). Native parameters load under `mixed_mlp.*`
+/// (`sanitize` renames this layer's `switch_mlp.*`); `custom` carries no parameters (mapped banks).
+final class Inkling2MixedExperts: Module {
+    @ModuleInfo(key: "gate_up_proj") var nativeGateUp: Inkling2NativeSwitchLinear?
+    @ModuleInfo(key: "down_proj") var nativeDown: Inkling2NativeSwitchLinear?
+    @ModuleInfo(key: "custom") var custom: JANGTRoutedExpertLayer
+    let inter: Int
+    let gateCap: Float
+    let upCap: Float
+    let caps: MLXArray
+
+    init(_ args: Inkling2LoopConfiguration, custom: JANGTRoutedExpertLayer, nativeGateUp: Bool, nativeDown: Bool) {
+        precondition(!(nativeGateUp && nativeDown), "an all-native layer runs Inkling2SwitchMLP")
+        let (H, I, E) = (args.hiddenSize, args.intermediateSize, args.nRoutedExperts)
+        _custom.wrappedValue = custom
+        if nativeGateUp {
+            _nativeGateUp.wrappedValue = Inkling2NativeSwitchLinear(inputDims: H, outputDims: 2 * I, experts: E)
+        }
+        if nativeDown {
+            _nativeDown.wrappedValue = Inkling2NativeSwitchLinear(inputDims: I, outputDims: H, experts: E)
+        }
+        inter = I
+        gateCap = args.mlpGateSoftcap
+        upCap = args.mlpUpSoftcap
+        caps = MLXArray([args.mlpGateSoftcap, args.mlpUpSoftcap])
+    }
+
+    /// `x` `[N, H]`, `inds` `[N, k]`, route weights `w` `[N, k]` fp32 -> `[N, H]` in `x`'s dtype: `sum_k expert_k(x) *
+    /// w_k`, fp32 accumulation. A float32 `x` keeps every custom group on its decode kernels (the batch-1 decode and
+    /// verify steps call this with their fp32 rows).
+    func callAsFunction(_ x: MLXArray, _ inds: MLXArray, _ w: MLXArray) -> MLXArray {
+        let ids = inds.asType(.uint32)
+        if let gateUp = nativeGateUp {
+            return custom.routedDown(nativeActivation(x, ids, gateUp), indices: ids, scores: w, outputDType: x.dtype)
+        }
+        if let down = nativeDown {
+            return nativeWeightedDown(custom.routedHidden(x, indices: ids), ids, w, down, dtype: x.dtype)
+        }
+        return custom.callRouted(x, indices: ids, scores: w)
+    }
+
+    /// Native gate/up + the softcapped activation: `[N * k, I]` fp32 in pair order (row-major (row, slot)).
+    private func nativeActivation(_ x: MLXArray, _ inds: MLXArray, _ gateUp: Inkling2NativeSwitchLinear) -> MLXArray {
+        let (N, k) = (inds.dim(0), inds.dim(1))
+        var xs = x.asType(f32).reshaped([N, 1, 1, x.dim(-1)])
+        var idx = inds
+        var inverse: MLXArray? = nil
+        let doSort = inds.size >= 64
+        if doSort {
+            let flat = inds.flattened()
+            let order = MLX.argSort(flat)
+            inverse = MLX.argSort(order)
+            xs = xs.flattened(start: 0, end: -3)[order.floorDivide(k)]
+            idx = flat[order]
+        }
+        let gu = gateUp(xs, idx, sorted: doSort).reshaped([N * k, 2 * inter])
+        let gateScale = gateUp.isNVFP4 ? gateUp.expertScale : MLXArray.ones([gateUp.expertScale.dim(0)], dtype: f32)
+        var act: MLXArray
+        if inklingUseKernels {
+            act = Inkling2Kernels.moeActivation(
+                [gu, idx.flattened(), gateScale, caps],
+                grid: (inter, N * k, 1), threadGroup: (min(256, inter), 1, 1),
+                outputShapes: [[N * k, inter]], outputDTypes: [f32])[0]
+        } else {
+            let pair = (gu * gateScale[idx.flattened()].reshaped([N * k, 1])).reshaped([N * k, inter, 2])
+            let g = pair[.ellipsis, 0]
+            let u = pair[.ellipsis, 1]
+            act = softcap(g, gateCap) * MLX.sigmoid(g) * softcap(u, upCap)
+        }
+        if let inverse { act = act[inverse] }
+        return act
+    }
+
+    /// Native down over the custom gate/up's `hidden` `[N * k, I]` (pair order), weighted and summed in fp32.
+    private func nativeWeightedDown(
+        _ hidden: MLXArray, _ inds: MLXArray, _ w: MLXArray, _ down: Inkling2NativeSwitchLinear, dtype: DType
+    ) -> MLXArray {
+        let (N, k) = (inds.dim(0), inds.dim(1))
+        let doSort = inds.size >= 64
+        var y: MLXArray
+        if doSort {
+            let flat = inds.flattened()
+            let order = MLX.argSort(flat)
+            y = down(hidden[order].reshaped([N * k, 1, inter]), flat[order], sorted: true)[MLX.argSort(order)]
+        } else {
+            y = down(hidden.reshaped([N, k, 1, inter]), inds, sorted: false)
+        }
+        y = y.reshaped([N, k, y.dim(-1)])
+        let downScale = down.isNVFP4 ? down.expertScale : MLXArray.ones([down.expertScale.dim(0)], dtype: f32)
+        if inklingUseKernels {
+            return Inkling2Kernels.moeCombine(
+                [y, inds, downScale, w.asType(f32)], grid: (y.dim(-1), N, 1),
+                threadGroup: (256, 1, 1), outputShapes: [[N, y.dim(-1)]], outputDTypes: [dtype])[0]
+        }
+        y = y * downScale[inds].expandedDimensions(axis: -1)
+        return MLX.sum(y * w.asType(f32).expandedDimensions(axis: -1), axis: -2).asType(dtype)
+    }
+}
+
 final class Inkling2Router: Module {
     var weight: MLXArray
     @ParameterInfo(key: "e_score_correction_bias") var bias: MLXArray
@@ -1003,15 +1105,30 @@ final class Inkling2MoE: Module {
     /// A JANGH bundle's mapped codebook banks for this layer (no parameters: the generic loader never sees the
     /// `tq2_*` tensors). Gate/up run with Inkling's softcapped activation fused into the epilogue.
     @ModuleInfo(key: "jangh_experts") var janghExperts: JANGHRoutedExpertLayer?
+    /// A JANGHT layer with a trellis group or one native group (`Inkling2MixedExperts`).
+    @ModuleInfo(key: "mixed_mlp") var mixedExperts: Inkling2MixedExperts?
     /// `[mlp_gate_softcap, mlp_up_softcap]` fp32 (the batch-1 JANGH kernels' activation constants).
     let softcaps: MLXArray
 
-    init(_ args: Inkling2LoopConfiguration, jangh: JANGHRoutedExpertLayer? = nil) {
+    init(
+        _ args: Inkling2LoopConfiguration, jangh: JANGHRoutedExpertLayer? = nil,
+        mixed: JANGHModelPreparation.MixedRoutedLayer? = nil
+    ) {
         softcaps = MLXArray([args.mlpGateSoftcap, args.mlpUpSoftcap])
         _gate.wrappedValue = Inkling2Router(args)
-        if let jangh {
+        switch (jangh, mixed) {
+        case (let jangh?, _), (nil, .codebook(let jangh)?):
             _janghExperts.wrappedValue = jangh
-        } else {
+        case (nil, .custom(let layer)?):
+            _mixedExperts.wrappedValue = Inkling2MixedExperts(
+                args, custom: layer, nativeGateUp: false, nativeDown: false)
+        case (nil, .nativeGateUp(let layer, _)?):
+            _mixedExperts.wrappedValue = Inkling2MixedExperts(
+                args, custom: layer, nativeGateUp: true, nativeDown: false)
+        case (nil, .nativeDown(let layer, _)?):
+            _mixedExperts.wrappedValue = Inkling2MixedExperts(
+                args, custom: layer, nativeGateUp: false, nativeDown: true)
+        case (nil, nil):
             _switchMLP.wrappedValue = Inkling2SwitchMLP(args)
         }
     }
@@ -1024,6 +1141,9 @@ final class Inkling2MoE: Module {
             // Reference: (expert_out * weight_fp32) summed in fp32, cast to the input dtype.
             return janghExperts.callRouted(flat, indices: inds.asType(.uint32), scores: w)
                 .reshaped([B, T, H])
+        }
+        if let mixedExperts {
+            return mixedExperts(flat, inds, w).reshaped([B, T, H])
         }
         return switchMLP!(flat, inds, w).reshaped([B, T, H])
     }
@@ -1191,7 +1311,10 @@ final class Inkling2DecoderLayer: Module {
     private let attnNormBox = Inkling2DerivedBox()
     private let mlpNormBox = Inkling2DerivedBox()
 
-    init(_ args: Inkling2LoopConfiguration, index: Int, jangh: JANGHRoutedExpertLayer? = nil) {
+    init(
+        _ args: Inkling2LoopConfiguration, index: Int, jangh: JANGHRoutedExpertLayer? = nil,
+        mixed: JANGHModelPreparation.MixedRoutedLayer? = nil
+    ) {
         self.index = index
         isSliding = args.isSliding(index)
         isBlockBoundary = args.isBlockBoundary(index)
@@ -1206,7 +1329,7 @@ final class Inkling2DecoderLayer: Module {
         }
         _mlpInput.wrappedValue = Inkling2BlockAttentionResidual(hidden: H, queries: 1)
         _selfAttn.wrappedValue = Inkling2Attention(args, layer: index)
-        _mlp.wrappedValue = Inkling2MoE(args, jangh: jangh)
+        _mlp.wrappedValue = Inkling2MoE(args, jangh: jangh, mixed: mixed)
         let eps = args.rmsNormEps
         if isSliding {
             _inputLN.wrappedValue = Inkling2RMSNorm(H, eps: eps)
@@ -1367,6 +1490,7 @@ public final class Inkling2LoopModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "embed_norm") var embedNorm: Inkling2RMSNorm
     let layers: [Inkling2DecoderLayer]
+    let usesMixedRoutedExperts: Bool
     @ModuleInfo(key: "norm") var norm: Inkling2RMSNorm
     @ModuleInfo(key: "final_input") var finalInput: Inkling2BlockAttentionResidual
     @ModuleInfo(key: "message_input") var messageInput: Inkling2MessageInput?
@@ -1374,13 +1498,17 @@ public final class Inkling2LoopModelInner: Module {
     /// fp32 ones: the weight of every unweighted RMSNorm (largest width used is `hidden`).
     let ones: MLXArray
 
-    init(_ args: Inkling2LoopConfiguration, routedExperts: [Int: JANGHRoutedExpertLayer] = [:]) {
+    init(
+        _ args: Inkling2LoopConfiguration, routedExperts: [Int: JANGHRoutedExpertLayer] = [:],
+        mixedRoutedExperts: [Int: JANGHModelPreparation.MixedRoutedLayer] = [:]
+    ) {
         self.args = args
+        usesMixedRoutedExperts = !mixedRoutedExperts.isEmpty
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
         _embedNorm.wrappedValue = Inkling2RMSNorm(args.hiddenSize, eps: args.rmsNormEps)
         layers = (0 ..< args.numHiddenLayers).map {
-            Inkling2DecoderLayer(args, index: $0, jangh: routedExperts[$0])
+            Inkling2DecoderLayer(args, index: $0, jangh: routedExperts[$0], mixed: mixedRoutedExperts[$0])
         }
         _norm.wrappedValue = Inkling2RMSNorm(args.hiddenSize, eps: args.rmsNormEps)
         _finalInput.wrappedValue = Inkling2BlockAttentionResidual(
@@ -1435,6 +1563,7 @@ public final class Inkling2LoopModelInner: Module {
             inklingUseKernels && cache != nil && ids.dim(0) == 1 && ids.dim(1) > 1
             && ids.dim(1) <= 16 && !Inkling2Runtime.forceGeneralDecode
             && decodeSupported
+        let matchDecode = recorder != nil && usesMixedRoutedExperts
         let scalars = Inkling2StepScalars()
         func visit(_ layer: Int, _ pass: Int) -> Int {
             if layer < args.loopStart { return layer }
@@ -1451,7 +1580,7 @@ public final class Inkling2LoopModelInner: Module {
                 if multiRow {
                     (h, stack) = layers[i].multiRowStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
-                        loopIndex: j, ones: ones, recorder: recorder)
+                        loopIndex: j, ones: ones, recorder: recorder, matchDecode: matchDecode)
                     continue
                 }
                 if let recorder {
@@ -1597,6 +1726,55 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
         _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
 
+    /// A JANGHT bundle (per layer and projection group: codebook, trellis or native): `mixedRoutedExperts` keyed by
+    /// layer (a layer whose three projections are all native is absent and runs `Inkling2SwitchMLP`),
+    /// `nativeRoutedModules` the native projections, `excludedTensorNames` exactly the custom banks' tensors.
+    init(
+        _ args: Inkling2LoopConfiguration, mixedRoutedExperts: [Int: JANGHModelPreparation.MixedRoutedLayer],
+        nativeRoutedModules: [String: JANGHNativeRoutedFormat], excludedTensorNames: Set<String>
+    ) throws {
+        func fail(_ why: String) -> Error {
+            Inkling2LoopJANGHPreparation.PreparationError.invalid("Inkling-2 JANGHT: \(why)")
+        }
+        var custom = Set<String>()
+        for layer in 0 ..< args.numHiddenLayers {
+            let parent = "model.layers.\(layer).mlp.switch_mlp."
+            let gateUpNative = nativeRoutedModules[parent + "gate_proj"] != nil
+            guard gateUpNative == (nativeRoutedModules[parent + "up_proj"] != nil) else {
+                throw fail("layer \(layer) gate and up differ in format")
+            }
+            let downNative = nativeRoutedModules[parent + "down_proj"] != nil
+            let expected: (Bool, Bool)?
+            switch mixedRoutedExperts[layer] {
+            case nil: expected = nil
+            case .codebook?, .custom?: expected = (false, false)
+            case .nativeGateUp?: expected = (true, false)
+            case .nativeDown?: expected = (false, true)
+            }
+            if let expected {
+                guard expected == (gateUpNative, downNative) else {
+                    throw fail("layer \(layer) routed banks do not match its native projections")
+                }
+            } else {
+                guard gateUpNative, downNative else { throw fail("layer \(layer) has no routed experts") }
+            }
+            if !gateUpNative { custom.formUnion([parent + "gate_proj", parent + "up_proj"]) }
+            if !downNative { custom.insert(parent + "down_proj") }
+        }
+        guard Set(nativeRoutedModules.keys).isSubset(of: Set((0 ..< args.numHiddenLayers).flatMap { l in
+                ["gate_proj", "up_proj", "down_proj"].map { "model.layers.\(l).mlp.switch_mlp.\($0)" }
+            })),
+            JANGHModelPreparation.isCanonicalCustomExclusionSet(excludedTensorNames, customProjections: custom)
+        else { throw fail("loader exclusions are not exactly the custom banks") }
+        self.args = args
+        vocabularySize = args.vocabSize
+        customTensorNames = excludedTensorNames
+        model = Inkling2LoopModelInner(args, mixedRoutedExperts: mixedRoutedExperts)
+        if let d = args.dspark { _drafter.wrappedValue = Inkling2DSparkDrafter(d) }
+        if let v = args.vision { _vision.wrappedValue = Inkling2VisionModel(v) }
+        _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+    }
+
     /// The per-slot cache state is path dependent and the forward is not batch aware.
     public var maximumSupportedDecodeBatchSize: Int? { 1 }
 
@@ -1631,7 +1809,14 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(trunk(inputs, cache: cache))
+        let matchDecode = pendingVerify != nil && model.usesMixedRoutedExperts
+        let hidden = trunk(inputs, cache: cache)
+        if matchDecode, hidden.dim(1) > 1 {
+            // Each verifier row uses the same output projection as an ordinary decode token.
+            return MLX.concatenated(
+                (0 ..< hidden.dim(1)).map { logits(hidden[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
+        }
+        return logits(hidden)
     }
 
     /// Chunked text prefill. Non-final chunks run the trunk only (no 200k-vocab logits); the
@@ -1795,8 +1980,18 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
             }
             out[n] = v
         }
-        for (k, v) in Self.canonicalExperts(communityExperts) { out[k] = v }
+        for (k, v) in Self.canonicalExperts(communityExperts) { out[mixedExpertKey(k)] = v }
         return out
+    }
+
+    /// A JANGHT layer whose experts are `Inkling2MixedExperts` loads its native group under `mixed_mlp.*`.
+    private func mixedExpertKey(_ key: String) -> String {
+        let prefix = "model.layers."
+        guard key.hasPrefix(prefix), let infix = key.range(of: ".mlp.switch_mlp."),
+            let layer = Int(key[key.index(key.startIndex, offsetBy: prefix.count) ..< infix.lowerBound]),
+            layer >= 0, layer < model.layers.count, model.layers[layer].mlp.mixedExperts != nil
+        else { return key }
+        return key.replacingCharacters(in: infix, with: ".mlp.mixed_mlp.")
     }
 
     /// Parameter shapes of this (placeholder) module tree, keyed like `sanitize`'s output.
