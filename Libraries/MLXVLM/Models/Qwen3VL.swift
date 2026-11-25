@@ -1507,7 +1507,14 @@ enum Qwen3VLLanguage {
         let textConfig: Qwen3VLConfiguration.TextConfiguration
         var kvHeads: [Int]
 
-        private var ropeDeltas: MLXArray? = nil
+        /// Decode offset of the current request's M-RoPE positions relative to its token index
+        /// (non-zero only after media). Belongs to ONE request: reset before every prefill by
+        /// ``resetPositionState()`` so a later request never decodes with another prompt's delta.
+        private(set) var ropeDeltas: MLXArray? = nil
+
+        /// Full-prompt M-RoPE positions armed by ``armRestoredPrefixPositions(inputIds:imageGridTHW:videoGridTHW:)``
+        /// for the prefill that follows a cache restore of a media request, consumed by that prefill.
+        private var restoredPrefixPositions: MLXArray? = nil
 
         init(_ config: Qwen3VLConfiguration) {
             self.config = config
@@ -1525,6 +1532,30 @@ enum Qwen3VLLanguage {
             }
         }
 
+        func resetPositionState() {
+            ropeDeltas = nil
+            restoredPrefixPositions = nil
+        }
+
+        /// A media request whose prefix was restored from the cache: plan the FULL prompt's
+        /// positions so the suffix gets exactly what a cold prefill gives it (text after a restored
+        /// image continues from the compressed media positions, not offset + index) and decode
+        /// continues from the full prompt's delta.
+        func armRestoredPrefixPositions(inputIds: MLXArray, imageGridTHW: [THW]?, videoGridTHW: [THW]?) {
+            let ids = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                inputIds: ids,
+                imageGridTHW: imageGridTHW,
+                videoGridTHW: videoGridTHW,
+                spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                imageTokenId: config.imageTokenIndex,
+                videoTokenId: config.videoTokenIndex,
+                visionStartTokenId: config.visionStartTokenId,
+                attentionMask: nil)
+            restoredPrefixPositions = computed
+            ropeDeltas = deltas
+        }
+
         func callAsFunction(
             _ inputIds: MLXArray?,
             cache: [KVCache]?,
@@ -1537,14 +1568,26 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
-            if pixelValues != nil {
+            var positionIds = providedPositionIds
+
+            if positionIds == nil, let plan = restoredPrefixPositions {
+                restoredPrefixPositions = nil
+                let start = cache?.first?.offset ?? 0
+                let end = start + (inputIds ?? inputEmbeddings!).dim(1)
+                if end <= plan.dim(2) {
+                    positionIds = plan[0..., 0..., start ..< end]
+                }
+            }
+            if pixelValues != nil && positionIds == nil {
                 ropeDeltas = nil
             }
 
-            var positionIds = providedPositionIds
-
             if positionIds == nil && (mask == nil || mask?.ndim == 2) {
                 if (cache?.first?.offset ?? 0) == 0 || ropeDeltas == nil || cache == nil {
+                    // The cache may already hold a restored prefix. Its tokens are text (a media
+                    // prefix arms the full-prompt plan above), whose positions equal their
+                    // indices, so the suffix continues from the cache offset.
+                    let offset = cache?.first?.offset ?? 0
                     if let inputIds {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputIds,
@@ -1556,20 +1599,18 @@ enum Qwen3VLLanguage {
                             visionStartTokenId: config.visionStartTokenId,
                             attentionMask: mask)
 
-                        positionIds = computed
+                        positionIds = offset == 0 ? computed : computed + MLXArray(Int32(offset))
                         ropeDeltas = deltas
-                    } else if let cache, ropeDeltas == nil {
+                    } else if cache != nil, ropeDeltas == nil {
                         let batch = inputEmbeddings!.dim(0)
                         let seqLength = inputEmbeddings!.dim(1)
-                        let currentOffset = cache.first?.offset ?? 0
 
                         var base = MLXArray(0 ..< seqLength).asType(.int32)
                         base = tiled(base[.newAxis, 0...], repetitions: [batch, 1])
-                        let offsetValue = MLXArray(currentOffset).asType(.int32)
-                        base = base + offsetValue
+                        base = base + MLXArray(Int32(offset))
 
                         positionIds = base[.newAxis, 0..., 0...]
-                        positionIds = tiled(positionIds!, repetitions: [3, batch, seqLength])
+                        positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
                     }
                 } else if let cache, let ropeDeltas {
                     let batch = (inputIds ?? inputEmbeddings!).dim(0)
@@ -2136,6 +2177,22 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
 extension Array where Element == THW {
     fileprivate var nilIfEmpty: [THW]? { isEmpty ? nil : self }
+}
+
+extension Qwen3VL: RestoredPrefixPositionModel {
+    /// Every prefill starts from this request's own positions: the previous request's decode delta
+    /// is dropped (a text-only prompt after an image would otherwise decode shifted by the image's
+    /// compression), and a restored prefix of a media request arms the full prompt's M-RoPE plan.
+    /// A restored text prefix needs no plan: its positions are its indices, so the suffix continues
+    /// from the cache offset.
+    public func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int) {
+        languageModel.resetPositionState()
+        guard restoredTokenCount > 0, fullInput.image != nil || fullInput.video != nil else { return }
+        languageModel.armRestoredPrefixPositions(
+            inputIds: fullInput.text.tokens,
+            imageGridTHW: fullInput.image?.frames,
+            videoGridTHW: fullInput.video?.frames)
+    }
 }
 
 extension Qwen3VL {
