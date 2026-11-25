@@ -4425,7 +4425,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         guard let boundaryInput = originalInput.inputForCacheBoundary(
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
+        // A pre-media boundary of a media request drops the media from its input, but its rows
+        // are still this cache's rows when the model declares them media-independent.
         let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
+            || cacheSaltPlan.prefixRowsAreMediaIndependent(boundary: tokens.count)
         if keepsMedia, snapshotIsViews, let views = prefixViews(of: storageSnapshot, rows: tokens.count) {
             return views
         }

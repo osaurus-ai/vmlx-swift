@@ -2195,6 +2195,21 @@ extension Qwen3VL: RestoredPrefixPositionModel {
     }
 }
 
+extension Qwen3VL: PrefixCacheInvariantModel {
+    /// M-RoPE gives every token before the first media placeholder the text position equal to its
+    /// index (the media only shifts what follows), attention is causal, and media embeddings are
+    /// spliced only at placeholders, so the KV before the first placeholder is the text-only
+    /// prompt's. The suffix carrying the media is positioned from the full prompt
+    /// (`RestoredPrefixPositionModel` above); `Qwen3VLRestoredPrefixPositionTests` pins an image
+    /// after a restored text prefix against a cold prefill. Without it every Computer Use step
+    /// (one fresh screenshot per prompt) re-prefilled its whole history.
+    public var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+
+    /// Plain causal attention: a restored exact-prefix row is the KV of exactly those tokens,
+    /// whatever the request appends next.
+    public var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+}
+
 extension Qwen3VL {
     fileprivate func castCache(_ cache: [any KVCache]) -> [KVCache]? {
         guard !cache.isEmpty else { return nil }

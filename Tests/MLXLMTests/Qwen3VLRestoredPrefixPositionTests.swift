@@ -188,4 +188,24 @@ struct Qwen3VLRestoredPrefixPositionTests {
             assertMatchesCold(try run(fresh, prepare: suffix, cache: cache), expected)
         }
     }
+
+    /// The test above is what lets the prefix cache resume an image prompt from a text boundary:
+    /// without the declaration that hit rolls back to a full prefill.
+    @Test("an image prompt resumes from a boundary before its first placeholder")
+    func preMediaBoundaryResumes() throws {
+        try MLXMetalTestLock.withLock {
+            let tokens = head + imageRun + tail
+            let full = input(tokens, image: true)
+            let plan = CacheBoundarySaltPlan.make(
+                requestSalt: "image", input: full, lookupTokenIds: tokens.map(Int.init),
+                model: try model(), parameters: GenerateParameters())
+            let firstPlaceholder = head.count + 1
+            #expect(plan.mediaIndependentTokenCount == firstPlaceholder)
+            #expect(plan.salt(forBoundary: head.count) != "image")
+            #expect(plan.salt(forBoundary: firstPlaceholder + 1) == "image")
+            #expect(plan.resumeBeforeMediaIsSafe(matchedTokens: head.count))
+            #expect(plan.prefixRowsAreMediaIndependent(boundary: firstPlaceholder))
+            #expect(!plan.prefixRowsAreMediaIndependent(boundary: firstPlaceholder + 1))
+        }
+    }
 }
