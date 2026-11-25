@@ -374,9 +374,14 @@ func runInkling2DSparkIteratorProbe(modelPath: String) async throws {
     let context = try await MLXLMCommon.loadModel(
         from: bundle, using: #huggingFaceTokenizerLoader(), loadConfiguration: .default)
     // BENCH_INKLING2_CHAT="<user message>": the message rendered through the app's chat path
-    // replaces the reference prompts.
+    // replaces the reference prompts; BENCH_INKLING2_CHATS="<m1>||<m2>||..." renders several.
     var prompts: [(String, LMInput)] = []
-    if let message = env["BENCH_INKLING2_CHAT"] {
+    if let messages = env["BENCH_INKLING2_CHATS"] {
+        for (i, message) in messages.components(separatedBy: "||").enumerated() {
+            let input = try await context.processor.prepare(input: UserInput(chat: [.user(message)]))
+            prompts.append(("chat\(i)", input))
+        }
+    } else if let message = env["BENCH_INKLING2_CHAT"] {
         let input = try await context.processor.prepare(input: UserInput(chat: [.user(message)]))
         prompts.append(("chat", input))
     } else {
@@ -385,8 +390,9 @@ func runInkling2DSparkIteratorProbe(modelPath: String) async throws {
             prompts.append((name, LMInput(tokens: MLXArray(ids.map { Int32($0) }))))
         }
     }
+    let temps = (env["BENCH_INKLING2_TEMPS"] ?? "0,1").split(separator: ",").compactMap { Float(String($0)) }
     for (name, input) in prompts {
-        for temp: Float in [0, 1] {
+        for temp in temps {
             var texts: [String] = []
             for useDSpark in [false, true] {
                 var p = GenerateParameters(maxTokens: maxNew, temperature: temp)
@@ -411,8 +417,35 @@ func runInkling2DSparkIteratorProbe(modelPath: String) async throws {
                     } ?? 0
                 print(
                     String(
-                        format: "[INK2I] %@ T=%.0f %@ gen=%d decode tok/s=%.1f", name, temp,
-                        useDSpark ? "dspark" : "ar    ", info?.generationTokenCount ?? -1, tps))
+                        format: "[INK2I] %@ T=%.0f %@ prompt=%d gen=%d decode tok/s=%.1f", name, temp,
+                        useDSpark ? "dspark" : "ar    ", input.text.tokens.size, info?.generationTokenCount ?? -1,
+                        tps))
+                if useDSpark {
+                    // Acceptance: tokens committed per verify round, from the same request driven through a
+                    // TokenIterator (the counters live on the iterator; the completion info does not carry them).
+                    // The draft depth is Adaptive's; nothing here pins it.
+                    let eos = context.configuration.eosTokenIds.union(Set(
+                        (context.model as? Inkling2LoopModel)?.toolCallTurnStopTokenIds ?? []))
+                    var it = try TokenIterator(
+                        input: input, model: context.model, cache: nil, parameters: p)
+                    var produced = 0
+                    while produced < maxNew, let t = it.next() {
+                        produced += 1
+                        if eos.contains(t) { break }
+                    }
+                    if let st = it.dsparkGenerationStats, st.specSteps > 0 {
+                        let widths = st.verifyWidths.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
+                            .joined(separator: ",")
+                        print(
+                            String(
+                                format:
+                                    "[INK2I] %@ T=%.0f dspark tokens=%d acceptance=%.3f tokens/verify (spec_emitted %d / spec_steps %d) accepted/drafted=%d/%d ar_steps=%d widths=%@",
+                                name, temp, produced, Double(st.specEmitted) / Double(st.specSteps),
+                                st.specEmitted, st.specSteps, st.accepted, st.drafted, st.arSteps, widths))
+                    } else {
+                        print("[INK2I] \(name) INVALID: no dSpark verify rounds (the drafter did not run)")
+                    }
+                }
             }
             if temp == 0 {
                 let a = texts[0]
@@ -680,4 +713,96 @@ func runInkling2VisionParity(modelPath: String, refPath: String) async throws {
             format: "[INK2V] %@ grid=%dx%d tiles=%d ref_mean_abs=%.4f max_abs_diff=%.4f rel_rms=%.2e min_cos=%.6f",
             name, Int(g[0]), Int(g[1]), want.dim(0), mag, maxAbs, rel, cos))
     }
+}
+
+/// BENCH_INKLING2_FIXTURE_REF=<safetensors>: per-prompt parity against stored reference logits (`p{i}.ids` int32
+/// token ids, `p{i}.last64` fp32 logits of the last 64 positions; the JANGHT fixture's `fixture_ref.safetensors`, or a
+/// native-checkpoint reference in the same layout as the harness control). Two routes per prompt:
+///  * prefill: chunked prefill (BENCH_INKLING2_CHUNK, default 2048, the reference's chunking), the last 64 rows;
+///  * decode: prefill all but the last 64 tokens, then the last 64 one token at a time (the batch-1 decode step).
+/// Reports KL(ref || runtime) median / mean / max and top-1 agreement over the 64 positions. Fails closed: a missing
+/// or empty reference, a vocabulary mismatch, a non-finite logit or fewer than 64 compared positions prints INVALID.
+func runInkling2FixtureParity(modelPath: String, refPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let chunk = max(Int(env["BENCH_INKLING2_CHUNK"] ?? "2048") ?? 2048, 1)
+    let routes = (env["BENCH_INKLING2_ROUTES"] ?? "prefill,decode").split(separator: ",").map(String.init)
+    let ref = try MLX.loadArrays(url: URL(fileURLWithPath: refPath))
+    let prompts = (0 ..< 16).filter { ref["p\($0).ids"] != nil && ref["p\($0).last64"] != nil }
+    guard !prompts.isEmpty else {
+        print("[INK2FIX] INVALID: no p{i}.ids / p{i}.last64 pairs in \(refPath)")
+        return
+    }
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let context = try await MLXLMCommon.loadModel(
+        from: URL(fileURLWithPath: modelPath), using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .default)
+    let model = context.model
+    print(
+        String(
+            format: "[INK2FIX] load=%.1fs type=%@ active=%.2fGB model=%@", CFAbsoluteTimeGetCurrent() - t0,
+            String(describing: type(of: model)), Double(MLX.Memory.activeMemory) / 1e9, modelPath))
+    var invalid = 0
+    for i in prompts {
+        let ids0 = ref["p\(i).ids"]!.asType(.int32).reshaped([-1]).asArray(Int32.self)
+        let want = ref["p\(i).last64"]!.asType(.float32)
+        let n = ids0.count
+        let rows = want.dim(0)
+        guard want.ndim == 2, rows > 0, rows <= n else {
+            print("[INK2FIX] p\(i) INVALID: reference shape \(want.shape) for \(n) tokens")
+            invalid += 1
+            continue
+        }
+        let ids = MLXArray(ids0)[.newAxis]
+        for route in routes {
+            let cache = model.newCache(parameters: nil)
+            var got: [MLXArray] = []
+            let tp = CFAbsoluteTimeGetCurrent()
+            if route == "prefill" {
+                var s = 0
+                while s < n {
+                    let e = min(s + chunk, n)
+                    let lg = model(ids[0..., s ..< e], cache: cache)[0]
+                    let lo = max(n - rows, s)
+                    if lo < e { got.append(lg[(lo - s) ..< (e - s)].asType(.float32)) }
+                    eval(got.last ?? lg[0], cache)
+                    s = e
+                }
+            } else {
+                var s = 0
+                while s < n - rows {
+                    let e = min(s + chunk, n - rows)
+                    eval(model(ids[0..., s ..< e], cache: cache)[0, -1])
+                    s = e
+                }
+                for t in (n - rows) ..< n {
+                    let lg = model(ids[0..., t ..< (t + 1)], cache: cache)[0, -1].asType(.float32)
+                    eval(lg)
+                    got.append(lg.reshaped([1, -1]))
+                }
+            }
+            let seconds = CFAbsoluteTimeGetCurrent() - tp
+            let have = got.isEmpty ? MLXArray.zeros([0, 0]) : MLX.concatenated(got, axis: 0)
+            guard have.dim(0) == rows, have.ndim == 2, have.dim(1) == want.dim(1) else {
+                print("[INK2FIX] p\(i) \(route) INVALID: runtime logits \(have.shape) vs reference \(want.shape)")
+                invalid += 1
+                continue
+            }
+            guard MLX.isFinite(have).all().item(Bool.self), MLX.isFinite(want).all().item(Bool.self) else {
+                print("[INK2FIX] p\(i) \(route) INVALID: non-finite logits")
+                invalid += 1
+                continue
+            }
+            let lp = want - logSumExp(want, axis: -1, keepDims: true)
+            let lq = have - logSumExp(have, axis: -1, keepDims: true)
+            let kls = (exp(lp) * (lp - lq)).sum(axis: -1).asArray(Float.self)
+            let top1 = (argMax(want, axis: -1) .== argMax(have, axis: -1)).asType(.int32).sum().item(Int.self)
+            let sorted = kls.sorted()
+            print(
+                String(
+                    format: "[INK2FIX] p%d n=%d %@ positions=%d KL median=%.5f mean=%.5f max=%.5f top1=%d/%d (%.1f%%) %.1fs",
+                    i, n, route, rows, sorted[sorted.count / 2], kls.reduce(0, +) / Float(kls.count),
+                    sorted.last!, top1, rows, 100 * Double(top1) / Double(rows), seconds))
+        }
+    }
+    print("[INK2FIX] \(invalid == 0 ? "DONE" : "INVALID rows: \(invalid)")")
 }

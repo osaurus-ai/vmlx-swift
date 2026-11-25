@@ -2,9 +2,10 @@
 //
 // Inkling-2-Mini multi-row step (B = 1, T rows): the speculative-verify / short-chunk path.
 // Same arithmetic as `decodeStep` (Inkling2Decode.swift) generalized to T rows: the short convs
-// walk the rows in order inside the kernels; attention takes an additive mask that carries the
-// causal / window structure, the relative bias and each row's sink (as an extra zero key).
+// walk the rows in order inside the kernels. Mixed-bank dSpark verification uses each row's native
+// attention sink and matches the single-token projection reductions.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -119,9 +120,9 @@ enum Inkling2VerifyKernels {
     /// valid = d >= 0 (and d < W if W > 0); value = bf16(r[t, h] . proj[:, d]) for d < E, 0 beyond,
     /// minus row t's sink logit for head h (qa at meta[3]); -inf when invalid.
     ///
-    /// The per-token sink is folded into the mask: attention runs with a zero native sink, and a
+    /// For short prefill the per-token sink is folded into the mask. Attention uses a zero native sink and a
     /// row-constant shift of every key's logit by -sink gives exp(s_j) / (exp(sink) + sum exp(s_i)),
-    /// the sink softmax, without a zero key concatenated in front of the whole cache each visit.
+    /// the sink softmax. Verify keeps the unshifted bias and passes each query's sink to attention.
     /// meta = [S, seen, kStart, sink off, qa row stride, W].
     static let maskT = MLXFast.metalKernel(
         name: "inkling2_ver_mask",
@@ -145,10 +146,79 @@ enum Inkling2VerifyKernels {
             if (d < E) {
                 for (int k = 0; k < DR; ++k) b += float(r[((size_t)t * NQ + h) * DR + k]) * float(proj[k * E + d]);
             }
-            float sink = float(qa[(size_t)t * qs + soff + h]);
-            ink_store(out, o, ink_round_as(out, b) - sink);
+            if constexpr (NATIVE_SINKS) {
+                ink_store(out, o, b);
+            } else {
+                float sink = float(qa[(size_t)t * qs + soff + h]);
+                ink_store(out, o, ink_round_as(out, b) - sink);
+            }
             """,
         header: header)
+
+    // Packing pays for itself on the measured M5 Max GPU. Other devices use the same stock
+    // attention in separate per-row calls.
+    static let supportsPackedSlidingAttention: Bool = {
+        #if canImport(Metal)
+            GPU.deviceInfo().architecture == "applegpu_g17s"
+        #else
+            false
+        #endif
+    }()
+
+    /// Copy each verifier row's fixed-size window and mask into independent head groups.
+    /// Stock vector attention then uses the original key count, GQA factor and native sink.
+    static let packAttentionWindows = MLXFast.metalKernel(
+        name: "inkling2_verify_pack_attention_windows",
+        inputNames: ["keys", "values", "bias"],
+        outputNames: ["packedK", "packedV", "packedMask"],
+        source: """
+            const size_t index = thread_position_in_grid.x;
+            constexpr size_t KV_SIZE = T * NK * W * D;
+            constexpr size_t MASK_SIZE = T * NQ * W;
+            if (index < KV_SIZE) {
+                const size_t d = index % D;
+                const size_t p = (index / D) % W;
+                const size_t head = (index / (D * W)) % NK;
+                const size_t query = index / (D * W * NK);
+                const size_t kBase = head * keys_strides[1] + (p + query) * keys_strides[2];
+                const size_t vBase = head * values_strides[1] + (p + query) * values_strides[2];
+                packedK[index] = keys[kBase + d * keys_strides[3]];
+                packedV[index] = values[vBase + d * values_strides[3]];
+            }
+            if (index < MASK_SIZE) {
+                const size_t p = index % W;
+                const size_t head = (index / W) % NQ;
+                const size_t query = index / (W * NQ);
+                packedMask[index] =
+                    bias[head * bias_strides[0] + query * bias_strides[1] + (p + query) * bias_strides[2]];
+            }
+            """,
+        ensureRowContiguous: false)
+
+    static func packedSlidingAttention(
+        q: MLXArray, keys: MLXArray, values: MLXArray, bias: MLXArray, sinks: MLXArray,
+        window: Int, scale: Float
+    ) -> MLXArray {
+        let rows = q.dim(0)
+        let nq = sinks.dim(1)
+        let nkv = keys.dim(1)
+        let dim = keys.dim(-1)
+        let packed = packAttentionWindows(
+            [keys, values, bias],
+            template: [("T", rows), ("NQ", nq), ("NK", nkv), ("W", window), ("D", dim)],
+            grid: (max(rows * nkv * window * dim, rows * nq * window), 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [
+                [1, rows * nkv, window, dim],
+                [1, rows * nkv, window, dim],
+                [1, rows * nq, 1, window],
+            ],
+            outputDTypes: [keys.dtype, values.dtype, bias.dtype])
+        return MLXFast.scaledDotProductAttention(
+            queries: q.reshaped([1, rows * nq, 1, dim]), keys: packed[0], values: packed[1],
+            scale: scale, mask: .array(packed[2]), sinks: sinks.reshaped([rows * nq])
+        ).reshaped([rows, nq * dim])
+    }
 
     /// Per channel, rows in order: m = dtype(sum_k down[t,k,j] * es[inds[t,k]] * w[t,k]); post-MLP
     /// conv (state at packed columns 2C + H + j); hout[t, j] = dtype(res[t, j] + fp32(dtype(conv))).
@@ -204,7 +274,8 @@ extension Inkling2DecoderLayer {
     /// With a recorder, every conv's pre-conv inputs are kept for rewinding.
     func multiRowStep(
         _ h: MLXArray, stack: MLXArray?, kv: any KVCache, conv: MambaCache,
-        messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?
+        messages: MLXArray?, loopIndex: Int, ones: MLXArray, recorder: Inkling2ConvRecorder?,
+        matchDecode: Bool
     ) -> (MLXArray, MLXArray?) {
         prepareDecodeWeights()
         let w = decodeWeights
@@ -273,6 +344,15 @@ extension Inkling2DecoderLayer {
             rowsV = g[2]
         }
 
+        // Preserve the single-vector reduction for sinks, dynamic conv taps, and routing.
+        func denseProject(_ x: MLXArray, _ weight: MLXArray) -> MLXArray {
+            if matchDecode {
+                return MLX.matmul(x.expandedDimensions(axis: 1), weight.expandedDimensions(axis: 0))
+                    .squeezed(axis: 1)
+            }
+            return MLX.matmul(x, weight)
+        }
+
         // 2. projections
         let nQ = nq * hd
         let nR = nq * dRel
@@ -281,20 +361,23 @@ extension Inkling2DecoderLayer {
         let va: MLXArray
         var imeta: [Int32]
         if let qp = w.quant {
+            func project(_ x: MLXArray, _ p: Inkling2QuantizedProjections.Packed) -> MLXArray {
+                matchDecode ? qp.verifyVectors(x, p) : qp(x, p)
+            }
             // Affine projections: qa = [q | r | gate | sink] (the plain sink appended, as the mask reads it at
             // 2nQ + nR), ka / va from the quantized k / v rows (+ the plain dynamic-tap rows after them).
-            qa = MLX.concatenated([qp(rowsQ, qp.qrg), MLX.matmul(rowsQ, qp.sink)], axis: -1)
+            qa = MLX.concatenated([project(rowsQ, qp.qrg), denseProject(rowsQ, qp.sink)], axis: -1)
             if rowsK == nil {
-                let kv = qp(rowsQ, qp.kv)  // [T, 2C]
+                let kv = project(rowsQ, qp.kv)  // [T, 2C]
                 ka = kv
                 va = kv
                 imeta = [0, Int32(nQ), 0, 0, Int32(C), 0, Int32(qa.dim(1)), Int32(2 * C), Int32(2 * C)]
             } else {
-                var kk = qp(rowsK!, qp.k)
-                var vv = qp(rowsV!, qp.v)
+                var kk = project(rowsK!, qp.k)
+                var vv = project(rowsV!, qp.v)
                 if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {
-                    kk = MLX.concatenated([kk, MLX.matmul(rowsK!, kt)], axis: -1)
-                    vv = MLX.concatenated([vv, MLX.matmul(rowsV!, vt)], axis: -1)
+                    kk = MLX.concatenated([kk, denseProject(rowsK!, kt)], axis: -1)
+                    vv = MLX.concatenated([vv, denseProject(rowsV!, vt)], axis: -1)
                 }
                 ka = kk
                 va = vv
@@ -349,7 +432,7 @@ extension Inkling2DecoderLayer {
             outputShapes: [[T, nQ], [T, nR], [T, C], [T, C], [3, 2 * C]],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
 
-        // 3. attention: keys [visible window], mask with sink column
+        // 3. Attention over the visible keys. In ordinary short prefill the mask also carries the sink shift.
         var (keys, values) = kv.update(
             keys: outs[2].reshaped([1, T, nkv, hd]).transposed(0, 2, 1, 3),
             values: outs[3].reshaped([1, T, nkv, hd]).transposed(0, 2, 1, 3))
@@ -373,19 +456,86 @@ extension Inkling2DecoderLayer {
                     Int32(a.window ?? 0),
                 ]),
             ],
+            template: [("NATIVE_SINKS", matchDecode)],
             grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
             outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
-        let attn = MLXFast.scaledDotProductAttention(
-            queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
-            keys: keys, values: values, scale: a.scale,
-            mask: .array(mask.reshaped([1, nq, T, S])),
-            sinks: w.zeroSinks(nq: nq, dtype: dtype))
-        let merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+        let merged: MLXArray
+        let directKeySpan = (a.window == nil && S >= 1023 + T)
+            || (a.window == 1024 && S == 1023 + T)
+        var directAttention: MLXArray?
+        if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+            directKeySpan, T <= 8, dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+        {
+            let query = outs[0]
+            let sinks = qa[0..., sinkOff ..< (sinkOff + nq)]
+            let stream = StreamOrDevice.default
+            var result = mlx_array_new()
+            // The C API borrows array handles. Keep the Swift owners alive
+            // until C++ has retained the arrays in the lazy primitive.
+            let accepted = withExtendedLifetime((query, keys, values, mask, sinks, stream)) {
+                vmlx_inkling_verify_attention(
+                    &result, query.ctx, keys.ctx, values.ctx, mask.ctx, sinks.ctx,
+                    a.scale, a.window != nil, stream.ctx)
+            }
+            if accepted {
+                directAttention = MLXArray(result)
+            } else {
+                _ = mlx_array_free(result)
+            }
+        }
+        if let directAttention {
+            merged = directAttention
+        } else if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+            let window = a.window, window == 1024, S == window - 1 + T, T <= 8,
+            dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+        {
+            merged = Inkling2VerifyKernels.packedSlidingAttention(
+                q: outs[0], keys: keys, values: values, bias: mask,
+                sinks: qa[0..., sinkOff ..< (sinkOff + nq)],
+                window: window, scale: a.scale)
+        } else if matchDecode {
+            merged = MLX.concatenated(
+                (0 ..< T).map { row in
+                    let end = seen + row + 1 - kStart
+                    let start = max(0, end - (a.window ?? end))
+                    let bias = mask[0..., row, start ..< end].reshaped([1, nq, 1, end - start])
+                    return MLXFast.scaledDotProductAttention(
+                        queries: outs[0][row].reshaped([1, nq, 1, hd]),
+                        keys: keys[0..., 0..., start ..< end, 0...],
+                        values: values[0..., 0..., start ..< end, 0...],
+                        scale: a.scale, mask: .array(bias),
+                        sinks: qa[row, sinkOff ..< (sinkOff + nq)]
+                    ).reshaped([1, nQ])
+                }, axis: 0)
+        } else {
+            let attn = MLXFast.scaledDotProductAttention(
+                queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
+                keys: keys, values: values, scale: a.scale,
+                mask: .array(mask.reshaped([1, nq, T, S])),
+                sinks: w.zeroSinks(nq: nq, dtype: dtype))
+            merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+        }
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [merged, qa[0..., (nQ + nR) ..< (2 * nQ + nR)], MLXArray([Int32(0)])],
             grid: (T * nQ, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, nQ]],
             outputDTypes: [dtype])[0]
-        let o = a.oProj(gated)  // [T, H]
+        let o: MLXArray
+        if !matchDecode {
+            o = a.oProj(gated)
+        } else if let linear = a.oProj as? QuantizedLinear,
+            type(of: linear) == QuantizedLinear.self, linear.bias == nil,
+            linear.scales.dtype == gated.dtype
+        {
+            o = MLX.quantizedMM(
+                gated.expandedDimensions(axis: 1), linear.weight.expandedDimensions(axis: 0),
+                scales: linear.scales.expandedDimensions(axis: 0),
+                biases: linear.biases?.expandedDimensions(axis: 0),
+                transpose: true,
+                groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode
+            ).squeezed(axis: 1)
+        } else {
+            o = MLX.concatenated((0 ..< T).map { a.oProj(gated[$0 ..< ($0 + 1)]) }, axis: 0)
+        }
 
         // 4. residual + MLP input
         let states = isBlockBoundary ? inklingAppendState(stack, h) : stack
@@ -426,7 +576,7 @@ extension Inkling2DecoderLayer {
 
         // 5. MoE
         let router = mlp.gate
-        let logits = MLX.matmul(xm32, w.routerT!)
+        let logits = denseProject(xm32, w.routerT!)
         let sel = Inkling2Kernels.routerSelect(
             [logits, router.bias, router.meta, router.scaleArray], grid: (T * 128, 1, 1),
             threadGroup: (128, 1, 1), outputShapes: [[T, router.topK], [T, router.topK]],
@@ -443,6 +593,31 @@ extension Inkling2DecoderLayer {
                 [
                     sum, perPick != nil ? inds : MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
                     perPick != nil ? sel[1] : MLXArray.ones([T, 1], dtype: f32),
+                    packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
+                    MLXArray([Int32(2 * C), Int32(H)]),
+                ],
+                grid: (P, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, H], [3, P], [T, H]],
+                outputDTypes: [dtype, f32, f32])
+            if let recorder {
+                let kRaw = ka[0..., Int(imeta[2]) ..< (Int(imeta[2]) + C)].asType(f32)
+                let vRaw = va[0..., Int(imeta[4]) ..< (Int(imeta[4]) + C)].asType(f32)
+                recorder.record(
+                    conv: conv, oldState: packed.reshaped([1, 3, P]),
+                    inputs: MLX.concatenated([kRaw, vRaw, o.asType(f32), fin[2]], axis: -1).reshaped([
+                        1, T, P,
+                    ]))
+            }
+            conv[0] = fin[1].reshaped([1, 3, P])
+            conv.offset += T
+            return (fin[0].reshaped([1, T, H]), states)
+        }
+        if let mx = mlp.mixedExperts {
+            // JANGHT trellis / half-native layer: the router-weighted sum per row (fp32 rows: decode kernels),
+            // combined by the final kernel as one slot.
+            let fin = Inkling2VerifyKernels.finalT(
+                [
+                    mx(xm32, inds, sel[1]), MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
+                    MLXArray.ones([T, 1], dtype: f32),
                     packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
                     MLXArray([Int32(2 * C), Int32(H)]),
                 ],

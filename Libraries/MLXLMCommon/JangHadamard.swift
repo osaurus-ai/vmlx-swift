@@ -21,18 +21,20 @@ public struct JangHadamardRuntimeContract: Sendable, Equatable {
     public let inverse: Set<String>
     public let computeDType: DType
     let sidecarSigns: [Int: [Float]]
+    let supportsPrismV2MTP: Bool
 
     public var modulePaths: Set<String> { forward.union(inverse) }
 
     init(
         blockSize: Int, forward: Set<String>, inverse: Set<String>,
-        sidecarSigns: [Int: [Float]] = [:]
+        sidecarSigns: [Int: [Float]] = [:], supportsPrismV2MTP: Bool = false
     ) {
         self.blockSize = blockSize
         self.forward = forward
         self.inverse = inverse
         self.computeDType = .float32
         self.sidecarSigns = sidecarSigns
+        self.supportsPrismV2MTP = supportsPrismV2MTP
     }
 }
 
@@ -41,6 +43,8 @@ public struct JangTernaryPackedRuntimeContract: Sendable, Equatable {
 }
 
 extension JangLoader {
+    public static let prismHadamardModelType = "prism_hadamard_qwen35"
+
     private static let hadamardTransformName = "normalized-sylvester-walsh-hadamard"
 
     private static func runtimeContractJSON(at url: URL) throws -> [String: Any] {
@@ -144,9 +148,23 @@ extension JangLoader {
         -> JangHadamardRuntimeContract?
     {
         let (config, jang) = try runtimeContractOwners(at: directory)
+        if config["model_type"] as? String == prismHadamardModelType {
+            let declared = try parsePrismHadamard(config)
+            return try loadHadamardSidecar(
+                declared, from: directory.appendingPathComponent("hadamard.json"), supportsPrismV2MTP: true)
+        }
         let runtime = try runtimeContractMarkers(jang)
         let requiresTransform = try runtimeContractFlag(
             runtime, key: "requires_hadamard_activation_transform")
+        let usesPrismMTP = try runtimeContractFlag(runtime, key: "prism_mtp_v2_sidecar")
+        if usesPrismMTP {
+            let source = jang["source_model"] as? [String: Any]
+            guard requiresTransform, config["model_type"] as? String == "qwen3_5",
+                source?["model_type"] as? String == prismHadamardModelType
+            else {
+                throw JangLoaderError.invalidConfig("Prism MTP requires a Hadamard Qwen3.5 repack")
+            }
+        }
         let manifest =
             (jang["quantization"] as? [String: Any])?["tensor_quantization_manifest"]
             as? [String: Any] ?? [:]
@@ -207,7 +225,63 @@ extension JangLoader {
                 "Hadamard declaration and tensor manifest coverage disagree")
         }
 
-        let prism = try runtimeContractJSON(at: directory.appendingPathComponent(sidecar))
+        return try loadHadamardSidecar(
+            parsed, from: directory.appendingPathComponent(sidecar), supportsPrismV2MTP: usesPrismMTP)
+    }
+
+    private static func parsePrismHadamard(_ config: [String: Any]) throws
+        -> JangHadamardRuntimeContract
+    {
+        guard config["schema_version"] as? Int == 2,
+            config["base_model_type"] as? String == "qwen3_5",
+            config["tensor_namespace"] as? String == "mlx-vlm-qwen3_5",
+            config["gdn_activation_layout"] as? String == "grouped",
+            config["hadamard_config"] as? String == "hadamard.json",
+            let components = config["components"] as? [String: Any],
+            try runtimeContractFlag(components, key: "text"),
+            try runtimeContractFlag(components, key: "vision"),
+            let quantization = config["quantization"] as? [String: Any],
+            quantization["bits"] as? Int == 2,
+            quantization["group_size"] as? Int == 128,
+            quantization["mode"] as? String == "affine",
+            let modules = config["modules"] as? [[String: Any]], !modules.isEmpty,
+            let block = modules.first?["block"] as? Int, [512, 1024, 2048, 4096].contains(block)
+        else {
+            throw JangLoaderError.invalidConfig("unsupported Prism Hadamard Qwen3.5 bundle layout")
+        }
+
+        var forward: [String] = []
+        var inverse: [String] = []
+        for entry in modules {
+            guard let path = entry["path"] as? String,
+                entry["block"] as? Int == block,
+                entry["dtype"] as? String == "float16",
+                entry["embedding"] != nil
+            else { throw JangLoaderError.invalidConfig("invalid Prism Hadamard module declaration") }
+            let isEmbedding = try runtimeContractFlag(entry, key: "embedding")
+            if isEmbedding {
+                inverse.append("language_model.\(path)")
+            } else {
+                forward.append("language_model.\(path)")
+            }
+        }
+        let forwardPaths = try contractPaths(forward, key: "forward_modules")
+        let inversePaths = try contractPaths(inverse, key: "inverse_modules")
+        guard !forwardPaths.isEmpty,
+            inversePaths == ["language_model.model.embed_tokens"],
+            forwardPaths.isDisjoint(with: inversePaths)
+        else {
+            throw JangLoaderError.invalidConfig("inconsistent Prism Hadamard module coverage")
+        }
+        return JangHadamardRuntimeContract(
+            blockSize: block, forward: forwardPaths, inverse: inversePaths)
+    }
+
+    private static func loadHadamardSidecar(
+        _ parsed: JangHadamardRuntimeContract, from url: URL, supportsPrismV2MTP: Bool
+    ) throws -> JangHadamardRuntimeContract
+    {
+        let prism = try runtimeContractJSON(at: url)
         guard prism["prism.hadamard.version"] as? Int == 1,
             prism["prism.hadamard.block_size"] as? Int == parsed.blockSize,
             prism["prism.hadamard.transform"] as? String == hadamardTransformName,
@@ -247,7 +321,7 @@ extension JangLoader {
         }
         return JangHadamardRuntimeContract(
             blockSize: parsed.blockSize, forward: parsed.forward, inverse: parsed.inverse,
-            sidecarSigns: signs)
+            sidecarSigns: signs, supportsPrismV2MTP: supportsPrismV2MTP)
     }
 
     public static func loadTernaryPackedRuntimeContract(at directory: URL) throws
@@ -452,7 +526,11 @@ extension JangHadamardRuntimeContract {
 
     func verifyLoaded(model: Module) throws {
         let modules = Dictionary(uniqueKeysWithValues: model.namedModules())
-        for path in modulePaths.sorted() {
+        let paths = modulePaths.sorted()
+        let expectedSigns = sidecarSigns.mapValues { MLXArray($0) }
+        var checks: [MLXArray] = []
+        checks.reserveCapacity(paths.count)
+        for path in paths {
             let signs: MLXArray
             let width: Int
             if forward.contains(path), let module = modules[path] as? HadamardQuantizedLinear {
@@ -466,18 +544,21 @@ extension JangHadamardRuntimeContract {
             } else {
                 throw JangLoaderError.loadFailed("Hadamard wrapper missing after load: \(path)")
             }
-            guard signs.dtype == .float32, signs.shape == [width],
-                MLX.all((signs .== 1) .|| (signs .== -1)).item(Bool.self)
-            else {
-                throw JangLoaderError.loadFailed(
-                    "Hadamard signs missing, malformed or not +/-1: \(path)")
+            guard signs.dtype == .float32, signs.shape == [width] else {
+                throw JangLoaderError.loadFailed("Malformed Hadamard signs: \(path)")
             }
-            if let expected = sidecarSigns[width],
-                !MLX.all(signs .== MLXArray(expected)).item(Bool.self)
-            {
-                throw JangLoaderError.loadFailed(
-                    "Hadamard signs disagree with Prism sidecar: \(path)")
+            if let expected = expectedSigns[width] {
+                checks.append(MLX.all(signs .== expected))
+            } else {
+                checks.append(MLX.all((signs .== 1) .|| (signs .== -1)))
             }
+        }
+        // Check all settled arrays with one host readback. The sidecar parser
+        // already requires every reference sign to be +1 or -1.
+        let matches = MLX.stacked(checks).asArray(Bool.self)
+        if let index = matches.firstIndex(of: false) {
+            throw JangLoaderError.loadFailed(
+                "Hadamard signs are invalid or disagree with the sidecar: \(paths[index])")
         }
     }
 }

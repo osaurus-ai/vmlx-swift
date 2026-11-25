@@ -1812,7 +1812,17 @@ public enum MTPBundleInspector {
             config: config,
             jangConfig: jangConfig)
         let tensorNames = try loadTensorNames(from: modelDirectory)
-        let mtpNames = tensorNames.filter { isMTPName($0, mtpLayerPrefixes: mtpLayerPrefixes) }
+        var mtpNames = tensorNames.filter { isMTPName($0, mtpLayerPrefixes: mtpLayerPrefixes) }
+        let prismHead = PrismNativeMTP.sidecar(at: modelDirectory)
+        let hasPrismHead = FileManager.default.fileExists(atPath: prismHead.path)
+            ? try JangLoader.loadHadamardRuntimeContract(at: modelDirectory)?.supportsPrismV2MTP == true
+            : false
+        if hasPrismHead {
+            guard mtpNames.isEmpty else {
+                throw JangLoaderError.invalidConfig("Prism bundle declares both inline and sidecar MTP tensors")
+            }
+            mtpNames = try PrismNativeMTP.translatedNames(safetensorsHeaderNames(prismHead))
+        }
         let visionNames = tensorNames.filter(isVisionName)
         let tuningLoad = loadNativeMTPTuning(from: modelDirectory)
         let nativeMTPTuning: NativeMTPTuning? = {
@@ -1828,12 +1838,13 @@ public enum MTPBundleInspector {
         // bundle's MTP artifact when it has no recursive head: its own config and shard headers
         // are the physical evidence, read the same way as the target's.
         let blockDrafter = inspectBlockDrafter(modelDirectory: modelDirectory, config: config)
-        let configuredLayers = Swift.max(headLayers, blockDrafter?.layers ?? 0)
+        let configuredLayers = Swift.max(headLayers, blockDrafter?.layers ?? 0, hasPrismHead ? 1 : 0)
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
         let metadataClaimsMTP = runtimeBundleHasMTP || runtimeMode != .none || configuredLayers > 0
         let bundleHasMTP = !mtpNames.isEmpty || blockDrafter != nil
         var statusEvidence = evidence
+        if hasPrismHead { statusEvidence.append(PrismNativeMTP.evidence) }
         if let blockDrafter {
             statusEvidence.append(
                 "block_drafter=lilicorr layers=\(blockDrafter.layers) tensors=\(blockDrafter.names.count)")

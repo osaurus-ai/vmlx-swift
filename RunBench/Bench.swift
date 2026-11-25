@@ -666,6 +666,10 @@ struct Bench {
             try await runRippleTimingProbe(modelPath: modelPath)
             return
         }
+        if let ref = env["BENCH_INKLING2_FIXTURE_REF"], (env["BENCH_INKLING2_DSPARK_ITER"] ?? "0") != "1" {
+            try await runInkling2FixtureParity(modelPath: modelPath, refPath: ref)
+            return
+        }
         if (env["BENCH_INKLING2_DSPARK_ITER"] ?? "0") == "1" {
             try await runInkling2DSparkIteratorProbe(modelPath: modelPath)
             return
