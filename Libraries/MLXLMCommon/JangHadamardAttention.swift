@@ -43,9 +43,31 @@ public enum JangHadamardAttention {
         } else {
             attentionMask = mask
         }
-        let output = attentionWithCacheUpdate(
-            queries: queries.asType(.float16), keys: keys.asType(.float16),
-            values: values.asType(.float16), cache: cache, scale: scale, mask: attentionMask)
+        let q = queries.asType(.float16)
+        let k = keys.asType(.float16)
+        let v = values.asType(.float16)
+        let rows = q.dim(2)
+        let output: MLXArray
+        if let simple = cache as? KVCacheSimple, type(of: simple) == KVCacheSimple.self,
+            (2...8).contains(rows),
+            NativeMTPVerifierStatePolicy.requestVerifierMode
+                == NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue,
+            FlashVerificationScope.usesRowExactVerification(
+                inputShape: [q.dim(0), rows, q.dim(-1)], site: "attn")
+        {
+            let (allKeys, allValues) = simple.update(keys: k, values: v)
+            let start = allKeys.dim(2) - rows
+            output = concatenated((0..<rows).map { row in
+                let end = start + row + 1
+                return MLXFast.scaledDotProductAttention(
+                    queries: q[0..., 0..., row..<(row + 1), 0...],
+                    keys: allKeys[0..., 0..., ..<end, 0...],
+                    values: allValues[0..., 0..., ..<end, 0...], scale: scale, mask: .none)
+            }, axis: 2)
+        } else {
+            output = attentionWithCacheUpdate(
+                queries: q, keys: k, values: v, cache: cache, scale: scale, mask: attentionMask)
+        }
         let shouldReport = reported.withLock { reported in
             if reported { return false }
             reported = true

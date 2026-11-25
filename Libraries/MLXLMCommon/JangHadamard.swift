@@ -406,7 +406,30 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ input: MLXArray) -> MLXArray {
-        super.callAsFunction(jangHadamardActivation(input, signs: signs, blockSize: blockSize))
+        let rotated = jangHadamardActivation(input, signs: signs, blockSize: blockSize)
+        guard mode == .affine, bits == 2, groupSize == 128,
+            rotated.ndim == 3, rotated.dim(0) == 1,
+            FlashVerificationScope.usesRowExactVerification(inputShape: rotated.shape)
+        else { return super.callAsFunction(rotated) }
+        let rows = rotated.dim(1)
+        if bias == nil, let output = RowExactAffineQMV.project(
+            rotated.reshaped(rows, -1), weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits,
+            reference: { projectRows($0.reshaped(1, rows, -1)).reshaped(rows, -1) })
+        {
+            return output.reshaped(1, rows, -1)
+        }
+        return projectRows(rotated)
+    }
+
+    private func projectRows(_ rotated: MLXArray) -> MLXArray {
+        // Apply the original packed projection using its decode shape for
+        // each independent verification row.
+        var outputs: [MLXArray] = []
+        for row in 0..<rotated.dim(1) {
+            outputs.append(super.callAsFunction(rotated[0..., row..<(row + 1), 0...]))
+        }
+        return concatenated(outputs, axis: 1)
     }
 }
 
