@@ -189,6 +189,68 @@ struct Qwen3VLRestoredPrefixPositionTests {
         }
     }
 
+    @Test("a restored media position plan spans multiple prefill chunks")
+    func restoredMediaPlanSurvivesSplitPrefill() throws {
+        try MLXMetalTestLock.withLock {
+            let prefix = head + imageRun
+            let intermediate = [Int32(45), 46]
+            let suffix = imageRun + tail
+            let tokens = prefix + intermediate + suffix
+            let full = LMInput(
+                text: .init(tokens: MLXArray(tokens, [1, tokens.count])),
+                image: .init(
+                    pixels: concatenated([pixels, pixels]), frames: [THW(1, 4, 4), THW(1, 4, 4)]),
+                mediaTokenIds: [98])
+            let expected = try cold(full)
+            let cache = try restoredCache(prefix: input(prefix, image: true))
+            let fresh = try model()
+            armRestore(fresh, full: full, restored: prefix.count)
+            let middle = try fresh.prepare(input(intermediate, image: false), cache: cache, windowSize: 0)
+            MLX.eval(try lastLogits(middle))
+            assertMatchesCold(try run(fresh, prepare: input(suffix, image: true), cache: cache), expected)
+        }
+    }
+
+    @Test("interleaved image and text requests keep their own decode positions")
+    func independentDecodePositionsAcrossRequests() throws {
+        try MLXMetalTestLock.withLock {
+            let imagePrompt = input(head + imageRun + tail, image: true)
+            let textPrompt = input(head + tail, image: false)
+            let soloImage = try model()
+            let soloImageCache = soloImage.newCache(parameters: nil)
+            let expectedImage = try run(soloImage, prepare: imagePrompt, cache: soloImageCache)
+            let soloText = try model()
+            let soloTextCache = soloText.newCache(parameters: nil)
+            let expectedText = try run(soloText, prepare: textPrompt, cache: soloTextCache)
+            let live = try model()
+            let imageCache = live.newCache(parameters: nil)
+            armRestore(live, full: imagePrompt, restored: 0)
+            MLX.eval(try lastLogits(live.prepare(imagePrompt, cache: imageCache, windowSize: 0)))
+
+            let textCache = try restoredCache(prefix: input(head, image: false))
+            armRestore(live, full: textPrompt, restored: head.count)
+            let resumed = try live.prepare(input(tail, image: false), cache: textCache, windowSize: 0)
+            MLX.eval(try lastLogits(resumed))
+
+            let imageStep = live(MLXArray([Int32(31)], [1, 1]), cache: imageCache)[0..., -1, 0...]
+            #expect(maxError(imageStep, expectedImage[1]) < 1e-4)
+
+            let batchCache = zip(imageCache, textCache).map { BatchKVCache(slotCaches: [$0.0, $0.1]) }
+            let batchStep = live(MLXArray([Int32(32), 31], [2, 1]), cache: batchCache)
+            let imageFirst = imageCache[0].state[0][0..., 0..., ..<imageCache[0].offset, 0...]
+            let soloImageFirst = soloImageCache[0].state[0][0..., 0..., ..<imageCache[0].offset, 0...]
+            let textFirst = textCache[0].state[0][0..., 0..., ..<textCache[0].offset, 0...]
+            let soloTextFirst = soloTextCache[0].state[0][0..., 0..., ..<textCache[0].offset, 0...]
+            // On Metal, batched projections can use TF32 where solo decode uses GEMV.
+            // First-layer keys isolate the rotary positions before later layers amplify rounding.
+            #expect(maxError(imageFirst, soloImageFirst) < 5e-4, "image first-layer keys")
+            #expect(maxError(textFirst, soloTextFirst) < 5e-4, "text first-layer keys")
+            #expect(maxError(batchStep[0 ..< 1, -1, 0...], expectedImage[2]) < 5e-3)
+            #expect(maxError(batchStep[1 ..< 2, -1, 0...], expectedText[1]) < 5e-3)
+            #expect(maxError(keys(imageCache), expectedImage[3]) < 2e-3)
+        }
+    }
+
     /// The test above is what lets the prefix cache resume an image prompt from a text boundary:
     /// without the declaration that hit rolls back to a full prefill.
     @Test("an image prompt resumes from a boundary before its first placeholder")

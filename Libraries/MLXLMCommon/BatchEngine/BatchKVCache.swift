@@ -41,7 +41,7 @@ import MLXNN
 public final class BatchKVCache: BaseKVCache {
 
     /// Per-sequence caches for this layer. Index matches batch dimension ordering.
-    private let slotCaches: [KVCache]
+    public let slotCaches: [KVCache]
 
     /// Number of sequences in this batch.
     public let batchSize: Int
