@@ -5,6 +5,7 @@
 // walk the rows in order inside the kernels. Mixed-bank dSpark verification uses each row's native
 // attention sink and matches the single-token projection reductions.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -459,7 +460,32 @@ extension Inkling2DecoderLayer {
             grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
             outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
         let merged: MLXArray
+        let directKeySpan = (a.window == nil && S >= 1023 + T)
+            || (a.window == 1024 && S == 1023 + T)
+        var directAttention: MLXArray?
         if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+            directKeySpan, T <= 8, dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+        {
+            let query = outs[0]
+            let sinks = qa[0..., sinkOff ..< (sinkOff + nq)]
+            let stream = StreamOrDevice.default
+            var result = mlx_array_new()
+            // The C API borrows array handles. Keep the Swift owners alive
+            // until C++ has retained the arrays in the lazy primitive.
+            let accepted = withExtendedLifetime((query, keys, values, mask, sinks, stream)) {
+                vmlx_inkling_verify_attention(
+                    &result, query.ctx, keys.ctx, values.ctx, mask.ctx, sinks.ctx,
+                    a.scale, a.window != nil, stream.ctx)
+            }
+            if accepted {
+                directAttention = MLXArray(result)
+            } else {
+                _ = mlx_array_free(result)
+            }
+        }
+        if let directAttention {
+            merged = directAttention
+        } else if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
             let window = a.window, window == 1024, S == window - 1 + T, T <= 8,
             dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
         {

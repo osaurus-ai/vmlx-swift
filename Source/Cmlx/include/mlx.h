@@ -2,3 +2,4 @@
 #include "mlx/c/transforms_impl.h"
 #include "mlx/c/linalg.h"
 #include "mlx/c/fast.h"
+#include "mlx/c/inkling_verify_attention.h"
