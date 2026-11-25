@@ -114,7 +114,7 @@ public enum VLMTypeRegistry {
 
     /// The set of model type strings supported by the VLM factory.
     /// Use this to check if a model_type from config.json is a known VLM architecture.
-    public static let supportedModelTypes: Set<String> = Set(_creators.keys)
+    public static let supportedModelTypes: Set<String> = Set(_creators.keys).union([JangLoader.prismHadamardModelType])
 
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry = .init(creators: _creators)
@@ -603,7 +603,8 @@ public final class VLMModelFactory: ModelFactory {
         // bundle's config.json reports `model_type: nemotron_h` (LLM only),
         // so we override the dispatch model_type here so the VLM factory
         // routes to NemotronHOmni instead of failing or hitting the LLM path.
-        var dispatchModelType = baseConfig.modelType
+        var dispatchModelType = baseConfig.modelType == JangLoader.prismHadamardModelType
+            ? "qwen3_5" : baseConfig.modelType
         let configOmniURL = modelDirectory.appending(component: "config_omni.json")
         if FileManager.default.fileExists(atPath: configOmniURL.path) {
             dispatchModelType = "NemotronH_Nano_Omni_Reasoning_V3"
@@ -787,6 +788,15 @@ public final class VLMModelFactory: ModelFactory {
             status: earlyMTPStatus)
         if !loadNativeMTP {
             mergedConfigData = try NativeMTPActivation.scrubInactiveMTPConfig(mergedConfigData)
+        } else if earlyMTPStatus?.configEvidence.contains(PrismNativeMTP.evidence) == true {
+            guard var outer = try JSONSerialization.jsonObject(with: mergedConfigData) as? [String: Any],
+                var text = outer["text_config"] as? [String: Any]
+            else { throw JangLoaderError.invalidConfig("Prism MTP requires Qwen3.5 text configuration") }
+            text["mtp_num_hidden_layers"] = 1
+            outer["text_config"] = text
+            // The source pack and its lossless JANG repacks share this draft ABI.
+            outer["model_type"] = JangLoader.prismHadamardModelType
+            mergedConfigData = try JSONSerialization.data(withJSONObject: outer)
         }
         // A qwen4_exp bundle whose vision tower has no processor file is constructed text-only.
         mergedConfigData = Qwen4ExpTextOnlyBundle.textOnlyConfiguration(
