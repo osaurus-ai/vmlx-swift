@@ -3893,7 +3893,10 @@ public actor BatchEngine {
                 }
                 guard let mediaBoundaryInput = slot.originalInput.inputForCacheBoundary(
                     tokens: tokens, fullPromptTokenIds: promptTokens) else { return nil }
+                // A pre-media boundary of a media request drops the media from its input, but
+                // its rows are still this cache's rows when the model declares them media-independent.
                 let keepsMedia = !slot.originalInput.hasMediaContent || mediaBoundaryInput.hasMediaContent
+                    || slot.cacheSaltPlan?.prefixRowsAreMediaIndependent(boundary: tokens.count) == true
                 let trimCount = storageSnapshotTokenCount - tokens.count
                 if keepsMedia, canTrimPromptCache(storageTopologySnapshot) {
                     if let trimmed = compactPromptPrefix(storageTopologySnapshot, count: tokens.count) {

@@ -46,6 +46,42 @@ private final class InvariantHybridModel: RecordingHybridModel, PrefixCacheInvar
     var exactPrefixRestoreIsSuffixIndependent: Bool { true }
 }
 
+/// A trimmable attention cache whose rows are the token ids, so a boundary
+/// can be cut from the finished cache and any token forwarded after the
+/// prompt is a replay.
+private class RecordingKVModel: Module, LanguageModel, @unchecked Sendable {
+    private(set) var forwarded: [Int] = []
+    var vocabularySize: Int { 64 }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [KVCacheSimple()] }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        let step = max(1, windowSize ?? 512)
+        var flat = input.text.tokens.reshaped([-1])
+        while flat.size > step {
+            _ = callAsFunction(flat[..<step][.newAxis, 0...], cache: cache)
+            MLX.eval(cache)
+            flat = flat[step...]
+        }
+        return .tokens(LMInput.Text(tokens: flat))
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let ids = inputs.reshaped([-1]).asArray(Int32.self).map(Int.init)
+        forwarded.append(contentsOf: ids)
+        if let layer = cache?.first {
+            let rows = MLXArray(ids.map(Float.init)).reshaped(1, 1, ids.count, 1)
+            _ = layer.update(keys: rows, values: rows)
+        }
+        return MLXArray.zeros([1, max(ids.count, 1), vocabularySize])
+    }
+}
+
+private final class InvariantKVModel: RecordingKVModel, PrefixCacheInvariantModel, @unchecked Sendable {
+    var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { true }
+    var exactPrefixRestoreIsSuffixIndependent: Bool { true }
+}
+
 final class MediaIndependentPrefixCacheTests: XCTestCase {
     // Step 7: none of the boundaries below (4, 12, 15, 25) is a multiple of it.
     private let step = 7
@@ -237,6 +273,43 @@ final class MediaIndependentPrefixCacheTests: XCTestCase {
         XCTAssertTrue(mediaOnly.hasDurableDiskEntry(tokens: Array(system.dropLast()), mediaSalt: imageSalt))
         XCTAssertFalse(mediaOnly.hasDurableDiskEntry(tokens: Array(system.dropLast()), mediaSalt: textSalt()),
                        "without the invariant the seed is only ever keyed under the image salt")
+    }
+
+    /// Storing a pre-media history boundary of an image turn must cut it from
+    /// the finished cache. Replaying it ran a whole extra prefill per boundary
+    /// after the answer, on the request path: 10-40 s per Computer Use step on
+    /// Qwen3-VL-8B, growing with every step.
+    func testPreMediaHistoryBoundaryIsCutFromTheFinishedCacheNotReplayed() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let history = system.count + user1.count
+        for declares in [true, false] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            roots.append(directory)
+            let disk = CacheCoordinator(config: .init(usePagedCache: false, enableDiskCache: true,
+                diskCacheDir: directory, modelKey: "media-independent-kv"))
+            disk.setGenPromptSuffixTokens(suffix)
+            let model: RecordingKVModel = declares ? InvariantKVModel() : RecordingKVModel()
+            var image = try TokenIterator(input: mediaInput(pixelSeed: 1), model: model,
+                parameters: parameters(), cacheCoordinator: disk)
+            let prefilled = model.forwarded.count
+            image.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            guard declares else {
+                XCTAssertGreaterThan(model.forwarded.count, prefilled,
+                                     "without the declaration the pre-media boundary is replayed")
+                continue
+            }
+            XCTAssertEqual(model.forwarded.count, prefilled, "no token may be replayed to store a boundary")
+            XCTAssertTrue(disk.hasDurableDiskEntry(
+                tokens: Array(mediaPrompt.prefix(history)), mediaSalt: textSalt()))
+
+            // The cut rows are the text prompt's rows: a text turn sharing the
+            // prefix restores them and continues with exactly its own tokens.
+            let textModel = InvariantKVModel()
+            let text = try TokenIterator(input: textInput(), model: textModel,
+                parameters: parameters(), cacheCoordinator: disk)
+            XCTAssertEqual(textModel.forwarded, Array(textPrompt.dropFirst(history)))
+            XCTAssertEqual(text.cache[0].state[0].reshaped(-1).asArray(Float.self), textPrompt.map(Float.init))
+        }
     }
 
     // MARK: - Forced tool selection

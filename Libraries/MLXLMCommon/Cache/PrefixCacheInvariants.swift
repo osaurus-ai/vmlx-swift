@@ -26,8 +26,10 @@ public protocol PrefixCacheInvariantModel: AnyObject {
     /// later text turn can reuse the rows a media turn writes. Boundaries at
     /// or after the first media token keep the media salt.
     ///
-    /// Must be false for M-RoPE families (Qwen-VL class) and for any model
-    /// whose pre-media positions or states depend on the media.
+    /// Must be false for any model whose pre-media positions or states depend
+    /// on the media, and for M-RoPE families (Qwen-VL class) unless they also
+    /// position a restored suffix from the full prompt
+    /// (`RestoredPrefixPositionModel`).
     var statesBeforeFirstMediaTokenAreMediaIndependent: Bool { get }
 
     /// The cache state restored from an exact token-prefix row is the state a
@@ -287,6 +289,13 @@ extension CacheBoundarySaltPlan {
         // there, and `mediaCarryingSuffixInput` hands `prepare` exactly those items.
         return matchedTokens <= mediaIndependentTokenCount
             || segments.contains { $0.contains(matchedTokens) }
+    }
+
+    /// Whether the first `boundary` rows of this media request's cache are the
+    /// text-only prompt's rows, so a boundary snapshot may be cut from the
+    /// finished cache instead of replaying the prefix through the model.
+    public func prefixRowsAreMediaIndependent(boundary: Int) -> Bool {
+        mediaIndependentTokenCount > 0 && boundary <= mediaIndependentTokenCount
     }
 }
 
