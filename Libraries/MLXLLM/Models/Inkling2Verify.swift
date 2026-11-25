@@ -154,6 +154,71 @@ enum Inkling2VerifyKernels {
             """,
         header: header)
 
+    // Packing pays for itself on the measured M5 Max GPU. Other devices use the same stock
+    // attention in separate per-row calls.
+    static let supportsPackedSlidingAttention: Bool = {
+        #if canImport(Metal)
+            GPU.deviceInfo().architecture == "applegpu_g17s"
+        #else
+            false
+        #endif
+    }()
+
+    /// Copy each verifier row's fixed-size window and mask into independent head groups.
+    /// Stock vector attention then uses the original key count, GQA factor and native sink.
+    static let packAttentionWindows = MLXFast.metalKernel(
+        name: "inkling2_verify_pack_attention_windows",
+        inputNames: ["keys", "values", "bias"],
+        outputNames: ["packedK", "packedV", "packedMask"],
+        source: """
+            const size_t index = thread_position_in_grid.x;
+            constexpr size_t KV_SIZE = T * NK * W * D;
+            constexpr size_t MASK_SIZE = T * NQ * W;
+            if (index < KV_SIZE) {
+                const size_t d = index % D;
+                const size_t p = (index / D) % W;
+                const size_t head = (index / (D * W)) % NK;
+                const size_t query = index / (D * W * NK);
+                const size_t kBase = head * keys_strides[1] + (p + query) * keys_strides[2];
+                const size_t vBase = head * values_strides[1] + (p + query) * values_strides[2];
+                packedK[index] = keys[kBase + d * keys_strides[3]];
+                packedV[index] = values[vBase + d * values_strides[3]];
+            }
+            if (index < MASK_SIZE) {
+                const size_t p = index % W;
+                const size_t head = (index / W) % NQ;
+                const size_t query = index / (W * NQ);
+                packedMask[index] =
+                    bias[head * bias_strides[0] + query * bias_strides[1] + (p + query) * bias_strides[2]];
+            }
+            """,
+        ensureRowContiguous: false)
+
+    static func packedSlidingAttention(
+        q: MLXArray, keys: MLXArray, values: MLXArray, bias: MLXArray, sinks: MLXArray,
+        window: Int, scale: Float
+    ) -> MLXArray {
+        let rows = q.dim(0)
+        let nq = sinks.dim(1)
+        let nkv = keys.dim(1)
+        let dim = keys.dim(-1)
+        let packed = packAttentionWindows(
+            [keys, values, bias],
+            template: [("T", rows), ("NQ", nq), ("NK", nkv), ("W", window), ("D", dim)],
+            grid: (max(rows * nkv * window * dim, rows * nq * window), 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [
+                [1, rows * nkv, window, dim],
+                [1, rows * nkv, window, dim],
+                [1, rows * nq, 1, window],
+            ],
+            outputDTypes: [keys.dtype, values.dtype, bias.dtype])
+        return MLXFast.scaledDotProductAttention(
+            queries: q.reshaped([1, rows * nq, 1, dim]), keys: packed[0], values: packed[1],
+            scale: scale, mask: .array(packed[2]), sinks: sinks.reshaped([rows * nq])
+        ).reshaped([rows, nq * dim])
+    }
+
     /// Per channel, rows in order: m = dtype(sum_k down[t,k,j] * es[inds[t,k]] * w[t,k]); post-MLP
     /// conv (state at packed columns 2C + H + j); hout[t, j] = dtype(res[t, j] + fp32(dtype(conv))).
     /// Also copies kvst / ast into the packed state and writes `mout` [T, H] (the conv inputs, for
@@ -394,7 +459,15 @@ extension Inkling2DecoderLayer {
             grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
             outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
         let merged: MLXArray
-        if matchDecode {
+        if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+            let window = a.window, window == 1024, S == window - 1 + T, T <= 8,
+            dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+        {
+            merged = Inkling2VerifyKernels.packedSlidingAttention(
+                q: outs[0], keys: keys, values: values, bias: mask,
+                sinks: qa[0..., sinkOff ..< (sinkOff + nq)],
+                window: window, scale: a.scale)
+        } else if matchDecode {
             merged = MLX.concatenated(
                 (0 ..< T).map { row in
                     let end = seen + row + 1 - kStart
