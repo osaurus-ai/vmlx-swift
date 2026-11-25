@@ -2541,8 +2541,21 @@ enum Qwen35Language {
                 var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjQKV, $0) }
                 z = (fusedInputs?[1] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjZ, $0) }).reshaped(
                     B, S, numVHeads, headVDim)
-                b = fusedInputs?[2] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjB, $0) }
-                a = fusedInputs?[3] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjA, $0) }
+                let rowExactHadamardGates = inProjQKV is HadamardQuantizedLinear
+                    && FlashVerificationScope.usesRowExactVerification(
+                        inputShape: inputs.shape, site: "gdn")
+                func gateProjection(_ projection: Linear) -> MLXArray {
+                    if rowExactHadamardGates {
+                        // These narrow dense gates still use a different reduction
+                        // when evaluated as a multi-row projection.
+                        return concatenated(MLX.split(inputs, parts: S, axis: 1).map {
+                            projection($0)
+                        }, axis: 1)
+                    }
+                    return verifyTiled(inputs) { qwen4ExpProjection(projection, $0) }
+                }
+                b = fusedInputs?[2] ?? gateProjection(inProjB)
+                a = fusedInputs?[3] ?? gateProjection(inProjA)
 
                 if let mask {
                     mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -4524,7 +4537,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         windowSize: Int?
     ) throws -> PrepareResult {
         try Task.checkCancellation()
-        let inputIds = input.text.tokens
+        let tokens = input.text.tokens
+        let inputIds = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
 
         var pixelValues: MLXArray?
         var imageFrames: [THW]?
