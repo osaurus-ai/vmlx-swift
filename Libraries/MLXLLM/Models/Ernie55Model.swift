@@ -53,6 +53,7 @@ struct Ernie55Configuration: Decodable {
     let indexTopk: Int
     let vhaRank: Int?
     let numNextnPredictLayers: Int
+    let eosTokenId: Int?
 
     static func decode(_ data: Data) throws -> Self {
         let decoder = JSONDecoder()
@@ -547,4 +548,10 @@ final class Ernie55Model: Module, LLMModel, ModalityBearing, SafetensorsLoadKeyE
     func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
         excludedTensorNames.contains(key)
     }
+}
+
+/// ERNIE's native renderer writes an assistant tool-call turn back with its closing `<|ernie:im_end|>`
+/// stop token, so tool-call turns can persist a post-answer SSD boundary for exact-prefix follow-up reuse.
+extension Ernie55Model: ToolCallTurnStopTokenModel {
+    public var toolCallTurnStopTokenIds: Set<Int> { [args.eosTokenId ?? 2] }
 }

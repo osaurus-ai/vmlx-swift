@@ -290,4 +290,48 @@ struct Ernie55MathTests {
             #expect(settings.bundledDSparkDrafter(configData: cfg, bundleDirectory: tmp, environment: [:]) == nil)
         }
     }
+
+    @Test("ERNIE hybrid HCA + dual-KV CacheList survives SSD disk cache round-trip with DSpark tail")
+    func hybridCacheDiskRoundTrip() throws {
+        try MLXMetalTestLock.withLock {
+            let hca = DeepseekV4Cache(
+                slidingWindow: 128, compressRatio: 128,
+                poolQuantizationEnabled: false, compactLocalWindow: true, sharesLocalKeysAndValues: true)
+            let kv = MLXRandom.normal([1, 1, 5, 16]).asType(.bfloat16)
+            _ = hca.update(keys: kv, values: kv)
+            hca.auxiliaryHiddenTail = HybridPoolHiddenTail(
+                capacity: 32, start: 0, rows: MLXRandom.normal([5, 24]).asType(.bfloat16))
+
+            let mlaLatent = KVCacheSimple()
+            let mlaIndex = KVCacheSimple()
+            let latentK = MLXRandom.normal([1, 1, 5, 32]).asType(.bfloat16)
+            let latentV = MLXArray.zeros([1, 1, 5, 0], dtype: .bfloat16)
+            let indexK = MLXRandom.normal([1, 1, 5, 12]).asType(.bfloat16)
+            let indexV = MLXArray.zeros([1, 1, 5, 0], dtype: .bfloat16)
+            _ = mlaLatent.update(keys: latentK, values: latentV)
+            _ = mlaIndex.update(keys: indexK, values: indexV)
+            let mla = CacheList(mlaLatent, mlaIndex)
+
+            let src: [any KVCache] = [hca, mla]
+            let serialized = TQDiskSerializer.serialize(cache: src)
+
+            let dstHca = DeepseekV4Cache(
+                slidingWindow: 128, compressRatio: 128,
+                poolQuantizationEnabled: false, compactLocalWindow: true, sharesLocalKeysAndValues: true)
+            let dstMla = CacheList(KVCacheSimple(), KVCacheSimple())
+            var dst: [any KVCache] = [dstHca, dstMla]
+            let restored = restoreFromDiskArrays(serialized, into: &dst)
+            #expect(restored == 5)
+            #expect(validateRestoredCacheBoundary(dst, matchedTokens: 5, restoredTokens: restored))
+            #expect(dstMla[0].offset == 5)
+            #expect(dstMla[1].offset == 5)
+            #expect(dstMla[0].state[0].shape == [1, 1, 5, 32])
+            #expect(dstMla[1].state[0].shape == [1, 1, 5, 12])
+            #expect(max(abs(dstMla[0].state[0].asType(.float32) - latentK.asType(.float32))).item(Float.self) == 0)
+            #expect(max(abs(dstMla[1].state[0].asType(.float32) - indexK.asType(.float32))).item(Float.self) == 0)
+            let restoredTail = try #require(dstHca.auxiliaryHiddenTail?.joined())
+            #expect(restoredTail.start == 0)
+            #expect(restoredTail.rows.shape == [5, 24])
+        }
+    }
 }
