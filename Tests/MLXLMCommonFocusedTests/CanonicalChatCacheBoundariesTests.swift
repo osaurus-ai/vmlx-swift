@@ -752,4 +752,83 @@ struct CanonicalChatCacheBoundariesTests {
             messages: next, tools: nil, additionalContext: nil)
         #expect(Array(nextPrompt.prefix(noGeneration.count)) == noGeneration)
     }
+
+    /// Models Qwen3.5 / Holo4-35B's `loop.index0 > ns.last_query_index` rule:
+    /// assistant messages after the last user query include `<think>\n`, while
+    /// earlier assistant messages strip `<think>` once a newer user turn arrives.
+    private struct LastQueryThinkingStripTokenizer: GenerationPromptControllableTokenizer {
+        func encode(text: String) -> [Int] { [] }
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var eosTokenId: Int? { nil }
+        var unknownToken: String? { nil }
+        var unknownTokenId: Int? { nil }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            try applyChatTemplate(
+                messages: messages, tools: tools, additionalContext: additionalContext,
+                addGenerationPrompt: true)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?,
+            addGenerationPrompt: Bool
+        ) throws -> [Int] {
+            let lastUserIdx = messages.lastIndex { ($0["role"] as? String) == "user" } ?? -1
+            var result: [Int] = []
+            for (idx, message) in messages.enumerated() {
+                switch message["role"] as? String {
+                case "user":
+                    result += [10, 11, 12, 13, 14]  // <|im_start|>user\n...<|im_end|>\n
+                case "assistant":
+                    result += [20, 21]              // <|im_start|>assistant\n
+                    if idx > lastUserIdx {
+                        result += [30, 31]          // <think>\n (kept only after last user query)
+                    }
+                    let c = (message["content"] as? String) ?? ""
+                    result.append(c == "z" ? 42 : 41)
+                    result += [14]                  // <|im_end|>\n
+                default:
+                    break
+                }
+            }
+            if addGenerationPrompt {
+                result += [20, 21, 30, 31]          // <|im_start|>assistant\n<think>\n
+            }
+            return result
+        }
+    }
+
+    @Test("Thinking-stripping templates place the history boundary BEFORE <think> so follow-up user turns hit")
+    func lastQueryThinkingStripBoundaryHitsOnFollowupUserTurn() throws {
+        let tokenizer = LastQueryThinkingStripTokenizer()
+        let turn1: [[String: any Sendable]] = [["role": "user", "content": "u1"]]
+        let prompt1 = try tokenizer.applyChatTemplate(
+            messages: turn1, tools: nil, additionalContext: nil)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: turn1, tools: nil, additionalContext: nil,
+            promptTokens: prompt1)
+        let top = try #require(boundaries.all.max())
+        // Turn 2 adds an assistant reply + a new user turn; the template strips [30, 31] (<think>\n)
+        // from assistant1. Turn 1's top boundary MUST be a prefix of Turn 2's prompt!
+        let turn2: [[String: any Sendable]] = [
+            ["role": "user", "content": "u1"],
+            ["role": "assistant", "content": "a1"],
+            ["role": "user", "content": "u2"],
+        ]
+        let prompt2 = try tokenizer.applyChatTemplate(
+            messages: turn2, tools: nil, additionalContext: nil)
+        #expect(top == 7, "expected boundary right after <|im_start|>assistant\\n (7), got \(top)")
+        #expect(Array(prompt2.prefix(top)) == Array(prompt1.prefix(top)))
+    }
 }

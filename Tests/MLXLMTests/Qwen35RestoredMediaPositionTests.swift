@@ -296,4 +296,134 @@ struct Qwen35RestoredMediaPositionTests {
             assertMatchesCold(actual, expected)
         }
     }
+
+    @Test("cold media split-prefill (head with image + text tail) preserves M-RoPE delta", arguments: [0, 3])
+    func coldSplitMediaThenTextTail(window: Int) throws {
+        try MLXMetalTestLock.withLock {
+            let headTokens: [Int32] = [1, 2] + imageRun + [5, 6]
+            let tailTokens: [Int32] = [7, 8, 9]
+            let full = input(headTokens + tailTokens, image: true)
+            let expected = try cold(full)
+
+            // Simulate TokenIterator's prefillBoundaryCapture on a cold media prompt:
+            // prepareRestoredPrefixPositions(restoredTokenCount: 0), then prepare(head with image),
+            // then prepare(tail text-only) on the same live cache.
+            let m = try model()
+            let cache = m.newCache(parameters: nil)
+            m.prepareRestoredPrefixPositions(fullInput: full, restoredTokenCount: 0)
+            MLX.eval(try logits(m.prepare(input(headTokens, image: true), cache: cache, windowSize: window)), cache)
+            var out = [try logits(m.prepare(input(tailTokens, image: false), cache: cache, windowSize: window))]
+            for token: Int32 in [31, 32] {
+                out.append(m(MLXArray([token], [1, 1]), cache: cache)[0..., -1, 0...])
+            }
+            out.append(attentionKeys(cache))
+            MLX.eval(out)
+            if window == 0 {
+                assertMatchesCold(out, expected)
+            } else {
+                // With window=3, headTokens (10) ends in an L=1 GEMV chunk while cold runs L=13 GEMM
+                // (TF32 vs FP32 matmul rounding ~1e-3..4e-3; a wiped M-RoPE delta moves keys by >1e-1).
+                for (a, e) in zip(out, expected) { #expect(maxError(a, e) < 5e-3) }
+            }
+        }
+    }
+
+    @Test("cold multi-segment split (stable text -> image segment -> text tail) matches uncut cold", arguments: [0, 3])
+    func coldStableTextThenImageThenTextTail(window: Int) throws {
+        try MLXMetalTestLock.withLock {
+            let stableText: [Int32] = [1, 2, 3, 4]
+            let mediaSeg: [Int32] = imageRun + [5, 6]
+            let genTail: [Int32] = [7, 8, 9]
+            let full = input(stableText + mediaSeg + genTail, image: true)
+            let expected = try cold(full)
+
+            let m = try model()
+            let cache = m.newCache(parameters: nil)
+            m.prepareRestoredPrefixPositions(fullInput: full, restoredTokenCount: 0)
+            MLX.eval(try logits(m.prepare(input(stableText, image: false), cache: cache, windowSize: window)), cache)
+            MLX.eval(try logits(m.prepare(input(mediaSeg, image: true), cache: cache, windowSize: window)), cache)
+            var out = [try logits(m.prepare(input(genTail, image: false), cache: cache, windowSize: window))]
+            for token: Int32 in [31, 32] {
+                out.append(m(MLXArray([token], [1, 1]), cache: cache)[0..., -1, 0...])
+            }
+            out.append(attentionKeys(cache))
+            MLX.eval(out)
+            if window == 0 {
+                assertMatchesCold(out, expected)
+            } else {
+                // stableText (4) splits into L=3 + L=1 GEMV vs cold GEMM TF32 rounding.
+                for (a, e) in zip(out, expected) { #expect(maxError(a, e) < 5e-3) }
+            }
+        }
+    }
+
+    @Test("interleaved two-image BatchKVCache decode keeps per-slot M-RoPE deltas isolated")
+    func interleavedTwoImageBatchDecode() throws {
+        try MLXMetalTestLock.withLock {
+            // Slot A: 1 image (16 patches -> 4 image_pad tokens, delta = -2)
+            let promptA = input([1, 2] + imageRun + [5, 6], image: true)
+            // Slot B: 2 images (32 patches -> 8 image_pad tokens, delta = -4) and longer text
+            let promptB = twoImages([1, 2] + imageRun + [5, 6] + imageRun + [7, 8, 9])
+
+            let m = try model()
+
+            // Isolated controls
+            let ctrlA = m.newCache(parameters: nil)
+            MLX.eval(try logits(m.prepare(promptA, cache: ctrlA, windowSize: 0)), ctrlA)
+            let expA1 = m(MLXArray([Int32(31)], [1, 1]), cache: ctrlA)[0, -1, 0...]
+            let expA2 = m(MLXArray([Int32(32)], [1, 1]), cache: ctrlA)[0, -1, 0...]
+            MLX.eval(expA1, expA2)
+
+            let ctrlB = m.newCache(parameters: nil)
+            MLX.eval(try logits(m.prepare(promptB, cache: ctrlB, windowSize: 0)), ctrlB)
+            let expB1 = m(MLXArray([Int32(41)], [1, 1]), cache: ctrlB)[0, -1, 0...]
+            let expB2 = m(MLXArray([Int32(42)], [1, 1]), cache: ctrlB)[0, -1, 0...]
+            MLX.eval(expB1, expB2)
+
+            // Interleaved on the SAME model instance: prefill A, prefill B, then decode both
+            // together in BatchKVCache, then drop B and continue A solo (simulating cancellation).
+            let cacheA = m.newCache(parameters: nil)
+            let cacheB = m.newCache(parameters: nil)
+            MLX.eval(try logits(m.prepare(promptA, cache: cacheA, windowSize: 0)), cacheA)
+            MLX.eval(try logits(m.prepare(promptB, cache: cacheB, windowSize: 0)), cacheB)
+
+            // Build batched caches per layer: BatchArraysCache for linear, BatchKVCache for full attn.
+            var batchArrays: [BatchArraysCache] = []
+            let batched: [KVCache] = zip(cacheA, cacheB).map { a, b in
+                if let ma = a as? ArraysCache, let mb = b as? ArraysCache {
+                    let bac = BatchArraysCache(slotCaches: [ma, mb])
+                    batchArrays.append(bac)
+                    return bac
+                }
+                return BatchKVCache(slotCaches: [a, b])
+            }
+            let step1 = m(MLXArray([Int32(31), Int32(41)], [2, 1]), cache: batched)
+            MLX.eval(step1)
+            for bac in batchArrays { bac.splitBack() }
+            // On Metal, batched B=2 projections use TF32 GEMM while solo B=1 decode uses GEMV
+            // (~1.6e-3 diff, matching Qwen3VLRestoredPrefixPositionTests; wrong M-RoPE delta is >1e-1).
+            #expect(maxError(step1[0, -1, 0...], expA1) < 5e-3, "batched slot A step 1")
+            #expect(maxError(step1[1, -1, 0...], expB1) < 5e-3, "batched slot B step 1")
+
+            // Simulate slot B cancelled: continue slot A solo and verify its delta survived untouched.
+            let step2A = m(MLXArray([Int32(32)], [1, 1]), cache: cacheA)
+            MLX.eval(step2A)
+            #expect(maxError(step2A[0, -1, 0...], expA2) < 5e-3, "surviving slot A solo step 2 after B cancelled")
+            // Also verify slot B's own cache retained its delta if continued solo.
+            let step2B = m(MLXArray([Int32(42)], [1, 1]), cache: cacheB)
+            MLX.eval(step2B)
+            #expect(maxError(step2B[0, -1, 0...], expB2) < 5e-3, "slot B solo step 2")
+            // Verify the rotated keys stored in each slot match the isolated controls closely.
+            #expect(maxError(attentionKeys(cacheA), attentionKeys(ctrlA)) < 5e-3, "slot A keys")
+            #expect(maxError(attentionKeys(cacheB), attentionKeys(ctrlB)) < 5e-3, "slot B keys")
+        }
+    }
+
+    @Test("Qwen35 conforms to ToolCallTurnStopTokenModel for per-tool-call cache persistence")
+    func conformsToToolCallTurnStopTokenModel() throws {
+        let m: any LanguageModel = try model()
+        let stopModel = try #require(m as? any ToolCallTurnStopTokenModel)
+        #expect(stopModel.toolCallTurnStopTokenIds.contains(248_046))
+        #expect(stopModel.toolCallTurnStopTokenIds.contains(151_645))
+    }
 }

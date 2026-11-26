@@ -267,6 +267,7 @@ extension BatchSlot {
         self.generatedTokenIds = []
         self.disablesGeneratedCacheBoundary =
             request.input.toolSchemas?.isEmpty == false
+            && !(model is ToolCallTurnBoundaryModel)
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize

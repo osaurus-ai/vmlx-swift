@@ -1914,7 +1914,10 @@ enum Qwen35Language {
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask, Qwen35CausalPrefillMask.applies(
+            if let batchCache = cache as? BatchKVCache {
+                // Batch masks size the key axis from each slot's pre-update offset.
+                attentionMask = batchCache.makeMask(n: L, windowSize: nil, returnArray: true)
+            } else if let mask, Qwen35CausalPrefillMask.applies(
                 mask: mask, rows: L, batch: B, cache: cache, fullBufferCache: fullBufferCache)
             {
                 attentionMask = .causal
@@ -3781,7 +3784,24 @@ enum Qwen35Language {
         let modelType: String
         let kvHeads: [Int]
 
-        fileprivate var precomputedPositionIds: MLXArray? = nil
+        private final class CachePosition {
+            weak var cache: BaseKVCache?
+            let delta: MLXArray
+
+            init(cache: BaseKVCache, delta: MLXArray) {
+                self.cache = cache
+                self.delta = delta
+            }
+        }
+
+        // Multiple requests can decode on the same model (BatchEngine interleaved VL
+        // sessions). Bind each request's M-RoPE delta to its full-attention cache so
+        // concurrent requests never clobber each other, and dead caches release their delta.
+        private var cachePositions: [ObjectIdentifier: CachePosition] = [:]
+        private var startsRequest = false
+        private var restoredPrefixPlan: (positions: MLXArray, delta: MLXArray)?
+        /// Fallback delta for callers without a per-request BaseKVCache handle
+        /// (compiled caches promoted from KVCacheSimple, or DFlash2 position delta).
         fileprivate var ropeDeltas: MLXArray? = nil
 
         /// The LM-head projection (untied `lm_head` or the tied embedding),
@@ -3824,15 +3844,36 @@ enum Qwen35Language {
         }
 
         func resetPositionState() {
-            precomputedPositionIds = nil
-            ropeDeltas = nil
-            restoredPrefixPositionsArmed = false
+            startsRequest = true
+            restoredPrefixPlan = nil
         }
 
         /// True from ``armRestoredPrefixPositions(inputIds:imageGridTHW:videoGridTHW:)`` until the
-        /// prefill that follows a cache restore has consumed the last prompt position. While set,
-        /// `prepare` keeps the plan instead of resetting it and `resolvedPositionIds` slices it.
-        fileprivate var restoredPrefixPositionsArmed = false
+        /// prefill that follows a cache restore has consumed the last prompt position.
+        fileprivate var hasRestoredPrefixPlan: Bool { restoredPrefixPlan != nil }
+
+        fileprivate func positionDelta(for cache: KVCache) -> MLXArray? {
+            guard let cache = cache as? BaseKVCache,
+                let position = cachePositions[ObjectIdentifier(cache)], position.cache === cache
+            else { return nil }
+            return position.delta
+        }
+
+        private func setPositionDelta(_ delta: MLXArray?, for cache: KVCache?) {
+            ropeDeltas = delta
+            guard let cache = cache as? BaseKVCache else { return }
+            cachePositions = cachePositions.filter { $0.value.cache != nil }
+            cachePositions[ObjectIdentifier(cache)] = delta.map {
+                CachePosition(cache: cache, delta: $0)
+            }
+        }
+
+        private func decodePositions(offsets: MLXArray, length: Int) -> MLXArray {
+            let batch = offsets.size
+            let range = MLXArray(0 ..< length).asType(.int32)
+            let positions = offsets.reshaped(batch, 1) + range[.newAxis, 0...]
+            return broadcast(positions[.newAxis, 0..., 0...], to: [3, batch, length])
+        }
 
         /// M-RoPE positions and decode delta of the request's FULL prompt (all tokens, every media
         /// grid), for a request whose prefix was restored from the cache. The suffix then takes
@@ -3864,9 +3905,9 @@ enum Qwen35Language {
                     visionStartTokenId: config.visionStartTokenId,
                     attentionMask: nil)
             }
-            precomputedPositionIds = computed
+            restoredPrefixPlan = (computed, deltas)
             ropeDeltas = deltas
-            restoredPrefixPositionsArmed = true
+            startsRequest = false
         }
 
         fileprivate func resolvedPositionIds(
@@ -3878,24 +3919,31 @@ enum Qwen35Language {
             videoGridTHW: [THW]?,
             resetForMedia: Bool
         ) -> MLXArray? {
-            if restoredPrefixPositionsArmed {
-                restoredPrefixPositionsArmed = false
-                if providedPositionIds == nil, let plan = precomputedPositionIds,
-                    let cache, let faCache = cache[model.faIdx],
-                    graphOffsetArray(for: faCache) == nil
-                {
-                    let start = faCache.offset
-                    let end = start + inputs.dim(1)
-                    if end <= plan.dim(2) {
-                        // Stay armed for the next prefill chunk until the prompt is consumed.
-                        restoredPrefixPositionsArmed = end < plan.dim(2)
-                        return plan[0..., 0..., start ..< end]
-                    }
+            let faCache = cache?[model.faIdx]
+
+            if startsRequest {
+                startsRequest = false
+                if let faCache, graphOffsetArray(for: faCache) == nil {
+                    setPositionDelta(nil, for: faCache)
+                } else if faCache == nil {
+                    ropeDeltas = nil
                 }
             }
-            if resetForMedia {
-                precomputedPositionIds = nil
-                ropeDeltas = nil
+
+            if providedPositionIds == nil, let plan = restoredPrefixPlan,
+                let faCache, graphOffsetArray(for: faCache) == nil
+            {
+                restoredPrefixPlan = nil
+                let start = faCache.offset
+                let end = start + inputs.dim(1)
+                if end <= plan.positions.dim(2) {
+                    setPositionDelta(plan.delta, for: faCache)
+                    if end < plan.positions.dim(2) {
+                        // Stay armed for the next prefill chunk until the prompt is consumed.
+                        restoredPrefixPlan = plan
+                    }
+                    return plan.positions[0..., 0..., start ..< end]
+                }
             }
 
             // Compiled decode: the promoted caches keep their offset as an
@@ -3905,7 +3953,7 @@ enum Qwen35Language {
             // Build the positions from the graph offset instead.
             var cacheOffset = 0
             var graphOffset: MLXArray? = nil
-            if let cache, let faCache = cache[model.faIdx] {
+            if let faCache {
                 if let g = graphOffsetArray(for: faCache) {
                     graphOffset = g
                 } else {
@@ -3919,32 +3967,36 @@ enum Qwen35Language {
             }
 
             var positionIds = providedPositionIds
+            if positionIds == nil, let batchCache = faCache as? BatchKVCache,
+                ropeMask == nil || ropeMask?.ndim == 2
+            {
+                // Continuous batching: each slot owns its own M-RoPE delta.
+                let slotDeltas = batchCache.slotCaches.map { positionDelta(for: $0) }
+                let perSlotDelta = concatenated(
+                    slotDeltas.map { ($0 ?? MLXArray([Int32(0)])).reshaped(1).asType(.int32) })
+                let offsets = batchCache.offsetArray.asType(.int32) + perSlotDelta
+                return decodePositions(offsets: offsets, length: inputs.dim(1))
+            }
+
             if positionIds == nil, let graphOffset,
                 ropeMask == nil || ropeMask?.ndim == 2
             {
-                // Graph-visible twin of the `else` (delta) branch below. A
+                // Graph-visible twin of the single-sequence delta branch below. A
                 // Compilable cache only exists after prefill, so the offset
                 // is non-zero and text positions are offset + arange —
-                // shifted by ropeDeltas when the prompt carried media.
+                // shifted by the cache's delta when the prompt carried media.
                 let batchSize = inputs.dim(0)
                 let seqLength = inputs.dim(1)
 
-                // Compiled single-sequence caches expose `[1]`, while
-                // `BatchKVCache` exposes one offset per live sequence as
-                // `[B]`. Preserve that batch dimension: reshaping `[B]` to a
-                // scalar is only valid for B == 1 and process-fatals as soon
-                // as continuous batching decodes two Qwen3.5/Ornith slots.
-                var delta = graphOffset.asType(.int32)
-                if let ropeDeltas {
-                    delta = delta + ropeDeltas.asType(.int32)
+                var delta = graphOffset.reshaped(-1).asType(.int32)
+                if let activeDelta = faCache.flatMap({ positionDelta(for: $0) }) ?? ropeDeltas {
+                    delta = delta + activeDelta.reshaped(-1).asType(.int32)
                 }
 
                 var base = MLXArray(0 ..< seqLength).asType(.int32)
                 base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
 
-                if delta.ndim == 0 {
-                    delta = broadcast(delta, to: [batchSize])
-                } else if delta.dim(0) < batchSize {
+                if delta.dim(0) < batchSize {
                     delta = repeated(delta, count: batchSize, axis: 0)
                 } else if delta.dim(0) > batchSize {
                     delta = delta[0 ..< batchSize]
@@ -3955,32 +4007,27 @@ enum Qwen35Language {
                     base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
             }
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
-                if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
-                    || ropeDeltas == nil
-                    || cache == nil
+                let activeDelta = faCache.flatMap { positionDelta(for: $0) }
+                if resetForMedia
+                    || faCache == nil
+                    || (cacheOffset == 0 && activeDelta == nil)
                 {
-                    if let precomputedPositionIds {
-                        let seqLength = inputs.dim(1)
-                        positionIds =
-                            precomputedPositionIds[
-                                0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                    } else if let canvas = config.miniCPMCanvas,
+                    let computed: MLXArray
+                    let deltas: MLXArray
+                    if let canvas = config.miniCPMCanvas,
                         imageGridTHW != nil || videoGridTHW != nil
                     {
                         // MiniCPM-V 4.7 canvas M-RoPE: thumbnail stretched over the slice canvas, markers
                         // pinned to its corners (`MiniCPMV4_7Model.get_rope_index`).
-                        let (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
+                        (computed, deltas) = MiniCPMV47Canvas.ropeIndex(
                             inputIds: inputs,
                             imageGrids: imageGridTHW,
                             videoGrids: videoGridTHW,
                             imageTokenId: config.imageTokenId,
                             videoTokenId: config.videoTokenId,
                             canvas: canvas)
-                        positionIds = computed
-                        precomputedPositionIds = computed
-                        ropeDeltas = deltas
                     } else {
-                        let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                        (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputs,
                             imageGridTHW: imageGridTHW,
                             videoGridTHW: videoGridTHW,
@@ -3989,17 +4036,16 @@ enum Qwen35Language {
                             videoTokenId: config.videoTokenId,
                             visionStartTokenId: config.visionStartTokenId,
                             attentionMask: ropeMask)
-                        positionIds = computed
-                        precomputedPositionIds = computed
-                        ropeDeltas = deltas
                     }
+                    positionIds = computed
+                    setPositionDelta(deltas, for: faCache)
                 } else {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
 
-                    var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas {
-                        delta = delta + ropeDeltas.asType(.int32)
+                    var delta = MLXArray(Int32(cacheOffset))
+                    if let activeDelta {
+                        delta = delta + activeDelta.reshaped(-1).asType(.int32)
                     }
 
                     var base = MLXArray(0 ..< seqLength).asType(.int32)
@@ -4094,8 +4140,10 @@ enum Qwen35Language {
             // (measured: restored offset 1375, chunk 33, slice [1408..<1412]
             // → broadcast abort). `nil` positions make attention derive
             // them from the cache offset, exactly like the plain forward.
+            let hasMediaDelta = (cacheOpt?[model.faIdx]).flatMap { positionDelta(for: $0) } != nil
+                || ropeDeltas != nil
             let positionIds: MLXArray? =
-                ropeDeltas != nil
+                hasMediaDelta
                 ? resolvedPositionIds(
                     inputs: inputs,
                     cache: cacheOpt,
@@ -4572,7 +4620,7 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
-        } else if !languageModel.restoredPrefixPositionsArmed {
+        } else if !languageModel.hasRestoredPrefixPlan {
             languageModel.resetPositionState()
         }
 
@@ -5612,7 +5660,7 @@ extension Qwen35: RestoredPrefixPositionModel {
     /// after a restored image, or an image after restored text) gets cold-prefill positions and
     /// decode continues from the full prompt's delta. Text-only and cold requests reset as before.
     public func prepareRestoredPrefixPositions(fullInput: LMInput, restoredTokenCount: Int) {
-        guard restoredTokenCount > 0, fullInput.image != nil || fullInput.video != nil else {
+        guard fullInput.image != nil || fullInput.video != nil else {
             languageModel.resetPositionState()
             return
         }
@@ -5721,4 +5769,13 @@ extension Qwen35: DFlash2MediaPrefillModel {
     public func dflash2ResetPositionState() {
         languageModel.resetPositionState()
     }
+}
+
+/// Qwen3.5 / Holo4 templates render assistant tool-call turns back with their closing `<|im_end|>`
+/// stop token (`248046` for Qwen3.5 248k vocab; `151645` for Qwen2.5/3 152k vocab) and preserve
+/// reasoning + tool-call tokens across multi-step tool loops. Persisting the post-tool-call cache
+/// boundary lets the next tool-response turn (and any subsequent image) restore past the generated
+/// thinking and tool call instead of re-prefilling them.
+extension Qwen35: ToolCallTurnStopTokenModel {
+    public var toolCallTurnStopTokenIds: Set<Int> { [248_046, 151_645] }
 }
