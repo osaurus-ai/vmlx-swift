@@ -339,6 +339,36 @@ public func canonicalChatCacheBoundaries(
             boundary += 1
         }
 
+        // Templates that strip `<think>` on prior assistant turns once a newer
+        // user query arrives (Qwen 3.5 / Holo4-35B `loop.index0 > ns.last_query_index`)
+        // still emit `<think>` in the 1-turn `[..., assistant]` probe above because
+        // that assistant follows the last user query. That places the boundary PAST
+        // `<think>`, so every follow-up user turn diverges before it and cold-prefills
+        // the entire Turn-1 prompt and images. Probe a follow-up user turn too and
+        // tighten `boundary` whenever it preserves at least the proven no-gen prefix.
+        var nextUserMessages = messages
+        nextUserMessages.append(["role": "assistant", "content": "0"])
+        nextUserMessages.append(["role": "user", "content": "x"])
+        if let nextUserProbe = try? controllable.applyChatTemplate(
+            messages: nextUserMessages,
+            tools: tools,
+            additionalContext: additionalContext,
+            addGenerationPrompt: false),
+            !nextUserProbe.isEmpty
+        {
+            let nextLimit = min(boundary, nextUserProbe.count)
+            var nextBoundary = 0
+            while nextBoundary < nextLimit,
+                  nextUserProbe[nextBoundary] == promptTokens[nextBoundary]
+            {
+                nextBoundary += 1
+            }
+            let minValid = exactPrefixBoundary(messages: messages) ?? 0
+            if nextBoundary >= minValid, nextBoundary > 0 {
+                boundary = nextBoundary
+            }
+        }
+
         guard boundary > 0,
               boundary < probeA.count,
               boundary < probeB.count,
