@@ -1045,6 +1045,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// `slidingWindow` local rows (``RotatingKVCache/compactToWindow()``), like the
     /// reference `cache.window = raw[:, -win:]`.
     public let compactLocalWindow: Bool
+    public let sharesLocalKeysAndValues: Bool
 
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
@@ -1117,6 +1118,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     /// dSpark verify capture requested for the next forward of this sequence (holder layer only).
     /// Transient: never copied, checkpointed or persisted.
     var dsparkVerifyCapture: DSV41VerifyCapture?
+    /// ERNIE 5.5 DSpark verify capture (holder layer 0 only; transient).
+    var ernieVerifyCapture: Ernie55VerifyCapture?
 
     public init(
         slidingWindow: Int,
@@ -1126,7 +1129,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         requiresAuxiliaryTokenHistory: Bool = false,
         poolQuantizationBits: Int = 8,
         contiguousPools: Bool = false,
-        compactLocalWindow: Bool = false
+        compactLocalWindow: Bool = false,
+        sharesLocalKeysAndValues: Bool = false
     ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         let quantizationEnabled = poolQuantizationEnabled
@@ -1148,6 +1152,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             contiguous: contiguousPools)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
         self.compactLocalWindow = compactLocalWindow
+        self.sharesLocalKeysAndValues = sharesLocalKeysAndValues
         self.requiresAuxiliaryTokenHistory = requiresAuxiliaryTokenHistory
     }
 
@@ -1469,7 +1474,7 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             requiresAuxiliaryTokenHistory: requiresAuxiliaryTokenHistory,
             poolQuantizationBits: compPool.bits,
             contiguousPools: compPool.contiguous,
-            compactLocalWindow: compactLocalWindow)
+            compactLocalWindow: compactLocalWindow, sharesLocalKeysAndValues: sharesLocalKeysAndValues)
         dup.auxiliaryTokenHistory = auxiliaryTokenHistory
         dup.auxiliaryHiddenTail = auxiliaryHiddenTail
         let localState = local.state

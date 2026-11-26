@@ -1313,6 +1313,9 @@ extension ReasoningParser {
                 endTagAliases: ["</ifm|think_fast>", "</ifm|think_faster>"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
+        case "ernie5_5_moe", "ernie55":
+            return ReasoningParser(
+                startTag: "<ernie:think>", endTag: "</ernie:think>", startInReasoning: true)
         case "inkling", "inkling2", "inkling2_loop", "inkling_channels":
             // Channel-switched (see `drainInklingChannel`). The model opens every
             // turn itself; the template has no generation prompt.
@@ -1574,6 +1577,7 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         .replacingOccurrences(of: ".", with: "_")
     let compact = normalized.replacingOccurrences(of: "_", with: "")
 
+    if t == "ernie5_5_moe" { return "ernie55" }
     if compact == "k2horizon" { return "k2_horizon" }
 
     // Inkling-2 (`inkling2`, `inkling2_loop`): channel tokens, no think tags.

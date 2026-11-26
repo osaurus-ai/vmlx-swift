@@ -131,14 +131,11 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             // or native down, whose input is the raw (unrotated) activation.
             gateUp = .codebook(
                 kernel: try JANGHFusedGateUpKernel(contract: contract, gateModule: gateName, upModule: upName,
-                                                   outputRotation: .none),
-                prefill: try JANGHPrefillKernel(contract: contract, module: gateName, upModule: upName),
+                                                   outputRotation: .none, activation: activation),
+                prefill: try JANGHPrefillKernel(contract: contract, module: gateName, upModule: upName,
+                                                activation: activation),
                 gate: gate, up: up,
-                separate: activation == .silu ? nil : SeparateCodebookPasses(
-                    gateDecode: try JANGHProjectionKernel(contract: contract, module: gateName,
-                                                          fuseFloatRotation: true),
-                    upDecode: try JANGHProjectionKernel(contract: contract, module: upName, fuseFloatRotation: true),
-                    upPrefill: try JANGHPrefillKernel(contract: contract, module: upName)))
+                separate: nil)
             count(gate, inputs: hiddenSize)
             count(up, inputs: hiddenSize)
         }
@@ -167,6 +164,72 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         self.activation = activation
         supplementalWeightBytes = bytes
         supplementalParameterCount = params
+        super.init()
+    }
+
+    /// A pure codebook (JANGH `jangtq2`) layer from in-memory tensors (e.g., ERNIE 5.5 DSpark draft layers).
+    public init(
+        codebookBits bits: Int, rotation: String, alpha: Double, beta: Double,
+        gatePacked: MLXArray, gateScales: MLXArray,
+        upPacked: MLXArray, upScales: MLXArray,
+        downPacked: MLXArray, downScales: MLXArray,
+        hiddenSize: Int, intermediateSize: Int, activationLimit: Float?,
+        activation: JANGTActivation = .silu
+    ) throws {
+        if let activationLimit, !activationLimit.isFinite || activationLimit <= 0 {
+            throw JANGHFormatContract.ValidationError.invalid("invalid JANGH activation limit")
+        }
+        let levelCount = 1 << bits
+        let levels = (0 ..< levelCount).map { index -> Double in
+            let u = Double(index) - Double(levelCount - 1) / 2
+            return Double(Float(u * (alpha + beta * u * u)))
+        }
+        let contractJSON: [String: Any] = [
+            "jangtq": [
+                "version": 2,
+                "packing": "lsb-bitstream",
+                "scale_dtype": "float16",
+                "codebook_family": "odd-cubic",
+                "rotation": rotation,
+                "codebooks": [
+                    String(bits): ["alpha": alpha, "beta": beta, "levels": levels]
+                ],
+            ],
+            "quantization": [
+                "draft.gate_proj": ["mode": "jangtq2", "bits": bits, "rotation": rotation],
+                "draft.up_proj": ["mode": "jangtq2", "bits": bits, "rotation": rotation],
+                "draft.down_proj": ["mode": "jangtq2", "bits": bits, "rotation": rotation],
+            ],
+        ]
+        let contract = try JANGHFormatContract(
+            configuration: try JSONSerialization.data(withJSONObject: contractJSON))
+        let gPacked = contiguous(gatePacked), gScales = contiguous(gateScales)
+        let uPacked = contiguous(upPacked), uScales = contiguous(upScales)
+        let dPacked = contiguous(downPacked), dScales = contiguous(downScales)
+        eval(gPacked, gScales, uPacked, uScales, dPacked, dScales)
+        let gateBank = JANGHMappedBanks.Projection(packed: gPacked, scales: gScales)
+        let upBank = JANGHMappedBanks.Projection(packed: uPacked, scales: uScales)
+        let downBank = JANGHMappedBanks.Projection(packed: dPacked, scales: dScales)
+        gateUp = .codebook(
+            kernel: try JANGHFusedGateUpKernel(
+                contract: contract, gateModule: "draft.gate_proj", upModule: "draft.up_proj",
+                outputRotation: .none, activation: activation),
+            prefill: try JANGHPrefillKernel(
+                contract: contract, module: "draft.gate_proj", upModule: "draft.up_proj",
+                activation: activation),
+            gate: gateBank, up: upBank, separate: nil)
+        down = .codebook(
+            kernel: try JANGHWeightedDownKernel(contract: contract, module: "draft.down_proj"),
+            prefill: try JANGHPrefillKernel(contract: contract, module: "draft.down_proj"),
+            bank: downBank)
+        self.hiddenSize = hiddenSize
+        self.intermediateSize = intermediateSize
+        self.limit = activationLimit ?? 0
+        self.activation = activation
+        supplementalWeightBytes = gatePacked.nbytes + gateScales.nbytes
+            + upPacked.nbytes + upScales.nbytes + downPacked.nbytes + downScales.nbytes
+        supplementalParameterCount = gateScales.size * hiddenSize
+            + upScales.size * hiddenSize + downScales.size * intermediateSize
         super.init()
     }
 
@@ -369,19 +432,29 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         return matmul(weights.reshaped(tokens, 1, routes), restored).reshaped(tokens, hiddenSize)
     }
 
-    /// The expert-aligned tile schedule shared by a layer's trellis groups (nil when disabled or no group is trellis).
+    /// The expert-aligned tile schedule shared by a layer's trellis and codebook groups.
     private func expertTilePlan(_ sortedIDs: MLXArray) -> JANGTPrefillKernel.ExpertTilePlan? {
         guard JANGTPrefillKernel.expertTilesEnabled else { return nil }
         var experts: Int?
-        if case .trellis(let gate, _, _) = gateUp { experts = gate.experts }
-        if case .trellis(let projection, _) = down { experts = projection.experts }
+        switch gateUp {
+        case .trellis(let gate, _, _): experts = gate.experts
+        case .codebook(_, _, let gate, _, _): experts = gate.packed.dim(0)
+        case .external: break
+        }
+        switch down {
+        case .trellis(let projection, _): experts = projection.experts
+        case .codebook(_, _, let bank): experts = bank.packed.dim(0)
+        case .external: break
+        }
         return experts.map { JANGTPrefillKernel.expertTilePlan(sortedIndices: sortedIDs, experts: $0) }
     }
 
     /// Prefill gate/up over the expert-sorted pairs: (pairs, I) hidden and whether it is already H32-rotated for a
     /// codebook down.
     private func prefillHidden(_ x: MLXArray, sourceRows tok: MLXArray, sortedIDs: MLXArray,
-                               plan: JANGTPrefillKernel.ExpertTilePlan?) throws -> (MLXArray, Bool) {
+                               plan: JANGTPrefillKernel.ExpertTilePlan?, rotateForDown: Bool = true)
+        throws -> (MLXArray, Bool)
+    {
         let dtype = x.dtype
         let downIsCodebook: Bool
         if case .codebook = down { downIsCodebook = true } else { downIsCodebook = false }
@@ -394,7 +467,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             if gate.outlierColumns == 0 {
                 // One NAX pass over both weight tiles with the (clamped) SwiGLU epilogue; a JANGH down gets its
                 // input already Hadamard-32 rotated (the H32 store epilogue).
-                let rotate = downIsCodebook && intermediateSize % 32 == 0
+                let rotate = rotateForDown && downIsCodebook && intermediateSize % 32 == 0
                 hidden = JANGTPrefillKernel.project(xr, gate, up: up, indices: sortedIDs, limit: limit,
                                                     activation: activation, rotateOutput: rotate, plan: plan)
                 hiddenRotated = rotate
@@ -416,14 +489,14 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             let xs = take(try rowRotation(x, outputDType: dtype), tok, axis: 0)
             if let separate {
                 let g = try prefillKernel.projectSorted(
-                    xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs).asType(.float32)
+                    xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs, plan: plan).asType(.float32)
                 let u = try separate.upPrefill.projectSorted(
-                    xs, packed: up.packed, scales: up.scales, indices: sortedIDs).asType(.float32)
+                    xs, packed: up.packed, scales: up.scales, indices: sortedIDs, plan: plan).asType(.float32)
                 hidden = activation(gate: g, up: u, limit: limit)
             } else {
                 hidden = try prefillKernel.projectSorted(
                     xs, packed: gate.packed, scales: gate.scales, indices: sortedIDs,
-                    upPacked: up.packed, upScales: up.scales, limit: limit > 0 ? limit : nil)
+                    upPacked: up.packed, upScales: up.scales, limit: limit > 0 ? limit : nil, plan: plan)
             }
         case .external:
             preconditionFailure("JANGT half layer: the host runs gate/up")
@@ -433,20 +506,132 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
 
     /// Prefill down over the expert-sorted pairs: (pairs, D) outputs, still in sorted order and unweighted.
     private func prefillDown(_ hidden: MLXArray, rotated hiddenRotated: Bool, sortedIDs: MLXArray,
-                             plan: JANGTPrefillKernel.ExpertTilePlan?, dtype: DType) throws -> MLXArray {
+                             plan: JANGTPrefillKernel.ExpertTilePlan?, dtype: DType,
+                             floatTrellisOutput: Bool = false) throws -> MLXArray {
         switch down {
         case .trellis(let projection, let signs):
             let hr = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: sortedIDs).asType(dtype)
-            var y = JANGTPrefillKernel.project(hr, projection, indices: sortedIDs, plan: plan).asType(.float32)
+            var y = JANGTPrefillKernel.project(
+                hr, projection, indices: sortedIDs, plan: plan, floatOutput: floatTrellisOutput).asType(.float32)
             if let o = JANGTPrefillKernel.outliers(hidden, projection, indices: sortedIDs) { y = y + o }
             return y
         case .codebook(let kernel, let prefillKernel, let bank):
             let hr = hiddenRotated || kernel.inputRotation != .hadamard32
                 ? hidden : try rowRotation(hidden, outputDType: dtype)
             return try prefillKernel.projectSorted(
-                hr, packed: bank.packed, scales: bank.scales, indices: sortedIDs)
+                hr, packed: bank.packed, scales: bank.scales, indices: sortedIDs, plan: plan)
         case .external:
             preconditionFailure("JANGT half layer: the host runs down")
+        }
+    }
+
+    /// Runs the W4A8 expert path with a single GPU routing plan across gate/up and down.
+    /// After SiTU, quantize in the raw basis and round each down output in the
+    /// activation dtype before combining original-order routes in FP32.
+    public func routedW4A8Prefill(
+        _ input: MLXArray, indices: MLXArray, scores: MLXArray,
+        roundActivations: (MLXArray) -> MLXArray
+    ) -> MLXArray? {
+        guard !Self.usesDecodeKernels(pairs: indices.size, dtype: input.dtype) else { return nil }
+        let tokens = input.size / hiddenSize
+        let routes = indices.dim(-1)
+        precondition(input.dim(-1) == hiddenSize && routes > 0
+            && indices.size == tokens * routes && scores.shape == indices.shape,
+            "JANGT W4A8 prefill routing does not match admitted geometry")
+        let x = input.reshaped(tokens, hiddenSize)
+        let flat = indices.flattened().asType(.uint32)
+        let order = argSort(flat)
+        let sortedIDs = take(flat, order)
+        let plan = expertTilePlan(sortedIDs)
+        do {
+            let (sortedHidden, _) = try prefillHidden(
+                roundActivations(x), sourceRows: Self.sourceRows(order, routes: routes),
+                sortedIDs: sortedIDs, plan: plan, rotateForDown: false)
+            let rounded = roundActivations(sortedHidden.asType(input.dtype))
+            let projected: MLXArray
+            if case .trellis = down {
+                projected = try prefillDown(
+                    rounded, rotated: false, sortedIDs: sortedIDs, plan: plan, dtype: input.dtype,
+                    floatTrellisOutput: true).asType(input.dtype)
+            } else {
+                projected = try prefillDown(
+                    rounded, rotated: false, sortedIDs: sortedIDs, plan: plan, dtype: input.dtype)
+            }
+            let restored = take(projected, argSort(order), axis: 0)
+                .reshaped(tokens, routes, hiddenSize).asType(.float32)
+            return matmul(scores.reshaped(tokens, 1, routes).asType(.float32), restored)
+                .reshaped(input.shape).asType(input.dtype)
+        } catch {
+            preconditionFailure("JANGT W4A8 prefill rejected admitted bank: \(error)")
+        }
+    }
+
+    /// Fast decode/verify W4A8 routed expert path (1...8 rows, row-invariant): uses `JANGTFastDecode`
+    /// for trellis groups and fused LUT codebook kernels for codebook groups, keeping per-slot BF16
+    /// rounding before the FP32 router-weighted sum in-kernel.
+    public func routedW4A8Decode(
+        _ input: MLXArray, indices: MLXArray, scores: MLXArray,
+        roundActivations: (MLXArray) -> MLXArray
+    ) -> MLXArray {
+        let routes = indices.dim(-1)
+        let x = input.reshaped(-1, hiddenSize)
+        let ids = indices.reshaped(-1, routes).asType(.uint32)
+        let weights = scores.reshaped(-1, routes).asType(.float32)
+        let xq = roundActivations(x)
+        do {
+            let hidden: MLXArray
+            switch gateUp {
+            case .trellis(let gate, let up, let signs):
+                if JANGTFastDecode.supportsProjection(gate) {
+                    hidden = JANGTFastDecode.gateUpGroup(
+                        xq, ids: ids, gate: gate, up: up, signs: signs,
+                        limit: limit, activation: activation, outputDType: input.dtype)
+                } else {
+                    hidden = JANGTKernels.gateUp(
+                        xr: JANGTKernels.rotateRows(xq, signs: signs), x: xq, indices: ids,
+                        gate: gate, up: up, limit: limit, activation: activation, outputDType: input.dtype)
+                }
+            case .codebook(let kernel, _, let gate, let up, nil):
+                hidden = try kernel.activatePreparedInput(
+                    kernel.prepareInputForFusedDecode(xq), gatePacked: gate.packed, gateScales: gate.scales,
+                    upPacked: up.packed, upScales: up.scales, indices: ids,
+                    limit: limit > 0 ? limit : nil).asType(input.dtype)
+            case .codebook(_, _, let gate, let up, let separate?):
+                let g = try separate.gateDecode.project(xq, packed: gate.packed, scales: gate.scales, indices: ids)
+                let u = try separate.upDecode.project(xq, packed: up.packed, scales: up.scales, indices: ids)
+                hidden = activation(gate: g, up: u, limit: limit).asType(input.dtype)
+            case .external:
+                preconditionFailure("JANGT half layer without a gate/up group")
+            }
+            let rounded = roundActivations(hidden)
+            let y: MLXArray
+            switch down {
+            case .trellis(let projection, let signs):
+                if JANGTFastDecode.supportsProjection(projection) && routes <= 16 {
+                    y = JANGTFastDecode.downGroup(
+                        rounded, ids: ids, weights: weights, projection: projection, signs: signs,
+                        roundSlotToBFloat16: true).asType(input.dtype)
+                } else {
+                    let rotated = JANGTKernels.rotateRows(rounded, signs: signs, rowExperts: ids.flattened())
+                    let perSlot = JANGTKernels.down(
+                        hr: rotated, h: rounded, indices: ids.reshaped(-1, 1),
+                        weights: MLXArray.ones([ids.size, 1]), projection: projection).asType(input.dtype)
+                    let paired = perSlot.reshaped(x.dim(0), routes, hiddenSize)
+                    y = (paired.asType(.float32) * weights.expandedDimensions(axis: -1))
+                        .sum(axis: -2).asType(input.dtype)
+                }
+            case .codebook(let kernel, _, let bank):
+                let prepared = kernel.inputRotation == .hadamard32
+                    ? try rowRotation(rounded, outputDType: .float32) : rounded.asType(.float32)
+                y = try kernel.projectPreparedHidden(
+                    prepared, preparedBasis: kernel.inputRotation, packed: bank.packed, scales: bank.scales,
+                    indices: ids, scores: weights, outputDType: input.dtype, roundRouteToBFloat16: true)
+            case .external:
+                preconditionFailure("JANGT half layer without a down group")
+            }
+            return y.reshaped(input.shape)
+        } catch {
+            preconditionFailure("JANGT W4A8 decode rejected admitted bank: \(error)")
         }
     }
 
@@ -455,7 +640,9 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     /// gate/up of a `gateUpOnly` half layer: `input` (R, D) any float dtype, `indices` (R, k) -> the activated hidden
     /// (R * k, I) float32 in the raw basis, pair order (row-major (row, slot)), ready for the host's down projection.
     /// Large bf16 / fp16 batches run the expert-sorted prefill tiles (the same crossover as `callRouted`).
-    public func routedHidden(_ input: MLXArray, indices: MLXArray) -> MLXArray {
+    public func routedHidden(
+        _ input: MLXArray, indices: MLXArray, usePrefillTiles: Bool = true
+    ) -> MLXArray {
         precondition(input.ndim >= 2 && input.dim(-1) == hiddenSize && indices.dim(-1) > 0
                      && indices.size / indices.dim(-1) == input.size / hiddenSize,
                      "JANGT half-layer input does not match admitted architecture")
@@ -463,13 +650,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         let x = input.reshaped(-1, hiddenSize)
         let ids = indices.reshaped(-1, routes).asType(.uint32)
         do {
-            if !Self.usesDecodeKernels(pairs: ids.size, dtype: input.dtype) {
+            if usePrefillTiles, !Self.usesDecodeKernels(pairs: ids.size, dtype: input.dtype) {
                 let flat = ids.flattened()
                 let order = argSort(flat)
                 let sortedIDs = take(flat, order).asType(.uint32)
                 let (hidden, _) = try prefillHidden(
                     x, sourceRows: Self.sourceRows(order, routes: routes), sortedIDs: sortedIDs,
-                    plan: expertTilePlan(sortedIDs))
+                    plan: expertTilePlan(sortedIDs), rotateForDown: false)
                 return take(hidden.asType(.float32), argSort(order), axis: 0)
             }
             switch gateUp {
@@ -497,7 +684,9 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
     /// down of a `downOnly` half layer: `hidden` (R * k, I) the host's activated gate/up in pair order (raw basis,
     /// any float dtype), `indices` / `scores` (R, k) -> the router-weighted sum (R, D) in `outputDType`, float32
     /// accumulation. Large bf16 / fp16 batches run the expert-sorted prefill tiles.
-    public func routedDown(_ hidden: MLXArray, indices: MLXArray, scores: MLXArray, outputDType: DType) -> MLXArray {
+    public func routedDown(
+        _ hidden: MLXArray, indices: MLXArray, scores: MLXArray, outputDType: DType, usePrefillTiles: Bool = true
+    ) -> MLXArray {
         let routes = indices.dim(-1)
         let ids = indices.reshaped(-1, routes).asType(.uint32)
         let weights = scores.reshaped(-1, routes).asType(.float32)
@@ -506,7 +695,7 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                      && hidden.dim(1) == intermediateSize && scores.size == ids.size,
                      "JANGT half-layer hidden does not match admitted architecture")
         do {
-            if !Self.usesDecodeKernels(pairs: ids.size, dtype: outputDType) {
+            if usePrefillTiles, !Self.usesDecodeKernels(pairs: ids.size, dtype: outputDType) {
                 let flat = ids.flattened()
                 let order = argSort(flat)
                 let sortedIDs = take(flat, order).asType(.uint32)

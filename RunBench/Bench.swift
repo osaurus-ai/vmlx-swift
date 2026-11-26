@@ -9064,6 +9064,12 @@ private func runPerfBenchBody(
                 params.compiledMaxCacheLength =
                     Int(env["BENCH_PERF_COMPILED_MAX_LEN"] ?? "4096") ?? 4096
             }
+            if let dsparkPath = env["BENCH_PERF_DSPARK"], !dsparkPath.isEmpty {
+                let url = dsparkPath == "1"
+                    ? modelDir.appendingPathComponent("dspark", isDirectory: true)
+                    : URL(fileURLWithPath: dsparkPath)
+                params.draftStrategy = .dspark(drafterPath: url)
+            }
             if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
                 params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
                 // BENCH_PERF_MTP_ADAPTIVE_MAX=<n>: the app's On (Adaptive) policy — start at the

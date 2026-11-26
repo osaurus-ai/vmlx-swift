@@ -400,10 +400,21 @@ public enum Glm5EffortPolicy: ReasoningEffortPolicy {
 
 // MARK: - Resolution
 
+/// ERNIE's native renderer defaults to high and disables thinking with enable_thinking=false.
+public enum Ernie55EffortPolicy: ReasoningEffortPolicy {
+    public static func applies(to modelType: String?) -> Bool { modelType == "ernie5_5_moe" }
+    public static let templateKey = "reasoning_effort"
+    public static let efforts = ["low", "medium", "high"]
+    public static let defaultEffort = "high"
+    public static let supportsDisabling = true
+    public static let offEffort: String? = nil
+}
+
 public enum ReasoningCapabilityRegistry {
     /// Families with a declaration of their own. Order is irrelevant: `applies(to:)` is disjoint.
     public static let policies: [any ReasoningEffortPolicy.Type] = [
         GptOssReasoningPolicy.self,
+        Ernie55EffortPolicy.self,
         MuseGlimmerReasoningPolicy.self,
         BailingReasoningPolicy.self,
         DeepseekV4EffortPolicy.self,

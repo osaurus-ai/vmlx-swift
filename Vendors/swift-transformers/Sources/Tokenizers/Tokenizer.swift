@@ -792,6 +792,17 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         postProcess(tokenize(text: text), addSpecialTokens: addSpecialTokens).map { model.convertTokenToId($0)! }
     }
 
+    /// Encode literal text without recognizing tokenizer-added control tokens.
+    public func encodeOrdinaryText(_ text: String) throws -> [Int] {
+        let pieces = fuseUnknown(preTokenize(normalize(text), options: [.firstSection]).flatMap { model($0) })
+        return try pieces.map { token in
+            guard !addedTokens.contains(token), let id = model.convertTokenToId(token) else {
+                throw TokenizerError.unencodableToken(token)
+            }
+            return id
+        }
+    }
+
     /// `encode`, but a token the vocabulary cannot represent is an error rather than a
     /// process kill.
     ///

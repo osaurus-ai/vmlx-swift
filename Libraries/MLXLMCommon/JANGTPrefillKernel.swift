@@ -102,7 +102,7 @@ enum JANGTPrefillKernel {
     /// `outliers` > 0, the fused outlier epilogue). The fused epilogue applies `activation` after the source's clamp
     /// at `lim`; `.silu` keeps the source's expression unchanged.
     static func naxSource(words: Int, outliers: Int = 0, activation: JANGTActivation = .silu,
-                          expertAligned: Bool = false) -> String {
+                          expertAligned: Bool = false, floatOutput: Bool = false) -> String {
         var s = JANGHPrefillSource.nax
         if activation != .silu {
             let silu = "return \(JANGTActivation.silu.metalValue());"
@@ -142,6 +142,9 @@ enum JANGTPrefillKernel {
         for (from, to) in replacements {
             precondition(s.contains(from), "JANGT prefill: NAX source anchor missing: \(from)")
             s = s.replacingOccurrences(of: from, with: to)
+        }
+        if floatOutput {
+            s = s.replacingOccurrences(of: "device T* y", with: "device float* y")
         }
         // Only the gather routine: the steel/split-K helpers are other kernels' sources.
         return s
@@ -196,13 +199,47 @@ enum JANGTPrefillKernel {
         public let rows: Int
     }
 
+    #if canImport(Metal)
+    private static let tilePlanStartsKernel = MLXFast.metalKernel(
+        name: "jangt_expert_tile_starts_bsearch",
+        inputNames: ["sorted_ids"],
+        outputNames: ["starts"],
+        source: """
+            const uint e = thread_position_in_grid.x;
+            if (e > uint(EXPERTS)) return;
+            uint lo = 0u, hi = uint(M);
+            while (lo < hi) {
+                const uint mid = (lo + hi) >> 1u;
+                if (sorted_ids[mid] < e) lo = mid + 1u; else hi = mid;
+            }
+            starts[e] = int(lo);
+            if (e == uint(EXPERTS)) starts[uint(EXPERTS) + 1u] = int(M);
+            """)
+    #endif
+
     public static func expertTilePlan(sortedIndices: MLXArray, experts: Int) -> ExpertTilePlan {
         let ids = sortedIndices.reshaped(-1).asType(.uint32)
         let m = ids.dim(0)
-        // starts[e] = #ids < e for e = 0 ... E (sorted ids: the first row of expert e), then M.
+        var starts: MLXArray
+        #if canImport(Metal)
+        if Device.defaultDevice().deviceType == .gpu, experts >= 8, m > 0 {
+            let tg = min(256, experts + 1)
+            let grid = ((experts + 1 + tg - 1) / tg) * tg
+            starts = tilePlanStartsKernel(
+                [contiguous(ids)],
+                template: [("EXPERTS", experts), ("M", m)],
+                grid: (grid, 1, 1), threadGroup: (tg, 1, 1),
+                outputShapes: [[experts + 2]], outputDTypes: [.int32])[0]
+        } else {
+            let bounds = MLXArray(0 ..< UInt32(experts + 1)).reshaped(experts + 1, 1)
+            let below = (ids.reshaped(1, m) .< bounds).asType(.int32).sum(axis: 1)
+            starts = concatenated([below, MLXArray([Int32(m)])]).asType(.int32)
+        }
+        #else
         let bounds = MLXArray(0 ..< UInt32(experts + 1)).reshaped(experts + 1, 1)
         let below = (ids.reshaped(1, m) .< bounds).asType(.int32).sum(axis: 1)
-        var starts = concatenated([below, MLXArray([Int32(m)])]).asType(.int32)
+        starts = concatenated([below, MLXArray([Int32(m)])]).asType(.int32)
+        #endif
         // Tiles per segment, ceil(rows / 64): a shift (non-negative), not MLX's composed integer floorDivide.
         let counts = rightShift(starts[1...] - starts[..<(experts + 1)] + MLXArray(Int32(63)), MLXArray(Int32(6)))
         var tiles = concatenated([MLXArray([Int32(0)]), cumsum(counts, axis: 0)]).asType(.int32)
@@ -223,14 +260,14 @@ enum JANGTPrefillKernel {
     }
 
     private static func kernel(k: Double, words: Int, dtype: DType, fused: Bool, rotate: Bool, outliers: Int = 0,
-                               activation: JANGTActivation = .silu, expertAligned: Bool = false)
+                               activation: JANGTActivation = .silu, expertAligned: Bool = false, floatOutput: Bool = false)
         -> MLXFast.MLXFastKernel
     {
         let type = dtype == .bfloat16 ? "bfloat16_t" : "half"
         // Only the fused epilogue applies the activation: single-weight tiles share the SiLU source and name.
         let activation = fused ? activation : .silu
         let name = "jangt_prefill_K\(JANGTKernels.kname(k))_w\(words)_\(type)_f\(fused ? 1 : 0)_r\(rotate ? 1 : 0)_o\(outliers)"
-            + activation.nameTag + (expertAligned ? "_et" : "")
+            + activation.nameTag + (expertAligned ? "_et" : "") + (floatOutput ? "_fp32out" : "")
         lock.lock()
         defer { lock.unlock() }
         if let cached = kernels[name] { return cached }
@@ -249,7 +286,8 @@ enum JANGTPrefillKernel {
             outputNames: ["y"],
             source: source,
             header: JANGHPrefillHeaders.nax + loaderSource(k: k, words: words)
-                + naxSource(words: words, outliers: outliers, activation: activation, expertAligned: expertAligned),
+                + naxSource(words: words, outliers: outliers, activation: activation,
+                            expertAligned: expertAligned, floatOutput: floatOutput),
             ensureRowContiguous: false)
         kernels[name] = built
         return built
@@ -263,7 +301,7 @@ enum JANGTPrefillKernel {
     static func project(
         _ x: MLXArray, _ projection: JANGTProjection, up: JANGTProjection? = nil, indices: MLXArray,
         limit: Float = 0, activation: JANGTActivation = .silu, rotateOutput: Bool = false,
-        plan: ExpertTilePlan? = nil
+        plan: ExpertTilePlan? = nil, floatOutput: Bool = false
     ) -> MLXArray {
         let m = x.dim(0), kin = x.dim(1), n = projection.outputs
         precondition(available && [.bfloat16, .float16].contains(x.dtype) && kin == projection.inputs
@@ -278,11 +316,11 @@ enum JANGTPrefillKernel {
             + (plan.map { [Int32($0.segments)] } ?? []))
         let u = up ?? projection
         return kernel(k: projection.k, words: projection.words, dtype: x.dtype, fused: up != nil, rotate: rotateOutput,
-                      activation: activation, expertAligned: plan != nil)(
+                      activation: activation, expertAligned: plan != nil, floatOutput: floatOutput)(
             [contiguous(x), projection.packed, projection.scale, u.packed, u.scale, contiguous(idx.asType(.uint32)),
              meta, MLXArray([limit])] + (plan.map { [$0.starts, $0.tiles] } ?? []),
             grid: (((n + 63) / 64) * 128, (m + 63) / 64 + (plan?.segments ?? 0), 1), threadGroup: (128, 1, 1),
-            outputShapes: [[m, n]], outputDTypes: [x.dtype])[0]
+            outputShapes: [[m, n]], outputDTypes: [floatOutput ? .float32 : x.dtype])[0]
     }
 
     /// Fused gate/up for expert-sorted rows with the layer-wide outlier columns `columns` (NO,) added before the

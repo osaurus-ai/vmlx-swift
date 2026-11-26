@@ -2635,6 +2635,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 logger.info("dSpark head not attached: this model does not use one")
             }
         } catch {
+            NSLog("[dSpark] head failed to load from \(directory.path): \(error)")
             logger.error(
                 "dSpark head failed to load from \(directory.path, privacy: .public) (decoding autoregressively): \(error.localizedDescription, privacy: .public)"
             )
@@ -4327,8 +4328,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         if endedOnToolCall, !stopTokenIsHistory {
             // Key exactly the returned tokens: anything the async pipeline forwarded past the call is not history.
             let keep = promptTokenIds.count + generatedTokenIds.count
-            for layer in cache where layer.offset > keep { layer.trim(layer.offset - keep) }
-            guard cache.allSatisfy({ $0.offset == keep }) else { return }
+            func trimToKeep(_ layer: any KVCache) {
+                if let list = layer as? CacheList {
+                    for idx in 0..<list.count { trimToKeep(list[idx]) }
+                } else if layer.offset > keep {
+                    _ = layer.trim(layer.offset - keep)
+                }
+            }
+            for layer in cache { trimToKeep(layer) }
+            guard cacheBoundaryLeafOffsets(cache).allSatisfy({ $0 == keep }) else { return }
             generatedBoundaryTokens = promptTokenIds + generatedTokenIds
         }
         // Whether the next prompt starts from this row depends on the

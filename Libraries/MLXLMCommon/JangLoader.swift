@@ -1738,6 +1738,7 @@ public struct JangLoader: Sendable {
     /// real-world snapshots: `TokenizersBackend` on Qwen-family VL
     /// models is functionally `Qwen2Tokenizer`.
     public static let defaultTokenizerClassSubstitutions: [String: String] = [
+        "ErnieChatTokenizer": "PreTrainedTokenizer",
         "TokenizersBackend": "Qwen2Tokenizer",
         // Kimi K2.x/K2.5/K2.6 bundles may ship a tiktoken.model plus a
         // generated tokenizer.json. swift-transformers does not register

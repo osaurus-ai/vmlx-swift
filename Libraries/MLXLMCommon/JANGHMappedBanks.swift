@@ -29,10 +29,12 @@ final class JANGHMappedBanks {
 
         init(directory: URL, metadata: JANGHHeaderAdapter.Snapshot,
              contract: JANGHFormatContract, dimensions: [String: JANGHTensorIndexPlan.Dimensions],
-             trellisDimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]) throws {
+             trellisDimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:],
+             allowsUnalignedResidentRegions: Bool = false) throws {
             let plan = try JANGHTensorIndexPlan(contract: contract, dimensions: dimensions,
                                                trellisDimensions: trellisDimensions,
-                                               weightMap: metadata.weightMap, shards: metadata.shards)
+                                               weightMap: metadata.weightMap, shards: metadata.shards,
+                                               allowsUnalignedResidentRegions: allowsUnalignedResidentRegions)
             guard directory.isFileURL else {
                 throw JANGHFormatContract.ValidationError.invalid("JANGH mapping requires a file directory")
             }

@@ -106,6 +106,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                     }
 
                     // swift-transformers uses `decode(tokens:)` instead of `decode(tokenIds:)`.
+                    func encodeOrdinaryText(_ text: String) throws -> [Int] {
+                        guard let tokenizer = upstream as? VMLXTokenizers.PreTrainedTokenizer else {
+                            throw MLXLMCommon.TokenizerError.missingChatTemplate
+                        }
+                        return try tokenizer.encodeOrdinaryText(text)
+                    }
                     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
                         upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
                     }
@@ -922,6 +928,9 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                     var unknownToken: String? { base.unknownToken }
                     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
                         base.encode(text: text, addSpecialTokens: addSpecialTokens)
+                    }
+                    func encodeOrdinaryText(_ text: String) throws -> [Int] {
+                        try base.encodeOrdinaryText(text)
                     }
                     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
                         base.decode(tokenIds: tokenIds, skipSpecialTokens: skipSpecialTokens)

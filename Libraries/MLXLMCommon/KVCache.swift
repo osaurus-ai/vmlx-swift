@@ -208,6 +208,9 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     var compressRatio: Int { get }
     var slidingWindow: Int { get }
 
+    /// True when rotating local attention reads the same tensor as keys and values.
+    var sharesLocalKeysAndValues: Bool { get }
+
     /// Pool tensors — `nil` when no rows have been emitted yet.
     func hybridPool(branch: HybridPoolBranch) -> MLXArray?
     func setHybridPool(branch: HybridPoolBranch, value: MLXArray?)
@@ -251,6 +254,8 @@ public struct HybridPoolTokenHistory: Sendable, Equatable {
 }
 
 public extension HybridPoolCache {
+    var sharesLocalKeysAndValues: Bool { false }
+
     var auxiliaryTokenHistory: HybridPoolTokenHistory? {
         get { nil }
         set {}

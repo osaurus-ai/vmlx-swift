@@ -53,7 +53,8 @@ struct JANGHTensorIndexPlan: Sendable {
     init(
         contract: JANGHFormatContract, dimensions: [String: Dimensions],
         trellisDimensions: [String: Dimensions] = [:],
-        weightMap: [String: String], shards: [String: ShardHeader]
+        weightMap: [String: String], shards: [String: ShardHeader],
+        allowsUnalignedResidentRegions: Bool = false
     ) throws {
         typealias Failure = JANGHFormatContract.ValidationError
         guard Set(dimensions.keys) == Set(contract.projections.keys),
@@ -133,7 +134,9 @@ struct JANGHTensorIndexPlan: Sendable {
             }
             // Range bounds above guarantee this sum cannot overflow.
             let offset = shard.dataStart + header.start
-            guard header.end - header.start == count, offset.isMultiple(of: bytesPerElement) else {
+            guard header.end - header.start == count,
+                allowsUnalignedResidentRegions || offset.isMultiple(of: bytesPerElement)
+            else {
                 throw Failure.invalid("JANGH bank byte count or dtype alignment mismatch")
             }
             return (header, Location(shard: file, tensor: name, fileOffset: offset, byteCount: count))

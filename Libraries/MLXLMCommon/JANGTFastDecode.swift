@@ -143,7 +143,7 @@ public enum JANGTFastDecode {
         case .oai(let alpha):
             return "_oai" + "\(alpha)".replacingOccurrences(of: ".", with: "p").replacingOccurrences(of: "-", with: "m")
                 + lim
-        case .inkling: return activation.nameTag + lim
+        case .inkling, .ernie55: return activation.nameTag + lim
         }
     }
 
@@ -261,7 +261,8 @@ public enum JANGTFastDecode {
     }
 
     /// Python `gen_dn4(..., O=4, NOG=2, KSPLIT=1, wload="scalar")`: per-slot down y (before the router weight).
-    static func downSlotsSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int) -> String {
+    static func downSlotsSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int,
+                                roundSlotToBFloat16: Bool = false) -> String {
         let (o, nog) = (4, 2)
         let (mu0, mu1, isd0, isd1) = stats(k)
         let pl = JANGTCode.laneBits(k)
@@ -269,6 +270,9 @@ public enum JANGTFastDecode {
         let loop = mainLoop(k, l, projs: [("d", "d")], ptrs: ["d": "wp"], o: o, w: words, adv: pl)
         let outl = downOutliers(kin: kin, n: n, o: o, outliers: outliers, kpGuard: true)
         let reduce = "float Dv[\(o)]; \(unroll) for (uint r = 0; r < \(o)u; r++) Dv[r] = simd_sum(d[r]);"
+        let storeVal = roundSlotToBFloat16
+            ? "float(bfloat16_t((Dv[r] - cst) * sd[(size_t)e * \(n)u + row0 + r]))"
+            : "(Dv[r] - cst) * sd[(size_t)e * \(n)u + row0 + r]"
         return "\n" + [
             "    const float ISD0 = \(lit(isd0)), ISD1 = \(lit(isd1));",
             "    uint sgi = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;",
@@ -287,19 +291,23 @@ public enum JANGTFastDecode {
             "    \(outl)",
             "    \(reduce)",
             "    const float cst = \(lit(mu0)) * ISD0 * st[ts * 2u] + \(lit(mu1)) * ISD1 * st[ts * 2u + 1u];",
-            "    \(unroll) for (uint r = 0; r < \(o)u; r++) if (lane == 0u) out[(size_t)ts * \(n)u + row0 + r] = (Dv[r] - cst) * sd[(size_t)e * \(n)u + row0 + r];",
+            "    \(unroll) for (uint r = 0; r < \(o)u; r++) if (lane == 0u) out[(size_t)ts * \(n)u + row0 + r] = \(storeVal);",
             "    ",
         ].joined(separator: "\n")
     }
 
     /// Python `gen_dn4c(..., O=4, NOG=2, KS=slots, wload="scalar")`: down + router-weighted slot combine, one launch.
-    static func downCombinedSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int, slots: Int) -> String {
+    static func downCombinedSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int, slots: Int,
+                                   roundSlotToBFloat16: Bool = false) -> String {
         let (o, nog) = (4, 2)
         let (mu0, mu1, isd0, isd1) = stats(k)
         let pl = JANGTCode.laneBits(k)
         let nb = kin / 512
         let loop = mainLoop(k, l, projs: [("d", "d")], ptrs: ["d": "wp"], o: o, w: words, adv: pl)
         let outl = downOutliers(kin: kin, n: n, o: o, outliers: outliers, kpGuard: false)
+        let slotVal = roundSlotToBFloat16
+            ? "float(bfloat16_t((Dv - cst) * sd[(size_t)e * \(n)u + row0 + r]))"
+            : "(Dv - cst) * sd[(size_t)e * \(n)u + row0 + r]"
         return "\n" + [
             "    const float ISD0 = \(lit(isd0)), ISD1 = \(lit(isd1));",
             "    uint sgi = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;",
@@ -319,7 +327,7 @@ public enum JANGTFastDecode {
             "    const float cst = \(lit(mu0)) * ISD0 * st[ts * 2u] + \(lit(mu1)) * ISD1 * st[ts * 2u + 1u];",
             "    \(unroll) for (uint r = 0; r < \(o)u; r++) {",
             "      float Dv = simd_sum(d[r]);",
-            "      if (lane == 0u) ysl[(sl * \(nog)u + og) * \(o)u + r] = (Dv - cst) * sd[(size_t)e * \(n)u + row0 + r];",
+            "      if (lane == 0u) ysl[(sl * \(nog)u + og) * \(o)u + r] = \(slotVal);",
             "    }",
             "    threadgroup_barrier(mem_flags::mem_threadgroup);",
             "    if (sl == 0u && lane < \(o)u) {",
@@ -372,23 +380,29 @@ public enum JANGTFastDecode {
                 limit: limit, activation: activation))
     }
 
-    static func downSlotsKernel(kin: Int, n: Int, k: Double, outliers: Int, words: Int, hdt: String) -> Kernel {
-        Kernel(
-            name: "jtf4_dn_k\(kin)_n\(n)_K\(kname(k))_o\(outliers)_w\(words)_\(hdt)_O4_G2_S1_scalar",
+    static func downSlotsKernel(kin: Int, n: Int, k: Double, outliers: Int, words: Int, hdt: String,
+                                roundSlotToBFloat16: Bool = false) -> Kernel {
+        let tag = roundSlotToBFloat16 ? "_rbf16" : ""
+        return Kernel(
+            name: "jtf4_dn_k\(kin)_n\(n)_K\(kname(k))_o\(outliers)_w\(words)_\(hdt)\(tag)_O4_G2_S1_scalar",
             inputs: ["xq", "xinv", "st", "h", "idx", "wd", "sd"] + (outliers > 0 ? ["ocol", "wout"] : []),
             outputs: ["out"],
-            source: downSlotsSource(kin: kin, n: n, k: k, l: JANGTCode.stateBits, outliers: outliers, words: words))
+            source: downSlotsSource(kin: kin, n: n, k: k, l: JANGTCode.stateBits, outliers: outliers, words: words,
+                                    roundSlotToBFloat16: roundSlotToBFloat16))
     }
 
-    static func downCombinedKernel(kin: Int, n: Int, k: Double, outliers: Int, words: Int, hdt: String, slots: Int)
+    static func downCombinedKernel(kin: Int, n: Int, k: Double, outliers: Int, words: Int, hdt: String, slots: Int,
+                                   roundSlotToBFloat16: Bool = false)
         -> Kernel
     {
-        Kernel(
-            name: "jtf4c_dn_k\(kin)_n\(n)_K\(kname(k))_o\(outliers)_w\(words)_\(hdt)_O4_G2_s\(slots)_scalar",
+        let tag = roundSlotToBFloat16 ? "_rbf16" : ""
+        return Kernel(
+            name: "jtf4c_dn_k\(kin)_n\(n)_K\(kname(k))_o\(outliers)_w\(words)_\(hdt)\(tag)_O4_G2_s\(slots)_scalar",
             inputs: ["xq", "xinv", "st", "h", "idx", "rw", "wd", "sd"] + (outliers > 0 ? ["ocol", "wout"] : []),
             outputs: ["out"],
             source: downCombinedSource(
-                kin: kin, n: n, k: k, l: JANGTCode.stateBits, outliers: outliers, words: words, slots: slots))
+                kin: kin, n: n, k: k, l: JANGTCode.stateBits, outliers: outliers, words: words, slots: slots,
+                roundSlotToBFloat16: roundSlotToBFloat16))
     }
 
     static func combineKernel(n: Int, slots: Int) -> Kernel {
@@ -431,42 +445,54 @@ public enum JANGTFastDecode {
         return (out[0], out[1], out[2])
     }
 
-    /// Python `routed_gate_up`: (T * k, I) f32 SwiGLU activations of every (row, slot).
-    public static func gateUp(_ x2: MLXArray, ids: MLXArray, _ t: JANGTRoutedExpertLayer.TrellisTensors) -> MLXArray {
-        let (xq, xinv, st) = packRows1(x2, signs: t.gateUpSigns)
+    /// Per-group fast trellis gate/up supporting mixed trellis/codebook layers (e.g. ERNIE 5.5).
+    public static func gateUpGroup(
+        _ x2: MLXArray, ids: MLXArray, gate: JANGTProjection, up: JANGTProjection, signs: MLXArray,
+        limit: Float, activation: JANGTActivation, outputDType: DType = .float32
+    ) -> MLXArray {
+        let (xq, xinv, st) = packRows1(x2, signs: signs)
         let rows = x2.dim(0), kin = x2.dim(1), slots = ids.dim(1)
-        let n = t.gate.outputs, words = t.gate.words, outliers = t.gate.outlierColumns
+        let n = gate.outputs, words = gate.words, outliers = gate.outlierColumns
         let xdt = JANGTKernels.metalType(x2.dtype)
-        let name = "jtf4_gu_k\(kin)_n\(n)_K\(kname(t.gate.k))_o\(outliers)_w\(words)_\(xdt)_float"
-            + "\(actTag(t.activation, limit: t.limit))_O4_G2_S1_scalar"
+        let odt = JANGTKernels.metalType(outputDType)
+        let name = "jtf4_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_w\(words)_\(xdt)_\(odt)"
+            + "\(actTag(activation, limit: limit))_O4_G2_S1_scalar"
         let kernel = compile(
             gateUpKernel(
-                kin: kin, n: n, k: t.gate.k, outliers: outliers, words: words, xdt: xdt, odt: "float", limit: t.limit,
-                activation: t.activation), name: name)
+                kin: kin, n: n, k: gate.k, outliers: outliers, words: words, xdt: xdt, odt: odt, limit: limit,
+                activation: activation), name: name)
         var inputs: [MLXArray] = [
-            xq, xinv, st, x2, ids.flattened().asType(.uint32), t.gate.packed, t.gate.scale, t.up.packed, t.up.scale,
+            xq, xinv, st, x2, ids.flattened().asType(.uint32), gate.packed, gate.scale, up.packed, up.scale,
         ]
-        if outliers > 0 { inputs += [t.gate.outlierColumnIndices, t.gate.outlierWeights, t.up.outlierWeights] }
+        if outliers > 0 { inputs += [gate.outlierColumnIndices, gate.outlierWeights, up.outlierWeights] }
         return kernel(
             inputs, template: [("KS", slots)], grid: (64, rows * slots, n / 8), threadGroup: (64, 1, 1),
-            outputShapes: [[rows * slots, n]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows * slots, n]], outputDTypes: [outputDType])[0]
     }
 
-    /// Python `routed_down`: (T, D) f32 router-weighted down projection of every row (one row: the in-kernel slot
-    /// combine; 2+ rows: per-slot kernel + combine kernel; a row's arithmetic is the same in both).
-    public static func down(_ h: MLXArray, ids: MLXArray, weights: MLXArray,
-                            _ t: JANGTRoutedExpertLayer.TrellisTensors) -> MLXArray {
-        let (xq, xinv, st) = packRows1(h, signs: t.downSigns, rowExperts: ids.flattened())
+    /// Python `routed_gate_up`: (T * k, I) f32 SwiGLU activations of every (row, slot).
+    public static func gateUp(_ x2: MLXArray, ids: MLXArray, _ t: JANGTRoutedExpertLayer.TrellisTensors) -> MLXArray {
+        gateUpGroup(x2, ids: ids, gate: t.gate, up: t.up, signs: t.gateUpSigns,
+                    limit: t.limit, activation: t.activation, outputDType: .float32)
+    }
+
+    /// Per-group fast trellis down supporting mixed trellis/codebook layers and optional per-slot BF16 rounding.
+    public static func downGroup(
+        _ h: MLXArray, ids: MLXArray, weights: MLXArray, projection d: JANGTProjection, signs: MLXArray,
+        roundSlotToBFloat16: Bool = false
+    ) -> MLXArray {
+        let (xq, xinv, st) = packRows1(h, signs: signs, rowExperts: ids.flattened())
         let rows = ids.dim(0), slots = ids.dim(1), kin = h.dim(1)
-        let d = t.down
         let n = d.outputs, words = d.words, outliers = d.outlierColumns
         let hdt = JANGTKernels.metalType(h.dtype)
         let idx = ids.flattened().asType(.uint32)
         let rw = weights.flattened().asType(.float32)
+        let tag = roundSlotToBFloat16 ? "_rbf16" : ""
         if rows == 1 {
-            let name = "jtf4c_dn_k\(kin)_n\(n)_K\(kname(d.k))_o\(outliers)_w\(words)_\(hdt)_O4_G2_s\(slots)_scalar"
+            let name = "jtf4c_dn_k\(kin)_n\(n)_K\(kname(d.k))_o\(outliers)_w\(words)_\(hdt)\(tag)_O4_G2_s\(slots)_scalar"
             let kernel = compile(
-                downCombinedKernel(kin: kin, n: n, k: d.k, outliers: outliers, words: words, hdt: hdt, slots: slots),
+                downCombinedKernel(kin: kin, n: n, k: d.k, outliers: outliers, words: words, hdt: hdt, slots: slots,
+                                   roundSlotToBFloat16: roundSlotToBFloat16),
                 name: name)
             var inputs: [MLXArray] = [xq, xinv, st, h, idx, rw, d.packed, d.scale]
             if outliers > 0 { inputs += [d.outlierColumnIndices, d.outlierWeights] }
@@ -475,9 +501,10 @@ public enum JANGTFastDecode {
                 inputs, grid: (tpg, rows, n / 8), threadGroup: (tpg, 1, 1), outputShapes: [[rows, n]],
                 outputDTypes: [.float32])[0]
         }
-        let name = "jtf4_dn_k\(kin)_n\(n)_K\(kname(d.k))_o\(outliers)_w\(words)_\(hdt)_O4_G2_S1_scalar"
+        let name = "jtf4_dn_k\(kin)_n\(n)_K\(kname(d.k))_o\(outliers)_w\(words)_\(hdt)\(tag)_O4_G2_S1_scalar"
         let kernel = compile(
-            downSlotsKernel(kin: kin, n: n, k: d.k, outliers: outliers, words: words, hdt: hdt), name: name)
+            downSlotsKernel(kin: kin, n: n, k: d.k, outliers: outliers, words: words, hdt: hdt,
+                            roundSlotToBFloat16: roundSlotToBFloat16), name: name)
         var inputs: [MLXArray] = [xq, xinv, st, h, idx, d.packed, d.scale]
         if outliers > 0 { inputs += [d.outlierColumnIndices, d.outlierWeights] }
         let ysl = kernel(
@@ -488,6 +515,18 @@ public enum JANGTFastDecode {
         return combine(
             [ysl, rw], grid: ((n + tg - 1) / tg * tg, rows, 1), threadGroup: (tg, 1, 1), outputShapes: [[rows, n]],
             outputDTypes: [.float32])[0]
+    }
+
+    /// Python `routed_down`: (T, D) f32 router-weighted down projection of every row (one row: the in-kernel slot
+    /// combine; 2+ rows: per-slot kernel + combine kernel; a row's arithmetic is the same in both).
+    public static func down(_ h: MLXArray, ids: MLXArray, weights: MLXArray,
+                            _ t: JANGTRoutedExpertLayer.TrellisTensors) -> MLXArray {
+        downGroup(h, ids: ids, weights: weights, projection: t.down, signs: t.downSigns, roundSlotToBFloat16: false)
+    }
+
+    /// Whether one trellis projection fits `packRows1` and `jtf4_*` geometry.
+    public static func supportsProjection(_ p: JANGTProjection) -> Bool {
+        p.inputs % 512 == 0 && p.inputs / 512 <= 32 && p.outputs % 8 == 0
     }
 
     /// Python `routed_fast`: the routed block for decode / verify rows, (T, D) f32.

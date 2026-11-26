@@ -647,15 +647,31 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return local
     }
 
-    /// Model types that carry a dSpark head in `dspark/`: DeepSeek-V4.1 (DSV4-0731 has none) and
-    /// MiniMax-M3 / M3.1 (a DSpark block drafter, ``miniMaxDSparkModelTypes``).
+    /// Model types that carry a dSpark head in `dspark/`: DeepSeek-V4.1 (DSV4-0731 has none),
+    /// MiniMax-M3 / M3.1 (a DSpark block drafter, ``miniMaxDSparkModelTypes``), and ERNIE 5.5 Flash
+    /// (a 3-layer DSpark block drafter with `draft-manifest.json`, ``ernie55DSparkModelTypes``).
     public static let dsparkModelTypes: Set<String> = [
-        "deepseek_v41", "deepseek_v41_text", "minimax_m3", "minimax_m3_vl",
+        "deepseek_v41", "deepseek_v41_text", "minimax_m3", "minimax_m3_vl", "ernie5_5_moe",
     ]
 
     /// MiniMax-M3 / M3.1: `dspark/` holds a block drafter with its own `config.json`
     /// (`DSparkMiniMaxDraftModel`, as released or pre-quantized) and safetensors.
     public static let miniMaxDSparkModelTypes: Set<String> = ["minimax_m3", "minimax_m3_vl"]
+
+    /// ERNIE 5.5 Flash: `dspark/` holds a 3-layer block drafter described by `draft-manifest.json`
+    /// plus `draft-head.safetensors` and `draft-layer-{0..N-1}.safetensors`.
+    public static let ernie55DSparkModelTypes: Set<String> = ["ernie5_5_moe"]
+
+    /// True when `directory` holds an ERNIE 5.5 DSpark draft sidecar (`draft-manifest.json`,
+    /// `draft-head.safetensors`, and `draft-layer-0.safetensors`).
+    public static func declaresErnie55DSparkDrafter(_ directory: URL) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.appendingPathComponent("draft-manifest.json").path),
+            fm.fileExists(atPath: directory.appendingPathComponent("draft-head.safetensors").path),
+            fm.fileExists(atPath: directory.appendingPathComponent("draft-layer-0.safetensors").path)
+        else { return false }
+        return true
+    }
 
     /// True when `directory/config.json` declares a DSpark drafter (an architecture naming DSpark, or a
     /// `dspark` projector) and the directory holds its safetensors. The vMLX Python runtime's rule
@@ -712,6 +728,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let local = bundleDirectory.appendingPathComponent("dspark", isDirectory: true)
         if types.contains(where: Self.miniMaxDSparkModelTypes.contains) {
             guard !DSparkEnvironment.miniMaxDisabled(environment), Self.declaresDSparkDrafter(local) else {
+                return nil
+            }
+            return local
+        }
+        if types.contains(where: Self.ernie55DSparkModelTypes.contains) {
+            guard !DSparkEnvironment.miniMaxDisabled(environment), Self.declaresErnie55DSparkDrafter(local) else {
                 return nil
             }
             return local
