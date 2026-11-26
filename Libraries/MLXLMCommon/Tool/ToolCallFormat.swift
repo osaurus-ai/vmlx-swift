@@ -247,6 +247,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// `<|message_model|>f<|content_invoke_tool_json|>{"name":"f","args":{…}}<|end_message|>`.
     case inkling
 
+    /// ERNIE 5.5 invoke blocks.
+    case ernie55
+
     // MARK: - Factory Methods
 
     /// Whether this format wraps tool calls in literal control markers that
@@ -310,6 +313,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return ATEMToolCallParser()
         case .hunyuan:
             return HunyuanToolCallParser()
+        case .ernie55:
+            return Ernie55ToolCallParser()
         case .inkling:
             return InklingToolCallParser()
         }
@@ -380,6 +385,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         let normalized = normalizedAlias(type)
         let compact = compactAlias(type)
 
+        if type == "ernie5_5_moe" { return .ernie55 }
         if compact == "k2horizon" { return .k2Horizon }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2).

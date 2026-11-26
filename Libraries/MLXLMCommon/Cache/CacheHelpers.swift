@@ -1676,6 +1676,7 @@ private func canRestoreDeepseekV4Layer(
     into layer: any KVCache
 ) -> Bool {
     guard let hybrid = layer as? HybridPoolCache,
+          !comp.sharesLocalKeysAndValues || hybrid.sharesLocalKeysAndValues,
           hybrid.compressRatio == comp.compressRatio,
           hybrid.slidingWindow == comp.slidingWindow,
           comp.keys.ndim >= 3,

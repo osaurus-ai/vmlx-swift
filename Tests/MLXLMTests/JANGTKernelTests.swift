@@ -170,6 +170,13 @@ final class JANGTKernelTests: XCTestCase {
         switch activation {
         case .silu: return Float(g / (1 + Foundation.exp(-g)) * u)
         case .oai(let alpha): return Float(g / (1 + Foundation.exp(-Double(alpha) * g)) * (u + 1))
+        case .ernie55(let gc, let uc):
+            func bf16(_ value: Double) -> Float {
+                let bits = Float(value).bitPattern
+                let half = (bits &+ 0x7fff &+ ((bits >> 16) & 1)) & 0xffff_0000
+                return Float(bitPattern: half)
+            }
+            return act(bf16(g), bf16(u), limit: 0, .inkling(gateCap: gc, upCap: uc))
         case .inkling(let gc, let uc):
             let (c, d) = (Double(gc), Double(uc))
             return Float(Foundation.tanh(g / c) * c / (1 + Foundation.exp(-g)) * (Foundation.tanh(u / d) * d))

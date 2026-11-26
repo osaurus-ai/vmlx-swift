@@ -93,7 +93,8 @@ final class JANGHPrefillKernel {
     }
 
     private func kernel(
-        dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64
+        dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64,
+        expertAligned: Bool = false
     )
         -> MLXFast.MLXFastKernel
     {
@@ -101,6 +102,7 @@ final class JANGHPrefillKernel {
         let key =
             "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
             + (tileRows == 64 ? "" : "_m\(tileRows)") + (fused ? activation.nameTag : "")
+            + (expertAligned ? "_et" : "")
         lock.lock()
         defer { lock.unlock() }
         if let value = kernels[key] { return value }
@@ -111,15 +113,17 @@ final class JANGHPrefillKernel {
                 threadgroup \(type) Wg[64 * PAD];
                 threadgroup \(type) Wu[\(fused ? 64 : 1) * PAD];
                 tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate), \(tileRows)>(
-                    x,wg,sg,wu,su,indices,y,meta[0],meta[1],meta[2],meta[3],lim[0],Wg,Wu,
+                    x,wg,sg,wu,su,indices,y,meta[0],meta[1],meta[2],meta[3],lim[0],\(expertAligned ? "expert_offsets,tile_offsets,meta[4]," : "")Wg,Wu,
                     threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
+            var naxSrc = JANGHPrefillSource.nax(activation: activation)
+            if expertAligned { naxSrc = JANGTPrefillKernel.expertAlignedSource(naxSrc) }
             value = MLXFast.metalKernel(
                 name: "jangh_prefill_" + key,
-                inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"],
+                inputNames: ["x", "wg", "sg", "wu", "su", "indices", "meta", "lim"]
+                    + (expertAligned ? ["expert_offsets", "tile_offsets"] : []),
                 outputNames: ["y"], source: source,
-                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader
-                    + JANGHPrefillSource.nax(activation: activation),
+                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader + naxSrc,
                 ensureRowContiguous: false)
         } else {
             let source = """
@@ -185,7 +189,8 @@ final class JANGHPrefillKernel {
     func projectSorted(
         _ input: MLXArray, packed: MLXArray, scales: MLXArray, indices: MLXArray,
         upPacked: MLXArray? = nil, upScales: MLXArray? = nil,
-        limit: Float? = nil, rotateOutput: Bool = false, backend: Backend? = nil
+        limit: Float? = nil, rotateOutput: Bool = false, backend: Backend? = nil,
+        plan: JANGTPrefillKernel.ExpertTilePlan? = nil
     ) throws -> MLXArray {
         guard input.ndim == 2, input.dim(0) > 0, input.dim(1) > 0,
             input.dim(1).isMultiple(of: 64), [.float16, .bfloat16, .float32].contains(input.dtype),
@@ -213,7 +218,9 @@ final class JANGHPrefillKernel {
         // tiled helper requires device pointers for its index vector.
         let idx = contiguous(indices.size < 8
             ? concatenated([indices, broadcast(indices[(indices.size - 1)...], to: [8 - indices.size])]) : indices)
-        let metadata = MLXArray([Int32(m), Int32(n), Int32(k), Int32(experts)])
+        let activePlan = (selected == .nax && experts > 1) ? plan : nil
+        let metadata = MLXArray([Int32(m), Int32(n), Int32(k), Int32(experts)]
+            + (activePlan.map { [Int32($0.segments)] } ?? []))
         func deviceArray(_ array: MLXArray) -> MLXArray {
             array.size < 8 ? concatenated([array.flattened(), MLXArray.zeros([8 - array.size], dtype: array.dtype)]) : array
         }
@@ -221,13 +228,14 @@ final class JANGHPrefillKernel {
             let inputs = [
                 x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed),
                 deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0]),
-            ]
+            ] + (activePlan.map { [$0.starts, $0.tiles] } ?? [])
             func run(_ tileRows: Int) -> MLXArray {
                 let threads = tileRows == 16 ? 64 : 128
+                let gridY = (m + tileRows - 1) / tileRows + (activePlan?.segments ?? 0)
                 return kernel(
                     dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput,
-                    width: bits, tileRows: tileRows)(
-                        inputs, grid: (((n + 63) / 64) * threads, (m + tileRows - 1) / tileRows, 1),
+                    width: bits, tileRows: tileRows, expertAligned: activePlan != nil)(
+                        inputs, grid: (((n + 63) / 64) * threads, gridY, 1),
                         threadGroup: (threads, 1, 1), outputShapes: [[m, n]],
                         outputDTypes: [input.dtype])[0]
             }

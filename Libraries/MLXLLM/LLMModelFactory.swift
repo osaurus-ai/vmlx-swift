@@ -1867,6 +1867,9 @@ public final class LLMModelFactory: ModelFactory {
         let inklingJANGHPreparation = try Inkling2LoopJANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let inklingJANGHPreparation { configData = inklingJANGHPreparation.ordinaryConfiguration }
+        let ernieJANGHPreparation = try Ernie55JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let ernieJANGHPreparation { configData = ernieJANGHPreparation.ordinaryConfiguration }
 
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
@@ -1875,7 +1878,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, ricursiveJANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, inklingJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if flintJANGHPreparation == nil, jangHPreparation == nil, k2JANGHPreparation == nil, ricursiveJANGHPreparation == nil, lfmJANGHPreparation == nil, nemotronJANGHPreparation == nil, dsv41JANGHPreparation == nil, miniMaxM3JANGHPreparation == nil, inklingJANGHPreparation == nil, ernieJANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -2075,7 +2078,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil {
+        if flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil && ernieJANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -2161,6 +2164,8 @@ public final class LLMModelFactory: ModelFactory {
                 model = try miniMaxM3JANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else if let inklingJANGHPreparation {
                 model = try inklingJANGHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let ernieJANGHPreparation {
+                model = try ernieJANGHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: configData, modelType: baseConfig.modelType,
@@ -2168,7 +2173,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil || inklingJANGHPreparation != nil { throw error }
+            if flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil || miniMaxM3JANGHPreparation != nil || inklingJANGHPreparation != nil || ernieJANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2358,19 +2363,23 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
+            quantization: ernieJANGHPreparation != nil ? Ernie55Model.fp8Quantization : (jangConfig != nil || flintJANGHPreparation != nil || jangHPreparation != nil || k2JANGHPreparation != nil || ricursiveJANGHPreparation != nil || lfmJANGHPreparation != nil || nemotronJANGHPreparation != nil || dsv41JANGHPreparation != nil
                 || miniMaxM3JANGHPreparation != nil || inklingJANGHPreparation != nil
-                ? baseConfig.quantizationContainer?.quantization : nil,
+                ? baseConfig.quantizationContainer?.quantization : nil),
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
-            perLayerQuantization: baseConfig.perLayerQuantization,
+            perLayerQuantization: ernieJANGHPreparation == nil ? baseConfig.perLayerQuantization : nil,
             jangConfig: flintJANGHPreparation == nil && jangHPreparation == nil && k2JANGHPreparation == nil && ricursiveJANGHPreparation == nil && lfmJANGHPreparation == nil && nemotronJANGHPreparation == nil && dsv41JANGHPreparation == nil
-                && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil ? jangConfig : nil,
+                && miniMaxM3JANGHPreparation == nil && inklingJANGHPreparation == nil && ernieJANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
-        let tokenizer = try await tokenizerTask
+        (model as? Ernie55Model)?.prepareDecode()
+
+        let loadedTokenizer = try await tokenizerTask
+        let tokenizer: any Tokenizer = ernieJANGHPreparation != nil
+            ? Ernie55ChatTokenizer(base: loadedTokenizer) : loadedTokenizer
 
         let messageGenerator =
             if let model = model as? LLMModel {

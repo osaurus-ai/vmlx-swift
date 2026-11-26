@@ -70,8 +70,11 @@ final class JANGHWeightedDownKernel {
 
                     for (uint r = 0; r < 4; ++r) {
                         float dot = simd_sum(accum[r]);
-                        if (row0 + r < N)
-                            total[r] += scores[dispatch] * dot * float(scales[size_t(expert) * N + row0 + r]);
+                        if (row0 + r < N) {
+                            float projected = dot * float(scales[size_t(expert) * N + row0 + r]);
+                            if (ROUND_BF16) projected = float(bfloat16_t(projected));
+                            total[r] += scores[dispatch] * projected;
+                        }
                     }
                 }
                 if (lane == 0) for (uint r = 0; r < 4; ++r)
@@ -86,7 +89,7 @@ final class JANGHWeightedDownKernel {
     func projectPreparedHidden(
         _ hidden: MLXArray, preparedBasis: JANGHFormatContract.Rotation,
         packed: MLXArray, scales: MLXArray, indices: MLXArray, scores: MLXArray,
-        outputDType: DType
+        outputDType: DType, roundRouteToBFloat16: Bool = false
     ) throws -> MLXArray {
         guard preparedBasis == inputRotation,
             hidden.ndim == 2, hidden.dtype == .float32,
@@ -123,6 +126,7 @@ final class JANGHWeightedDownKernel {
                 ("T", outputDType), ("H", h), ("N", n), ("EXPERTS", experts),
                 ("ROUTES", indices.dim(1)),
                 ("WORDS", width.partialValue / 32),
+                ("ROUND_BF16", roundRouteToBFloat16),
             ],
             grid: (64, (n + 7) / 8, indices.dim(0)), threadGroup: (64, 1, 1),
             outputShapes: [[indices.dim(0), n]], outputDTypes: [outputDType])[0]

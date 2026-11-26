@@ -264,3 +264,35 @@ extension MambaCache: SpeculativeCheckpointCache {
         offset = c.offset
     }
 }
+
+extension CacheList: SpeculativeCheckpointCache {
+    private struct Checkpoint {
+        let children: [(cache: any SpeculativeCheckpointCache, state: Any)]
+    }
+
+    public var speculativeCheckpointIsExact: Bool {
+        type(of: self) == CacheList.self
+            && !caches.isEmpty
+            && caches.allSatisfy {
+                ($0 as? any SpeculativeCheckpointCache)?.speculativeCheckpointIsExact == true
+            }
+    }
+
+    public func speculativeCheckpoint() -> Any {
+        Checkpoint(children: caches.map { child in
+            guard let c = child as? any SpeculativeCheckpointCache else {
+                preconditionFailure("CacheList: child does not support speculativeCheckpoint")
+            }
+            return (c, c.speculativeCheckpoint())
+        })
+    }
+
+    public func restoreSpeculativeCheckpoint(_ checkpoint: Any) {
+        guard let c = checkpoint as? Checkpoint, c.children.count == caches.count else {
+            preconditionFailure("CacheList: foreign speculative checkpoint")
+        }
+        for child in c.children {
+            child.cache.restoreSpeculativeCheckpoint(child.state)
+        }
+    }
+}

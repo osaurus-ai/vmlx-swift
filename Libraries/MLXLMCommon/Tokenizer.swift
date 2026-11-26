@@ -39,6 +39,8 @@ public protocol Tokenizer: Sendable {
     var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { get }
 
     func encode(text: String, addSpecialTokens: Bool) -> [Int]
+    /// Optional encoding for models that separate literal text from trusted control markers.
+    func encodeOrdinaryText(_ text: String) throws -> [Int]
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String
     func convertTokenToId(_ token: String) -> Int?
     func convertIdToToken(_ id: Int) -> String?
@@ -52,6 +54,12 @@ public protocol Tokenizer: Sendable {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int]
+}
+
+public extension Tokenizer {
+    func encodeOrdinaryText(_ text: String) throws -> [Int] {
+        throw TokenizerError.missingChatTemplate
+    }
 }
 
 /// Optional tokenizer capability for rendering the same chat template with

@@ -713,7 +713,11 @@ public enum TQDiskSerializer {
         }
 
         result["dsv4_\(i)_keys"] = state[0]
-        result["dsv4_\(i)_values"] = state[1]
+        if dsv4.sharesLocalKeysAndValues {
+            result["__dsv4_\(i)_shared_local__"] = metaInt32(1)
+        } else {
+            result["dsv4_\(i)_values"] = state[1]
+        }
         result["__dsv4_\(i)_meta__"] = MLXArray([
             keep, maxSize, step, offset, idx,
             Int32(dsv4.compressRatio),
@@ -1033,6 +1037,7 @@ public enum TQDiskSerializer {
     public struct DeepseekV4LayerComponents {
         public let keys: MLXArray
         public let values: MLXArray
+        public let sharesLocalKeysAndValues: Bool
         public let keep: Int
         public let maxSize: Int
         public let step: Int
@@ -1699,12 +1704,21 @@ public enum TQDiskSerializer {
         from arrays: [String: MLXArray]
     ) -> DeepseekV4LayerComponents? {
         guard let keys = arrays["dsv4_\(i)_keys"],
-              let values = arrays["dsv4_\(i)_values"],
               let metaArr = arrays["__dsv4_\(i)_meta__"]
         else { return nil }
         guard !metaArr.shape.isEmpty, metaArr.shape[0] == 7 else { return nil }
         let m = metaArr.asArray(Int32.self)
         guard m.count == 7 else { return nil }
+
+        let sharedMarker = arrays["__dsv4_\(i)_shared_local__"]
+        let values: MLXArray
+        if let sharedMarker {
+            guard readMetaInt32(sharedMarker) == 1, arrays["dsv4_\(i)_values"] == nil else { return nil }
+            values = keys.reshaped(keys.shape)
+        } else {
+            guard let stored = arrays["dsv4_\(i)_values"] else { return nil }
+            values = stored
+        }
 
         let nilMask = arrays["__dsv4_\(i)_nilmask__"]?.asArray(Int32.self)
 
@@ -1802,7 +1816,7 @@ public enum TQDiskSerializer {
         }
 
         var components = DeepseekV4LayerComponents(
-            keys: keys, values: values,
+            keys: keys, values: values, sharesLocalKeysAndValues: sharedMarker != nil,
             keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
             offset: Int(m[3]), idx: Int(m[4]),
             compressRatio: Int(m[5]),

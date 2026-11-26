@@ -157,6 +157,8 @@ public enum JANGTActivation: Sendable, Equatable {
     /// Inkling-2 (`inkling2` / `inkling2_loop`): h = softcap(g, gateCap) * sigmoid(g) * softcap(u, upCap) with
     /// softcap(x, c) = tanh(x / c) * c; the sigmoid sees the RAW gate. Inkling-2-Mini: caps 4 and 25, no limit.
     case inkling(gateCap: Float, upCap: Float)
+    /// ERNIE W4A8 rounds each expert projection to BF16 before SiTU.
+    case ernie55(gateCap: Float, upCap: Float)
 
     /// Metal float expression of h from the (already clamped) `g` / `u`. `.silu` is the exact expression the kernels
     /// carried before the variants existed, so their generated source is unchanged; `.oai` writes alpha by its float32
@@ -167,6 +169,9 @@ public enum JANGTActivation: Sendable, Equatable {
             return "(\(g) / (1.0f + metal::fast::exp(-\(g)))) * \(u)"
         case .oai(let alpha):
             return "(\(g) / (1.0f + metal::fast::exp(-(as_type<float>(\(alpha.bitPattern)u) * \(g))))) * (\(u) + 1.0f)"
+        case .ernie55(let gc, let uc):
+            return JANGTActivation.inkling(gateCap: gc, upCap: uc).metalValue(
+                g: "float(bfloat16_t(\(g)))", u: "float(bfloat16_t(\(u)))")
         case .inkling(let gc, let uc):
             let gcs = "as_type<float>(\(gc.bitPattern)u)", ucs = "as_type<float>(\(uc.bitPattern)u)"
             return "(metal::precise::tanh(\(g) / \(gcs)) * \(gcs)) * (1.0f / (1.0f + metal::precise::exp(-\(g))))"
@@ -180,6 +185,8 @@ public enum JANGTActivation: Sendable, Equatable {
         switch self {
         case .silu: return ""
         case .oai(let alpha): return "_oai\(String(alpha.bitPattern, radix: 16))"
+        case .ernie55(let gc, let uc):
+            return "_ernie55\(String(gc.bitPattern, radix: 16))_\(String(uc.bitPattern, radix: 16))"
         case .inkling(let gc, let uc):
             return "_ink\(String(gc.bitPattern, radix: 16))_\(String(uc.bitPattern, radix: 16))"
         }
@@ -195,6 +202,9 @@ public enum JANGTActivation: Sendable, Equatable {
         switch self {
         case .silu: return g * sigmoid(g) * u
         case .oai(let alpha): return g * sigmoid(alpha * g) * (u + 1)
+        case .ernie55(let gc, let uc):
+            return JANGTActivation.inkling(gateCap: gc, upCap: uc)(
+                gate: g.asType(.bfloat16).asType(.float32), up: u.asType(.bfloat16).asType(.float32), limit: 0)
         case .inkling(let gc, let uc): return tanh(g / gc) * gc * sigmoid(g) * (tanh(u / uc) * uc)
         }
     }

@@ -2635,6 +2635,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 logger.info("dSpark head not attached: this model does not use one")
             }
         } catch {
+            NSLog("[dSpark] head failed to load from \(directory.path): \(error)")
             logger.error(
                 "dSpark head failed to load from \(directory.path, privacy: .public) (decoding autoregressively): \(error.localizedDescription, privacy: .public)"
             )

@@ -12,19 +12,35 @@ enum JANGHDecodeQDot {
         var lines = ["{", "uint qbase = ((\(columnBase)) * \(bits)u) >> 5u;", "auto qwords = \(packed) + \(rowBase) + qbase;"]
         let units = bits == 3 ? 2 : 16 * bits / 32
         for word in 0 ..< units { lines.append("uint qw\(word) = uint(qwords[\(word)]);") }
+        let useLUT = bits <= 4
+        if useLUT {
+            let count = 1 << bits
+            let center = Float(count - 1) / 2
+            let table = (0 ..< count).map { code -> String in
+                let u = Float(code) - center
+                let level = u * alpha.addingProduct(beta, u * u)
+                return "as_type<float>(0x\(String(level.bitPattern, radix: 16))u)"
+            }.joined(separator: ", ")
+            lines.append("const float LV[\(count)] = {\(table)};")
+        }
         if bits == 3 {
-            // A16-value chunk starts at bit0 or16 of a UInt32 word and spans48bits.
-            // Two words suffice in either case; K%32 keeps the final pair in-row.
+            // A 16-value chunk starts at bit 0 or 16 of a UInt32 word and spans 48 bits.
+            // Realign into (a0, a1) once per lane to eliminate 16 branches in the inner loop.
             lines.append("uint qstart = ((\(columnBase)) * 3u) & 31u;")
+            lines.append("uint a0 = qstart == 0u ? qw0 : ((qw0 >> 16u) | (qw1 << 16u));")
+            lines.append("uint a1 = qstart == 0u ? qw1 : (qw1 >> 16u);")
         }
         for i in 0 ..< 16 {
             let code: String
             if bits == 3 {
-                // The branch avoids undefined shifts by32 and preserves small-buffer space.
-                lines.append("uint qb\(i) = qstart + \(i * 3)u;")
-                lines.append("uint qc\(i) = qb\(i) < 32u ? (qw0 >> qb\(i)) : (qw1 >> (qb\(i) - 32u));")
-                lines.append("if (qb\(i) > 29u && qb\(i) < 32u) qc\(i) |= qw1 << (32u - qb\(i));")
-                code = "qc\(i)"
+                let bit = i * 3
+                if bit + 3 <= 32 {
+                    code = bit == 0 ? "a0" : "(a0 >> \(bit)u)"
+                } else if bit >= 32 {
+                    code = bit == 32 ? "a1" : "(a1 >> \(bit - 32)u)"
+                } else {
+                    code = "((a0 >> \(bit)u) | (a1 << \(32 - bit)u))"
+                }
             } else {
                 let bit = i * bits, word = bit / 32, shift = bit % 32
                 var unpacked = "(qw\(word) >> \(shift)u)"
@@ -33,7 +49,12 @@ enum JANGHDecodeQDot {
                 }
                 code = unpacked
             }
-            lines.append("{ float u = float(\(code) & \((1 << bits) - 1)u) - \(Float((1 << bits) - 1) / 2)f; float level = u * fma(\(beta)f, u * u, \(alpha)f); \(accumulator) = fma(\(values)[\(i)], level, \(accumulator)); }")
+            let mask = (1 << bits) - 1
+            if useLUT {
+                lines.append("\(accumulator) = fma(\(values)[\(i)], LV[\(code) & \(mask)u], \(accumulator));")
+            } else {
+                lines.append("{ float u = float(\(code) & \(mask)u) - \(Float((1 << bits) - 1) / 2)f; float level = u * fma(\(beta)f, u * u, \(alpha)f); \(accumulator) = fma(\(values)[\(i)], level, \(accumulator)); }")
+            }
         }
         lines.append("}")
         return lines.joined(separator: "\n")

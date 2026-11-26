@@ -1179,6 +1179,13 @@ public func fromFP8(
     return MLXArray(result)
 }
 
+/// Encode float values as E4M3 bytes using MLX's rounding rules.
+public func toFP8(_ x: MLXArray, stream: StreamOrDevice = .default) -> MLXArray {
+    var result = mlx_array_new()
+    mlx_to_fp8(&result, x.ctx, stream.ctx)
+    return MLXArray(result)
+}
+
 /// Element-wise division.
 ///
 /// Divide two arrays with <doc:broadcasting>.

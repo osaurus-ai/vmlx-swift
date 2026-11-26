@@ -112,7 +112,10 @@ public final class JANGHModelPreparation {
     }
 
     public init(directory: URL, configuration: Data, sidecar: Data?,
-                layout: JANGHRoutedModelLayout) throws {
+                layout: JANGHRoutedModelLayout, allowsUnalignedResidentRegions: Bool = false) throws {
+        guard !allowsUnalignedResidentRegions || layout.modelType == "ernie5_5_moe" else {
+            throw JANGHFormatContract.ValidationError.invalid("Unaligned JANGH bank access requires a resident reader")
+        }
         // The generic loader treats these historical files as executable
         // codebook/overlay inputs. Never mix them with a custom-v2 bank owner.
         for legacyName in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
@@ -179,7 +182,8 @@ public final class JANGHModelPreparation {
         source = try JANGHMappedBanks.SourceLease(
             directory: directory, metadata: metadata, contract: partition.contract,
             dimensions: custom.filter { trellis[$0.key] == nil },
-            trellisDimensions: custom.filter { trellis[$0.key] != nil })
+            trellisDimensions: custom.filter { trellis[$0.key] != nil },
+            allowsUnalignedResidentRegions: allowsUnalignedResidentRegions)
         nativeRoutedModules = native
         hiddenSize = layout.hiddenSize
         intermediateSize = layout.intermediateSize
