@@ -476,10 +476,20 @@ final class Inkling2DynamicShortConv: Module {
 final class Inkling2RelLogits: Module {
     var proj: MLXArray
     let extent: Int
+    private var _projTBF16: MLXArray?
 
     init(dRel: Int, extent: Int) {
         proj = MLXArray.zeros([dRel, extent])
         self.extent = extent
+    }
+
+    func transposedBF16() -> MLXArray {
+        if let cached = _projTBF16, cached.dim(0) == proj.dim(1), cached.dim(1) == proj.dim(0) {
+            return cached
+        }
+        let t = MLX.contiguous(proj.T.asType(.bfloat16))
+        _projTBF16 = t
+        return t
     }
 }
 
@@ -755,6 +765,36 @@ final class Inkling2Attention: Module {
                 queries: q, keys: keys, values: values, scale: scale,
                 mask: .array(bias.asType(q.dtype)),
                 sinks: sinks.reshaped([nq]).asType(q.dtype))
+        } else if inklingUseKernels, B == 1, S <= 2048,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0"
+        {
+            // Fused maskT folds -sink into the relative bias so stock hardware MMA FlashAttention
+            // runs with zero sinks and without copying K/V to prepend a zero key or materializing
+            // takeAlong/broadcast/where intermediates. Always handles all 40 sliding visits (S <= 2047).
+            let sinks2D = MLX.contiguous(sinks.reshaped([T, nq]).asType(q.dtype))
+            let mask = Inkling2VerifyKernels.maskT(
+                [
+                    MLX.contiguous(r.reshaped([T, nq, dRel])), relLogits.proj, sinks2D,
+                    MLXArray([
+                        Int32(S), Int32(seen), Int32(kStart), Int32(0), Int32(nq),
+                        Int32(window ?? 0),
+                    ]),
+                ],
+                template: [("NATIVE_SINKS", false)],
+                grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
+                outputShapes: [[nq, T, S]], outputDTypes: [q.dtype])[0]
+            out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: values, scale: scale,
+                mask: .array(mask.reshaped([1, nq, T, S])),
+                sinks: MLXArray.zeros([nq], dtype: q.dtype))
+        } else if inklingUseKernels,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0",
+            let fused = Inkling2Kernels.prefillAttention(
+                q: q, k: keys, v: values, r: r, projT: relLogits.transposedBF16(),
+                sinks: sinks, seen: seen, kStart: kStart, window: window,
+                relExtent: relExtent, scale: scale)
+        {
+            out = fused
         } else {
             let qPos = MLXArray(Int32(seen) ..< Int32(seen + T))
             let kPos = MLXArray(Int32(kStart) ..< Int32(kStart + S))
@@ -1861,8 +1901,10 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
         // when every image is inside the restored cache prefix).
         let embeddings = try imageEmbeddings(ids: ids, image: input.image)
         let n = ids.dim(1)
-        let step = max(windowSize ?? 512, 1)
+        let requested = windowSize ?? 512
+        let step = max(requested == 512 && n > 512 ? 1024 : requested, 1)
         var offset = 0
+        var chunksRun = 0
         while n - offset > step {
             try Task.checkCancellation()
             _ = trunk(
@@ -1870,10 +1912,16 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
                 embeddings: embeddings?[0..., offset ..< (offset + step), 0...])
             MLX.eval(cache)
             offset += step
+            chunksRun += 1
             PrefillProgressReporter.reportCompletedUnits(offset)
-            MLX.Memory.clearCache()
+            if chunksRun % 4 == 0 {
+                MLX.Memory.clearCache()
+            }
         }
         let h = trunk(ids[0..., offset...], cache: cache, embeddings: embeddings?[0..., offset..., 0...])
+        if chunksRun > 0 {
+            MLX.Memory.clearCache()
+        }
         return .logits(LMOutput(logits: logits(h[0..., (h.dim(1) - 1)..., 0...])))
     }
 
@@ -2540,6 +2588,12 @@ extension Inkling2LoopModel: HiddenStateCaptureModel {
         let hidden = model.forward(
             inputs, cache: cache, capture: cap, recorder: recorder)
         let matchDecode = recorder != nil && model.usesMixedRoutedExperts
+        // DFlash 2 prefill (`recorder == nil`, multi-row) only consumes the final token's logits;
+        // slicing before the 201k-vocab `lm_head` + FP32 softcap skips (T-1) wasted vocab rows.
+        if recorder == nil, hidden.ndim == 3, hidden.dim(1) > 1 {
+            let lastRow = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+            return (logits(lastRow, matchDecode: false), cap?.values ?? [:])
+        }
         return (logits(hidden, matchDecode: matchDecode), cap?.values ?? [:])
     }
 }

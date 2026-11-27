@@ -334,4 +334,133 @@ struct Ernie55MathTests {
             #expect(restoredTail.rows.shape == [5, 24])
         }
     }
+
+    @Test("Fused sparse MLA indexer scores and sparse absorbed MLA prefill match dense reference")
+    func sparseMLALongContextPrefillMatchesReference() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(123)
+            let (B, H, T, S, D) = (1, 32, 16, 128, 128)
+            let q = (MLXRandom.normal([B, H, T, D]) * 0.2).asType(.bfloat16)
+            let k = (MLXRandom.normal([B, 1, S, D]) * 0.2).asType(.bfloat16)
+            let w = (MLXRandom.normal([B, T, H]) * 0.1).asType(.float32)
+            let gotScores = try #require(Ernie55Kernels.mlaIndexScores(q: q, k: k, weights: w))
+            let refDots = maximum(matmul(q, k.swappedAxes(-1, -2)), 0).asType(.float32)
+            let refScores = (refDots * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
+                .sum(axis: 1, keepDims: true)
+            eval(gotScores, refScores)
+            #expect(max(abs(gotScores - refScores)).item(Float.self) < 1e-2)
+
+            // Sparse absorbed MLA prefill with per-query selected indices including -1 masked slots.
+            let (NQ, latent, rope, M) = (16, 128, 64, 24)
+            let scale: Float = 1 / sqrt(Float(latent + rope))
+            let qAbs = (MLXRandom.normal([B, NQ, T, latent]) * 0.25).asType(.bfloat16)
+            let qPos = (MLXRandom.normal([B, NQ, T, rope]) * 0.25).asType(.bfloat16)
+            let kv = (MLXRandom.normal([B, 1, S, latent]) * 0.25).asType(.bfloat16)
+            let kPos = (MLXRandom.normal([B, 1, S, rope]) * 0.25).asType(.bfloat16)
+            let sinks = (MLXRandom.normal([NQ]) * 0.5).asType(.bfloat16)
+            var idxValues: [Int32] = []
+            idxValues.reserveCapacity(T * M)
+            for t in 0 ..< T {
+                for m in 0 ..< M {
+                    idxValues.append(m < 2 && t < 3 ? -1 : Int32((t * 7 + m * 5) % S))
+                }
+            }
+            let indices = MLXArray(idxValues, [B, 1, T, M])
+            let gotAttn = try #require(Ernie55Kernels.sparseMLAPrefill(
+                qAbs: qAbs, qPos: qPos, kv: kv, kPos: kPos,
+                indices: indices, sinks: sinks, scale: scale))
+
+            // Reference: explicit per-row gathered SDPA over the exact same indices.
+            var refRows: [MLXArray] = []
+            for t in 0 ..< T {
+                let rowIdx = indices[0, 0, t]
+                let valid = rowIdx .>= Int32(0)
+                let safe = maximum(rowIdx, Int32(0))
+                let kvRow = kv[0, 0, safe].reshaped([1, 1, M, latent])
+                let kpRow = kPos[0, 0, safe].reshaped([1, 1, M, rope])
+                let qA = qAbs[0..., 0..., t ..< (t + 1), 0...]
+                let qP = qPos[0..., 0..., t ..< (t + 1), 0...]
+                let pos = matmul(qP * scale, kpRow.swappedAxes(-1, -2))
+                let bias = `where`(valid.reshaped([1, 1, 1, M]), pos, MLXArray(-Float.infinity).asType(pos.dtype))
+                let a = MLXFast.scaledDotProductAttention(
+                    queries: qA, keys: kvRow, values: kvRow, scale: scale, mask: bias, sinks: sinks)
+                refRows.append(a)
+            }
+            let refAttn = concatenated(refRows, axis: 2)
+            eval(gotAttn, refAttn)
+            let maxDiff = max(abs(gotAttn.asType(.float32) - refAttn.asType(.float32))).item(Float.self)
+            #expect(maxDiff < 0.03, "sparseMLAPrefill maxDiff=\(maxDiff)")
+
+            // Exact 3-pass radix Top-K + recent window vs argPartition reference (including ties & edge N <= K).
+            let (topK, win, bigS) = (64, 16, 4096)
+            let bigScores = MLXRandom.normal([1, 1, 19, bigS]).asType(.float32)
+            // Test both T=1 (1024-thread TG) and T=19 (256-thread TG) and small startQPos (N <= K).
+            for (subT, startPos) in [(1, bigS - 1), (19, bigS - 19), (19, 30)] {
+                let sIn = bigScores[0..., 0..., ..<subT, 0...]
+                let gotIdx = try #require(Ernie55Kernels.mlaTopKSelect(
+                    scores: sIn, startQPos: startPos, topK: topK, window: win))
+                eval(gotIdx, sIn)
+                let idxArr = gotIdx.asArray(Int32.self)
+                let scoreArr = sIn.asArray(Float.self)
+                let strideM = topK + win
+                for row in 0 ..< subT {
+                    let qPos = startPos + row
+                    let nOlder = min(bigS, max(0, qPos - win + 1))
+                    let rowStart = row * strideM
+                    // Check recent window slots exactly.
+                    for wIdx in 0 ..< win {
+                        let expected = qPos - (win - 1) + wIdx
+                        let expVal = (expected >= 0 && expected < bigS) ? Int32(expected) : Int32(-1)
+                        #expect(idxArr[rowStart + topK + wIdx] == expVal)
+                    }
+                    // Check selected older set matches exact top-K cutoff.
+                    let picked = (0 ..< topK).map { Int(idxArr[rowStart + $0]) }
+                    if nOlder <= topK {
+                        for k in 0 ..< topK {
+                            #expect(picked[k] == (k < nOlder ? k : -1))
+                        }
+                    } else {
+                        #expect(Set(picked).count == topK)
+                        #expect(picked.allSatisfy { $0 >= 0 && $0 < nOlder })
+                        let rowScores = (0 ..< nOlder).map { scoreArr[row * bigS + $0] }
+                        let sortedDesc = rowScores.sorted(by: >)
+                        let kthVal = sortedDesc[topK - 1]
+                        let minPicked = picked.map { rowScores[$0] }.min()!
+                        #expect(minPicked >= kthVal, "minPicked=\(minPicked) < kthVal=\(kthVal)")
+                        // Every strictly-greater-than-kth index must be in picked.
+                        let pickedSet = Set(picked)
+                        for c in 0 ..< nOlder where rowScores[c] > kthVal {
+                            #expect(pickedSet.contains(c))
+                        }
+                    }
+                }
+            }
+
+            // Fused MMA HCA prefill matches reference SDPA over local window + completed pooled KV.
+            let (hcaNQ, hcaT, hcaD, hcaWin, hcaRatio) = (64, 37, 512, 16, 16)
+            let hcaOffset = 64
+            let hcaPrior = 16
+            let hcaPoolCount = (hcaOffset + hcaT) / hcaRatio
+            let hcaQ = (MLXRandom.normal([1, hcaNQ, hcaT, hcaD]) * 0.2).asType(.bfloat16)
+            let hcaLocal = (MLXRandom.normal([1, 1, hcaPrior + hcaT, hcaD]) * 0.2).asType(.bfloat16)
+            let hcaPool = (MLXRandom.normal([1, hcaPoolCount, hcaD]) * 0.2).asType(.bfloat16)
+            let hcaSinks = (MLXRandom.normal([hcaNQ]) * 0.5).asType(.bfloat16)
+            let hcaScale: Float = 1 / sqrt(Float(hcaD))
+            let gotHCA = try #require(Ernie55Kernels.hcaPrefillAttention(
+                q: hcaQ, localKV: hcaLocal, pooled: hcaPool, sinks: hcaSinks,
+                offset: hcaOffset, priorLocal: hcaPrior, window: hcaWin, ratio: hcaRatio, scale: hcaScale))
+            let qPosArr = MLXArray(Int32(hcaOffset) ..< Int32(hcaOffset + hcaT)).reshaped(hcaT, 1)
+            let kPosArr = MLXArray(Int32(hcaOffset - hcaPrior) ..< Int32(hcaOffset + hcaT)).reshaped(1, hcaPrior + hcaT)
+            let locMask = (kPosArr .<= qPosArr) & (kPosArr .> (qPosArr - Int32(hcaWin)))
+            let poolMask = Ernie55Math.hcaPoolMask(start: hcaOffset, length: hcaT, columns: hcaPoolCount, ratio: hcaRatio)
+            let fullMask = concatenated([locMask, poolMask], axis: -1)
+            let fullKV = concatenated([hcaLocal, hcaPool.expandedDimensions(axis: 1)], axis: 2)
+            let refHCA = MLXFast.scaledDotProductAttention(
+                queries: hcaQ, keys: fullKV, values: fullKV, scale: hcaScale,
+                mask: fullMask, sinks: hcaSinks)
+            eval(gotHCA, refHCA)
+            let hcaMaxDiff = max(abs(gotHCA.asType(.float32) - refHCA.asType(.float32))).item(Float.self)
+            #expect(hcaMaxDiff < 0.03, "hcaPrefillAttention maxDiff=\(hcaMaxDiff)")
+        }
+    }
 }
