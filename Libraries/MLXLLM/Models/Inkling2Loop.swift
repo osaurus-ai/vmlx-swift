@@ -476,10 +476,20 @@ final class Inkling2DynamicShortConv: Module {
 final class Inkling2RelLogits: Module {
     var proj: MLXArray
     let extent: Int
+    private var _projTBF16: MLXArray?
 
     init(dRel: Int, extent: Int) {
         proj = MLXArray.zeros([dRel, extent])
         self.extent = extent
+    }
+
+    func transposedBF16() -> MLXArray {
+        if let cached = _projTBF16, cached.dim(0) == proj.dim(1), cached.dim(1) == proj.dim(0) {
+            return cached
+        }
+        let t = MLX.contiguous(proj.T.asType(.bfloat16))
+        _projTBF16 = t
+        return t
     }
 }
 
@@ -755,6 +765,14 @@ final class Inkling2Attention: Module {
                 queries: q, keys: keys, values: values, scale: scale,
                 mask: .array(bias.asType(q.dtype)),
                 sinks: sinks.reshaped([nq]).asType(q.dtype))
+        } else if inklingUseKernels,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0",
+            let fused = Inkling2Kernels.prefillAttention(
+                q: q, k: keys, v: values, r: r, projT: relLogits.transposedBF16(),
+                sinks: sinks, seen: seen, kStart: kStart, window: window,
+                relExtent: relExtent, scale: scale)
+        {
+            out = fused
         } else {
             let qPos = MLXArray(Int32(seen) ..< Int32(seen + T))
             let kPos = MLXArray(Int32(kStart) ..< Int32(kStart + S))
@@ -1861,8 +1879,10 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
         // when every image is inside the restored cache prefix).
         let embeddings = try imageEmbeddings(ids: ids, image: input.image)
         let n = ids.dim(1)
-        let step = max(windowSize ?? 512, 1)
+        let requested = windowSize ?? 512
+        let step = max(requested == 512 && n > 512 ? 1024 : requested, 1)
         var offset = 0
+        var chunksRun = 0
         while n - offset > step {
             try Task.checkCancellation()
             _ = trunk(
@@ -1870,10 +1890,16 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
                 embeddings: embeddings?[0..., offset ..< (offset + step), 0...])
             MLX.eval(cache)
             offset += step
+            chunksRun += 1
             PrefillProgressReporter.reportCompletedUnits(offset)
-            MLX.Memory.clearCache()
+            if chunksRun % 4 == 0 {
+                MLX.Memory.clearCache()
+            }
         }
         let h = trunk(ids[0..., offset...], cache: cache, embeddings: embeddings?[0..., offset..., 0...])
+        if chunksRun > 0 {
+            MLX.Memory.clearCache()
+        }
         return .logits(LMOutput(logits: logits(h[0..., (h.dim(1) - 1)..., 0...])))
     }
 
@@ -2540,6 +2566,12 @@ extension Inkling2LoopModel: HiddenStateCaptureModel {
         let hidden = model.forward(
             inputs, cache: cache, capture: cap, recorder: recorder)
         let matchDecode = recorder != nil && model.usesMixedRoutedExperts
+        // DFlash 2 prefill (`recorder == nil`, multi-row) only consumes the final token's logits;
+        // slicing before the 201k-vocab `lm_head` + FP32 softcap skips (T-1) wasted vocab rows.
+        if recorder == nil, hidden.ndim == 3, hidden.dim(1) > 1 {
+            let lastRow = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+            return (logits(lastRow, matchDecode: false), cap?.values ?? [:])
+        }
         return (logits(hidden, matchDecode: matchDecode), cap?.values ?? [:])
     }
 }

@@ -189,7 +189,7 @@ final class Ernie55HCAAttention: Module {
             let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
             let priorLocal = localKV.dim(2) - length
-            let subSize = 192
+            let subSize = pooled.dim(1) >= 2048 ? 128 : 192
             let scale: Float = 1 / sqrt(Float(shape.headWidth))
             var chunks: [MLXArray] = []
             chunks.reserveCapacity((length + subSize - 1) / subSize)
@@ -342,24 +342,68 @@ final class Ernie55MLAIndexer: Module {
             .reshaped(batch, length, heads, dimension).transposed(0, 2, 1, 3)
         let q = MLXFast.RoPE(
             projectedQ, dimensions: ropeWidth, traditional: false, base: theta, scale: 1, offset: offset)
-        let distances = MLXArray(Int32(0)..<Int32(columns)).expandedDimensions(axis: 0)
-            - MLXArray(Int32(columns - length)..<Int32(columns)).expandedDimensions(axis: 1)
-        let recent = (distances .<= 0) & (distances .> -window)
-        let older = distances .<= -window
         let headWeights = weights(x).asType(.float32) * (1 / sqrt(Float(heads * dimension)))
-        let dots = maximum(matmul(q, keys.swappedAxes(-1, -2)), 0).asType(.float32)
-        let scores = (dots * headWeights.transposed(0, 2, 1).expandedDimensions(axis: -1))
-            .sum(axis: 1, keepDims: true)
-        let valid = older & mask
-        let eligible = `where`(valid, scores, MLXArray(-Float.infinity))
-        let selected = argPartition(-eligible, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        let marked = putAlong(MLXArray.zeros(scores.shape, dtype: .bool), selected, values: MLXArray(true), axis: -1)
-        let sparse = ((marked & older) | recent) & mask
-        guard length == 1 else { return (sparse, nil, currentKeys) }
-        let recentIndices = broadcast(
-            MLXArray(Int32(columns - window)..<Int32(columns)).reshaped(1, 1, 1, window),
-            to: [batch, 1, 1, window])
-        return (sparse, concatenated([selected.asType(.int32), recentIndices], axis: -1), currentKeys)
+        if length == 1 {
+            let distances = MLXArray(Int32(0)..<Int32(columns)).expandedDimensions(axis: 0)
+                - MLXArray(Int32(columns - length)..<Int32(columns)).expandedDimensions(axis: 1)
+            let recent = (distances .<= 0) & (distances .> -window)
+            let older = distances .<= -window
+            let scores: MLXArray
+            if let fused = Ernie55Kernels.mlaIndexScores(q: q, k: keys, weights: headWeights) {
+                scores = fused
+            } else {
+                let dots = maximum(matmul(q, keys.swappedAxes(-1, -2)), 0).asType(.float32)
+                scores = (dots * headWeights.transposed(0, 2, 1).expandedDimensions(axis: -1))
+                    .sum(axis: 1, keepDims: true)
+            }
+            let valid = older & mask
+            let eligible = `where`(valid, scores, MLXArray(-Float.infinity))
+            let selected = argPartition(-eligible, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+            let marked = putAlong(MLXArray.zeros(scores.shape, dtype: .bool), selected, values: MLXArray(true), axis: -1)
+            let sparse = ((marked & older) | recent) & mask
+            let recentIndices = broadcast(
+                MLXArray(Int32(columns - window)..<Int32(columns)).reshaped(1, 1, 1, window),
+                to: [batch, 1, 1, window])
+            return (sparse, concatenated([selected.asType(.int32), recentIndices], axis: -1), currentKeys)
+        }
+        // Long-context prefill (columns > topK + window): sub-block query strips so score buffers stay
+        // bounded (<= ~64 MB even at 1M context) and return compact [B, 1, length, topK + window] indices.
+        let stripLen = max(1, min(length, 16_000_000 / max(columns, 1)))
+        let keyPositions = MLXArray(Int32(0)..<Int32(columns)).reshaped(1, 1, 1, columns)
+        let windowOffsets = MLXArray(Int32(1 - window)...Int32(0)).reshaped(1, 1, 1, window)
+        var stripIndices: [MLXArray] = []
+        stripIndices.reserveCapacity((length + stripLen - 1) / stripLen)
+        var subStart = 0
+        while subStart < length {
+            let subEnd = min(length, subStart + stripLen)
+            let subLen = subEnd - subStart
+            let qSub = q[0..., 0..., subStart ..< subEnd, 0...]
+            let wSub = headWeights[0..., subStart ..< subEnd, 0...]
+            let scores: MLXArray
+            if let fused = Ernie55Kernels.mlaIndexScores(q: qSub, k: keys, weights: wSub) {
+                scores = fused
+            } else {
+                let dots = maximum(matmul(qSub, keys.swappedAxes(-1, -2)), 0).asType(.float32)
+                scores = (dots * wSub.transposed(0, 2, 1).expandedDimensions(axis: -1))
+                    .sum(axis: 1, keepDims: true)
+            }
+            let qPos = MLXArray(Int32(columns - length + subStart)..<Int32(columns - length + subEnd))
+                .reshaped(1, 1, subLen, 1)
+            let olderLimit = qPos - Int32(window)
+            let older = keyPositions .<= olderLimit
+            let eligible = `where`(older, scores, MLXArray(-Float.infinity))
+            let rawSelected = argPartition(-eligible, kth: topK - 1, axis: -1)[.ellipsis, ..<topK].asType(.int32)
+            let validSelected = `where`(rawSelected .<= olderLimit, rawSelected, MLXArray(Int32(-1)))
+            let rawRecent = qPos + windowOffsets
+            let validRecent = `where`(rawRecent .>= Int32(0), rawRecent, MLXArray(Int32(-1)))
+            let combined = concatenated([validSelected, validRecent], axis: -1)
+            let bCombined = combined.dim(0) == batch
+                ? combined : broadcast(combined, to: [batch, 1, subLen, topK + window])
+            stripIndices.append(bCombined)
+            subStart = subEnd
+        }
+        let allIndices = stripIndices.count == 1 ? stripIndices[0] : concatenated(stripIndices, axis: 2)
+        return (mask, allIndices, currentKeys)
     }
 }
 
@@ -498,7 +542,8 @@ final class Ernie55MLAAttention: Module {
                 .mla(offset: offset, kv: currentKV, kPos: currentKPos, indexKeys: selection.currentKeys))
         }
         var mask = selection.mask
-        if let indices = selection.indices {
+        let sparseIndices = selection.indices
+        if length == 1, let indices = sparseIndices {
             let takeRows = indices[0..., 0..., 0, 0..., .newAxis]
             kv = takeAlong(kv, takeRows, axis: 2)
             kPos = takeAlong(kPos, takeRows, axis: 2)
@@ -511,7 +556,30 @@ final class Ernie55MLAAttention: Module {
         // Use absorbed MLA for 1-token decode and 2...16-row DSpark verify (same arithmetic, avoids expanding KV).
         let absorbed = length <= 16
         let out: MLXArray
-        if !absorbed && length >= 512 {
+        if length > 1, let indices = sparseIndices {
+            // Long-context sparse absorbed MLA prefill: each query attends only to its topK + window
+            // latent KV rows directly via Metal gather-attention — zero 16x KV expansion, zero O(L*S)
+            // positional bias matrix, constant memory and FLOPs per token up to 1M context.
+            let qAbs = matmul(qPlain, eqT)
+            if let fused = Ernie55Kernels.sparseMLAPrefill(
+                qAbs: qAbs, qPos: qPos, kv: kv, kPos: kPos,
+                indices: indices, sinks: typedSinks, scale: scale)
+            {
+                out = matmul(fused, uvT)
+            } else {
+                // CPU/fallback path: reconstruct dense sparse mask from selected indices.
+                let validIdx = maximum(indices, Int32(0))
+                let marked = putAlong(
+                    MLXArray.zeros([batch, 1, length, kv.dim(2)], dtype: .bool),
+                    validIdx, values: indices .>= Int32(0), axis: -1)
+                let sparseMask = marked & mask
+                let positions = matmul(qPos * scale, kPos.swappedAxes(-1, -2))
+                let bias = `where`(sparseMask, positions, MLXArray(-Float.infinity).asType(positions.dtype))
+                let attention = MLXFast.scaledDotProductAttention(
+                    queries: qAbs, keys: kv, values: kv, scale: scale, mask: bias, sinks: typedSinks)
+                out = matmul(attention, uvT)
+            }
+        } else if !absorbed && length >= 512 {
             // 512-strip chunked MLA prefill: avoids materializing O(L * S) [64, 2048, S] positional bias.
             let keys = matmul(kv, embedQuery)
             let values = matmul(kv, uvT)

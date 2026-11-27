@@ -334,4 +334,62 @@ struct Ernie55MathTests {
             #expect(restoredTail.rows.shape == [5, 24])
         }
     }
+
+    @Test("Fused sparse MLA indexer scores and sparse absorbed MLA prefill match dense reference")
+    func sparseMLALongContextPrefillMatchesReference() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(123)
+            let (B, H, T, S, D) = (1, 32, 16, 128, 128)
+            let q = (MLXRandom.normal([B, H, T, D]) * 0.2).asType(.bfloat16)
+            let k = (MLXRandom.normal([B, 1, S, D]) * 0.2).asType(.bfloat16)
+            let w = (MLXRandom.normal([B, T, H]) * 0.1).asType(.float32)
+            let gotScores = try #require(Ernie55Kernels.mlaIndexScores(q: q, k: k, weights: w))
+            let refDots = maximum(matmul(q, k.swappedAxes(-1, -2)), 0).asType(.float32)
+            let refScores = (refDots * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
+                .sum(axis: 1, keepDims: true)
+            eval(gotScores, refScores)
+            #expect(max(abs(gotScores - refScores)).item(Float.self) < 1e-2)
+
+            // Sparse absorbed MLA prefill with per-query selected indices including -1 masked slots.
+            let (NQ, latent, rope, M) = (16, 128, 64, 24)
+            let scale: Float = 1 / sqrt(Float(latent + rope))
+            let qAbs = (MLXRandom.normal([B, NQ, T, latent]) * 0.25).asType(.bfloat16)
+            let qPos = (MLXRandom.normal([B, NQ, T, rope]) * 0.25).asType(.bfloat16)
+            let kv = (MLXRandom.normal([B, 1, S, latent]) * 0.25).asType(.bfloat16)
+            let kPos = (MLXRandom.normal([B, 1, S, rope]) * 0.25).asType(.bfloat16)
+            let sinks = (MLXRandom.normal([NQ]) * 0.5).asType(.bfloat16)
+            var idxValues: [Int32] = []
+            idxValues.reserveCapacity(T * M)
+            for t in 0 ..< T {
+                for m in 0 ..< M {
+                    idxValues.append(m < 2 && t < 3 ? -1 : Int32((t * 7 + m * 5) % S))
+                }
+            }
+            let indices = MLXArray(idxValues, [B, 1, T, M])
+            let gotAttn = try #require(Ernie55Kernels.sparseMLAPrefill(
+                qAbs: qAbs, qPos: qPos, kv: kv, kPos: kPos,
+                indices: indices, sinks: sinks, scale: scale))
+
+            // Reference: explicit per-row gathered SDPA over the exact same indices.
+            var refRows: [MLXArray] = []
+            for t in 0 ..< T {
+                let rowIdx = indices[0, 0, t]
+                let valid = rowIdx .>= Int32(0)
+                let safe = maximum(rowIdx, Int32(0))
+                let kvRow = kv[0, 0, safe].reshaped([1, 1, M, latent])
+                let kpRow = kPos[0, 0, safe].reshaped([1, 1, M, rope])
+                let qA = qAbs[0..., 0..., t ..< (t + 1), 0...]
+                let qP = qPos[0..., 0..., t ..< (t + 1), 0...]
+                let pos = matmul(qP * scale, kpRow.swappedAxes(-1, -2))
+                let bias = `where`(valid.reshaped([1, 1, 1, M]), pos, MLXArray(-Float.infinity).asType(pos.dtype))
+                let a = MLXFast.scaledDotProductAttention(
+                    queries: qA, keys: kvRow, values: kvRow, scale: scale, mask: bias, sinks: sinks)
+                refRows.append(a)
+            }
+            let refAttn = concatenated(refRows, axis: 2)
+            eval(gotAttn, refAttn)
+            let maxDiff = max(abs(gotAttn.asType(.float32) - refAttn.asType(.float32))).item(Float.self)
+            #expect(maxDiff < 0.03, "sparseMLAPrefill maxDiff=\(maxDiff)")
+        }
+    }
 }

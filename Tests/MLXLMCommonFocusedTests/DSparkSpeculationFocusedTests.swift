@@ -775,6 +775,29 @@ struct DSparkSpeculationFocusedTests {
         #expect(seq2.suffix(20).filter { $0 == .spec }.count > 15)
     }
 
+    @Test("governor does not thrash into AR on stochastic sampled bursts when spec beats AR")
+    func governorDoesNotThrashOnStochasticSampledBursts() {
+        // Reproduces sampled ERNIE 5.5 DSpark (mean_emit ~3.6 at 52 ms = 14.4 ms/tok vs AR 22 ms/tok)
+        // with realistic stochastic runs of 1-token (0-accept) misses.
+        let pattern = [5, 1, 1, 6, 4, 1, 7, 1, 2, 5, 1, 1, 8, 3, 1, 4, 2, 6, 1, 5]
+        var g = DSparkGovernor()
+        var specSteps = 0, arSteps = 0, idx = 0
+        for _ in 0 ..< 400 {
+            switch g.choose() {
+            case .spec:
+                let emitted = pattern[idx % pattern.count]
+                idx += 1
+                g.record(.spec, seconds: 0.052, emitted: emitted)
+                specSteps += 1
+            case .ar:
+                g.record(.ar, seconds: 0.022, emitted: 1)
+                arSteps += 1
+            }
+        }
+        #expect(!g.arMode)
+        #expect(Double(specSteps) / Double(specSteps + arSteps) > 0.90, "spec=\(specSteps) ar=\(arSteps)")
+    }
+
     // MARK: TokenIterator integration
 
     @Test("TokenIterator with .dspark returns the AR tokens and leaves the cache at prompt + output")

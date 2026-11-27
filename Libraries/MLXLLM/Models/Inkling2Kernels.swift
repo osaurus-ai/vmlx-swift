@@ -509,4 +509,161 @@ enum Inkling2Kernels {
             outputShapes: [[rows, q.dim(0), H]],
             outputDTypes: [normWeight == nil ? .float32 : outDType])[0]
     }
+
+    // MARK: Fused zero-mask prefill attention (online softmax + relative bias + per-token sink)
+
+    /// Fused FlashAttention prefill for Inkling-2-Mini (D=128, DR=16, bfloat16).
+    /// Eliminates O(T * S) [B, NQ, T, S+1] mask materialization, `rel = r @ proj`, and the `zk` KV copy.
+    /// One threadgroup handles 1 KV head x GQA query heads x Q_ROWS query rows, sharing BK=16 K/V tiles
+    /// in 8 KB threadgroup memory. Supports sliding window (W > 0) and full attention (W == 0) up to 1M+.
+    static let prefillAttnKernel = MLXFast.metalKernel(
+        name: "inkling2_prefill_attn",
+        inputNames: ["q", "k", "v", "r", "projT", "sinks", "meta", "scaleArr"],
+        outputNames: ["out"],
+        source: """
+            constexpr int D = 128;
+            constexpr int DR = 16;
+            constexpr int BK = 16;
+            uint hkv = threadgroup_position_in_grid.x;
+            uint tBlock = threadgroup_position_in_grid.y * Q_ROWS;
+            uint b = threadgroup_position_in_grid.z;
+            uint tid = thread_position_in_threadgroup.x;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+            int NQ = q_shape[1];
+            int T = q_shape[2];
+            int NKV = k_shape[1];
+            int S = k_shape[2];
+            int seen = meta[0];
+            int kStart = meta[1];
+            int W = meta[2];
+            int E = meta[3];
+            float sc = scaleArr[0];
+
+            uint localT = sg / GQA;
+            uint localG = sg % GQA;
+            int t = int(tBlock + localT);
+            int h = int(hkv * GQA + localG);
+            bool activeQ = (t < T) && (h < NQ);
+
+            float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
+            float rVal = 0.f;
+            float m = -INFINITY;
+            float l = 1.0f;
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+
+            if (activeQ) {
+                size_t qBase = (((size_t)b * NQ + h) * T + t) * D;
+                q0 = float(q[qBase + lane]) * sc;
+                q1 = float(q[qBase + lane + 32]) * sc;
+                q2 = float(q[qBase + lane + 64]) * sc;
+                q3 = float(q[qBase + lane + 96]) * sc;
+                if (lane < (uint)DR) {
+                    rVal = float(r[(((size_t)b * T + t) * NQ + h) * DR + lane]);
+                }
+                m = float(sinks[((size_t)b * T + t) * NQ + h]);
+            }
+
+            int tFirst = int(tBlock);
+            int tLast = min(T - 1, int(tBlock) + Q_ROWS - 1);
+            int qPosMin = seen + tFirst;
+            int qPosMax = seen + tLast;
+            int jStart = (W > 0) ? max(0, qPosMin - W + 1 - kStart) : 0;
+            int jEnd = min(S, qPosMax - kStart + 1);
+
+            threadgroup bfloat16_t kTile[BK][D];
+            threadgroup bfloat16_t vTile[BK][D];
+            constexpr uint TG_THREADS = 32 * GQA * Q_ROWS;
+            size_t kvHeadBase = ((size_t)b * NKV + hkv) * S * D;
+
+            for (int jBase = jStart; jBase < jEnd; jBase += BK) {
+                int tileLen = min(BK, jEnd - jBase);
+                int totalElems = tileLen * D;
+                for (int idx = int(tid); idx < totalElems; idx += int(TG_THREADS)) {
+                    int jj = idx / D;
+                    int dd = idx % D;
+                    size_t src = kvHeadBase + (size_t)(jBase + jj) * D + dd;
+                    kTile[jj][dd] = k[src];
+                    vTile[jj][dd] = v[src];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (activeQ) {
+                    int qPos = seen + t;
+                    int tileMinDist = qPos - (kStart + jBase + tileLen - 1);
+                    int tileMaxDist = qPos - (kStart + jBase);
+                    bool tileHasRel = (tileMaxDist >= 0) && (tileMinDist < E);
+                    for (int jj = 0; jj < tileLen; ++jj) {
+                        int d = qPos - (kStart + jBase + jj);
+                        if (d < 0 || (W > 0 && d >= W)) continue;
+                        float dot = q0 * float(kTile[jj][lane])
+                                  + q1 * float(kTile[jj][lane + 32])
+                                  + q2 * float(kTile[jj][lane + 64])
+                                  + q3 * float(kTile[jj][lane + 96]);
+                        float score = simd_sum(dot);
+                        if (tileHasRel && d < E) {
+                            float rp = (lane < (uint)DR)
+                                ? (rVal * float(projT[(size_t)d * DR + lane])) : 0.f;
+                            float bias = float(bfloat16_t(simd_sum(rp)));
+                            score += bias;
+                        }
+                        float mNew = max(m, score);
+                        float alpha = exp(m - mNew);
+                        float p = exp(score - mNew);
+                        l = l * alpha + p;
+                        a0 = a0 * alpha + p * float(vTile[jj][lane]);
+                        a1 = a1 * alpha + p * float(vTile[jj][lane + 32]);
+                        a2 = a2 * alpha + p * float(vTile[jj][lane + 64]);
+                        a3 = a3 * alpha + p * float(vTile[jj][lane + 96]);
+                        m = mNew;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (activeQ) {
+                float invL = 1.0f / l;
+                size_t oBase = (((size_t)b * NQ + h) * T + t) * D;
+                out[oBase + lane] = bfloat16_t(a0 * invL);
+                out[oBase + lane + 32] = bfloat16_t(a1 * invL);
+                out[oBase + lane + 64] = bfloat16_t(a2 * invL);
+                out[oBase + lane + 96] = bfloat16_t(a3 * invL);
+            }
+            """)
+
+    static func prefillAttention(
+        q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray, projT: MLXArray, sinks: MLXArray,
+        seen: Int, kStart: Int, window: Int?, relExtent: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+            r.dtype == .bfloat16, projT.dtype == .bfloat16,
+            q.dim(3) == 128, r.dim(3) == 16
+        else { return nil }
+        let (B, NQ, T, D) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+        let NKV = k.dim(1)
+        guard NKV > 0, NQ % NKV == 0 else { return nil }
+        let gqa = NQ / NKV
+        let qRows = gqa <= 3 ? 4 : 2
+        guard gqa * qRows <= 16 else { return nil }
+        let tgThreads = 32 * gqa * qRows
+        let tBlocks = (T + qRows - 1) / qRows
+        let meta = MLXArray([Int32(seen), Int32(kStart), Int32(window ?? 0), Int32(relExtent)])
+        let scaleArr = MLXArray([scale])
+        return prefillAttnKernel(
+            [
+                MLX.contiguous(q), MLX.contiguous(k), MLX.contiguous(v),
+                MLX.contiguous(r), MLX.contiguous(projT),
+                MLX.contiguous(sinks.asType(.bfloat16)), meta, scaleArr,
+            ],
+            template: [("GQA", gqa), ("Q_ROWS", qRows)],
+            grid: (NKV * tgThreads, tBlocks, B),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[B, NQ, T, D]],
+            outputDTypes: [.bfloat16])[0]
+        #else
+        return nil
+        #endif
+    }
 }

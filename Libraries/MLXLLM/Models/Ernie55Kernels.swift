@@ -1376,4 +1376,222 @@ enum Ernie55Kernels {
         return nil
         #endif
     }
+
+    // MARK: Sparse MLA Long-Context Prefill (O(1) memory indexer + sparse absorbed MLA up to 1M+)
+
+    #if canImport(Metal)
+    /// Fused MLA indexer scores: `scores[b, 0, t, c] = sum_h w[b, t, h] * max(0, dot(q[b, h, t], k[b, 0, c]))`.
+    /// Keeps `q[b, :, t, :]` in threadgroup memory (8 KB at H=32, D=128) and streams keys in registers,
+    /// avoiding the O(H * T * S) FP32 intermediate (26.2 GB at 100K, 262 GB at 1M).
+    private static let mlaIndexScoresKernel = MLXFast.metalKernel(
+        name: "ernie55_mla_index_scores",
+        inputNames: ["q", "k", "w"],
+        outputNames: ["scores"],
+        source: """
+            constexpr int D = 128;
+            constexpr int KEYS_PER_TG = 64;
+            uint cBlock = threadgroup_position_in_grid.x;
+            uint t = threadgroup_position_in_grid.y;
+            uint b = threadgroup_position_in_grid.z;
+            uint tid = thread_position_in_threadgroup.x;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+            int T = q_shape[2];
+            int S = k_shape[2];
+
+            threadgroup bfloat16_t qTile[H][D];
+            threadgroup float wTile[H];
+            for (int idx = int(tid); idx < H * D; idx += 256) {
+                int h = idx / D;
+                int d = idx % D;
+                qTile[h][d] = q[(((size_t)b * H + h) * T + t) * D + d];
+            }
+            if (int(tid) < H) {
+                wTile[tid] = w[((size_t)b * T + t) * H + tid];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            int cBase = int(cBlock) * KEYS_PER_TG;
+            size_t kHeadBase = (size_t)b * S * D;
+            size_t outBase = ((size_t)b * T + t) * S;
+
+            for (int kk = int(sg); kk < KEYS_PER_TG; kk += 8) {
+                int c = cBase + kk;
+                if (c >= S) break;
+                size_t kOff = kHeadBase + (size_t)c * D;
+                float k0 = float(k[kOff + lane]);
+                float k1 = float(k[kOff + lane + 32]);
+                float k2 = float(k[kOff + lane + 64]);
+                float k3 = float(k[kOff + lane + 96]);
+                float total = 0.f;
+                for (int h = 0; h < H; ++h) {
+                    float dot = k0 * float(qTile[h][lane])
+                              + k1 * float(qTile[h][lane + 32])
+                              + k2 * float(qTile[h][lane + 64])
+                              + k3 * float(qTile[h][lane + 96]);
+                    float s = simd_sum(dot);
+                    if (s > 0.f) total += wTile[h] * s;
+                }
+                if (lane == 0) {
+                    scores[outBase + c] = total;
+                }
+            }
+            """)
+
+    /// Sparse absorbed MLA prefill over per-query selected key indices `[B, 1, T, M]`.
+    /// Each threadgroup handles HEADS_PER_TG query heads for one `(b, t)`, sharing BK=4 gathered
+    /// latent `kv[idx]` + `kPos[idx]` rows in 4.5 KB threadgroup memory. Zero 16x KV expansion
+    /// and zero O(T * S) positional bias allocation even at 1M context.
+    private static let sparseMLAPrefillKernel = MLXFast.metalKernel(
+        name: "ernie55_sparse_mla_prefill",
+        inputNames: ["qAbs", "qPos", "kv", "kPos", "indices", "sinks", "scaleArr"],
+        outputNames: ["out"],
+        source: """
+            constexpr int EL = LATENT / 32;
+            constexpr int RL = ROPE / 32;
+            constexpr int BK = 4;
+            constexpr uint TG_THREADS = 32 * HEADS_PER_TG;
+            uint hg = threadgroup_position_in_grid.x;
+            uint t = threadgroup_position_in_grid.y;
+            uint b = threadgroup_position_in_grid.z;
+            uint tid = thread_position_in_threadgroup.x;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint lane = thread_index_in_simdgroup;
+            int NQ = qAbs_shape[1];
+            int T = qAbs_shape[2];
+            int S = kv_shape[2];
+            int M = indices_shape[3];
+            float sc = scaleArr[0];
+            int h = int(hg * HEADS_PER_TG + sg);
+
+            float qa[EL];
+            float qp[RL];
+            float acc[EL];
+            size_t qAbsBase = (((size_t)b * NQ + h) * T + t) * LATENT;
+            size_t qPosBase = (((size_t)b * NQ + h) * T + t) * ROPE;
+            for (int e = 0; e < EL; ++e) {
+                qa[e] = float(qAbs[qAbsBase + lane + 32 * e]) * sc;
+                acc[e] = 0.f;
+            }
+            for (int r = 0; r < RL; ++r) {
+                qp[r] = float(qPos[qPosBase + lane + 32 * r]) * sc;
+            }
+            float m = float(sinks[h]);
+            float l = 1.0f;
+
+            threadgroup bfloat16_t kvTile[BK][LATENT];
+            threadgroup bfloat16_t kpTile[BK][ROPE];
+            threadgroup int idxTile[BK];
+            size_t idxBase = ((size_t)b * T + t) * M;
+            size_t kvBatchBase = (size_t)b * S * LATENT;
+            size_t kpBatchBase = (size_t)b * S * ROPE;
+
+            for (int mBase = 0; mBase < M; mBase += BK) {
+                int tileLen = min(BK, M - mBase);
+                if (int(tid) < tileLen) {
+                    idxTile[tid] = indices[idxBase + mBase + tid];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (int i = int(tid); i < tileLen * LATENT; i += int(TG_THREADS)) {
+                    int kk = i / LATENT;
+                    int d = i % LATENT;
+                    int kIdx = idxTile[kk];
+                    kvTile[kk][d] = (kIdx >= 0 && kIdx < S)
+                        ? kv[kvBatchBase + (size_t)kIdx * LATENT + d] : bfloat16_t(0.f);
+                }
+                for (int i = int(tid); i < tileLen * ROPE; i += int(TG_THREADS)) {
+                    int kk = i / ROPE;
+                    int d = i % ROPE;
+                    int kIdx = idxTile[kk];
+                    kpTile[kk][d] = (kIdx >= 0 && kIdx < S)
+                        ? kPos[kpBatchBase + (size_t)kIdx * ROPE + d] : bfloat16_t(0.f);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (int kk = 0; kk < tileLen; ++kk) {
+                    int kIdx = idxTile[kk];
+                    if (kIdx < 0 || kIdx >= S) continue;
+                    float dot = 0.f;
+                    for (int e = 0; e < EL; ++e) {
+                        dot += qa[e] * float(kvTile[kk][lane + 32 * e]);
+                    }
+                    for (int r = 0; r < RL; ++r) {
+                        dot += qp[r] * float(kpTile[kk][lane + 32 * r]);
+                    }
+                    float score = simd_sum(dot);
+                    float mNew = max(m, score);
+                    float alpha = exp(m - mNew);
+                    float p = exp(score - mNew);
+                    l = l * alpha + p;
+                    for (int e = 0; e < EL; ++e) {
+                        acc[e] = acc[e] * alpha + p * float(kvTile[kk][lane + 32 * e]);
+                    }
+                    m = mNew;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float invL = 1.0f / l;
+            for (int e = 0; e < EL; ++e) {
+                out[qAbsBase + lane + 32 * e] = bfloat16_t(acc[e] * invL);
+            }
+            """)
+    #endif
+
+    static func mlaIndexScores(q: MLXArray, k: MLXArray, weights: MLXArray) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            q.ndim == 4, k.ndim == 4, weights.ndim == 3,
+            q.dim(3) == 128, k.dim(1) == 1, k.dim(3) == 128,
+            q.dim(1) > 0, q.dim(1) <= 64
+        else { return nil }
+        let (B, H, T) = (q.dim(0), q.dim(1), q.dim(2))
+        let S = k.dim(2)
+        let cBlocks = (S + 63) / 64
+        return mlaIndexScoresKernel(
+            [contiguous(q.asType(.bfloat16)), contiguous(k.asType(.bfloat16)), contiguous(weights.asType(.float32))],
+            template: [("H", H)],
+            grid: (cBlocks * 256, T, B),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[B, 1, T, S]],
+            outputDTypes: [.float32])[0]
+        #else
+        return nil
+        #endif
+    }
+
+    static func sparseMLAPrefill(
+        qAbs: MLXArray, qPos: MLXArray, kv: MLXArray, kPos: MLXArray,
+        indices: MLXArray, sinks: MLXArray, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            qAbs.ndim == 4, qPos.ndim == 4, kv.ndim == 4, kPos.ndim == 4, indices.ndim == 4,
+            kv.dim(1) == 1, kPos.dim(1) == 1
+        else { return nil }
+        let (B, NQ, T, latent) = (qAbs.dim(0), qAbs.dim(1), qAbs.dim(2), qAbs.dim(3))
+        let rope = qPos.dim(3)
+        guard latent > 0, latent <= 512, latent % 32 == 0,
+            rope > 0, rope <= 128, rope % 32 == 0
+        else { return nil }
+        let headsPerTG = NQ % 8 == 0 ? 8 : (NQ % 4 == 0 ? 4 : 1)
+        let tgThreads = 32 * headsPerTG
+        let headGroups = NQ / headsPerTG
+        let scaleArr = MLXArray([scale])
+        return sparseMLAPrefillKernel(
+            [
+                contiguous(qAbs.asType(.bfloat16)), contiguous(qPos.asType(.bfloat16)),
+                contiguous(kv.asType(.bfloat16)), contiguous(kPos.asType(.bfloat16)),
+                contiguous(indices.asType(.int32)), contiguous(sinks.asType(.bfloat16)), scaleArr,
+            ],
+            template: [("LATENT", latent), ("ROPE", rope), ("HEADS_PER_TG", headsPerTG)],
+            grid: (headGroups * tgThreads, T, B),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[B, NQ, T, latent]],
+            outputDTypes: [.bfloat16])[0].asType(qAbs.dtype)
+        #else
+        return nil
+        #endif
+    }
 }

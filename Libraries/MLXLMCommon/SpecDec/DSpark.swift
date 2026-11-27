@@ -250,6 +250,9 @@ public struct DSparkGovernor: Sendable, Equatable {
     public let arProbeEvery: Int
     public let alpha: Double
     public let warmupSpec: Int
+    public let probeBurst: Int
+    public let arSwitchStreak: Int
+    public let arMargin: Double
 
     /// EMAs of one mode's seconds per step and tokens emitted per step.
     private struct Steps: Sendable, Equatable {
@@ -264,12 +267,22 @@ public struct DSparkGovernor: Sendable, Equatable {
     private var sinceAR = 0
     private var specStale = false
     private var nSpec = 0
+    private var probeRemaining = 0
+    private var probeSeconds = 0.0
+    private var probeTokens = 0.0
+    private var slowSpecStreak = 0
 
-    public init(probeEvery: Int = 16, arProbeEvery: Int = 64, alpha: Double = 0.3, warmupSpec: Int = 2) {
+    public init(
+        probeEvery: Int = 16, arProbeEvery: Int = 64, alpha: Double = 0.15, warmupSpec: Int = 2,
+        probeBurst: Int = 1, arSwitchStreak: Int = 2, arMargin: Double = 1.03
+    ) {
         self.probeEvery = Swift.max(1, probeEvery)
         self.arProbeEvery = Swift.max(1, arProbeEvery)
         self.alpha = alpha
         self.warmupSpec = warmupSpec
+        self.probeBurst = Swift.max(1, probeBurst)
+        self.arSwitchStreak = Swift.max(1, arSwitchStreak)
+        self.arMargin = Swift.max(1.0, arMargin)
     }
 
     /// Seconds per emitted token of speculative steps (nil until measured).
@@ -290,32 +303,74 @@ public struct DSparkGovernor: Sendable, Equatable {
         let tokens = Double(Swift.max(1, emitted))
         switch mode {
         case .spec:
+            nSpec += 1
+            if arMode {
+                probeSeconds += seconds
+                probeTokens += tokens
+                probeRemaining = Swift.max(0, probeRemaining - 1)
+                let burst = Steps(seconds: probeSeconds, tokens: probeTokens)
+                specSteps = burst
+                if let ar, burst.perToken < ar {
+                    specStale = false
+                    arMode = false
+                    probeRemaining = 0
+                    probeSeconds = 0
+                    probeTokens = 0
+                    slowSpecStreak = 0
+                    sinceAR += 1
+                } else if probeRemaining == 0 {
+                    specStale = false
+                    probeSeconds = 0
+                    probeTokens = 0
+                    sinceProbe = 0
+                }
+                return
+            }
             specSteps = ema(specSteps, seconds, tokens, replace: specStale)
             specStale = false
-            nSpec += 1
             sinceAR += 1
+            if let spec, let ar {
+                if spec >= ar * arMargin {
+                    slowSpecStreak += 1
+                    if slowSpecStreak >= arSwitchStreak {
+                        arMode = true
+                        sinceProbe = 0
+                        slowSpecStreak = 0
+                    }
+                } else {
+                    slowSpecStreak = 0
+                }
+            }
         case .ar:
             arSteps = ema(arSteps, seconds, tokens)
             sinceAR = 0
-            if arMode { sinceProbe += 1 }
-        }
-        if let spec, let ar {
-            let slower = spec >= ar
-            if slower && !arMode {
-                arMode = true
-                sinceProbe = 0
-            } else if !slower && arMode {
-                arMode = false
+            if arMode {
+                sinceProbe += 1
+            } else if let spec, let ar {
+                if spec >= ar * arMargin {
+                    slowSpecStreak += 1
+                    if slowSpecStreak >= arSwitchStreak {
+                        arMode = true
+                        sinceProbe = 0
+                        slowSpecStreak = 0
+                    }
+                } else {
+                    slowSpecStreak = 0
+                }
             }
         }
     }
 
     public mutating func choose() -> Mode {
         if arMode {
+            if probeRemaining > 0 { return .spec }
             if sinceProbe >= probeEvery {
                 sinceProbe = 0
                 specStale = true
-                return .spec  // probe
+                probeRemaining = probeBurst
+                probeSeconds = 0
+                probeTokens = 0
+                return .spec  // probe burst
             }
             return .ar
         }

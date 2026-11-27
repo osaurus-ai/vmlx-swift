@@ -1011,20 +1011,31 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let end = start + take
             let chunk = MLXArray(tokens[start ..< end].map { Int32($0) })
                 .reshaped(1, take)
+            // Skip capturing hidden layers on early chunks of a long prompt when every row in
+            // this chunk would be immediately evicted by `hiddenLimit` before the boundary/end.
+            let needCapture: Bool = {
+                guard let limit = hiddenLimit else { return true }
+                if let boundary = captureBoundaryAt, start < boundary, boundary - end <= limit {
+                    return true
+                }
+                return (tokens.count - end) <= limit
+            }()
             let (chunkLogits, captured) = target.callAsFunction(
-                chunk, cache: cache, captureLayerIDs: captureLayerIDs,
+                chunk, cache: cache, captureLayerIDs: needCapture ? captureLayerIDs : [],
                 recordPrefixCommitStates: false)
             logits = chunkLogits
-            let chunkHidden = extractContextFeature(
-                captured: captured, targetLayerIDs: orderedLayerIDs)
-            conditioning =
-                DFlash2PrefixContext.appending(
-                    chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
-                    to: conditioning, limit: hiddenLimit)
-                ?? DFlash2PrefixContext.appending(
-                    chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
-                    to: nil, limit: hiddenLimit)
-            retained = conditioning?.hidden
+            if needCapture {
+                let chunkHidden = extractContextFeature(
+                    captured: captured, targetLayerIDs: orderedLayerIDs)
+                conditioning =
+                    DFlash2PrefixContext.appending(
+                        chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
+                        to: conditioning, limit: hiddenLimit)
+                    ?? DFlash2PrefixContext.appending(
+                        chunkHidden, endingAt: initialOffset + end, layerIDs: orderedLayerIDs,
+                        to: nil, limit: hiddenLimit)
+                retained = conditioning?.hidden
+            }
             if end == captureBoundaryAt {
                 try Task.checkCancellation()
                 MLX.eval(cache)
