@@ -765,6 +765,28 @@ final class Inkling2Attention: Module {
                 queries: q, keys: keys, values: values, scale: scale,
                 mask: .array(bias.asType(q.dtype)),
                 sinks: sinks.reshaped([nq]).asType(q.dtype))
+        } else if inklingUseKernels, B == 1, S <= 4096,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0"
+        {
+            // Fused maskT folds -sink into the relative bias so stock hardware MMA FlashAttention
+            // runs with zero sinks and without copying K/V to prepend a zero key or materializing
+            // takeAlong/broadcast/where intermediates. Always handles all 40 sliding visits (S <= 2047).
+            let sinks2D = MLX.contiguous(sinks.reshaped([T, nq]).asType(q.dtype))
+            let mask = Inkling2VerifyKernels.maskT(
+                [
+                    MLX.contiguous(r.reshaped([T, nq, dRel])), relLogits.proj, sinks2D,
+                    MLXArray([
+                        Int32(S), Int32(seen), Int32(kStart), Int32(0), Int32(nq),
+                        Int32(window ?? 0),
+                    ]),
+                ],
+                template: [("NATIVE_SINKS", false)],
+                grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
+                outputShapes: [[nq, T, S]], outputDTypes: [q.dtype])[0]
+            out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: values, scale: scale,
+                mask: .array(mask.reshaped([1, nq, T, S])),
+                sinks: MLXArray.zeros([nq], dtype: q.dtype))
         } else if inklingUseKernels,
             ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0",
             let fused = Inkling2Kernels.prefillAttention(
