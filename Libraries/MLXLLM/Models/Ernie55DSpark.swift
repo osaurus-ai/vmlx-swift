@@ -155,6 +155,9 @@ final class Ernie55DSparkAttention: Module {
     @ParameterInfo(key: "o_group_weight") var groupedOutput: MLXArray
     @ParameterInfo(key: "o_group_scales") var groupedOutputScales: MLXArray
     @ParameterInfo(key: "attn_sink") var sinks: MLXArray
+    private var _attnSinkBF16: MLXArray?
+    private var _qbOGWeight: MLXArray?
+    private var _qbOGScales: MLXArray?
 
     init(shape: Ernie55AttentionShape, window: Int, outputGroups: Int, outputRank: Int) {
         self.shape = shape
@@ -178,13 +181,30 @@ final class Ernie55DSparkAttention: Module {
 
     func prepare() {
         virtualHeads.prepare()
+        let sinkBF16 = contiguous(sinks.asType(.bfloat16))
+        eval(sinkBF16)
+        _attnSinkBF16 = sinkBF16
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FUSE_PROJ"] != "0" else { return }
+        if _qbOGWeight == nil,
+            let qb = queryUp as? QuantizedLinear, qb.mode == .mxfp8, qb.bias == nil,
+            let og = gate as? QuantizedLinear, og.mode == .mxfp8, og.bias == nil,
+            qb.weight.dim(1) == og.weight.dim(1)
+        {
+            let w = contiguous(concatenated([qb.weight, og.weight], axis: 0))
+            let s = contiguous(concatenated([qb.scales, og.scales], axis: 0))
+            eval(w, s)
+            _qbOGWeight = w
+            _qbOGScales = s
+            Ernie55Kernels.releaseMXFP8(qb)
+            Ernie55Kernels.releaseMXFP8(og)
+        }
     }
 
     /// Committed context KV rows `[1, 1, C, headWidth]` rotated at positions `offset ..< offset + C`.
     func contextKV(_ context: MLXArray, rope: DeepseekV4RoPE, offset: Int) -> MLXArray {
         let count = context.dim(1)
         let phase = rope.cosSin(offset: offset, length: count)
-        let raw = DeepseekV41FP8Rows.apply(keyValue, context)
+        let raw = Ernie55Kernels.mxfp8Linear(keyValue, context)
         let normed = keyValueNorm(raw).expandedDimensions(axis: 1)
         return DeepseekV4Math.applyPartialRoPE(
             normed, cos: phase.cos, sin: phase.sin, ropeDim: shape.ropeWidth)
@@ -195,11 +215,22 @@ final class Ernie55DSparkAttention: Module {
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         let phase = rope.cosSin(offset: offset, length: length)
-        let queryRank = queryNorm(DeepseekV41FP8Rows.apply(queryDown, x))
-        let unrotated = DeepseekV41FP8Rows.apply(queryUp, queryRank)
-            .reshaped(batch, length, shape.heads, shape.headWidth)
+        let queryRank = queryNorm(Ernie55Kernels.mxfp8Linear(queryDown, x))
+        let rawQUp: MLXArray
+        let rawGate: MLXArray?
+        if let w = _qbOGWeight, let s = _qbOGScales {
+            let combined = Ernie55Kernels.mxfp8Rows(queryRank, weight: w, scales: s)
+                ?? quantizedMM(queryRank, w, scales: s, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            let qWidth = shape.heads * shape.headWidth
+            rawQUp = combined[.ellipsis, ..<qWidth]
+            rawGate = combined[.ellipsis, qWidth...]
+        } else {
+            rawQUp = Ernie55Kernels.mxfp8Linear(queryUp, queryRank)
+            rawGate = nil
+        }
+        let unrotated = rawQUp.reshaped(batch, length, shape.heads, shape.headWidth)
         let (q, ownKV) = prepareAttentionRows(
-            unrotated, rawKV: DeepseekV41FP8Rows.apply(keyValue, x), phase: phase)
+            unrotated, rawKV: Ernie55Kernels.mxfp8Linear(keyValue, x), phase: phase)
         let kv = contextKV.map { concatenated([$0, ownKV], axis: 2) } ?? ownKV
 
         var mask: MLXArray? = nil
@@ -213,9 +244,10 @@ final class Ernie55DSparkAttention: Module {
             }
         }
 
+        let typedSinks = (q.dtype == .bfloat16 ? _attnSinkBF16 : nil) ?? sinks.asType(q.dtype)
         let attended = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
-            mask: mask, sinks: sinks.asType(q.dtype))
+            mask: mask, sinks: typedSinks)
         let groups: MLXArray
         if batch == 1, let fusedGroups = Ernie55Kernels.invRoPEVHAGroup(
             attended, cos: phase.cos, sin: phase.sin, vhaMix: virtualHeads.mixMatrix,
@@ -231,7 +263,8 @@ final class Ernie55DSparkAttention: Module {
         let reducedGroups: MLXArray
         if groupedOutputScales.size > 0 {
             let g3 = groups.ndim == 3 ? groups : groups.squeezed(axis: 0)
-            let qOut = DeepseekV41FP8Rows.rows(g3, weight: groupedOutput, scales: groupedOutputScales)
+            let qOut = Ernie55Kernels.mxfp8Rows(g3, weight: groupedOutput, scales: groupedOutputScales)
+                ?? DeepseekV41FP8Rows.rows(g3, weight: groupedOutput, scales: groupedOutputScales)
                 ?? quantizedMM(g3, groupedOutput, scales: groupedOutputScales, biases: nil,
                                transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
             reducedGroups = qOut.transposed(1, 0, 2).reshaped(batch, length, outputGroups * outputRank)
@@ -240,8 +273,9 @@ final class Ernie55DSparkAttention: Module {
             reducedGroups = matmul(g4, groupedOutput.swappedAxes(-1, -2))
                 .transposed(0, 2, 1, 3).reshaped(batch, length, outputGroups * outputRank)
         }
-        let gated = reducedGroups * sigmoid(DeepseekV41FP8Rows.apply(gate, queryRank))
-        return DeepseekV41FP8Rows.apply(output, gated)
+        let gateInput = rawGate ?? Ernie55Kernels.mxfp8Linear(gate, queryRank)
+        let gated = reducedGroups * sigmoid(gateInput)
+        return Ernie55Kernels.mxfp8Linear(output, gated)
     }
 
     private func prepareAttentionRows(
@@ -276,7 +310,7 @@ final class Ernie55DSparkLayer: Module {
     @ModuleInfo(key: "attn_norm") var attentionNorm: RMSNorm
     @ModuleInfo(key: "ffn_norm") var feedForwardNorm: RMSNorm
 
-    init(_ c: Ernie55Configuration, routed: JANGTRoutedExpertLayer) {
+    init(_ c: Ernie55Configuration, routed: any Ernie55RoutedExperts) {
         _attn.wrappedValue = Ernie55DSparkAttention(
             shape: c.hcaShape, window: c.slidingWindow, outputGroups: c.oGroups,
             outputRank: c.oLoraRank)
@@ -290,6 +324,7 @@ final class Ernie55DSparkLayer: Module {
 
     func prepare() {
         attn.prepare()
+        moe.prepare()
     }
 
     func callAsFunction(
@@ -343,7 +378,8 @@ enum Ernie55DSparkFeatureProjection {
                 scaled, w, scales: s, biases: b, transpose: true,
                 groupSize: groupSize, bits: bits, mode: .affine)
         case .mxfp8(let w, let s):
-            return DeepseekV41FP8Rows.rows(features, weight: w, scales: s)
+            return Ernie55Kernels.mxfp8Rows(features, weight: w, scales: s)
+                ?? DeepseekV41FP8Rows.rows(features, weight: w, scales: s)
                 ?? quantizedMM(features, w, scales: s, biases: nil, transpose: true,
                                groupSize: 32, bits: 8, mode: .mxfp8)
         }
@@ -396,6 +432,8 @@ final class Ernie55DSparkHead: @unchecked Sendable {
     let embed: (MLXArray) -> MLXArray
     let rawHead: (MLXArray) -> MLXArray
     let multiMax: (MLXArray) -> MLXArray
+    let multiMaxRanges: MLXArray?
+    let multiMaxSlopes: MLXArray?
     let candidates: Int
 
     init(
@@ -407,6 +445,8 @@ final class Ernie55DSparkHead: @unchecked Sendable {
         embed: @escaping (MLXArray) -> MLXArray,
         rawHead: @escaping (MLXArray) -> MLXArray,
         multiMax: @escaping (MLXArray) -> MLXArray,
+        multiMaxRanges: MLXArray? = nil,
+        multiMaxSlopes: MLXArray? = nil,
         candidates: Int = Ernie55DSpark.markovCandidates
     ) {
         self.config = config
@@ -422,6 +462,8 @@ final class Ernie55DSparkHead: @unchecked Sendable {
         self.embed = embed
         self.rawHead = rawHead
         self.multiMax = multiMax
+        self.multiMaxRanges = multiMaxRanges
+        self.multiMaxSlopes = multiMaxSlopes
         self.candidates = candidates
     }
 
@@ -494,7 +536,26 @@ final class Ernie55DSparkHead: @unchecked Sendable {
         // For coupled sampled speculation (noise != nil), use a wider candidate set (or full vocab)
         // so Gumbel draws from the top-p nucleus are not clipped by a narrow greedy top-K.
         let effectiveCandidates = (noise != nil && candidates > 0) ? max(candidates, 256) : candidates
-        if effectiveCandidates > 0 && effectiveCandidates < vocab {
+        // Fast path for greedy full-vocab Markov selection (single fused 512x256 Metal kernel,
+        // matching vMLX Python `ernie_dspark_markov_argmax` with zero 201K-element intermediates).
+        if noise == nil, let ranges = multiMaxRanges, let slopes = multiMaxSlopes {
+            var previous = MLXArray(Int32(anchor))
+            for i in 0 ..< count {
+                let transition = markovEmbed[previous]
+                let token: MLXArray
+                if let fast = Ernie55Kernels.dsparkMarkovArgmax(
+                    baseRow: base[i], markovHead: markovHead, transition: transition,
+                    ranges: ranges, ts: slopes)
+                {
+                    token = fast
+                } else {
+                    let bias = matmul(markovHead, transition).asType(.float32)
+                    token = argMax(multiMax(base[i] + bias)).asType(.int32)
+                }
+                tokens.append(token.reshaped(1))
+                previous = token
+            }
+        } else if effectiveCandidates > 0 && effectiveCandidates < vocab {
             let k = effectiveCandidates
             let cand = argPartition(-base, kth: k - 1, axis: -1)[0..., ..<k]  // [count, K]
             let candBase = takeAlong(base, cand, axis: -1)  // [count, K]
@@ -540,7 +601,9 @@ extension Ernie55DSparkHead {
         directory: URL, targetConfig: Ernie55Configuration,
         embed: @escaping (MLXArray) -> MLXArray,
         rawHead: @escaping (MLXArray) -> MLXArray,
-        multiMax: @escaping (MLXArray) -> MLXArray
+        multiMax: @escaping (MLXArray) -> MLXArray,
+        multiMaxRanges: MLXArray? = nil,
+        multiMaxSlopes: MLXArray? = nil
     ) throws -> Ernie55DSparkHead {
         let cfg = try Ernie55DSparkConfig.decode(directory: directory, target: targetConfig)
         guard let cb = oddCubicCodebookParams[cfg.expertBits] else {
@@ -640,12 +703,155 @@ extension Ernie55DSparkHead {
         let markovEmbed = contiguous(try reqHead("markov_head.markov_w1.weight").transposed().asType(.bfloat16))
         let markovHead = contiguous(try reqHead("markov_head.markov_w2.weight").asType(.bfloat16))
         eval(hcHead, featureNorm, normWeight, markovEmbed, markovHead)
+        Memory.clearCache()
 
         return Ernie55DSparkHead(
             config: cfg, targetConfig: targetConfig, rope: rope, layers: layers, featureProj: featureProj,
             featureNorm: featureNorm, hcHead: hcHead, normWeight: normWeight,
             markovEmbed: markovEmbed, markovHead: markovHead,
-            embed: embed, rawHead: rawHead, multiMax: multiMax)
+            embed: embed, rawHead: rawHead, multiMax: multiMax,
+            multiMaxRanges: multiMaxRanges, multiMaxSlopes: multiMaxSlopes)
+    }
+
+    /// Loads an inline MXFP4 ERNIE 5.5 DSpark drafter (`model.mtp.{0..N-1}.*` + `model.mtp.{feature_*,
+    /// mhc_contract.*, norm.*, markov_head.*}`) directly from the bundle's `model.safetensors.index.json`
+    /// using uncached `ResidentSafetensorsReader` I/O on only the shards containing `model.mtp.*`.
+    static func loadInlineMXFP4(
+        directory: URL, targetConfig: Ernie55Configuration,
+        embed: @escaping (MLXArray) -> MLXArray,
+        rawHead: @escaping (MLXArray) -> MLXArray,
+        multiMax: @escaping (MLXArray) -> MLXArray,
+        multiMaxRanges: MLXArray? = nil,
+        multiMaxSlopes: MLXArray? = nil
+    ) throws -> Ernie55DSparkHead {
+        let configURL = directory.appendingPathComponent("config.json")
+        let configData = try Data(contentsOf: configURL)
+        guard let root = try JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
+            throw Ernie55DSparkConfig.LoadError.unexpected("config.json is not a JSON object")
+        }
+        let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
+        let indexData = try Data(contentsOf: indexURL)
+        guard let indexJSON = try JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+            let weightMap = indexJSON["weight_map"] as? [String: String]
+        else {
+            throw Ernie55DSparkConfig.LoadError.unexpected("invalid model.safetensors.index.json")
+        }
+
+        let blockSize = (root["dspark_block_size"] as? NSNumber)?.intValue ?? 7
+        let maskTokenId = (root["dspark_noise_token_id"] as? NSNumber)?.intValue ?? 1024
+        let rawFeatures = (root["dspark_target_layer_ids"] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue }
+            ?? [targetConfig.numHiddenLayers - 3, targetConfig.numHiddenLayers - 2, targetConfig.numHiddenLayers - 1]
+        let zeroBased = rawFeatures.map { $0 - 1 }
+        guard !zeroBased.isEmpty, zeroBased.allSatisfy({ (0 ..< targetConfig.numHiddenLayers).contains($0) }) else {
+            throw Ernie55DSparkConfig.LoadError.unexpected("invalid dspark_target_layer_ids \(rawFeatures)")
+        }
+
+        // Discover inline draft layer indices (e.g. model.mtp.0, model.mtp.1, model.mtp.2).
+        var layerSet = Set<Int>()
+        for key in weightMap.keys where key.hasPrefix("model.mtp.") {
+            let parts = key.split(separator: ".")
+            if parts.count > 3, let idx = Int(parts[2]) {
+                layerSet.insert(idx)
+            }
+        }
+        let layerIndices = layerSet.sorted()
+        guard !layerIndices.isEmpty else {
+            throw Ernie55DSparkConfig.LoadError.unexpected("no model.mtp.<N> layers in index")
+        }
+
+        let cfg = Ernie55DSparkConfig(
+            blockSize: blockSize, maskTokenId: maskTokenId, layers: layerIndices.count,
+            targetLayerIndices: zeroBased, experts: targetConfig.nRoutedExperts,
+            expertBits: 4, expertRotation: "none",
+            featureBits: 8, featureGroupSize: 32,
+            slidingWindow: targetConfig.slidingWindow, hiddenSize: targetConfig.hiddenSize,
+            vocabularySize: targetConfig.vocabSize)
+
+        let routedLayers = try Ernie55MXFP4Preparation.loadStackedMXFP4Experts(
+            directory: directory,
+            weightMap: weightMap,
+            layerPrefix: "model.mtp.",
+            layerIndices: layerIndices,
+            expertCount: targetConfig.nRoutedExperts,
+            hiddenSize: targetConfig.moeLatentSize,
+            intermediateSize: targetConfig.moeIntermediateSize)
+
+        // Load only non-expert model.mtp.* keys from the shards that contain them.
+        var shardWanted: [String: Set<String>] = [:]
+        for (key, shard) in weightMap where key.hasPrefix("model.mtp.") && !key.contains(".block_sparse_moe.experts.") {
+            shardWanted[shard, default: []].insert(key)
+        }
+        var shardAll: [String: Set<String>] = [:]
+        for (key, shard) in weightMap where shardWanted[shard] != nil {
+            shardAll[shard, default: []].insert(key)
+        }
+        var mtpRaw: [String: MLXArray] = [:]
+        for shard in shardWanted.keys.sorted() {
+            let excluded = (shardAll[shard] ?? []).subtracting(shardWanted[shard] ?? [])
+            let url = directory.appendingPathComponent(shard)
+            let (loaded, _) = try ResidentSafetensorsReader.loadWeights(url: url, excludingKeys: excluded)
+            for (k, v) in loaded { mtpRaw[k] = v }
+        }
+
+        let rope = DeepseekV4RoPE(
+            dim: targetConfig.qkRopeHeadDim, base: targetConfig.ropeTheta, factor: 1.0)
+        var layers: [Ernie55DSparkLayer] = []
+        layers.reserveCapacity(layerIndices.count)
+        for index in layerIndices {
+            guard let routed = routedLayers[index] else {
+                throw Ernie55DSparkConfig.LoadError.unexpected("missing routed MXFP4 experts for model.mtp.\(index)")
+            }
+            let layer = Ernie55DSparkLayer(targetConfig, routed: routed)
+            let mapped = sanitizeDraftLayer(mtpRaw, prefix: "model.mtp.\(index).", targetConfig: targetConfig)
+            quantize(model: layer) { path, module -> (groupSize: Int, bits: Int, mode: QuantizationMode)? in
+                guard module is Linear, mapped[path + ".scales"] != nil else { return nil }
+                return (32, 8, .mxfp8)
+            }
+            do {
+                try layer.update(parameters: ModuleParameters.unflattened(mapped), verify: .all)
+            } catch {
+                throw Ernie55DSparkConfig.LoadError.unexpected("inline MXFP4 draft layer \(index): \(error)")
+            }
+            layer.prepare()
+            eval(layer)
+            layers.append(layer)
+        }
+
+        func reqHead(_ suffix: String) throws -> MLXArray {
+            let key = "model.mtp." + suffix
+            guard let t = mtpRaw[key] else { throw Ernie55DSparkConfig.LoadError.missingTensor(key) }
+            return t
+        }
+        let (fw, fs) = Ernie55Model.unpackFP8(
+            try reqHead("feature_projection.weight"),
+            scale: try reqHead("feature_projection.weight_scale_inv"),
+            keepPacked: true)
+        guard let fs else {
+            throw Ernie55DSparkConfig.LoadError.unexpected("inline feature_projection must be exact MXFP8")
+        }
+        let featureProj = Ernie55DSparkFeatureProjection.mxfp8(weight: fw, scales: fs)
+
+        let hcHead = Ernie55HyperHead(targetConfig)
+        let hcParams: [String: MLXArray] = [
+            "fn": contiguous(try reqHead("mhc_contract.hc_head_fn").transposed().asType(.float32)),
+            "base": try reqHead("mhc_contract.hc_head_base").asType(.float32),
+            "scale": try reqHead("mhc_contract.hc_head_scale").reshaped(-1).asType(.float32),
+        ]
+        try hcHead.update(parameters: ModuleParameters.unflattened(hcParams), verify: .all)
+
+        let featureNorm = try reqHead("feature_norm.weight")
+        let normWeight = try reqHead("norm.weight")
+        let markovEmbed = contiguous(try reqHead("markov_head.markov_w1.weight").transposed().asType(.bfloat16))
+        let markovHead = contiguous(try reqHead("markov_head.markov_w2.weight").asType(.bfloat16))
+        eval(fw, fs, hcHead, featureNorm, normWeight, markovEmbed, markovHead)
+        Memory.clearCache()
+
+        return Ernie55DSparkHead(
+            config: cfg, targetConfig: targetConfig, rope: rope, layers: layers, featureProj: featureProj,
+            featureNorm: featureNorm, hcHead: hcHead, normWeight: normWeight,
+            markovEmbed: markovEmbed, markovHead: markovHead,
+            embed: embed, rawHead: rawHead, multiMax: multiMax,
+            multiMaxRanges: multiMaxRanges, multiMaxSlopes: multiMaxSlopes)
     }
 
     private static func sanitizeDraftLayer(
@@ -859,15 +1065,32 @@ extension Ernie55Model: DSparkSpeculativeModel {
         dsparkAttachLock.lock()
         defer { dsparkAttachLock.unlock() }
         if dsparkHead != nil { return true }
-        guard VMLXServerRuntimeSettings.declaresErnie55DSparkDrafter(directory) else { return false }
+        let isSidecar = VMLXServerRuntimeSettings.declaresErnie55DSparkDrafter(directory)
+        let isInline = !isSidecar && VMLXServerRuntimeSettings.declaresErnie55InlineDSparkDrafter(directory)
+        guard isSidecar || isInline else { return false }
         let start = Date()
-        let head = try Ernie55DSparkHead.load(
-            directory: directory, targetConfig: args,
-            embed: { [unowned self] ids in self.model.embedding(ids) },
-            rawHead: { [unowned self] h in self.projectLogits(h, applyMultiMax: false) },
-            multiMax: { [unowned self] logits in
-                Ernie55Math.multiMax(logits, ranges: self.logitRanges, slopes: self.logitSlopes)
-            })
+        let head: Ernie55DSparkHead
+        if isSidecar {
+            head = try Ernie55DSparkHead.load(
+                directory: directory, targetConfig: args,
+                embed: { [unowned self] ids in self.model.embedding(ids) },
+                rawHead: { [unowned self] h in self.projectLogits(h, applyMultiMax: false) },
+                multiMax: { [unowned self] logits in
+                    Ernie55Math.multiMax(logits, ranges: self.logitRanges, slopes: self.logitSlopes)
+                },
+                multiMaxRanges: self.logitRanges,
+                multiMaxSlopes: self.logitSlopes)
+        } else {
+            head = try Ernie55DSparkHead.loadInlineMXFP4(
+                directory: directory, targetConfig: args,
+                embed: { [unowned self] ids in self.model.embedding(ids) },
+                rawHead: { [unowned self] h in self.projectLogits(h, applyMultiMax: false) },
+                multiMax: { [unowned self] logits in
+                    Ernie55Math.multiMax(logits, ranges: self.logitRanges, slopes: self.logitSlopes)
+                },
+                multiMaxRanges: self.logitRanges,
+                multiMaxSlopes: self.logitSlopes)
+        }
         dsparkHead = head
         model.dsparkTailCapacity = head.config.slidingWindow
         model.dsparkTapLayers = head.config.targetLayerIndices

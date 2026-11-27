@@ -11,6 +11,11 @@ import MLXNN
 /// bundle, not load rotated weights as ordinary affine matrices.
 public protocol JangHadamardRuntimeModel: LanguageModel {
     func validateJangHadamardRuntime() throws
+    func prepareHadamardProjectionGroups()
+}
+
+extension JangHadamardRuntimeModel {
+    public func prepareHadamardProjectionGroups() {}
 }
 
 /// Validated Prism activation-basis contract. This is unrelated to JANGTQ's
@@ -156,7 +161,11 @@ extension JangLoader {
         let runtime = try runtimeContractMarkers(jang)
         let requiresTransform = try runtimeContractFlag(
             runtime, key: "requires_hadamard_activation_transform")
-        let usesPrismMTP = try runtimeContractFlag(runtime, key: "prism_mtp_v2_sidecar")
+        let usesPrismSidecar = try runtimeContractFlag(runtime, key: "prism_mtp_v2_sidecar")
+        let usesInlinePrismMTP = try runtimeContractFlag(runtime, key: "bundle_has_mtp")
+            && (jang["source_model"] as? [String: Any])?["model_type"] as? String
+                == prismHadamardModelType
+        let usesPrismMTP = usesPrismSidecar || usesInlinePrismMTP
         if usesPrismMTP {
             let source = jang["source_model"] as? [String: Any]
             guard requiresTransform, config["model_type"] as? String == "qwen3_5",
@@ -376,6 +385,126 @@ extension JangLoader {
     }
 }
 
+private enum JangHadamardFusedFWHT {
+    static let enabled = ProcessInfo.processInfo.environment["VMLX_FUSED_HADAMARD"] != "0"
+
+    #if canImport(Metal)
+    private static let fwhtKernel = MLXFast.metalKernel(
+        name: "vmlx_fused_hadamard_fwht",
+        inputNames: ["x", "signs"],
+        outputNames: ["out"],
+        source: """
+            // Fused sign-multiply + normalized Sylvester Walsh-Hadamard transform (block = 512 or 1024).
+            // TG size: BLOCK / 8 (128 for 1024, 64 for 512); 1 threadgroup per block, 1 TG barrier.
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint blk = threadgroup_position_in_grid.x;
+            const uint blk_in_row = blk % uint(BLOCKS_PER_ROW);
+            const size_t base = size_t(blk) * uint(BLOCK) + tid * 8u;
+            const uint s_base = blk_in_row * uint(BLOCK) + tid * 8u;
+            const float scale = (BLOCK == 1024) ? 0.03125f : 0.04419417382415922f;
+
+            float v[8];
+            #pragma clang loop unroll(full)
+            for (uint k = 0u; k < 8u; ++k) {
+                float val = float(x[base + k]);
+                if (!INVERSE) val *= signs[s_base + k];
+                v[k] = val;
+            }
+            // Stages 0..2: in-register 8-point FWHT (strides 1, 2, 4).
+            {
+                float a0 = v[0] + v[1], a1 = v[0] - v[1];
+                float a2 = v[2] + v[3], a3 = v[2] - v[3];
+                float a4 = v[4] + v[5], a5 = v[4] - v[5];
+                float a6 = v[6] + v[7], a7 = v[6] - v[7];
+                float b0 = a0 + a2, b1 = a1 + a3, b2 = a0 - a2, b3 = a1 - a3;
+                float b4 = a4 + a6, b5 = a5 + a7, b6 = a4 - a6, b7 = a5 - a7;
+                v[0] = b0 + b4; v[1] = b1 + b5; v[2] = b2 + b6; v[3] = b3 + b7;
+                v[4] = b0 - b4; v[5] = b1 - b5; v[6] = b2 - b6; v[7] = b3 - b7;
+            }
+            // Stages 3..7: intra-simdgroup 32-lane FWHT (strides 8, 16, 32, 64, 128).
+            #pragma clang loop unroll(full)
+            for (ushort mask = 1u; mask <= 16u; mask <<= 1u) {
+                const bool upper = (lane & mask) != 0u;
+                #pragma clang loop unroll(full)
+                for (uint k = 0u; k < 8u; ++k) {
+                    const float peer = simd_shuffle_xor(v[k], mask);
+                    v[k] = upper ? (peer - v[k]) : (v[k] + peer);
+                }
+            }
+            // Stages 8(..9): cross-simdgroup FWHT via single TG barrier.
+            threadgroup float sh[BLOCK];
+            const uint off = lane * 8u;
+            #pragma clang loop unroll(full)
+            for (uint k = 0u; k < 8u; ++k) {
+                sh[sg * 256u + off + k] = v[k];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (BLOCK == 1024) {
+                #pragma clang loop unroll(full)
+                for (uint k = 0u; k < 8u; ++k) {
+                    const float a0 = sh[off + k];
+                    const float a1 = sh[256u + off + k];
+                    const float a2 = sh[512u + off + k];
+                    const float a3 = sh[768u + off + k];
+                    const float b0 = a0 + a1;
+                    const float b1 = a0 - a1;
+                    const float b2 = a2 + a3;
+                    const float b3 = a2 - a3;
+                    float res = (sg == 0u) ? (b0 + b2)
+                              : (sg == 1u) ? (b1 + b3)
+                              : (sg == 2u) ? (b0 - b2)
+                              : (b1 - b3);
+                    res *= scale;
+                    if (INVERSE) res *= signs[s_base + k];
+                    out[base + k] = T(res);
+                }
+            } else {
+                #pragma clang loop unroll(full)
+                for (uint k = 0u; k < 8u; ++k) {
+                    const float a0 = sh[off + k];
+                    const float a1 = sh[256u + off + k];
+                    float res = (sg == 0u) ? (a0 + a1) : (a0 - a1);
+                    res *= scale;
+                    if (INVERSE) res *= signs[s_base + k];
+                    out[base + k] = T(res);
+                }
+            }
+            """)
+    #endif
+
+    static func apply(
+        _ input: MLXArray, signs: MLXArray, blockSize: Int, inverse: Bool
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+            (blockSize == 1024 || blockSize == 512),
+            signs.dtype == .float32,
+            input.size > 0,
+            [.float16, .bfloat16, .float32].contains(input.dtype)
+        else { return nil }
+        let width = input.dim(-1)
+        guard width % blockSize == 0, signs.size == width else { return nil }
+        let blocksPerRow = width / blockSize
+        let totalBlocks = input.size / blockSize
+        let tg = blockSize / 8
+        return fwhtKernel(
+            [contiguous(input), contiguous(signs)],
+            template: [
+                ("T", input.dtype), ("BLOCK", blockSize),
+                ("BLOCKS_PER_ROW", blocksPerRow), ("INVERSE", inverse),
+            ],
+            grid: (totalBlocks * tg, 1, 1),
+            threadGroup: (tg, 1, 1),
+            outputShapes: [input.shape],
+            outputDTypes: [input.dtype])[0]
+        #else
+        return nil
+        #endif
+    }
+}
+
 /// Normalized block FWHT in float32; sign multiplication moves to the other
 /// side for inverse embedding lookup. The activation dtype is not changed.
 public func jangHadamardActivation(
@@ -383,6 +512,9 @@ public func jangHadamardActivation(
 ) -> MLXArray {
     precondition([512, 1024, 2048, 4096].contains(blockSize))
     precondition(input.ndim > 0 && input.dim(-1) % blockSize == 0)
+    if let fused = JangHadamardFusedFWHT.apply(input, signs: signs, blockSize: blockSize, inverse: inverse) {
+        return fused
+    }
     let source = input.asType(.float32)
     let signed = inverse ? source : source * signs
     let transformed = MLX.hadamardTransform(
@@ -406,7 +538,143 @@ public final class HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ input: MLXArray) -> MLXArray {
-        super.callAsFunction(jangHadamardActivation(input, signs: signs, blockSize: blockSize))
+        let rotated = jangHadamardActivation(input, signs: signs, blockSize: blockSize)
+        guard mode == .affine, bits == 2, groupSize == 128,
+            rotated.ndim == 3, rotated.dim(0) == 1,
+            FlashVerificationScope.usesRowExactVerification(inputShape: rotated.shape)
+        else { return super.callAsFunction(rotated) }
+        let rows = rotated.dim(1)
+        if bias == nil, let output = RowExactAffineQMV.project(
+            rotated.reshaped(rows, -1), weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits,
+            reference: { projectRows($0.reshaped(1, rows, -1)).reshaped(rows, -1) })
+        {
+            return output.reshaped(1, rows, -1)
+        }
+        return projectRows(rotated)
+    }
+
+    private func projectRows(_ rotated: MLXArray) -> MLXArray {
+        // Apply the original packed projection using its decode shape for
+        // each independent verification row.
+        var outputs: [MLXArray] = []
+        for row in 0..<rotated.dim(1) {
+            outputs.append(super.callAsFunction(rotated[0..., row..<(row + 1), 0...]))
+        }
+        return concatenated(outputs, axis: 1)
+    }
+}
+
+/// Fuses sibling `HadamardQuantizedLinear` projections that share the same input,
+/// signs, blockSize, and affine quantization geometry into a single Hadamard
+/// activation transform + single quantized matmul (or single row-exact QMV during
+/// speculative verify), splitting the concatenated output along the last axis.
+public final class HadamardProjectionGroup {
+    public let blockSize: Int
+    public let signs: MLXArray
+    public let weight: MLXArray
+    public let scales: MLXArray
+    public let biases: MLXArray
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+    public let splitIndices: [Int]
+
+    public static func make(from modules: [Linear]) -> HadamardProjectionGroup? {
+        guard ProcessInfo.processInfo.environment["VMLX_FUSE_HADAMARD_GROUPS"] != "0",
+            modules.count >= 2
+        else { return nil }
+        let hadamards = modules.compactMap { $0 as? HadamardQuantizedLinear }
+        guard hadamards.count == modules.count,
+            let first = hadamards.first,
+            let firstBiases = first.biases,
+            first.mode == .affine, first.bias == nil
+        else { return nil }
+        for m in hadamards.dropFirst() {
+            guard m.blockSize == first.blockSize,
+                m.groupSize == first.groupSize,
+                m.bits == first.bits,
+                m.mode == first.mode,
+                m.bias == nil,
+                m.weight.dim(1) == first.weight.dim(1),
+                m.scales.dtype == first.scales.dtype,
+                let mb = m.biases, mb.dtype == firstBiases.dtype,
+                m.signs.shape == first.signs.shape,
+                MLX.all(m.signs .== first.signs).item(Bool.self)
+            else { return nil }
+        }
+        // Only concatenate when originals can be rebound as slices (zero extra RAM).
+        guard WeightBacking.copyWouldReplace(WeightBacking.storage(of: hadamards)) else {
+            return nil
+        }
+        let weight = contiguous(concatenated(hadamards.map(\.weight), axis: 0))
+        let scales = contiguous(concatenated(hadamards.map(\.scales), axis: 0))
+        let biases = contiguous(concatenated(hadamards.map { $0.biases! }, axis: 0))
+        MLX.eval(weight, scales, biases)
+        WeightBacking.rebindAsRows(hadamards, weight: weight, scales: scales, biases: biases)
+        var splitIndices: [Int] = []
+        splitIndices.reserveCapacity(hadamards.count - 1)
+        var running = 0
+        for m in hadamards.dropLast() {
+            running += m.weight.dim(0)
+            splitIndices.append(running)
+        }
+        return HadamardProjectionGroup(
+            blockSize: first.blockSize, signs: first.signs,
+            weight: weight, scales: scales, biases: biases,
+            groupSize: first.groupSize, bits: first.bits, mode: first.mode,
+            splitIndices: splitIndices)
+    }
+
+    private init(
+        blockSize: Int, signs: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int, bits: Int, mode: QuantizationMode, splitIndices: [Int]
+    ) {
+        self.blockSize = blockSize
+        self.signs = signs
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.splitIndices = splitIndices
+    }
+
+    public func callAsFunction(_ input: MLXArray) -> [MLXArray] {
+        let rotated = jangHadamardActivation(input, signs: signs, blockSize: blockSize)
+        let combined: MLXArray
+        if mode == .affine, bits == 2, groupSize == 128,
+            rotated.ndim == 3, rotated.dim(0) == 1,
+            FlashVerificationScope.usesRowExactVerification(inputShape: rotated.shape)
+        {
+            let rows = rotated.dim(1)
+            if let exact = RowExactAffineQMV.project(
+                rotated.reshaped(rows, -1), weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits,
+                reference: { projectRows($0.reshaped(1, rows, -1)).reshaped(rows, -1) })
+            {
+                combined = exact.reshaped(1, rows, -1)
+            } else {
+                combined = projectRows(rotated)
+            }
+        } else {
+            combined = quantizedMM(
+                rotated, weight, scales: scales, biases: biases,
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+        }
+        return MLX.split(combined, indices: splitIndices, axis: -1)
+    }
+
+    private func projectRows(_ rotated: MLXArray) -> MLXArray {
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(rotated.dim(1))
+        for row in 0..<rotated.dim(1) {
+            outputs.append(quantizedMM(
+                rotated[0..., row..<(row + 1), 0...], weight, scales: scales, biases: biases,
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode))
+        }
+        return concatenated(outputs, axis: 1)
     }
 }
 

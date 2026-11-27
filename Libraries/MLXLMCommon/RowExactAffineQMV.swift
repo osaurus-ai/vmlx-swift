@@ -59,7 +59,16 @@ public enum RowExactAffineQMV {
         template <typename T, typename U, int values_per_thread, int bits, bool WIDEN = false>
         inline U rx_load_vector(const device T* x, thread U* x_thread) {
           U sum = 0;
-          if (bits == 4 && WIDEN) {
+          if (bits == 2) {
+            for (int i = 0; i < values_per_thread; i += 4) {
+              sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+              x_thread[i] = x[i];
+              x_thread[i + 1] = x[i + 1] / 4.0f;
+              x_thread[i + 2] = x[i + 2] / 16.0f;
+              x_thread[i + 3] = x[i + 3] / 64.0f;
+            }
+          }
+          else if (bits == 4 && WIDEN) {
             for (int i = 0; i < values_per_thread; i += 4) {
               U x0 = x[i], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
               sum += x0 + x1 + x2 + x3;
@@ -115,7 +124,16 @@ public enum RowExactAffineQMV {
             U bias,
             U sum) {
           U accum = 0;
-          if (bits == 4) {
+          if (bits == 2) {
+            for (int i = 0; i < (values_per_thread / 4); i++) {
+              accum +=
+                  (x_thread[4 * i] * (w[i] & 0x03) +
+                   x_thread[4 * i + 1] * (w[i] & 0x0c) +
+                   x_thread[4 * i + 2] * (w[i] & 0x30) +
+                   x_thread[4 * i + 3] * (w[i] & 0xc0));
+            }
+          }
+          else if (bits == 4) {
             const device uint16_t* ws = (const device uint16_t*)w;
             for (int i = 0; i < (values_per_thread / 4); i++) {
               accum +=
@@ -189,6 +207,49 @@ public enum RowExactAffineQMV {
           return scale * accum + sum * bias;
         }
 
+        // 2-bit rows: x vectors of a chunk of up to 4 rows precomputed (rx_load_vector), each
+        // 32-bit weight word (16 x 2-bit values) loaded once and applied to every row of the chunk.
+        // Per (row, output) the accumulator sees exactly rx_qdot's statement order:
+        // accum += (x0*(b&0x03) + x1*(b&0x0c) + x2*(b&0x30) + x3*(b&0xc0)) for i ascending,
+        // then scale * accum + sum * bias.
+        template <typename T, typename S, int values_per_thread, int RC>
+        inline void rx_q2_chunk(
+            const device uint8_t* ws, const device S* scales, const device S* biases,
+            const int in_vec_size_w, const int in_vec_size_g,
+            const thread float (&xt)[RC][values_per_thread], const thread float (&sums)[RC],
+            const int rc, thread float (&result)[RC][4]) {
+          for (int row = 0; row < 4; row++) {
+            const device uint32_t* wsr = (const device uint32_t*)(ws + row * in_vec_size_w);
+            float accum[RC];
+            for (int m = 0; m < RC; m++) accum[m] = 0;
+            for (int p = 0; p < (values_per_thread / 16); p++) {
+              const uint32_t word = wsr[p];
+              for (int b = 0; b < 4; b++) {
+                const int i = p * 4 + b;
+                const uint32_t byte = (word >> (b * 8)) & 0xffu;
+                const float w0 = (byte & 0x03u);
+                const float w1 = (byte & 0x0cu);
+                const float w2 = (byte & 0x30u);
+                const float w3 = (byte & 0xc0u);
+                for (int m = 0; m < RC; m++) {
+                  if (m < rc) {
+                    accum[m] +=
+                        (xt[m][4 * i] * w0 +
+                         xt[m][4 * i + 1] * w1 +
+                         xt[m][4 * i + 2] * w2 +
+                         xt[m][4 * i + 3] * w3);
+                  }
+                }
+              }
+            }
+            const float s = scales[row * in_vec_size_g];
+            const float b = biases[row * in_vec_size_g];
+            for (int m = 0; m < RC; m++) {
+              if (m < rc) result[m][row] += s * accum[m] + sums[m] * b;
+            }
+          }
+        }
+
         // 4-bit rows: x vectors of a chunk of up to 4 rows precomputed (rx_load_vector), each weight
         // word widened once and applied to every row of the chunk. Per (row, output) the accumulator
         // sees exactly rx_qdot's sequence: accum += (x0*w0 + x1*w1 + x2*w2 + x3*w3) for i ascending,
@@ -240,7 +301,7 @@ public enum RowExactAffineQMV {
             uint tid_y,
             uint simd_gid,
             uint simd_lid) {
-          constexpr int packs_per_thread = 2;
+          constexpr int packs_per_thread = bits == 2 ? 1 : 2;
           constexpr int num_simdgroups = 2;
           constexpr int results_per_simdgroup = 4;
           // get_pack_factor<bits, 32>() / get_bytes_per_pack<bits, 32>(): 6 bits pack 4 values in 3 bytes.
@@ -288,6 +349,21 @@ public enum RowExactAffineQMV {
                   result[m][row] += rx_qdot_f<U, values_per_thread, bits>(
                       wf[row], x_thread, s_r[row], b_r[row], sum, values_per_thread);
                 }
+              }
+            } else if (bits == 2) {
+              constexpr int RC = ROWS < 4 ? ROWS : 4;
+              for (int m0 = 0; m0 < ROWS; m0 += RC) {
+                const int rc = min(RC, ROWS - m0);
+                thread float xt[RC][values_per_thread];
+                thread float sums[RC];
+                thread float part[RC][4];
+                for (int m = 0; m < RC; m++) {
+                  for (int r = 0; r < 4; r++) part[m][r] = result[min(m0 + m, ROWS - 1)][r];
+                  if (m < rc) sums[m] = rx_load_vector<T, U, values_per_thread, bits, widen>(x + (m0 + m) * in_vec_size, xt[m]);
+                }
+                rx_q2_chunk<T, S, values_per_thread, RC>(ws, scales, biases, in_vec_size_w, in_vec_size_g, xt, sums, rc, part);
+                for (int m = 0; m < rc; m++)
+                  for (int r = 0; r < 4; r++) result[m0 + m][r] = part[m][r];
               }
             } else if (bits == 6) {
               // qmv_fast_impl's statements per row: load_vector, then rx_qdot straight from the weight bytes for
@@ -354,7 +430,8 @@ public enum RowExactAffineQMV {
         hasBiases: Bool
     ) -> Bool {
         // 4 bits above `maxRows4Bit` rows: the caller splits the rows into blocks (or runs one-row calls).
-        guard enabled, (2 ... maxRows).contains(rows), [4, 6, 8].contains(bits), hasBiases,
+        guard enabled, (2 ... maxRows).contains(rows), [2, 4, 6, 8].contains(bits), hasBiases,
+            bits != 2 || (inputDType == .float16 && groupSize == 128 && rows <= 8),
             bits != 4 || rows <= maxRows4Bit,
             // Mixed BF16-x-F16 metadata at 6 bits: MLX's one-row call does not run the widened q6 branch here
             // (measured: not admitted), so only matching dtypes.
@@ -363,7 +440,7 @@ public enum RowExactAffineQMV {
             inputDType == .bfloat16 || inputDType == .float16,
             scalesDType == inputDType || (inputDType == .bfloat16 && scalesDType == .float16)
         else { return false }
-        let valuesPerThread = (bits == 6 ? 4 : 32 / bits) * 2
+        let valuesPerThread = (bits == 6 ? 4 : 32 / bits) * (bits == 2 ? 1 : 2)
         let blockSize = valuesPerThread * 32
         return k % blockSize == 0 && n % 8 == 0 && groupSize % valuesPerThread == 0
     }

@@ -412,7 +412,12 @@ struct DFlash2WidthChooser {
     /// One finished cycle: `tokens` emitted (accepted + 1) in `seconds` wall time at `verifyWidth` rows.
     /// `count` > 1: that many identical AR steps timed together (one cost observation, `count` cycles
     /// toward the next re-time).
-    mutating func observe(verifyWidth: Int, tokens: Int, seconds: Double, count: Int = 1) {
+    /// `recordCost` is `false` for Cycle-1 prompt-context ingestion (when the drafter prefills hundreds
+    /// or thousands of prompt hidden rows in one shot) so that one-time cost never poisons steady-state
+    /// per-cycle width costs.
+    mutating func observe(
+        verifyWidth: Int, tokens: Int, seconds: Double, count: Int = 1, recordCost: Bool = true
+    ) {
         guard seconds > 0, widths.contains(verifyWidth) else { return }  // clipped final block
         let accepted = tokens - 1
         let lastVerified = min(accepted + 1, verifyWidth - 1)
@@ -434,9 +439,11 @@ struct DFlash2WidthChooser {
             }
         }
         if sharesAcceptance, lastVerified >= 1 { costs.storeAcceptance(trials: trials, hits: hits) }
-        costs.observe(width: verifyWidth, seconds: seconds, bucket: costBucket)
+        if recordCost {
+            costs.observe(width: verifyWidth, seconds: seconds, bucket: costBucket)
+            lastTimed[verifyWidth] = cycles + count
+        }
         cycles += count
-        lastTimed[verifyWidth] = cycles
         guard widths.count > 1 else { return }
         if let unseen = untimedWidth() {
             width = unseen

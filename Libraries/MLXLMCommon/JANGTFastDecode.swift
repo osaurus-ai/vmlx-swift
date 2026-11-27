@@ -217,6 +217,75 @@ public enum JANGTFastDecode {
             + "\n        \(unroll) for (uint r = 0; r < \(o)u; r++) d[r] += ho * float(wout[((size_t)e * \(n)u + row0 + r) * \(outliers)u + lane]) / sd[(size_t)e * \(n)u + row0 + r]; } }"
     }
 
+    /// Split-simdgroup fast gate/up (sg0=gate, sg1=up via 16 B threadgroup memory, 4 rows/TG).
+    /// Halves live accumulators and outlier registers under multi-row verify occupancy while staying
+    /// bit-identical to `gateUpSource`.
+    static func gateUpSplitSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int, odt: String,
+                                  limit: Float, activation: JANGTActivation) -> String {
+        let o = 4
+        let (mu0, mu1, isd0, isd1) = stats(k)
+        let pl = JANGTCode.laneBits(k)
+        let nb = kin / 512
+        let loop = mainLoop(k, l, projs: [("a", "a")], ptrs: ["a": "wp"], o: o, w: words, adv: pl)
+        let outl = outliers == 0 ? "" : "\n    if (lane < \(outliers)u) { int c = ocol[(size_t)e * \(outliers)u + lane];"
+            + "\n      if (c >= 0) { float xo = float(x[(size_t)t * \(kin)u + uint(c)]);"
+            + "\n        \(unroll) for (uint r = 0; r < \(o)u; r++) {"
+            + "\n          float wov = (sgi == 0u) ? float(woutg[((size_t)e * \(n)u + row0 + r) * \(outliers)u + lane])"
+            + "\n                                  : float(woutu[((size_t)e * \(n)u + row0 + r) * \(outliers)u + lane]);"
+            + "\n          float sc = (sgi == 0u) ? sg[(size_t)e * \(n)u + row0 + r] : su_[(size_t)e * \(n)u + row0 + r];"
+            + "\n          a[r] += xo * wov / sc; } } }"
+        let value = activation.metalValue(g: "gg", u: "uu")
+        return "\n" + [
+            "    const float ISD0 = \(lit(isd0)), ISD1 = \(lit(isd1));",
+            "    uint sgi = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;",
+            "    uint row0 = threadgroup_position_in_grid.z * \(o)u; uint ts = threadgroup_position_in_grid.y;",
+            "    uint t = ts / KS; uint e = idx[ts];",
+            "    const uint nbp = \(nb)u;",
+            "    const uint lb = lane * \(pl)u; const uint sh = lb & 31u; (void)sh;",
+            "    const device uint32_t* wp = (sgi == 0u ? wg : wu) + ((size_t)e * \(n)u + row0) * \(words)u + (lb >> 5);",
+            "    const device uint4* xq4 = (const device uint4*)(xq + (size_t)t * \(kin / 2)u) + lane * 2u;",
+            "    const device float* xinv_p = xinv + (size_t)t * \(kin / 16)u + lane;",
+            "    float a[\(o)];",
+            "    \(unroll) for (uint r = 0; r < \(o)u; r++) a[r] = 0.0f;",
+            "    \(loop)",
+            "    \(outl)",
+            "    const float SE = st[t * 2u], SO = st[t * 2u + 1u];",
+            "    const float cst = \(lit(mu0)) * ISD0 * SE + \(lit(mu1)) * ISD1 * SO;",
+            "    threadgroup float g_sh[\(o)];",
+            "    float val[\(o)];",
+            "    \(unroll) for (uint r = 0; r < \(o)u; r++) {",
+            "      float Av = simd_sum(a[r]);",
+            "      if (lane == 0u) {",
+            "        float sc = (sgi == 0u) ? sg[(size_t)e * \(n)u + row0 + r] : su_[(size_t)e * \(n)u + row0 + r];",
+            "        val[r] = (Av - cst) * sc;",
+            "      }",
+            "    }",
+            "    if (sgi == 0u && lane == 0u) { \(unroll) for (uint r = 0; r < \(o)u; r++) g_sh[r] = val[r]; }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "    if (sgi == 1u && lane == 0u) {",
+            "      \(unroll) for (uint r = 0; r < \(o)u; r++) {",
+            "        float gg = g_sh[r], uu = val[r];",
+            "        \(clamp(limit))",
+            "        out[(size_t)ts * \(n)u + row0 + r] = \(odt)(\(value));",
+            "      }",
+            "    }",
+            "    ",
+        ].joined(separator: "\n")
+    }
+
+    static func gateUpSplitKernel(kin: Int, n: Int, k: Double, outliers: Int, words: Int, xdt: String, odt: String,
+                                  limit: Float, activation: JANGTActivation) -> Kernel {
+        Kernel(
+            name: "jtf4_gusg_k\(kin)_n\(n)_K\(kname(k))_o\(outliers)_w\(words)_\(xdt)_\(odt)"
+                + "\(actTag(activation, limit: limit))_O4_S1_scalar",
+            inputs: ["xq", "xinv", "st", "x", "idx", "wg", "sg", "wu", "su_"]
+                + (outliers > 0 ? ["ocol", "woutg", "woutu"] : []),
+            outputs: ["out"],
+            source: gateUpSplitSource(
+                kin: kin, n: n, k: k, l: JANGTCode.stateBits, outliers: outliers, words: words, odt: odt,
+                limit: limit, activation: activation))
+    }
+
     /// Python `gen_gu4(..., O=4, NOG=2, KSPLIT=1, wload="scalar")`; template `KS`.
     static func gateUpSource(kin: Int, n: Int, k: Double, l: Int, outliers: Int, words: Int, odt: String, limit: Float,
                              activation: JANGTActivation) -> String {
@@ -455,18 +524,18 @@ public enum JANGTFastDecode {
         let n = gate.outputs, words = gate.words, outliers = gate.outlierColumns
         let xdt = JANGTKernels.metalType(x2.dtype)
         let odt = JANGTKernels.metalType(outputDType)
-        let name = "jtf4_gu_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_w\(words)_\(xdt)_\(odt)"
-            + "\(actTag(activation, limit: limit))_O4_G2_S1_scalar"
-        let kernel = compile(
-            gateUpKernel(
-                kin: kin, n: n, k: gate.k, outliers: outliers, words: words, xdt: xdt, odt: odt, limit: limit,
-                activation: activation), name: name)
         var inputs: [MLXArray] = [
             xq, xinv, st, x2, ids.flattened().asType(.uint32), gate.packed, gate.scale, up.packed, up.scale,
         ]
         if outliers > 0 { inputs += [gate.outlierColumnIndices, gate.outlierWeights, up.outlierWeights] }
+        let name = "jtf4_gusg_k\(kin)_n\(n)_K\(kname(gate.k))_o\(outliers)_w\(words)_\(xdt)_\(odt)"
+            + "\(actTag(activation, limit: limit))_O4_S1_scalar"
+        let kernel = compile(
+            gateUpSplitKernel(
+                kin: kin, n: n, k: gate.k, outliers: outliers, words: words, xdt: xdt, odt: odt, limit: limit,
+                activation: activation), name: name)
         return kernel(
-            inputs, template: [("KS", slots)], grid: (64, rows * slots, n / 8), threadGroup: (64, 1, 1),
+            inputs, template: [("KS", slots)], grid: (64, rows * slots, n / 4), threadGroup: (64, 1, 1),
             outputShapes: [[rows * slots, n]], outputDTypes: [outputDType])[0]
     }
 
@@ -488,7 +557,7 @@ public enum JANGTFastDecode {
         let idx = ids.flattened().asType(.uint32)
         let rw = weights.flattened().asType(.float32)
         let tag = roundSlotToBFloat16 ? "_rbf16" : ""
-        if rows == 1 {
+        if rows == 1 && 2 * slots <= 32 {
             let name = "jtf4c_dn_k\(kin)_n\(n)_K\(kname(d.k))_o\(outliers)_w\(words)_\(hdt)\(tag)_O4_G2_s\(slots)_scalar"
             let kernel = compile(
                 downCombinedKernel(kin: kin, n: n, k: d.k, outliers: outliers, words: words, hdt: hdt, slots: slots,

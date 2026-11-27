@@ -519,7 +519,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                         && ProcessInfo.processInfo.environment["VMLX_DFLASH2_BOUND_COSTS"] != "0",
                     probesWhileEvidenceIsThin:
                         (target as? DFlash2WidthLadderPolicy)?.dflash2ProbesWhileEvidenceIsThin == true
-                        && ProcessInfo.processInfo.environment["VMLX_DFLASH2_THIN_PROBES"] != "0")
+                        && ProcessInfo.processInfo.environment["VMLX_DFLASH2_THIN_PROBES"] != "0",
+                    rewardsWinningProbes:
+                        (target as? DFlash2WidthLadderPolicy)?.dflash2ProbesWhileEvidenceIsThin == true)
             }
         }
         self.arBurstSteps = Self.arBurstSteps(for: target)
@@ -836,19 +838,22 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.hybridStripSnapshot = prefill.boundarySnapshot
         self.hybridStripConditioningContext = prefill.boundaryContext
         self.promptConditioningContext =
-            hybridStripBoundary == nil
+            (cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary)
             ? DFlash2PrefixContext(
                 hidden: prefill.hidden, end: promptTokenIds.count, layerIDs: orderedLayerIDs) : nil
         self.recordsGeneratedContext =
             cacheCoordinator?.canPersistBoundaries == true && input.cachePromptIntent != .auxiliary
-            && hybridStripBoundary == nil && promptConditioningContext != nil
-            && self.cache.allSatisfy { $0.isTrimmable && !($0 is MambaCache) }
+            && promptConditioningContext != nil
         // Vocabulary agreement, checked against the first real logits row.
         // The drafter borrows the target's LM head, so a mismatch here
         // would not throw — it would silently index a different token
         // space and emit fluent nonsense.
         let targetVocab = prefill.lastLogits.dim(-1)
-        guard targetVocab == config.vocabSize else {
+        let vocabMatches =
+            targetVocab == config.vocabSize
+            || (targetVocab > 0 && targetVocab <= config.vocabSize
+                && target.paddedVocabularySize == config.vocabSize)
+        guard vocabMatches else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
                 "drafter vocab_size \(config.vocabSize) != model vocabulary \(targetVocab)")
         }
@@ -1150,6 +1155,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // (MiniCPM-V 4.7 1B DSpark prose 221 -> 160 tok/s).
         arStreak = Swift.max(0, arStreak - 1)
         let cycleStart = Date.timeIntervalSinceReferenceDate
+        let contextRowsBefore = contextHidden.dim(1)
         if treeMode == nil { treeMode = resolveTreeMode() }
         if treeMode == true, let ok = runTreeCycle(rows: bs, cycleStart: cycleStart) {
             return ok
@@ -1174,9 +1180,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let ok = completeVerify(flight)
         if ok, widthChooser != nil {
             // Wall time of the whole cycle (draft + verify + accept + commit) is the width's real cost.
+            // Cycle 1 ingests the entire prompt's conditioning rows (`contextRowsBefore > bs`) in one
+            // shot; update acceptance evidence without poisoning steady-state per-cycle width costs.
             widthChooser!.observe(
                 verifyWidth: bs, tokens: pendingTokens.count,
-                seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
+                seconds: Date.timeIntervalSinceReferenceDate - cycleStart,
+                recordCost: contextRowsBefore <= bs)
             stats.widthCycles[bs, default: 0] += 1
             traceWidthDecision(width: bs, tokens: pendingTokens.count)
         }
@@ -2064,23 +2073,25 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // longest-prefix match. Same policy as TokenIterator's
         // `usesCanonicalHybridBoundary`.
         if let stripAt = hybridStripBoundary {
-            guard let snapshot = hybridStripSnapshot,
+            if let snapshot = hybridStripSnapshot,
                 snapshot.allSatisfy({ $0.offset == stripAt })
-            else {
-                // Boundary sat inside a restored prefix — an entry at
-                // least that long is already stored and is the one the
-                // next turn matches. Nothing to add.
-                return
+            {
+                coordinator.storeAfterGeneration(
+                    promptTokens: Array(promptTokenIds.prefix(stripAt)),
+                    perLayerData: extractLayerData(from: snapshot),
+                    ssmStates: extractSSMStates(from: snapshot),
+                    cache: snapshot,
+                    mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
+                    chainId: cacheInitParameters.cacheChainId,
+                    isResumeBoundary: true,
+                    dflash2Context: hybridStripConditioningContext)
             }
-            coordinator.storeAfterGeneration(
-                promptTokens: Array(promptTokenIds.prefix(stripAt)),
-                perLayerData: extractLayerData(from: snapshot),
-                ssmStates: extractSSMStates(from: snapshot),
-                cache: snapshot,
-                mediaSalt: cacheSaltPlan.salt(forBoundary: stripAt),
-                chainId: cacheInitParameters.cacheChainId,
-                isResumeBoundary: true,
-                dflash2Context: hybridStripConditioningContext)
+            // Also persist the post-answer / tool-call boundary when the live cache aligns cleanly,
+            // matching TokenIterator's hybrid post-answer policy so multi-turn and per-tool-call
+            // continuations restore past the completed answer instead of re-prefilling it.
+            _ = storePostAnswerBoundary(
+                generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary,
+                endedOnToolCall: endedOnToolCall, coordinator: coordinator)
             return
         }
 
@@ -2097,7 +2108,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         storeStableBoundaries(coordinator: coordinator)
         let storedAnswer = storePostAnswerBoundary(
             generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary,
-            coordinator: coordinator)
+            endedOnToolCall: endedOnToolCall, coordinator: coordinator)
         // A completed answer's entry serves the next turn. The exact-prompt entry would only serve a regenerate, which
         // otherwise re-prefills this request's prompt suffix from the entry it restored: not worth a second full SSD
         // write per turn when that suffix is short (a tool call or an interrupted turn has no answer entry and keeps it).
@@ -2127,7 +2138,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// new chat with the same system prompt restores them instead of prefilling it. A boundary at or inside the
     /// restored prefix is already stored. Append-only targets only; hybrid targets keep their stripped boundary.
     private mutating func storeStableBoundaries(coordinator: CacheCoordinator) {
-        guard recordsGeneratedContext, let promptContext = promptConditioningContext else { return }
+        guard recordsGeneratedContext,
+            cache.allSatisfy({ $0.isTrimmable && !($0 is MambaCache) }),
+            let promptContext = promptConditioningContext
+        else { return }
         for boundary in originalInput.cacheStablePrefixTokenCounts.sorted()
         where boundary > restoredPromptTokenCount && boundary < promptTokenIds.count {
             guard let views = prefixViews(of: cache, rows: boundary) else { return }
@@ -2157,7 +2171,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// stores nothing rather than a misaligned context.
     @discardableResult
     private mutating func storePostAnswerBoundary(
-        generatedTokenIds: [Int], includeGeneratedBoundary: Bool, coordinator: CacheCoordinator
+        generatedTokenIds: [Int], includeGeneratedBoundary: Bool, endedOnToolCall: Bool,
+        coordinator: CacheCoordinator
     ) -> Bool {
         defer { generatedContextRows.removeAll() }
         if Self.traceEnabled {
@@ -2186,10 +2201,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         // Keep the answer plus the forwarded stop token (the AR iterator's post-answer key); rows a speculative cycle
         // committed past it were never returned to the caller and are not history.
-        // A tool call ends where the consumer stopped reading: exactly the returned tokens.
+        // A tool call ends where the consumer stopped reading unless the model's template includes the
+        // closing stop token in tool-call history (`ToolCallTurnStopTokenModel`, e.g. Inkling / Qwen3.5).
+        let stopTokenIsToolHistory: Bool = {
+            guard endedOnToolCall, let m = target as? ToolCallTurnStopTokenModel,
+                committedTokenLog.count > generatedTokenIds.count
+            else { return false }
+            return m.toolCallTurnStopTokenIds.contains(committedTokenLog[generatedTokenIds.count])
+        }()
         let keep = Swift.min(
-            offset, promptTokenIds.count + generatedTokenIds.count + (endedOnToolCall ? 0 : 1))
+            offset,
+            promptTokenIds.count + generatedTokenIds.count
+                + ((!endedOnToolCall || stopTokenIsToolHistory) ? 1 : 0))
+        let allTrimmable = cache.allSatisfy { $0.isTrimmable && !($0 is MambaCache) }
         if keep < offset {
+            guard allTrimmable else { return false }
             for layer in cache { _ = layer.trim(offset - keep) }
             guard cache.allSatisfy({ $0.offset == keep }) else { return false }
         }
@@ -2202,7 +2228,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         coordinator.storeAfterGeneration(
             promptTokens: tokens,
             perLayerData: extractLayerData(from: cache),
-            ssmStates: nil,
+            ssmStates: allTrimmable ? nil : extractSSMStates(from: cache),
             cache: cache,
             mediaSalt: cacheSaltPlan.salt(forBoundary: keep),
             chainId: cacheInitParameters.cacheChainId,

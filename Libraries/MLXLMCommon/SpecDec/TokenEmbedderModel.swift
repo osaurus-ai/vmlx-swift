@@ -42,4 +42,13 @@ public protocol TokenEmbedderModel: LanguageModel {
     /// - Returns: `(B, L, vocab)` logits — byte-identical to what the
     ///   target's own forward produces from the same hidden.
     func projectToLogits(_ hidden: MLXArray) -> MLXArray
+
+    /// Padded checkpoint vocabulary size when the target's `lm_head` and the drafter's codebooks
+    /// are stored at a padded width (e.g. Inkling-2-Mini: 201024) while valid logits are sliced
+    /// to the unpadded vocabulary (200058). `nil` when logits width equals `config.vocab_size`.
+    var paddedVocabularySize: Int? { get }
+}
+
+extension TokenEmbedderModel {
+    public var paddedVocabularySize: Int? { nil }
 }

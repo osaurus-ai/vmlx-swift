@@ -32,6 +32,13 @@ extension Ernie55Model {
         ]
         var result: [String: MLXArray] = [:]
         for (name, raw) in weights where !name.hasSuffix("_scale_inv") {
+            // Skip optional upstream vLLM/SGLang FlashIndexer sidecar weights and inline MTP/DSpark weights.
+            if name.hasPrefix("model.mtp.")
+                || name.contains(".indexer.flashindexer_bias")
+                || name.contains(".indexer.linear_gate.")
+            {
+                continue
+            }
             var key = name
             var value = raw
             let parts = name.split(separator: ".")

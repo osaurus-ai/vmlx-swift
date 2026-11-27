@@ -101,9 +101,18 @@ final class Ernie55MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let g = DeepseekV41FP8Rows.apply(gate, x)
-        let u = DeepseekV41FP8Rows.apply(up, x)
-        return DeepseekV41FP8Rows.apply(down, Ernie55Math.situ(g, u, gateCap: caps.gate, upCap: caps.up))
+        let g = Ernie55Kernels.mxfp8Linear(gate, x)
+        let u = Ernie55Kernels.mxfp8Linear(up, x)
+        return Ernie55Kernels.mxfp8Linear(down, Ernie55Math.situ(g, u, gateCap: caps.gate, upCap: caps.up))
+    }
+
+    func releaseGateUp() {
+        if let q = gate as? QuantizedLinear { Ernie55Kernels.releaseMXFP8(q) }
+        if let q = up as? QuantizedLinear { Ernie55Kernels.releaseMXFP8(q) }
+    }
+
+    func releaseDown() {
+        if let q = down as? QuantizedLinear { Ernie55Kernels.releaseMXFP8(q) }
     }
 }
 
@@ -138,25 +147,47 @@ final class Ernie55MoE: Module {
     @ModuleInfo(key: "latent_norm") var latentNorm: RMSNorm
     @ModuleInfo(key: "shared_experts") var shared: Ernie55MLP
     @ParameterInfo(key: "e_score_correction_bias") var correction: MLXArray
-    let routed: JANGTRoutedExpertLayer
-    private var compiledDecode: (@Sendable ([MLXArray]) -> [MLXArray])?
+    let routed: any Ernie55RoutedExperts
+    private var sharedFC1Weight: MLXArray?
+    private var sharedFC1Scales: MLXArray?
+    private var sharedFC1Width: Int = 0
+    private var sharedFC2Weight: MLXArray?
+    private var sharedFC2Scales: MLXArray?
 
-    func compileDecode() {
-        let gate = self.gate
-        let latentIn = self.latentIn
-        let latentOut = self.latentOut
-        let latentNorm = self.latentNorm
-        let shared = self.shared
-        let routed = self.routed
-        compiledDecode = vmlxTrustedCompile(inputs: [gate, latentIn, latentOut, latentNorm, shared]) { inputs in
-            let x = inputs[0]
-            let (ids, scores) = gate(x, correction: inputs[1])
-            let combined = Self.routedActivations(latentIn(x), ids: ids, scores: scores, routed: routed)
-            return [shared(x) + latentOut(latentNorm(combined))]
+    func prepare() {
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FUSE_PROJ"] != "0" else { return }
+        if sharedFC1Weight == nil,
+            let sg = shared.gate as? QuantizedLinear, sg.mode == .mxfp8, sg.bias == nil,
+            let su = shared.up as? QuantizedLinear, su.mode == .mxfp8, su.bias == nil,
+            let li = latentIn as? QuantizedLinear, li.mode == .mxfp8, li.bias == nil,
+            sg.weight.dim(1) == su.weight.dim(1), sg.weight.dim(1) == li.weight.dim(1),
+            sg.weight.dim(0) == su.weight.dim(0)
+        {
+            let w = contiguous(concatenated([sg.weight, su.weight, li.weight], axis: 0))
+            let s = contiguous(concatenated([sg.scales, su.scales, li.scales], axis: 0))
+            eval(w, s)
+            sharedFC1Weight = w
+            sharedFC1Scales = s
+            sharedFC1Width = sg.weight.dim(0)
+            shared.releaseGateUp()
+            Ernie55Kernels.releaseMXFP8(li)
+        }
+        if sharedFC2Weight == nil,
+            let sd = shared.down as? QuantizedLinear, sd.mode == .mxfp8, sd.bias == nil,
+            let lo = latentOut as? QuantizedLinear, lo.mode == .mxfp8, lo.bias == nil,
+            sd.weight.dim(0) == lo.weight.dim(0)
+        {
+            let w = contiguous(concatenated([sd.weight, lo.weight], axis: 1))
+            let s = contiguous(concatenated([sd.scales, lo.scales], axis: 1))
+            eval(w, s)
+            sharedFC2Weight = w
+            sharedFC2Scales = s
+            shared.releaseDown()
+            Ernie55Kernels.releaseMXFP8(lo)
         }
     }
 
-    init(_ c: Ernie55Configuration, routed: JANGTRoutedExpertLayer) {
+    init(_ c: Ernie55Configuration, routed: any Ernie55RoutedExperts) {
         self.routed = routed
         _gate.wrappedValue = Ernie55Router(c)
         _latentIn.wrappedValue = Linear(c.hiddenSize, c.moeLatentSize, bias: false)
@@ -168,25 +199,43 @@ final class Ernie55MoE: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let compiledDecode, x.dim(1) == 1, !CompiledDecodeTrace.isActive {
-            return compiledDecode([x, correction])[0]
-        }
         let (ids, scores) = gate(x, correction: correction)
+        if let fc1W = sharedFC1Weight, let fc1S = sharedFC1Scales {
+            let fc1 = Ernie55Kernels.mxfp8Rows(x, weight: fc1W, scales: fc1S)
+                ?? quantizedMM(x, fc1W, scales: fc1S, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            let w = sharedFC1Width
+            let sg = fc1[.ellipsis, ..<w]
+            let su = fc1[.ellipsis, w ..< (2 * w)]
+            let latent = fc1[.ellipsis, (2 * w)...]
+            let combined = Self.routedActivations(latent, ids: ids, scores: scores, routed: routed, caps: shared.caps)
+            if let fc2W = sharedFC2Weight, let fc2S = sharedFC2Scales {
+                let merged: MLXArray
+                if let fused = Ernie55Kernels.sharedSiTULatentNormConcat(
+                    proj: fc1, combined: combined, normWeight: latentNorm.weight,
+                    sharedWidth: w, gateCap: shared.caps.gate, upCap: shared.caps.up,
+                    normEps: latentNorm.eps)
+                {
+                    merged = fused
+                } else {
+                    let act = Ernie55Math.situ(sg, su, gateCap: shared.caps.gate, upCap: shared.caps.up)
+                    merged = concatenated([act, latentNorm(combined)], axis: -1)
+                }
+                return Ernie55Kernels.mxfp8Rows(merged, weight: fc2W, scales: fc2S)
+                    ?? quantizedMM(merged, fc2W, scales: fc2S, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            }
+            let act = Ernie55Math.situ(sg, su, gateCap: shared.caps.gate, upCap: shared.caps.up)
+            return Ernie55Kernels.mxfp8Linear(shared.down, act) + Ernie55Kernels.mxfp8Linear(latentOut, latentNorm(combined))
+        }
         let combined = Self.routedActivations(
-            DeepseekV41FP8Rows.apply(latentIn, x), ids: ids, scores: scores, routed: routed)
-        return shared(x) + DeepseekV41FP8Rows.apply(latentOut, latentNorm(combined))
+            Ernie55Kernels.mxfp8Linear(latentIn, x), ids: ids, scores: scores, routed: routed, caps: shared.caps)
+        return shared(x) + Ernie55Kernels.mxfp8Linear(latentOut, latentNorm(combined))
     }
 
     private static func routedActivations(
-        _ latent: MLXArray, ids: MLXArray, scores: MLXArray, routed: JANGTRoutedExpertLayer
+        _ latent: MLXArray, ids: MLXArray, scores: MLXArray, routed: any Ernie55RoutedExperts,
+        caps: (gate: Float, up: Float)
     ) -> MLXArray {
-        if let prefill = routed.routedW4A8Prefill(
-            latent, indices: ids, scores: scores, roundActivations: Ernie55Math.roundExpertActivations)
-        {
-            return prefill
-        }
-        return routed.routedW4A8Decode(
-            latent, indices: ids, scores: scores, roundActivations: Ernie55Math.roundExpertActivations)
+        routed.callRouted(latent, indices: ids, scores: scores, caps: caps)
     }
 }
 
@@ -250,7 +299,7 @@ final class Ernie55DecoderLayer: Module {
     @ModuleInfo(key: "attn_norm") var attentionNorm: RMSNorm
     @ModuleInfo(key: "ffn_norm") var feedForwardNorm: RMSNorm
 
-    init(_ c: Ernie55Configuration, at index: Int, rope: DeepseekV4RoPE, routed: JANGTRoutedExpertLayer?) {
+    init(_ c: Ernie55Configuration, at index: Int, rope: DeepseekV4RoPE, routed: (any Ernie55RoutedExperts)?) {
         let ratio = c.compressRatios[index]
         if ratio == -2 {
             _mla.wrappedValue = Ernie55MLAAttention(
@@ -277,6 +326,7 @@ final class Ernie55DecoderLayer: Module {
     func prepare() {
         hca?.prepare()
         mla?.prepare()
+        moe?.prepare()
     }
 
     func callAsFunction(
@@ -358,7 +408,7 @@ final class Ernie55Backbone: Module {
     /// Sliding window capacity of the DSpark hidden tail stored on layer 0's cache.
     var dsparkTailCapacity: Int = 128
 
-    init(_ c: Ernie55Configuration, routed: [Int: JANGTRoutedExpertLayer]) {
+    init(_ c: Ernie55Configuration, routed: [Int: any Ernie55RoutedExperts]) {
         streams = c.hcMult
         let rope = DeepseekV4RoPE(
             dim: c.qkRopeHeadDim, base: c.compressRopeTheta, factor: c.ropeScaling.factor,
@@ -386,6 +436,7 @@ final class Ernie55Backbone: Module {
         var x = broadcast(embeds.expandedDimensions(axis: -2),
                           to: [embeds.dim(0), embeds.dim(1), streams, embeds.dim(-1)])
         if x.dim(0) == 1 && (1...16).contains(x.dim(1)) && Device.defaultDevice().deviceType == .gpu {
+            let asyncStride = Int(ProcessInfo.processInfo.environment["VMLX_ERNIE_ASYNC_EVAL_STRIDE"] ?? "") ?? 4
             var stream = contiguous(x)
             var pendingOut: MLXArray? = nil
             var pendingPost: MLXArray? = nil
@@ -404,6 +455,9 @@ final class Ernie55Backbone: Module {
                     pendingOut = step.out
                     pendingPost = step.post
                     pendingComb = step.comb
+                    if asyncStride > 0 && (index + 1) % asyncStride == 0 && index + 1 < layers.count {
+                        asyncEval(stream, step.out, step.post, step.comb)
+                    }
                 } else {
                     if let out = pendingOut, let post = pendingPost, let comb = pendingComb {
                         stream = Ernie55Math.expand(out, residual: stream, post: post, mix: comb)
@@ -472,7 +526,7 @@ final class Ernie55Model: Module, LLMModel, ModalityBearing, SafetensorsLoadKeyE
     var recommendedPrefillStepSize: Int? { 2048 }
     var requiresResidentSafetensorsWeights: Bool { true }
 
-    init(_ args: Ernie55Configuration, routed: [Int: JANGTRoutedExpertLayer], excluded: Set<String>) {
+    init(_ args: Ernie55Configuration, routed: [Int: any Ernie55RoutedExperts], excluded: Set<String>) {
         self.args = args
         self.excludedTensorNames = excluded
         self.model = Ernie55Backbone(args, routed: routed)
@@ -533,8 +587,7 @@ final class Ernie55Model: Module, LLMModel, ModalityBearing, SafetensorsLoadKeyE
     /// Called after the loader has installed the final projection modules.
     func prepareDecode() {
         for layer in model.layers { layer.prepare() }
-        guard HardwareInfo.isCompiledDecodeSupported else { return }
-        for layer in model.layers { layer.moe?.compileDecode() }
+        Memory.clearCache()
     }
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -547,6 +600,9 @@ final class Ernie55Model: Module, LLMModel, ModalityBearing, SafetensorsLoadKeyE
 
     func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
         excludedTensorNames.contains(key)
+            || key.hasPrefix("model.mtp.")
+            || key.contains(".indexer.flashindexer_bias")
+            || key.contains(".indexer.linear_gate.")
     }
 }
 

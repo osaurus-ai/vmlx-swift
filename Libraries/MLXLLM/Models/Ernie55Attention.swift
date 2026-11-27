@@ -67,6 +67,11 @@ final class Ernie55HCAAttention: Module {
     @ParameterInfo(key: "o_group_weight") var groupedOutput: MLXArray
     @ParameterInfo(key: "o_group_scales") var groupedOutputScales: MLXArray
     @ParameterInfo(key: "attn_sink") var sinks: MLXArray
+    private var _attnSinkBF16: MLXArray?
+    private var _qaKVWeight: MLXArray?
+    private var _qaKVScales: MLXArray?
+    private var _qbOGWeight: MLXArray?
+    private var _qbOGScales: MLXArray?
 
     init(
         shape: Ernie55AttentionShape, window: Int, ratio: Int, outputGroups: Int,
@@ -98,6 +103,36 @@ final class Ernie55HCAAttention: Module {
 
     func prepare() {
         virtualHeads.prepare()
+        let sinkBF16 = contiguous(sinks.asType(.bfloat16))
+        eval(sinkBF16)
+        _attnSinkBF16 = sinkBF16
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FUSE_PROJ"] != "0" else { return }
+        if _qaKVWeight == nil,
+            let qa = queryDown as? QuantizedLinear, qa.mode == .mxfp8, qa.bias == nil,
+            let kv = keyValue as? QuantizedLinear, kv.mode == .mxfp8, kv.bias == nil,
+            qa.weight.dim(1) == kv.weight.dim(1)
+        {
+            let w = contiguous(concatenated([qa.weight, kv.weight], axis: 0))
+            let s = contiguous(concatenated([qa.scales, kv.scales], axis: 0))
+            eval(w, s)
+            _qaKVWeight = w
+            _qaKVScales = s
+            Ernie55Kernels.releaseMXFP8(qa)
+            Ernie55Kernels.releaseMXFP8(kv)
+        }
+        if _qbOGWeight == nil,
+            let qb = queryUp as? QuantizedLinear, qb.mode == .mxfp8, qb.bias == nil,
+            let og = gate as? QuantizedLinear, og.mode == .mxfp8, og.bias == nil,
+            qb.weight.dim(1) == og.weight.dim(1)
+        {
+            let w = contiguous(concatenated([qb.weight, og.weight], axis: 0))
+            let s = contiguous(concatenated([qb.scales, og.scales], axis: 0))
+            eval(w, s)
+            _qbOGWeight = w
+            _qbOGScales = s
+            Ernie55Kernels.releaseMXFP8(qb)
+            Ernie55Kernels.releaseMXFP8(og)
+        }
     }
 
     func callAsFunction(
@@ -106,14 +141,36 @@ final class Ernie55HCAAttention: Module {
         let (batch, length) = (x.dim(0), x.dim(1))
         let offset = cache?.offset ?? 0
         let phase = rope.cosSin(offset: offset, length: length)
-        let queryRank = queryNorm(DeepseekV41FP8Rows.apply(queryDown, x))
-        let unrotated = DeepseekV41FP8Rows.apply(queryUp, queryRank)
-            .reshaped(batch, length, shape.heads, shape.headWidth)
-        let (q, currentKV) = prepareAttentionRows(
-            unrotated, rawKV: DeepseekV41FP8Rows.apply(keyValue, x), phase: phase)
+        let rawQDown: MLXArray
+        let rawKV: MLXArray
+        if let w = _qaKVWeight, let s = _qaKVScales {
+            let combined = Ernie55Kernels.mxfp8Rows(x, weight: w, scales: s)
+                ?? quantizedMM(x, w, scales: s, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            rawQDown = combined[.ellipsis, ..<shape.queryRank]
+            rawKV = combined[.ellipsis, shape.queryRank...]
+        } else {
+            rawQDown = Ernie55Kernels.mxfp8Linear(queryDown, x)
+            rawKV = Ernie55Kernels.mxfp8Linear(keyValue, x)
+        }
+        let queryRank = queryNorm(rawQDown)
+        let rawQUp: MLXArray
+        let rawGate: MLXArray?
+        if let w = _qbOGWeight, let s = _qbOGScales {
+            let combined = Ernie55Kernels.mxfp8Rows(queryRank, weight: w, scales: s)
+                ?? quantizedMM(queryRank, w, scales: s, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            let qWidth = shape.heads * shape.headWidth
+            rawQUp = combined[.ellipsis, ..<qWidth]
+            rawGate = combined[.ellipsis, qWidth...]
+        } else {
+            rawQUp = Ernie55Kernels.mxfp8Linear(queryUp, queryRank)
+            rawGate = nil
+        }
+        let unrotated = rawQUp.reshaped(batch, length, shape.heads, shape.headWidth)
+        let (q, currentKV) = prepareAttentionRows(unrotated, rawKV: rawKV, phase: phase)
         if let capture {
             capture.record(layer: layerIndex, .hca(offset: offset, kv: currentKV, x: x))
         }
+        let typedSinks = (q.dtype == .bfloat16 ? _attnSinkBF16 : nil) ?? sinks.asType(q.dtype)
         let attended: MLXArray
         if length == 1 {
             // Single-token decode: every local window row and every completed pooled row is visible.
@@ -124,17 +181,16 @@ final class Ernie55HCAAttention: Module {
             }
             attended = MLXFast.scaledDotProductAttention(
                 queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
-                mask: nil, sinks: sinks.asType(q.dtype))
-        } else if length > 256 {
+                mask: nil, sinks: typedSinks)
+        } else if length > 192 {
             // Prefill sub-blocking: MLX's head_dim=512 SDPA materializes the full QxK score matrix.
-            // Slicing queries into 256-token blocks restricts each block to only its active 128-token
-            // sliding window + completed pooled keys (~5x less attention work and peak memory).
+            // Slicing queries into 192-token strips keeps each strip's score tile in L2 while
+            // restricting keys to its active 128-token sliding window + completed pooled keys.
             let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
             let priorLocal = localKV.dim(2) - length
-            let subSize = 256
+            let subSize = 192
             let scale: Float = 1 / sqrt(Float(shape.headWidth))
-            let typedSinks = sinks.asType(q.dtype)
             var chunks: [MLXArray] = []
             chunks.reserveCapacity((length + subSize - 1) / subSize)
             var subStart = 0
@@ -183,7 +239,7 @@ final class Ernie55HCAAttention: Module {
             }
             attended = MLXFast.scaledDotProductAttention(
                 queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
-                mask: mask, sinks: sinks.asType(q.dtype))
+                mask: mask, sinks: typedSinks)
         }
         let groups: MLXArray
         if batch == 1, let fusedGroups = Ernie55Kernels.invRoPEVHAGroup(
@@ -200,7 +256,8 @@ final class Ernie55HCAAttention: Module {
         let reducedGroups: MLXArray
         if groupedOutputScales.size > 0 {
             let g3 = groups.ndim == 3 ? groups : groups.squeezed(axis: 0)
-            let qOut = DeepseekV41FP8Rows.rows(g3, weight: groupedOutput, scales: groupedOutputScales)
+            let qOut = Ernie55Kernels.mxfp8Rows(g3, weight: groupedOutput, scales: groupedOutputScales)
+                ?? DeepseekV41FP8Rows.rows(g3, weight: groupedOutput, scales: groupedOutputScales)
                 ?? quantizedMM(g3, groupedOutput, scales: groupedOutputScales, biases: nil,
                                transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
             reducedGroups = qOut.transposed(1, 0, 2).reshaped(batch, length, outputGroups * outputRank)
@@ -209,8 +266,9 @@ final class Ernie55HCAAttention: Module {
             reducedGroups = matmul(g4, groupedOutput.swappedAxes(-1, -2))
                 .transposed(0, 2, 1, 3).reshaped(batch, length, outputGroups * outputRank)
         }
-        let gated = reducedGroups * sigmoid(DeepseekV41FP8Rows.apply(gate, queryRank))
-        return DeepseekV41FP8Rows.apply(output, gated)
+        let gateInput = rawGate ?? Ernie55Kernels.mxfp8Linear(gate, queryRank)
+        let gated = reducedGroups * sigmoid(gateInput)
+        return Ernie55Kernels.mxfp8Linear(output, gated)
     }
 
     func commitCapturedPrefix(offset: Int, kv: MLXArray, x: MLXArray, keep: Int, cache: DeepseekV4Cache) {
@@ -280,7 +338,7 @@ final class Ernie55MLAIndexer: Module {
         }
         let columns = keys.dim(2)
         guard columns > topK + window else { return (mask, nil, currentKeys) }
-        let projectedQ = DeepseekV41FP8Rows.apply(query, queryRank)
+        let projectedQ = Ernie55Kernels.mxfp8Linear(query, queryRank)
             .reshaped(batch, length, heads, dimension).transposed(0, 2, 1, 3)
         let q = MLXFast.RoPE(
             projectedQ, dimensions: ropeWidth, traditional: false, base: theta, scale: 1, offset: offset)
@@ -325,6 +383,11 @@ final class Ernie55MLAAttention: Module {
     @ParameterInfo(key: "attn_sink") var sinks: MLXArray
     private var _embedQueryT: MLXArray?
     private var _unembedValueT: MLXArray?
+    private var _attnSinkBF16: MLXArray?
+    private var _qaKVAWeight: MLXArray?
+    private var _qaKVAScales: MLXArray?
+    private var _qbOGWeight: MLXArray?
+    private var _qbOGScales: MLXArray?
 
     init(
         shape: Ernie55AttentionShape, latentWidth: Int, valueWidth: Int,
@@ -355,9 +418,38 @@ final class Ernie55MLAAttention: Module {
         virtualHeads.prepare()
         let eqT = contiguous(embedQuery.swappedAxes(-1, -2))
         let uvT = contiguous(unembedValue.swappedAxes(-1, -2))
-        eval(eqT, uvT)
+        let sinkBF16 = contiguous(sinks.asType(.bfloat16))
+        eval(eqT, uvT, sinkBF16)
         _embedQueryT = eqT
         _unembedValueT = uvT
+        _attnSinkBF16 = sinkBF16
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FUSE_PROJ"] != "0" else { return }
+        if _qaKVAWeight == nil,
+            let qa = queryDown as? QuantizedLinear, qa.mode == .mxfp8, qa.bias == nil,
+            let kva = keyValue as? QuantizedLinear, kva.mode == .mxfp8, kva.bias == nil,
+            qa.weight.dim(1) == kva.weight.dim(1)
+        {
+            let w = contiguous(concatenated([qa.weight, kva.weight], axis: 0))
+            let s = contiguous(concatenated([qa.scales, kva.scales], axis: 0))
+            eval(w, s)
+            _qaKVAWeight = w
+            _qaKVAScales = s
+            Ernie55Kernels.releaseMXFP8(qa)
+            Ernie55Kernels.releaseMXFP8(kva)
+        }
+        if _qbOGWeight == nil,
+            let qb = queryUp as? QuantizedLinear, qb.mode == .mxfp8, qb.bias == nil,
+            let og = gate as? QuantizedLinear, og.mode == .mxfp8, og.bias == nil,
+            qb.weight.dim(1) == og.weight.dim(1)
+        {
+            let w = contiguous(concatenated([qb.weight, og.weight], axis: 0))
+            let s = contiguous(concatenated([qb.scales, og.scales], axis: 0))
+            eval(w, s)
+            _qbOGWeight = w
+            _qbOGScales = s
+            Ernie55Kernels.releaseMXFP8(qb)
+            Ernie55Kernels.releaseMXFP8(og)
+        }
     }
 
     func callAsFunction(
@@ -366,12 +458,33 @@ final class Ernie55MLAAttention: Module {
         let (batch, length) = (x.dim(0), x.dim(1))
         let latentCache = cache?[0]
         let offset = latentCache?.offset ?? 0
-        let latentQuery = queryNorm(DeepseekV41FP8Rows.apply(queryDown, x))
-        let q = DeepseekV41FP8Rows.apply(queryUp, latentQuery)
-            .reshaped(batch, length, shape.heads, shape.headWidth).transposed(0, 2, 1, 3)
+        let rawQDown: MLXArray
+        let kvProjection: MLXArray
+        if let w = _qaKVAWeight, let s = _qaKVAScales {
+            let combined = Ernie55Kernels.mxfp8Rows(x, weight: w, scales: s)
+                ?? quantizedMM(x, w, scales: s, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            rawQDown = combined[.ellipsis, ..<shape.queryRank]
+            kvProjection = combined[.ellipsis, shape.queryRank...]
+        } else {
+            rawQDown = Ernie55Kernels.mxfp8Linear(queryDown, x)
+            kvProjection = Ernie55Kernels.mxfp8Linear(keyValue, x)
+        }
+        let latentQuery = queryNorm(rawQDown)
+        let rawQUp: MLXArray
+        let rawGate: MLXArray?
+        if let w = _qbOGWeight, let s = _qbOGScales {
+            let combined = Ernie55Kernels.mxfp8Rows(latentQuery, weight: w, scales: s)
+                ?? quantizedMM(latentQuery, w, scales: s, biases: nil, transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+            let qWidth = shape.heads * shape.headWidth
+            rawQUp = combined[.ellipsis, ..<qWidth]
+            rawGate = combined[.ellipsis, qWidth...]
+        } else {
+            rawQUp = Ernie55Kernels.mxfp8Linear(queryUp, latentQuery)
+            rawGate = nil
+        }
+        let q = rawQUp.reshaped(batch, length, shape.heads, shape.headWidth).transposed(0, 2, 1, 3)
         let qPlain = q[.ellipsis, ..<plainWidth]
         let qPos = rotary(q[.ellipsis, plainWidth...], offset: offset)
-        let kvProjection = DeepseekV41FP8Rows.apply(keyValue, x)
         let currentKV = keyValueNorm(kvProjection[.ellipsis, ..<latentWidth]).expandedDimensions(axis: 1)
         let currentKPos = rotary(kvProjection[.ellipsis, latentWidth...].expandedDimensions(axis: 1), offset: offset)
         var kv = currentKV
@@ -392,21 +505,51 @@ final class Ernie55MLAAttention: Module {
             mask = takeAlong(mask, indices, axis: -1)
         }
         let scale: Float = 1 / sqrt(Float(shape.headWidth))
-        let positions = matmul(qPos * scale, kPos.swappedAxes(-1, -2))
-        let bias = `where`(mask, positions, MLXArray(-Float.infinity).asType(positions.dtype))
         let eqT = _embedQueryT ?? embedQuery.swappedAxes(-1, -2)
         let uvT = _unembedValueT ?? unembedValue.swappedAxes(-1, -2)
+        let typedSinks = (qPlain.dtype == .bfloat16 ? _attnSinkBF16 : nil) ?? sinks.asType(qPlain.dtype)
         // Use absorbed MLA for 1-token decode and 2...16-row DSpark verify (same arithmetic, avoids expanding KV).
         let absorbed = length <= 16
-        let queries = absorbed ? matmul(qPlain, eqT) : qPlain
-        let keys = absorbed ? kv : matmul(kv, embedQuery)
-        let values = absorbed ? kv : matmul(kv, uvT)
-        let attention = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: bias,
-            sinks: sinks.asType(queries.dtype))
-        let out = absorbed ? matmul(attention, uvT) : attention
+        let out: MLXArray
+        if !absorbed && length >= 512 {
+            // 512-strip chunked MLA prefill: avoids materializing O(L * S) [64, 2048, S] positional bias.
+            let keys = matmul(kv, embedQuery)
+            let values = matmul(kv, uvT)
+            let kPosT = kPos.swappedAxes(-1, -2)
+            let negInf = MLXArray(-Float.infinity).asType(qPos.dtype)
+            let subSize = 512
+            var chunks: [MLXArray] = []
+            chunks.reserveCapacity((length + subSize - 1) / subSize)
+            var subStart = 0
+            while subStart < length {
+                let subEnd = min(length, subStart + subSize)
+                let qPlainSub = qPlain[0..., 0..., subStart ..< subEnd, 0...]
+                let qPosSub = qPos[0..., 0..., subStart ..< subEnd, 0...]
+                let posSub = matmul(qPosSub * scale, kPosT)
+                let maskSub = mask.ndim == 2
+                    ? mask[subStart ..< subEnd, 0...]
+                    : mask[.ellipsis, subStart ..< subEnd, 0...]
+                let biasSub = `where`(maskSub, posSub, negInf)
+                chunks.append(MLXFast.scaledDotProductAttention(
+                    queries: qPlainSub, keys: keys, values: values, scale: scale, mask: biasSub,
+                    sinks: typedSinks))
+                subStart = subEnd
+            }
+            out = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
+        } else {
+            let positions = matmul(qPos * scale, kPos.swappedAxes(-1, -2))
+            let bias = `where`(mask, positions, MLXArray(-Float.infinity).asType(positions.dtype))
+            let queries = absorbed ? matmul(qPlain, eqT) : qPlain
+            let keys = absorbed ? kv : matmul(kv, embedQuery)
+            let values = absorbed ? kv : matmul(kv, uvT)
+            let attention = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale, mask: bias,
+                sinks: typedSinks)
+            out = absorbed ? matmul(attention, uvT) : attention
+        }
         let mixed = virtualHeads(out.transposed(0, 2, 1, 3)).reshaped(batch, length, -1)
-        return DeepseekV41FP8Rows.apply(output, mixed * sigmoid(DeepseekV41FP8Rows.apply(gate, latentQuery)))
+        let gateInput = rawGate ?? Ernie55Kernels.mxfp8Linear(gate, latentQuery)
+        return Ernie55Kernels.mxfp8Linear(output, mixed * sigmoid(gateInput))
     }
 
     func commitCapturedPrefix(

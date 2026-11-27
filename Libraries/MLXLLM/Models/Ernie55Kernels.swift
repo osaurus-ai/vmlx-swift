@@ -737,17 +737,214 @@ enum Ernie55Kernels {
             threadGroup: (128, 1, 1),
             outputShapes: [[rows, experts]],
             outputDTypes: [.float32])[0]
-        let picked = routerTopKKernel(
-            [scores, correction, expertScale],
-            template: [("E", experts), ("TOPK", count), ("NORMALIZE", normalize)],
-            grid: (experts, rows, 1),
-            threadGroup: (experts, 1, 1),
-            outputShapes: [[1, rows, count], [1, rows, count]],
-            outputDTypes: [.uint32, .float32])
-        return (picked[0], picked[1])
+        let picked = routeTopK(
+            scores, correction: correction, expertScale: expertScale, count: count, normalize: normalize)!
+        return (picked.indices.reshaped(1, rows, count), picked.weights.reshaped(1, rows, count))
         #else
         return nil
         #endif
+    }
+
+    #if canImport(Metal)
+    /// Single-dispatch exact top-K over 512 experts (256 threads / 8 simdgroups, 2 experts per thread).
+    /// Handles both decode/verify (T=1..16) and prefill (T up to 65535).
+    private static let multiRouterTopKKernel = MLXFast.metalKernel(
+        name: "ernie55_multi_router_topk_256",
+        inputNames: ["scores", "correction", "expertScale"],
+        outputNames: ["indices", "weights"],
+        source: """
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint sg   = tid >> 5;
+            const uint lane = tid & 31u;
+            const uint row  = threadgroup_position_in_grid.y;
+
+            const device float* s_row = scores + size_t(row) * 512u;
+            float r0 = s_row[tid];
+            float r1 = s_row[tid + 256u];
+            float v0 = r0 + float(correction[tid]);
+            float v1 = r1 + float(correction[tid + 256u]);
+
+            threadgroup float sg_val[8];
+            threadgroup uint  sg_idx[8];
+            threadgroup uint  win_idx_sh;
+            threadgroup uint  picked_idx[TOPK];
+            threadgroup float picked_raw[TOPK];
+
+            for (uint k = 0u; k < uint(TOPK); ++k) {
+                float bv = (v0 >= v1) ? v0 : v1;
+                uint  bi = (v0 >= v1) ? tid : (tid + 256u);
+                float sm = simd_max(bv);
+                uint  si = simd_min((bv == sm) ? bi : 0xFFFFFFFFu);
+                if (lane == 0u) {
+                    sg_val[sg] = sm;
+                    sg_idx[sg] = si;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    float best_v = sg_val[0];
+                    uint  best_i = sg_idx[0];
+                    for (uint s = 1u; s < 8u; ++s) {
+                        if (sg_val[s] > best_v || (sg_val[s] == best_v && sg_idx[s] < best_i)) {
+                            best_v = sg_val[s];
+                            best_i = sg_idx[s];
+                        }
+                    }
+                    win_idx_sh = best_i;
+                    picked_idx[k] = best_i;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint w = win_idx_sh;
+                if (tid == w) {
+                    picked_raw[k] = r0;
+                    v0 = -INFINITY;
+                } else if (tid + 256u == w) {
+                    picked_raw[k] = r1;
+                    v1 = -INFINITY;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                float raw = (lane < uint(TOPK)) ? picked_raw[lane] : 0.0f;
+                float denom = metal::max(simd_sum(raw), 1e-20f);
+                if (lane < uint(TOPK)) {
+                    uint id = picked_idx[lane];
+                    float w = NORMALIZE ? (raw / denom) : raw;
+                    indices[size_t(row) * uint(TOPK) + lane] = id;
+                    weights[size_t(row) * uint(TOPK) + lane] = w * float(expertScale[id]);
+                }
+            }
+            """)
+    #endif
+
+    static func routeTopK(
+        _ scores: MLXArray, correction: MLXArray, expertScale: MLXArray,
+        count: Int, normalize: Bool
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            scores.dim(-1) == 512, count > 0, count <= 32, scores.dtype == .float32
+        else { return nil }
+        let lead = Array(scores.shape.dropLast())
+        let rows = scores.size / 512
+        guard rows >= 1 && rows <= 65535 else { return nil }
+        let picked = multiRouterTopKKernel(
+            [contiguous(scores.reshaped(rows, 512)),
+             contiguous(correction.asType(.float32)),
+             contiguous(expertScale.asType(.float32))],
+            template: [("TOPK", count), ("NORMALIZE", normalize)],
+            grid: (256, rows, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, count], [rows, count]],
+            outputDTypes: [.uint32, .float32])
+        return (picked[0].reshaped(lead + [count]), picked[1].reshaped(lead + [count]))
+        #else
+        return nil
+        #endif
+    }
+
+    // MARK: - 3b. Fused LatentMoE: Shared SiTU + Latent RMSNorm + Concat
+
+    #if canImport(Metal)
+    private static let sharedSiTULatentNormConcatKernel = MLXFast.metalKernel(
+        name: "ernie55_shared_situ_latent_norm_concat",
+        inputNames: ["proj", "comb", "norm_w", "floats"],
+        outputNames: ["out"],
+        source: """
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint sg   = tid >> 5;
+            const uint lane = tid & 31u;
+            const uint row  = threadgroup_position_in_grid.y;
+
+            const float beta = floats[0];
+            const float lbeta = floats[1];
+            const float norm_eps = floats[2];
+
+            const device T* p_row = proj + size_t(row) * uint(P_DIM);
+            const device T* c_row = comb + size_t(row) * uint(L_DIM);
+            device T* o_row = out + size_t(row) * uint(S_DIM + L_DIM);
+
+            for (uint i = tid; i < uint(S_DIM); i += 256u) {
+                float g = float(p_row[i]);
+                float u = float(p_row[uint(S_DIM) + i]);
+                float sig = 1.0f / (1.0f + metal::precise::exp(-g));
+                float g_act = beta * metal::precise::tanh(g / beta) * sig;
+                float u_act = lbeta * metal::precise::tanh(u / lbeta);
+                o_row[i] = T(g_act * u_act);
+            }
+
+            threadgroup float sg_sq[8];
+            float sq = 0.0f;
+            for (uint j = tid; j < uint(L_DIM); j += 256u) {
+                float v = float(c_row[j]);
+                sq += v * v;
+            }
+            float sg_s = simd_sum(sq);
+            if (lane == 0u) sg_sq[sg] = sg_s;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float total_sq = sg_sq[0] + sg_sq[1] + sg_sq[2] + sg_sq[3]
+                           + sg_sq[4] + sg_sq[5] + sg_sq[6] + sg_sq[7];
+            float inv_rms = metal::precise::rsqrt(total_sq / float(L_DIM) + norm_eps);
+            for (uint j = tid; j < uint(L_DIM); j += 256u) {
+                float v = float(c_row[j]);
+                o_row[uint(S_DIM) + j] = T(v * inv_rms * float(norm_w[j]));
+            }
+            """)
+    #endif
+
+    static func sharedSiTULatentNormConcat(
+        proj: MLXArray, combined: MLXArray, normWeight: MLXArray,
+        sharedWidth: Int, gateCap: Float, upCap: Float, normEps: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            proj.dtype == combined.dtype,
+            [.bfloat16, .float16, .float32].contains(combined.dtype)
+        else { return nil }
+        let pDim = proj.dim(-1)
+        let lDim = combined.dim(-1)
+        guard pDim >= 2 * sharedWidth, sharedWidth > 0, lDim > 0 else { return nil }
+        let rows = combined.size / lDim
+        guard rows >= 1 && rows <= 65535 else { return nil }
+        let lead = Array(combined.shape.dropLast())
+        let nw = normWeight.dtype == combined.dtype ? normWeight : normWeight.asType(combined.dtype)
+        let floats = MLXArray([gateCap, upCap, normEps])
+        let out = sharedSiTULatentNormConcatKernel(
+            [contiguous(proj.reshaped(rows, pDim)), contiguous(combined.reshaped(rows, lDim)),
+             contiguous(nw), floats],
+            template: [("T", combined.dtype), ("P_DIM", pDim), ("S_DIM", sharedWidth), ("L_DIM", lDim)],
+            grid: (256, rows, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, sharedWidth + lDim]],
+            outputDTypes: [combined.dtype])[0]
+        return out.reshaped(lead + [sharedWidth + lDim])
+        #else
+        return nil
+        #endif
+    }
+
+    // MARK: - 3c. Native MXFP8 Linear / Row Projection
+
+    static func releaseMXFP8(_ linear: QuantizedLinear) {
+        linear.update(parameters: ModuleParameters.unflattened([
+            "weight": MLXArray.zeros([1, 1], dtype: .uint32),
+            "scales": MLXArray.zeros([1, 1], dtype: .uint8),
+        ]))
+    }
+
+    static func mxfp8Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
+        if let q = linear as? QuantizedLinear, q.mode == .mxfp8, q.bias == nil {
+            return quantizedMM(
+                x, q.weight, scales: q.scales, biases: nil,
+                transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
+        }
+        return linear(x)
+    }
+
+    static func mxfp8Rows(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
+        guard weight.dtype == .uint32, scales.dtype == .uint8 else { return nil }
+        return quantizedMM(
+            x, weight, scales: scales, biases: nil,
+            transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
     }
 
     // MARK: - 4. Fused BF16 LM Head + MultiMax (1...8 rows)
@@ -1071,6 +1268,110 @@ enum Ernie55Kernels {
             outputShapes: [[1, heads, rows, 512], [1, 1, rows, 512]],
             outputDTypes: [query.dtype, rawKV.dtype])
         return (out[0], out[1])
+        #else
+        return nil
+        #endif
+    }
+
+    #if canImport(Metal)
+    private static let dsparkMarkovStage1Kernel = MLXFast.metalKernel(
+        name: "ernie55_dspark_markov_s1",
+        inputNames: ["base_row", "w2", "trans", "ranges", "ts"],
+        outputNames: ["blk_val", "blk_idx"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tg = threadgroup_position_in_grid.x;
+            const uint n_tg = threadgroups_per_grid.x;
+
+            threadgroup float t_smem[256];
+            t_smem[tid] = float(trans[tid]);
+            threadgroup float sg_val[8];
+            threadgroup uint  sg_idx[8];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float tv0 = t_smem[lane * 8u + 0u];
+            float tv1 = t_smem[lane * 8u + 1u];
+            float tv2 = t_smem[lane * 8u + 2u];
+            float tv3 = t_smem[lane * 8u + 3u];
+            float tv4 = t_smem[lane * 8u + 4u];
+            float tv5 = t_smem[lane * 8u + 5u];
+            float tv6 = t_smem[lane * 8u + 6u];
+            float tv7 = t_smem[lane * 8u + 7u];
+
+            const float r0 = ranges[0], r1 = ranges[1], r2 = ranges[2], r3 = ranges[3];
+            const float t0 = ts[0], t1 = ts[1], t2 = ts[2], t3 = ts[3];
+
+            float best_v = -1e38f;
+            uint best_i = 0u;
+            const uint global_sg = tg * 8u + sg;
+            const uint stride_sg = n_tg * 8u;
+
+            for (uint v = global_sg; v < uint(V); v += stride_sg) {
+                const device bfloat16_t* wp = w2 + size_t(v) * 256u + lane * 8u;
+                float4 w_lo = float4(*(const device vec<bfloat16_t, 4>*)(wp));
+                float4 w_hi = float4(*(const device vec<bfloat16_t, 4>*)(wp + 4u));
+                float d = w_lo.x * tv0 + w_lo.y * tv1 + w_lo.z * tv2 + w_lo.w * tv3
+                        + w_hi.x * tv4 + w_hi.y * tv5 + w_hi.z * tv6 + w_hi.w * tv7;
+                float dot_v = simd_sum(d);
+                if (lane == 0u) {
+                    float val = base_row[v] + float(bfloat16_t(dot_v));
+                    float a = metal::max(r0 - val, 0.0f);
+                    float b = metal::max(val - r1, 0.0f);
+                    float c = metal::max(r2 - val, 0.0f);
+                    float e = metal::max(val - r3, 0.0f);
+                    val = val + t0 * a + t1 * b + t2 * (c * c) + t3 * (e * e);
+                    if (val > best_v) {
+                        best_v = val;
+                        best_i = v;
+                    }
+                }
+            }
+            if (lane == 0u) {
+                sg_val[sg] = best_v;
+                sg_idx[sg] = best_i;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                float bv = sg_val[0];
+                uint bi = sg_idx[0];
+                for (uint s = 1u; s < 8u; s++) {
+                    if (sg_val[s] > bv || (sg_val[s] == bv && sg_idx[s] < bi)) {
+                        bv = sg_val[s];
+                        bi = sg_idx[s];
+                    }
+                }
+                blk_val[tg] = bv;
+                blk_idx[tg] = bi;
+            }
+            """)
+    #endif
+
+    /// Single-pass fused argmax_v MultiMax(baseRow[v] + (markovHead @ transition)[v]).
+    static func dsparkMarkovArgmax(
+        baseRow: MLXArray, markovHead: MLXArray, transition: MLXArray,
+        ranges: MLXArray, ts: MLXArray
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            markovHead.ndim == 2, markovHead.dim(1) == 256,
+            markovHead.dtype == .bfloat16,
+            baseRow.ndim == 1, baseRow.dim(0) == markovHead.dim(0)
+        else { return nil }
+        let vocab = markovHead.dim(0)
+        let nTG = 512
+        let out = dsparkMarkovStage1Kernel(
+            [contiguous(baseRow.asType(.float32)), contiguous(markovHead),
+             contiguous(transition.asType(.bfloat16)),
+             contiguous(ranges.asType(.float32)), contiguous(ts.asType(.float32))],
+            template: [("V", vocab)],
+            grid: (nTG * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[nTG], [nTG]],
+            outputDTypes: [.float32, .uint32])
+        let winner = argMax(out[0])
+        return out[1][winner].asType(.int32)
         #else
         return nil
         #endif
