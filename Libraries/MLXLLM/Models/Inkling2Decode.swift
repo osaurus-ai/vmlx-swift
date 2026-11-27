@@ -185,16 +185,21 @@ enum Inkling2DecodeKernels {
                     ink_store(qo, h * D + lane + 32 * e, y);
                 }
             } else if (head >= (uint)(NQ + 2 * NKV)) {
-                // r heads: NB groups per head, group b covers keys [b * SB, (b + 1) * SB)
+                // r heads: when WRITE_BIAS=0, emit only clipped+scaled r [NQ, DR] (zero S-length mask).
                 int rh = head - NQ - 2 * NKV;
-                int h = rh / NB, blk = rh % NB;
-                int SB = (S + NB - 1) / NB;
+                int h = WRITE_BIAS ? (rh / NB) : rh;
+                int blk = WRITE_BIAS ? (rh % NB) : 0;
                 float x = 0.f;
                 if (lane < (uint)DR) x = float(qa[imeta[1] + h * DR + lane]) * rscale[h * DR + lane];
                 float ss = simd_sum(x * x);
                 float f = min(rc / (sqrt(ss) + 1e-6f), 1.f);
                 float y = ink_round_as(bias, x * f);
                 if (tau != 1.f) y = ink_round_as(bias, y * tau);
+                if (!WRITE_BIAS) {
+                    if (lane < (uint)DR) ink_store(bias, (size_t)h * DR + lane, y);
+                    return;
+                }
+                int SB = (S + NB - 1) / NB;
                 if (lane < (uint)DR) rr[lane] = y;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 int j1 = min(S, (blk + 1) * SB);
@@ -1407,8 +1412,11 @@ extension Inkling2DecoderLayer {
         }
         let seen = kv.offset
         let S = a.window.map { min(seen + 1, $0) } ?? (seen + 1)
-        // relative-bias rows: one simdgroup per 128 keys per head
-        let nb = max(1, (S + 127) / 128)
+        let useSplitK =
+            !a.isSliding && S > 2048 && dtype == .bfloat16 && hd == 128 && dRel == 16
+            && ProcessInfo.processInfo.environment["VMLX_INKLING2_SPLITK_ATTN"] != "0"
+        // relative-bias rows: one simdgroup per 128 keys per head (skipped when split-K runs zero-mask)
+        let nb = useSplitK ? 1 : max(1, (S + 127) / 128)
         var fmeta = w.qkvFMeta!
         if !a.isSliding, Float(seen + 1) > a.logFloor {
             let tau = 1 + a.logAlpha * Foundation.log(max(Float(seen + 1) / a.logFloor, 1))
@@ -1430,9 +1438,13 @@ extension Inkling2DecoderLayer {
             ],
             template: [
                 ("NQ", nq), ("NKV", nkv), ("D", hd), ("DR", dRel), ("DYN", a.isSliding ? 0 : 1), ("PP", P),
+                ("WRITE_BIAS", useSplitK ? 0 : 1),
             ],
             grid: ((nq + 2 * nkv + nq * nb) * 32, 1, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1, nq, 1, hd], [1, nkv, 1, hd], [1, nkv, 1, hd], [1, nq, 1, S], [3, 2 * C]],
+            outputShapes: [
+                [1, nq, 1, hd], [1, nkv, 1, hd], [1, nkv, 1, hd],
+                useSplitK ? [1, 1, nq, dRel] : [1, nq, 1, S], [3, 2 * C],
+            ],
             outputDTypes: [dtype, dtype, dtype, dtype, f32])
 
         // 3. attention
@@ -1442,9 +1454,19 @@ extension Inkling2DecoderLayer {
             keys = keys[0..., 0..., (total - S)..., 0...]
             values = values[0..., 0..., (total - S)..., 0...]
         }
-        let attn = MLXFast.scaledDotProductAttention(
-            queries: outs[0], keys: keys, values: values, scale: a.scale, mask: .array(outs[3]),
-            sinks: sinks)
+        let attn: MLXArray
+        if useSplitK,
+            let splitOut = Inkling2Kernels.decodeSplitKAttention(
+                q: outs[0], k: keys, v: values, r: outs[3], projT: a.relLogits.transposedBF16(),
+                sinks: sinks.reshaped([1, 1, nq]), seen: seen, kStart: seen + 1 - S,
+                relExtent: a.relExtent, scale: a.scale)
+        {
+            attn = splitOut
+        } else {
+            attn = MLXFast.scaledDotProductAttention(
+                queries: outs[0], keys: keys, values: values, scale: a.scale, mask: .array(outs[3]),
+                sinks: sinks)
+        }
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [attn, y, w.sigMeta!], grid: (nQ, 1, 1),
             threadGroup: (256, 1, 1), outputShapes: [[1, nQ]], outputDTypes: [dtype])[0]

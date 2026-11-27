@@ -447,72 +447,85 @@ extension Inkling2DecoderLayer {
             }
         }
         let sinkOff = 2 * nQ + nR
-        let mask = Inkling2VerifyKernels.maskT(
-            [
-                outs[1].reshaped([T, nq, dRel]), a.relLogits.proj, qa,
-                MLXArray([
-                    Int32(S), Int32(seen), Int32(kStart), Int32(sinkOff), Int32(qa.dim(1)),
-                    Int32(a.window ?? 0),
-                ]),
-            ],
-            template: [("NATIVE_SINKS", matchDecode)],
-            grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
-            outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
         let merged: MLXArray
-        let directKeySpan = (a.window == nil && S >= 1023 + T)
-            || (a.window == 1024 && S == 1023 + T)
-        var directAttention: MLXArray?
-        if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
-            directKeySpan, T <= 8, dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+        if !a.isSliding, S > 2048, dtype == .bfloat16, hd == 128, dRel == 16,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_SPLITK_ATTN"] != "0",
+            let splitOut = Inkling2Kernels.decodeSplitKAttention(
+                q: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
+                k: keys, v: values,
+                r: outs[1].reshaped([1, T, nq, dRel]),
+                projT: a.relLogits.transposedBF16(),
+                sinks: qa[0..., sinkOff ..< (sinkOff + nq)].reshaped([1, T, nq]),
+                seen: seen, kStart: kStart, relExtent: a.relExtent, scale: a.scale)
         {
-            let query = outs[0]
-            let sinks = qa[0..., sinkOff ..< (sinkOff + nq)]
-            let stream = StreamOrDevice.default
-            var result = mlx_array_new()
-            // The C API borrows array handles. Keep the Swift owners alive
-            // until C++ has retained the arrays in the lazy primitive.
-            let accepted = withExtendedLifetime((query, keys, values, mask, sinks, stream)) {
-                vmlx_inkling_verify_attention(
-                    &result, query.ctx, keys.ctx, values.ctx, mask.ctx, sinks.ctx,
-                    a.scale, a.window != nil, stream.ctx)
-            }
-            if accepted {
-                directAttention = MLXArray(result)
-            } else {
-                _ = mlx_array_free(result)
-            }
-        }
-        if let directAttention {
-            merged = directAttention
-        } else if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
-            let window = a.window, window == 1024, S == window - 1 + T, T <= 8,
-            dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
-        {
-            merged = Inkling2VerifyKernels.packedSlidingAttention(
-                q: outs[0], keys: keys, values: values, bias: mask,
-                sinks: qa[0..., sinkOff ..< (sinkOff + nq)],
-                window: window, scale: a.scale)
-        } else if matchDecode {
-            merged = MLX.concatenated(
-                (0 ..< T).map { row in
-                    let end = seen + row + 1 - kStart
-                    let start = max(0, end - (a.window ?? end))
-                    let bias = mask[0..., row, start ..< end].reshaped([1, nq, 1, end - start])
-                    return MLXFast.scaledDotProductAttention(
-                        queries: outs[0][row].reshaped([1, nq, 1, hd]),
-                        keys: keys[0..., 0..., start ..< end, 0...],
-                        values: values[0..., 0..., start ..< end, 0...],
-                        scale: a.scale, mask: .array(bias),
-                        sinks: qa[row, sinkOff ..< (sinkOff + nq)]
-                    ).reshaped([1, nQ])
-                }, axis: 0)
+            merged = splitOut.transposed(0, 2, 1, 3).reshaped([T, nQ])
         } else {
-            let attn = MLXFast.scaledDotProductAttention(
-                queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
-                keys: keys, values: values, scale: a.scale,
-                mask: .array(mask.reshaped([1, nq, T, S])),
-                sinks: w.zeroSinks(nq: nq, dtype: dtype))
-            merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+            let mask = Inkling2VerifyKernels.maskT(
+                [
+                    outs[1].reshaped([T, nq, dRel]), a.relLogits.proj, qa,
+                    MLXArray([
+                        Int32(S), Int32(seen), Int32(kStart), Int32(sinkOff), Int32(qa.dim(1)),
+                        Int32(a.window ?? 0),
+                    ]),
+                ],
+                template: [("NATIVE_SINKS", matchDecode)],
+                grid: (S, T, nq), threadGroup: (min(256, S), 1, 1),
+                outputShapes: [[nq, T, S]], outputDTypes: [dtype])[0]
+            let directKeySpan = (a.window == nil && S >= 1023 + T)
+                || (a.window == 1024 && S == 1023 + T)
+            var directAttention: MLXArray?
+            if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+                directKeySpan, T <= 8, dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+            {
+                let query = outs[0]
+                let sinks = qa[0..., sinkOff ..< (sinkOff + nq)]
+                let stream = StreamOrDevice.default
+                var result = mlx_array_new()
+                // The C API borrows array handles. Keep the Swift owners alive
+                // until C++ has retained the arrays in the lazy primitive.
+                let accepted = withExtendedLifetime((query, keys, values, mask, sinks, stream)) {
+                    vmlx_inkling_verify_attention(
+                        &result, query.ctx, keys.ctx, values.ctx, mask.ctx, sinks.ctx,
+                        a.scale, a.window != nil, stream.ctx)
+                }
+                if accepted {
+                    directAttention = MLXArray(result)
+                } else {
+                    _ = mlx_array_free(result)
+                }
+            }
+            if let directAttention {
+                merged = directAttention
+            } else if matchDecode, Inkling2VerifyKernels.supportsPackedSlidingAttention,
+                let window = a.window, window == 1024, S == window - 1 + T, T <= 8,
+                dtype == .bfloat16, nq == 24, nkv == 8, hd == 128
+            {
+                merged = Inkling2VerifyKernels.packedSlidingAttention(
+                    q: outs[0], keys: keys, values: values, bias: mask,
+                    sinks: qa[0..., sinkOff ..< (sinkOff + nq)],
+                    window: window, scale: a.scale)
+            } else if matchDecode {
+                merged = MLX.concatenated(
+                    (0 ..< T).map { row in
+                        let end = seen + row + 1 - kStart
+                        let start = max(0, end - (a.window ?? end))
+                        let bias = mask[0..., row, start ..< end].reshaped([1, nq, 1, end - start])
+                        return MLXFast.scaledDotProductAttention(
+                            queries: outs[0][row].reshaped([1, nq, 1, hd]),
+                            keys: keys[0..., 0..., start ..< end, 0...],
+                            values: values[0..., 0..., start ..< end, 0...],
+                            scale: a.scale, mask: .array(bias),
+                            sinks: qa[row, sinkOff ..< (sinkOff + nq)]
+                        ).reshaped([1, nQ])
+                    }, axis: 0)
+            } else {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
+                    keys: keys, values: values, scale: a.scale,
+                    mask: .array(mask.reshaped([1, nq, T, S])),
+                    sinks: w.zeroSinks(nq: nq, dtype: dtype))
+                merged = attn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+            }
         }
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [merged, qa[0..., (nQ + nR) ..< (2 * nQ + nR)], MLXArray([Int32(0)])],

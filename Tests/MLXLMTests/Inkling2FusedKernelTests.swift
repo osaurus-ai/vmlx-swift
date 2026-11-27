@@ -140,6 +140,7 @@ final class Inkling2FusedKernelTests: XCTestCase {
         for (seen, kStart, T, S, window) in [
             (128, 65, 32, 95, Optional(64)),
             (100, 0, 16, 116, Optional<Int>.none),
+            (240, 0, 37, 277, Optional<Int>.none),
         ] {
             let q = values([B, NQ, T, D], seed: 21, scale: 0.5).asType(.bfloat16)
             let k = values([B, NKV, S, D], seed: 22, scale: 0.5).asType(.bfloat16)
@@ -181,6 +182,55 @@ final class Inkling2FusedKernelTests: XCTestCase {
             eval(got, ref)
             let maxDiff = MLX.abs(got.asType(.float32) - ref.asType(.float32)).max().item(Float.self)
             XCTAssertLessThan(maxDiff, 0.03, "window=\(String(describing: window)) maxDiff=\(maxDiff)")
+        }
+    }
+
+    /// Zero-mask Split-K FlashDecoding (T=1 AR and T=8/12 DFlash 2 verify) matches reference
+    /// attention across both far-past unmasked keys (d >= E) and relative-bias keys (d < E).
+    func testDecodeSplitKAttentionMatchesReference() throws {
+        let (B, NQ, NKV, D, DR, E) = (1, 24, 8, 128, 16, 64)
+        let scale: Float = 1 / Float(D).squareRoot()
+        for T in [1, 8, 12] {
+            let seen = 1500
+            let S = seen + T
+            let q = values([B, NQ, T, D], seed: 31 + UInt64(T), scale: 0.4).asType(.bfloat16)
+            let k = values([B, NKV, S, D], seed: 32 + UInt64(T), scale: 0.4).asType(.bfloat16)
+            let v = values([B, NKV, S, D], seed: 33 + UInt64(T), scale: 0.4).asType(.bfloat16)
+            let r = values([B, T, NQ, DR], seed: 34 + UInt64(T), scale: 0.4).asType(.bfloat16)
+            let proj = values([DR, E], seed: 35 + UInt64(T), scale: 0.3).asType(.bfloat16)
+            let projT = MLX.contiguous(proj.T)
+            let sinks = values([B, T, NQ], seed: 36 + UInt64(T), scale: 0.8).asType(.bfloat16)
+
+            guard let got = Inkling2Kernels.decodeSplitKAttention(
+                q: q, k: k, v: v, r: r, projT: projT, sinks: sinks,
+                seen: seen, kStart: 0, relExtent: E, scale: scale)
+            else {
+                XCTFail("decodeSplitKAttention returned nil on GPU for T=\(T)")
+                return
+            }
+
+            let qPos = MLXArray(Int32(seen) ..< Int32(seen + T))
+            let kPos = MLXArray(Int32(0) ..< Int32(S))
+            let d = qPos.expandedDimensions(axis: 1) - kPos.expandedDimensions(axis: 0)
+            let idx = MLX.clip(d, min: 0, max: E - 1)
+            let rel = MLX.matmul(r, proj).transposed(0, 2, 1, 3)
+            let gathered = MLX.takeAlong(
+                rel, MLX.broadcast(idx.reshaped([1, 1, T, S]), to: [B, NQ, T, S]), axis: -1)
+            let valid = d .>= 0
+            let inBand = (d .>= 0) .&& (d .< E)
+            let bias = MLX.where(inBand, gathered, MLXArray(Float(0)).asType(.bfloat16))
+            let negInf = MLXArray(-Float.infinity).asType(.bfloat16)
+            let additive = MLX.where(valid, bias, negInf)
+            let sinkCol = sinks.transposed(0, 2, 1).expandedDimensions(axis: -1)
+            let mask = MLX.concatenated([sinkCol, additive], axis: -1)
+            let zk = MLXArray.zeros([B, NKV, 1, D], dtype: .bfloat16)
+            let ref = MLXFast.scaledDotProductAttention(
+                queries: q, keys: MLX.concatenated([zk, k], axis: 2),
+                values: MLX.concatenated([zk, v], axis: 2),
+                scale: scale, mask: .array(mask))
+            eval(got, ref)
+            let maxDiff = MLX.abs(got.asType(.float32) - ref.asType(.float32)).max().item(Float.self)
+            XCTAssertLessThan(maxDiff, 0.03, "splitK T=\(T) maxDiff=\(maxDiff)")
         }
     }
 }

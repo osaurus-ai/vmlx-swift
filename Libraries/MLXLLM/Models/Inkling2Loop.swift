@@ -765,7 +765,7 @@ final class Inkling2Attention: Module {
                 queries: q, keys: keys, values: values, scale: scale,
                 mask: .array(bias.asType(q.dtype)),
                 sinks: sinks.reshaped([nq]).asType(q.dtype))
-        } else if inklingUseKernels, B == 1, S <= 4096,
+        } else if inklingUseKernels, B == 1, S <= 2048,
             ProcessInfo.processInfo.environment["VMLX_INKLING2_PREFILL_ATTN"] != "0"
         {
             // Fused maskT folds -sink into the relative bias so stock hardware MMA FlashAttention
