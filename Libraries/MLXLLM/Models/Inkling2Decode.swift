@@ -1029,18 +1029,30 @@ struct Inkling2QuantizedProjections {
             bits: bits, mode: mode)
     }
 
-    /// Batch independent vectors while keeping M = 1 in the quantized matmul dispatch.
+    /// Batch independent vectors while keeping M = 1 arithmetic bit-exact.
+    /// Uses `RowExactAffineQMV` (single weight read across all T rows) for supported affine shapes,
+    /// falling back to batched M = 1 `quantizedMM`.
     func verifyVectors(_ x: MLXArray, _ p: Packed) -> MLXArray {
-        if x.dtype != p.scales.dtype {
-            return MLX.concatenated(
-                (0 ..< x.dim(0)).map { self(x[$0 ..< ($0 + 1)], p) }, axis: 0)
+        let fallback: (MLXArray) -> MLXArray = { input in
+            if input.dtype != p.scales.dtype {
+                return MLX.concatenated(
+                    (0 ..< input.dim(0)).map { self(input[$0 ..< ($0 + 1)], p) }, axis: 0)
+            }
+            return MLX.quantizedMM(
+                input.expandedDimensions(axis: 1), p.weight.expandedDimensions(axis: 0),
+                scales: p.scales.expandedDimensions(axis: 0),
+                biases: p.biases?.expandedDimensions(axis: 0),
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode
+            ).squeezed(axis: 1)
         }
-        return MLX.quantizedMM(
-            x.expandedDimensions(axis: 1), p.weight.expandedDimensions(axis: 0),
-            scales: p.scales.expandedDimensions(axis: 0),
-            biases: p.biases?.expandedDimensions(axis: 0),
-            transpose: true, groupSize: groupSize, bits: bits, mode: mode
-        ).squeezed(axis: 1)
+        if mode == .affine, let biases = p.biases,
+            let fast = RowExactAffineQMV.project(
+                x, weight: p.weight, scales: p.scales, biases: biases,
+                groupSize: groupSize, bits: bits, reference: fallback)
+        {
+            return fast
+        }
+        return fallback(x)
     }
 
     var arrays: [MLXArray] {

@@ -53,6 +53,7 @@ public struct DFlash2InnerConfig: Codable, Sendable {
     public let inputEmbeddingScale: Float
     public let outputMultiplier: Float
     public let finalLogitSoftcapping: Float?
+    public let selectorSoftcapMode: String
 
     enum CodingKeys: String, CodingKey {
         case blockSize = "block_size"
@@ -65,6 +66,7 @@ public struct DFlash2InnerConfig: Codable, Sendable {
         case inputEmbeddingScale = "input_embedding_scale"
         case outputMultiplier = "output_multiplier"
         case finalLogitSoftcapping = "final_logit_softcapping"
+        case selectorSoftcapMode = "selector_softcap_mode"
     }
 
     public init(from decoder: Decoder) throws {
@@ -81,6 +83,8 @@ public struct DFlash2InnerConfig: Codable, Sendable {
         self.outputMultiplier = try c.decodeIfPresent(Float.self, forKey: .outputMultiplier) ?? 1.0
         self.finalLogitSoftcapping = try c.decodeIfPresent(
             Float.self, forKey: .finalLogitSoftcapping)
+        self.selectorSoftcapMode =
+            try c.decodeIfPresent(String.self, forKey: .selectorSoftcapMode) ?? "before_correction"
     }
 }
 
@@ -249,6 +253,7 @@ extension DFlash2InnerConfig {
             "selector_top_k": selectorTopK,
             "input_embedding_scale": inputEmbeddingScale,
             "output_multiplier": outputMultiplier,
+            "selector_softcap_mode": selectorSoftcapMode,
         ]
         if let finalLogitSoftcapping {
             dict["final_logit_softcapping"] = finalLogitSoftcapping
@@ -665,6 +670,7 @@ public struct DFlash2Proposal {
 /// single LM-head projection that produced the logits.
 final class DFlash2CandidateSelector: Module {
     let topK: Int
+    let postSoftcap: Float?
 
     @ModuleInfo(key: "predecessor_codebook") var predecessorCodebook: Embedding
     @ModuleInfo(key: "successor_codebook") var successorCodebook: Embedding
@@ -672,6 +678,9 @@ final class DFlash2CandidateSelector: Module {
 
     init(_ config: DFlash2Configuration) {
         self.topK = config.dflash.selectorTopK
+        self.postSoftcap =
+            (config.dflash.selectorSoftcapMode == "after_correction")
+            ? config.dflash.finalLogitSoftcapping : nil
         self._predecessorCodebook.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.dflash.selectorRank)
         self._successorCodebook.wrappedValue = Embedding(
@@ -709,7 +718,10 @@ final class DFlash2CandidateSelector: Module {
             let h = projected[0..., position, 0...].expandedDimensions(axis: 1)
             let succ = successorCodebook(candidates[0..., position, 0...])
             let edges = (prev * h * succ).sum(axis: -1)
-            let scores = unary[0..., position, 0...] + edges
+            var scores = unary[0..., position, 0...] + edges
+            if let cap = postSoftcap, cap > 0 {
+                scores = tanh(scores / cap) * cap
+            }
 
             let selected: MLXArray
             if temperature > 0 {
@@ -898,13 +910,13 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
 
     /// Project drafter hidden states through the target's LM head.
     public func computeLogits(
-        _ hidden: MLXArray, embedder: any TokenEmbedderModel
+        _ hidden: MLXArray, embedder: any TokenEmbedderModel, applySoftcap: Bool = true
     ) -> MLXArray {
         var logits = embedder.projectToLogits(hidden)
         if config.dflash.outputMultiplier != 1.0 {
             logits = logits * config.dflash.outputMultiplier
         }
-        if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
+        if applySoftcap, let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
             logits = tanh(logits / cap) * cap
         }
         return logits
@@ -991,7 +1003,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             inputs: inputs, targetHidden: targetHidden, cache: cache,
             embedder: embedder, logitsStart: 1)
         guard hidden.ndim == 3 else { return nil }
-        let logits = computeLogits(hidden, embedder: embedder)
+        let logits = computeLogits(
+            hidden, embedder: embedder,
+            applySoftcap: config.dflash.selectorSoftcapMode != "after_correction")
         return candidateSelector.lattice(
             hidden: hidden, logits: logits, anchorIds: inputs[0..., 0])
     }
@@ -1020,7 +1034,9 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             return DFlash2Proposal(
                 tokens: hidden, candidates: hidden, probabilities: nil)
         }
-        let logits = computeLogits(hidden, embedder: embedder)
+        let logits = computeLogits(
+            hidden, embedder: embedder,
+            applySoftcap: config.dflash.selectorSoftcapMode != "after_correction")
         guard let candidateSelector else {
             return DFlash2Proposal(tokens: hidden, candidates: hidden, probabilities: nil)
         }

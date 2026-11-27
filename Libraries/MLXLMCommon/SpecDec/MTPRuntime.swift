@@ -1273,6 +1273,10 @@ public enum NativeMTPAutoDecodePolicy {
         // topology (never a path or name); a bundle's explicit tuning block still wins, and the request's
         // adaptive controller still falls back to AR on a workload that does not accept drafts.
         if isOrnith122BTopology(config) { return ornith122BColdStartDepth }
+        // Bonsai 2.5 27B Hadamard (dense Qwen 3.5, 64 layers x 5120, 2-bit Hadamard + Prism MTP v2):
+        // row-exact 2-bit verify + fused FWHT + HadamardProjectionGroup + post-norm hidden detection;
+        // cold-start at depth 2 and let the Adaptive controller scale or fall back per workload.
+        if isBonsai25HadamardTopology(config) { return bonsai25ColdStartDepth }
         // Nemotron's row-exact verifier and LiLiCorr proposer still need an
         // in-app speedup measurement. Physical head presence establishes
         // capability, not profitability. Keep Auto tuning-file driven;
@@ -1281,6 +1285,22 @@ public enum NativeMTPAutoDecodePolicy {
     }
 
     static let ornith122BColdStartDepth = 1
+    static let bonsai25ColdStartDepth = 2
+
+    static func isBonsai25HadamardTopology(_ config: [String: Any]?) -> Bool {
+        guard let config else { return false }
+        let topType = normalize((config["model_type"] as? String) ?? "")
+        let hasHadamard = config["hadamard"] != nil || topType == JangLoader.prismHadamardModelType
+        guard hasHadamard else { return false }
+        let text = (config["text_config"] as? [String: Any]) ?? config
+        func int(_ key: String) -> Int? { (text[key] as? NSNumber)?.intValue }
+        let modelType = normalize((text["model_type"] as? String) ?? topType)
+        return (modelType == "qwen3_5_text" || modelType == "qwen3_5"
+            || topType == JangLoader.prismHadamardModelType)
+            && int("hidden_size") == 5120 && int("num_hidden_layers") == 64
+            && (int("num_experts") ?? 0) == 0
+            && (int("mtp_num_hidden_layers") ?? 0) >= 1
+    }
 
     static func isOrnith122BTopology(_ config: [String: Any]?) -> Bool {
         guard let config else { return false }

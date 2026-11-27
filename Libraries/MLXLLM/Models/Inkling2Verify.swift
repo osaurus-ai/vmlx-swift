@@ -155,11 +155,10 @@ enum Inkling2VerifyKernels {
             """,
         header: header)
 
-    // Packing pays for itself on the measured M5 Max GPU. Other devices use the same stock
-    // attention in separate per-row calls.
+    // Direct/packed verify attention pays for itself on Apple M5 family GPUs (M5 Pro/Max/Ultra: g17*).
     static let supportsPackedSlidingAttention: Bool = {
         #if canImport(Metal)
-            GPU.deviceInfo().architecture == "applegpu_g17s"
+            GPU.deviceInfo().architecture.hasPrefix("applegpu_g17")
         #else
             false
         #endif
@@ -526,13 +525,24 @@ extension Inkling2DecoderLayer {
             type(of: linear) == QuantizedLinear.self, linear.bias == nil,
             linear.scales.dtype == gated.dtype
         {
-            o = MLX.quantizedMM(
-                gated.expandedDimensions(axis: 1), linear.weight.expandedDimensions(axis: 0),
-                scales: linear.scales.expandedDimensions(axis: 0),
-                biases: linear.biases?.expandedDimensions(axis: 0),
-                transpose: true,
-                groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode
-            ).squeezed(axis: 1)
+            let fallback: (MLXArray) -> MLXArray = { input in
+                MLX.quantizedMM(
+                    input.expandedDimensions(axis: 1), linear.weight.expandedDimensions(axis: 0),
+                    scales: linear.scales.expandedDimensions(axis: 0),
+                    biases: linear.biases?.expandedDimensions(axis: 0),
+                    transpose: true,
+                    groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode
+                ).squeezed(axis: 1)
+            }
+            if linear.mode == .affine, let biases = linear.biases,
+                let fast = RowExactAffineQMV.project(
+                    gated, weight: linear.weight, scales: linear.scales, biases: biases,
+                    groupSize: linear.groupSize, bits: linear.bits, reference: fallback)
+            {
+                o = fast
+            } else {
+                o = fallback(gated)
+            }
         } else {
             o = MLX.concatenated((0 ..< T).map { a.oProj(gated[$0 ..< ($0 + 1)]) }, axis: 0)
         }

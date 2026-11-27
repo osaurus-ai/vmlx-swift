@@ -1813,9 +1813,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 try model.prepare(part, cache: cache, windowSize: windowSize)
             }
         }
-        guard let coordinator = cacheCoordinator,
-            coordinator.canPersistBoundaries,
-            originalInput.cachePromptIntent != .auxiliary,
+        guard originalInput.cachePromptIntent != .auxiliary,
             !originalInput.hasMediaContent,
             !originalInput.requiresPostPrepareCacheKey,
             !input.hasMediaContent,
@@ -1851,9 +1849,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // 5.7 s for the 4,315-token tool seed — an 8.6 s stall between the
         // last streamed token and the end of the first turn of every chat,
         // which the AR lane had already stopped paying on 2026-10-13.
-        let stripAt = TokenIterator.hybridStripBoundaryIndex(
-            coordinator: coordinator, promptTokenIds: promptTokenIds,
-            input: originalInput, cache: cache)
+        // Stable prefill splits affect the numerical result even when there
+        // is no durable cache. Match AR's split schedule independently of
+        // whether the runtime will retain snapshots for a later store.
+        let storage = cacheCoordinator.flatMap { $0.canPersistBoundaries ? $0 : nil }
+        let stripAt = storage.flatMap {
+            TokenIterator.hybridStripBoundaryIndex(
+                coordinator: $0, promptTokenIds: promptTokenIds,
+                input: originalInput, cache: cache)
+        }
         let canonical = stripAt.flatMap { $0 >= restored ? $0 : nil }
         let stableStart = canonical ?? restored
         var wanted = Set(
@@ -1864,16 +1868,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Seeds inside the head, before the canonical boundary. A seed that
         // is already durable on disk is not captured: the store loop skips
         // it, so a retained copy would only hold KV bytes through decode.
-        wanted.formUnion(Self.storeSeedsInsidePrefillHead(
-            stablePrefixTokenCounts: originalInput.cacheStablePrefixTokenCounts,
-            promptTokenCount: promptTokenIds.count,
-            restored: restored,
-            headEnd: stableStart,
-            requiresRecurrentSSMCompanion: coordinator.requiresRecurrentSSMCompanion,
-            isDurable: { count in
-                coordinator.hasDurableDiskEntry(
-                    tokens: Array(promptTokenIds.prefix(count)), mediaSalt: mediaSalt)
-            }))
+        if let storage {
+            wanted.formUnion(Self.storeSeedsInsidePrefillHead(
+                stablePrefixTokenCounts: originalInput.cacheStablePrefixTokenCounts,
+                promptTokenCount: promptTokenIds.count,
+                restored: restored,
+                headEnd: stableStart,
+                requiresRecurrentSSMCompanion: storage.requiresRecurrentSSMCompanion,
+                isDurable: { count in
+                    storage.hasDurableDiskEntry(
+                        tokens: Array(promptTokenIds.prefix(count)), mediaSalt: mediaSalt)
+                }))
+        }
         // Keep segmentation independent of whether an SSD entry already
         // exists, just as the AR iterator does.
         if let canonical { wanted.insert(canonical) }
@@ -1924,7 +1930,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     stage: .prefill, completedUnitCount: boundary,
                     totalUnitCount: total, detail: "native-mtp-boundary"))
             }
-            if cache.allSatisfy({ $0.offset == boundary }) {
+            if storage != nil, cache.allSatisfy({ $0.offset == boundary }) {
                 // Materialize OWNED copies before subsequent prefill/decode
                 // mutates recurrent state or needs unique buffer ownership.
                 prefillBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)

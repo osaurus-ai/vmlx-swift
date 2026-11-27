@@ -136,16 +136,31 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             return
                 "Drafter was trained for a \(vocabularySize)-token vocabulary; this model has \(vocabulary)."
         }
-        if let layers = (text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int),
-            let deepest = targetLayerIDs.max(), deepest >= layers
-        {
-            return
-                "Drafter reads layer \(deepest) of its target; this model has \(layers) layers."
-        }
-        if let layers = (text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int),
-            layers != targetLayerCount
-        {
-            return "Drafter expects \(targetLayerCount) target layers; this model has \(layers)."
+        if let rawLayers = (text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int) {
+            let loopConfig = (text["loop_config"] as? [String: Any]) ?? (root["loop_config"] as? [String: Any])
+            let isLooped: Bool
+            let effectiveLayers: Int
+            if let loopConfig,
+                let start = (loopConfig["core_start"] as? Int) ?? (loopConfig["loop_start"] as? Int),
+                let end = (loopConfig["core_end"] as? Int) ?? (loopConfig["loop_end"] as? Int),
+                let passes = (loopConfig["num_passes"] as? Int) ?? (loopConfig["loop_passes"] as? Int),
+                end > start, passes > 1
+            {
+                isLooped = true
+                effectiveLayers = rawLayers + (passes - 1) * (end - start)
+            } else {
+                isLooped = false
+                effectiveLayers = rawLayers
+            }
+            if let deepest = targetLayerIDs.max(),
+                isLooped ? (deepest > effectiveLayers) : (deepest >= effectiveLayers)
+            {
+                return
+                    "Drafter reads layer \(deepest) of its target; this model has \(effectiveLayers) layers."
+            }
+            if effectiveLayers != targetLayerCount {
+                return "Drafter expects \(targetLayerCount) target layers; this model has \(effectiveLayers)."
+            }
         }
         if let hidden = (text["hidden_size"] as? Int) ?? (root["hidden_size"] as? Int),
             let drafterHidden = drafterHiddenSize, hidden != drafterHidden

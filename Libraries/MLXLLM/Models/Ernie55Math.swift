@@ -112,6 +112,11 @@ enum Ernie55Math {
         let x = input.asType(.float32)
         let scores = sigmoid(matmul(x, first.asType(.float32).transposed()))
             + sigmoid(matmul(x, second.asType(.float32).transposed()))
+        if let fastTopK = Ernie55Kernels.routeTopK(
+            scores, correction: correction, expertScale: expertScale, count: count, normalize: normalize)
+        {
+            return fastTopK
+        }
         let indices = argPartition(-(scores + correction), kth: count - 1, axis: -1)[.ellipsis, ..<count]
         let picked = takeAlong(scores, indices, axis: -1)
         let weights = normalize ? picked / maximum(picked.sum(axis: -1, keepDims: true), 1e-20) : picked

@@ -561,9 +561,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 drafterPath: URL(fileURLWithPath: selected.path),
                 blockSize: mtp.dflash2BlockSize)
         }
-        // DeepSeek-V4.1 bundles ship their own dSpark head in `dspark/`. It is speed-only and exact
-        // (greedy and sampled requests), and its wall-clock governor keeps it at or above AR, so it is
-        // on by default; Off (and only Off, or VMLX_DSV41_DSPARK=0) turns it off.
+        // Prefer an explicit bundled `dflash2/` drafter (e.g. IncoAI DFlash 2 attached to an
+        // Inkling-2-Mini bundle) over a native DSpark head when both are present.
+        if let bundledDFlash2 = bundledDedicatedDFlash2Drafter(
+            configData: configData, bundleDirectory: bundleDirectory)
+        {
+            return .dflash2(
+                drafterPath: URL(fileURLWithPath: bundledDFlash2.path),
+                blockSize: mtp.dflash2BlockSize)
+        }
+        // DeepSeek-V4.1 / ERNIE 5.5 / Inkling-2 bundles ship their own dSpark head in `dspark/`
+        // or inline. It is speed-only and exact (greedy and sampled requests), and its wall-clock
+        // governor keeps it at or above AR, so it is on by default; Off turns it off.
         if let dspark = bundledDSparkDrafter(configData: configData, bundleDirectory: bundleDirectory) {
             return .dspark(drafterPath: dspark)
         }
@@ -673,6 +682,25 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return true
     }
 
+    /// True when `directory` is an ERNIE 5.5 MXFP4 bundle that ships its 3-layer DSpark drafter
+    /// inline under `model.mtp.*` in `model.safetensors.index.json` alongside `dspark_block_size` in `config.json`.
+    public static func declaresErnie55InlineDSparkDrafter(_ directory: URL) -> Bool {
+        let configURL = directory.appendingPathComponent("config.json")
+        let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
+        guard let configData = try? Data(contentsOf: configURL),
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            (config["model_type"] as? String) == "ernie5_5_moe",
+            config["dspark_block_size"] != nil,
+            let qcfg = config["quantization_config"] as? [String: Any],
+            (qcfg["expert_dtype"] as? String)?.lowercased() == "mxfp4",
+            let indexData = try? Data(contentsOf: indexURL),
+            let indexJSON = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+            let weightMap = indexJSON["weight_map"] as? [String: String]
+        else { return false }
+        return weightMap["model.mtp.feature_norm.weight"] != nil
+            && weightMap["model.mtp.markov_head.markov_w1.weight"] != nil
+    }
+
     /// True when `directory/config.json` declares a DSpark drafter (an architecture naming DSpark, or a
     /// `dspark` projector) and the directory holds its safetensors. The vMLX Python runtime's rule
     /// (`config_declares_dspark`): a sidecar config that does not declare DSpark is not a DSpark drafter.
@@ -733,10 +761,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             return local
         }
         if types.contains(where: Self.ernie55DSparkModelTypes.contains) {
-            guard !DSparkEnvironment.miniMaxDisabled(environment), Self.declaresErnie55DSparkDrafter(local) else {
-                return nil
-            }
-            return local
+            guard !DSparkEnvironment.miniMaxDisabled(environment) else { return nil }
+            if Self.declaresErnie55DSparkDrafter(local) { return local }
+            if Self.declaresErnie55InlineDSparkDrafter(bundleDirectory) { return bundleDirectory }
+            return nil
         }
         guard
             FileManager.default.fileExists(
@@ -767,6 +795,21 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         return (0 ..< layers).allSatisfy { index in
             layer.allSatisfy { tensors.contains("mtp_drafter.layers.\(index).\($0).weight") }
         }
+    }
+
+    /// The bundle-local `dflash2/` drafter ONLY (excluding `dspark/`), when it fits and
+    /// speculation is not switched off. Checked before `bundledDSparkDrafter` so a dedicated
+    /// DFlash 2 drafter (e.g. `incoai/Inkling-2-Mini-DFlash2` attached under `dflash2/`) is
+    /// preferred over an inline/native DSpark head when both are present.
+    public func bundledDedicatedDFlash2Drafter(
+        configData: Data?, bundleDirectory: URL?
+    ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off, let bundleDirectory else { return nil }
+        let local = bundleDirectory.appendingPathComponent("dflash2", isDirectory: true)
+        guard let info = VMLXDFlash2DrafterInfo.read(at: local),
+            info.mismatchReason(configData: configData) == nil
+        else { return nil }
+        return info
     }
 
     /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.

@@ -74,7 +74,7 @@ struct Ernie55JANGHPreparation {
         let caps = configuration.caps
         let routed = try banks.makeRoutedExperts(
             activationLimit: nil, activation: .ernie55(gateCap: caps.gate, upCap: caps.up))
-        let experts = try routed.mapValues { layer -> JANGTRoutedExpertLayer in
+        let experts: [Int: any Ernie55RoutedExperts] = try routed.mapValues { layer -> any Ernie55RoutedExperts in
             guard let ernieBank = layer as? JANGTRoutedExpertLayer else {
                 throw JangLoaderError.invalidConfig("ERNIE needs the SiTU routed expert banks")
             }

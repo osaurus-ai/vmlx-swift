@@ -1791,6 +1791,11 @@ enum Qwen35Language {
         @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
         let rotaryEmbedding: RotaryEmbedding
+        private var hadamardQKVGroup: HadamardProjectionGroup?
+
+        func prepareHadamardProjectionGroups() {
+            hadamardQKVGroup = HadamardProjectionGroup.make(from: [qProj, kProj, vProj])
+        }
 
         init(_ args: Qwen35Configuration.TextConfiguration) {
             self.numKeyValueHeads = args.kvHeads
@@ -1848,19 +1853,28 @@ enum Qwen35Language {
             // once. The pad is sliced off before q/k norms, RoPE, and the
             // KV cache write, so the cache only ever sees the real rows.
             // Off unless VMLX_MTP_VERIFY_TILE is set.
-            let qProjOutput = Qwen4ExpVerifyTile.padded(
-                x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { qwen4ExpProjection(qProj, $0) }
+            let qProjOutput: MLXArray
+            var keys: MLXArray
+            var values: MLXArray
+            if let group = hadamardQKVGroup {
+                let parts = group(x)
+                qProjOutput = parts[0]
+                keys = parts[1]
+                values = parts[2]
+            } else {
+                qProjOutput = Qwen4ExpVerifyTile.padded(
+                    x, family: Qwen4ExpVerifyTile.Family.qwen35
+                ) { qwen4ExpProjection(qProj, $0) }
+                keys = Qwen4ExpVerifyTile.padded(
+                    x, family: Qwen4ExpVerifyTile.Family.qwen35
+                ) { qwen4ExpProjection(kProj, $0) }
+                values = Qwen4ExpVerifyTile.padded(
+                    x, family: Qwen4ExpVerifyTile.Family.qwen35
+                ) { qwen4ExpProjection(vProj, $0) }
+            }
             let qSplit = qProjOutput.reshaped(B, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
             var queries = qSplit[0]
             let gate = qSplit[1].reshaped(B, L, -1)
-
-            var keys = Qwen4ExpVerifyTile.padded(
-                x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { qwen4ExpProjection(kProj, $0) }
-            var values = Qwen4ExpVerifyTile.padded(
-                x, family: Qwen4ExpVerifyTile.Family.qwen35
-            ) { qwen4ExpProjection(vProj, $0) }
 
             let captureLayer = Qwen4ExpRowExactCapture.currentLayer
             Qwen4ExpRowExactCapture.part(captureLayer, "attn.q_proj", qProjOutput)
@@ -1931,7 +1945,8 @@ enum Qwen35Language {
                 attentionMask = .none
             }
 
-            let hadamard = JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+            let hadamard = hadamardQKVGroup != nil
+                || JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
             let attended: MLXArray
             if let split = decisionStateTokenCount {
                 // Zero selects noncausal full attention; a positive value selects prefix-bidir.
@@ -2011,6 +2026,13 @@ enum Qwen35Language {
         @ModuleInfo(key: "gate_proj") var gateProj: UnaryLayer
         @ModuleInfo(key: "down_proj") var downProj: UnaryLayer
         @ModuleInfo(key: "up_proj") var upProj: UnaryLayer
+        private var hadamardGateUpGroup: HadamardProjectionGroup?
+
+        func prepareHadamardProjectionGroups() {
+            if let g = gateProj as? Linear, let u = upProj as? Linear {
+                hadamardGateUpGroup = HadamardProjectionGroup.make(from: [g, u])
+            }
+        }
 
         private func project(_ module: UnaryLayer, _ x: MLXArray) -> MLXArray {
             if let linear = module as? Linear { return qwen4ExpProjection(linear, x) }
@@ -2026,8 +2048,16 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
-            let gate = project(gateProj, x)
-            let up = project(upProj, x)
+            let gate: MLXArray
+            let up: MLXArray
+            if let group = hadamardGateUpGroup {
+                let parts = group(x)
+                gate = parts[0]
+                up = parts[1]
+            } else {
+                gate = project(gateProj, x)
+                up = project(upProj, x)
+            }
             let activated = _vlmCompiledSwiGLU(gate, up)
             let result = project(downProj, activated)
             return result
@@ -2062,6 +2092,11 @@ enum Qwen35Language {
             case single(member: Int)
         }
         private var fusedInputSegments: [FusedInputSegment]?
+        private var hadamardQKVZGroup: HadamardProjectionGroup?
+
+        func prepareHadamardProjectionGroups() {
+            hadamardQKVZGroup = HadamardProjectionGroup.make(from: [inProjQKV, inProjZ])
+        }
 
         let hiddenSize: Int
         let numVHeads: Int
@@ -2541,11 +2576,35 @@ enum Qwen35Language {
                 }
             } else {
                 let fusedInputs = fusedDecodeInputs(inputs, exactRowVerifier: exactRowVerifier)
-                var mixedQKV = fusedInputs?[0] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjQKV, $0) }
-                z = (fusedInputs?[1] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjZ, $0) }).reshaped(
-                    B, S, numVHeads, headVDim)
-                b = fusedInputs?[2] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjB, $0) }
-                a = fusedInputs?[3] ?? verifyTiled(inputs) { qwen4ExpProjection(inProjA, $0) }
+                var mixedQKV: MLXArray
+                if let fusedInputs {
+                    mixedQKV = fusedInputs[0]
+                    z = fusedInputs[1].reshaped(B, S, numVHeads, headVDim)
+                } else if let group = hadamardQKVZGroup {
+                    let parts = group(inputs)
+                    mixedQKV = parts[0]
+                    z = parts[1].reshaped(B, S, numVHeads, headVDim)
+                } else {
+                    mixedQKV = verifyTiled(inputs) { qwen4ExpProjection(inProjQKV, $0) }
+                    z = verifyTiled(inputs) { qwen4ExpProjection(inProjZ, $0) }.reshaped(
+                        B, S, numVHeads, headVDim)
+                }
+                let rowExactHadamardGates =
+                    (hadamardQKVZGroup != nil || inProjQKV is HadamardQuantizedLinear)
+                    && FlashVerificationScope.usesRowExactVerification(
+                        inputShape: inputs.shape, site: "gdn")
+                func gateProjection(_ projection: Linear) -> MLXArray {
+                    if rowExactHadamardGates {
+                        // These narrow dense gates still use a different reduction
+                        // when evaluated as a multi-row projection.
+                        return concatenated(MLX.split(inputs, parts: S, axis: 1).map {
+                            projection($0)
+                        }, axis: 1)
+                    }
+                    return verifyTiled(inputs) { qwen4ExpProjection(projection, $0) }
+                }
+                b = fusedInputs?[2] ?? gateProjection(inProjB)
+                a = fusedInputs?[3] ?? gateProjection(inProjA)
 
                 if let mask {
                     mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
@@ -4204,10 +4263,46 @@ enum Qwen35Language {
                 logits: logits, hiddenStates: mtpUsesPostNormHidden ? normed : hidden)
         }
 
+        private var _cachedMTPUsesPostNormHidden: Bool?
+
+        private static func pearsonCorrelation(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let af = a.asType(.float32).reshaped(-1)
+            let bf = b.asType(.float32).reshaped(-1)
+            guard af.size == bf.size, af.size > 1 else { return 0 }
+            let da = af - af.mean()
+            let db = bf - bf.mean()
+            let denom = (sqrt((da * da).sum()) * sqrt((db * db).sum())).item(Float.self)
+            guard denom > 1e-12 else { return 0 }
+            return (da * db).sum().item(Float.self) / denom
+        }
+
         private var mtpUsesPostNormHidden: Bool {
-            config.modelType == JangLoader.prismHadamardModelType
-                || (textConfig.numExperts > 0
-                    && ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"] != "pre")
+            if let cached = _cachedMTPUsesPostNormHidden { return cached }
+            let env = ProcessInfo.processInfo.environment["VMLX_QWEN35_MTP_HIDDEN"]?.lowercased()
+            let resolved: Bool
+            if env == "post" {
+                resolved = true
+            } else if env == "pre" {
+                resolved = false
+            } else if config.modelType == JangLoader.prismHadamardModelType || textConfig.numExperts > 0 {
+                resolved = true
+            } else if let mtp {
+                // Auto-detect post-norm MTP heads (e.g. Bonsai 2.5 Prism v2 repacks whose
+                // config.json keeps model_type == "qwen3_5"): post-norm heads share the
+                // trunk's final norm weight distribution (r > 0.7) while pre_fc_norm_hidden
+                // is independent (r < 0.3).
+                let rNorm = Self.pearsonCorrelation(model.norm.weight, mtp.norm.weight)
+                let rPreFC = Self.pearsonCorrelation(model.norm.weight, mtp.preFCNormHidden.weight)
+                resolved = rNorm > 0.7 && rPreFC < 0.3
+                RuntimeDiagnostics.write(Data(
+                    ("[Qwen35] mtp_hidden_contract=\(resolved ? "post" : "pre") "
+                        + "r_norm=\(String(format: "%.3f", rNorm)) "
+                        + "r_prefc=\(String(format: "%.3f", rPreFC))\n").utf8))
+            } else {
+                resolved = false
+            }
+            _cachedMTPUsesPostNormHidden = resolved
+            return resolved
         }
 
         func nativeMTPForward(
@@ -4572,7 +4667,8 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
         windowSize: Int?
     ) throws -> PrepareResult {
         try Task.checkCancellation()
-        let inputIds = input.text.tokens
+        let tokens = input.text.tokens
+        let inputIds = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
 
         var pixelValues: MLXArray?
         var imageFrames: [THW]?
@@ -5108,13 +5204,28 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
 extension Qwen35: JangHadamardRuntimeModel {
     public func validateJangHadamardRuntime() throws {
         let text = config.textConfiguration
-        let prismSidecar = config.modelType == JangLoader.prismHadamardModelType
+        let supportsSingleMTPLayer =
+            (config.modelType == JangLoader.prismHadamardModelType || config.modelType == "qwen3_5")
             && text.mtpNumHiddenLayers == 1
         guard !text.tieWordEmbeddings, text.numExperts == 0,
-            text.mtpNumHiddenLayers == 0 || prismSidecar
+            text.mtpNumHiddenLayers == 0 || supportsSingleMTPLayer
         else {
             throw JangLoaderError.loadFailed(
                 "Hadamard Qwen3.5 requires an untied dense model with a supported draft layout")
+        }
+    }
+
+    public func prepareHadamardProjectionGroups() {
+        for layer in languageModel.model.layers {
+            layer.selfAttn?.prepareHadamardProjectionGroups()
+            layer.linearAttn?.prepareHadamardProjectionGroups()
+            (layer.mlp as? Qwen35Language.MLP)?.prepareHadamardProjectionGroups()
+        }
+        if let mtp = languageModel.mtp {
+            for layer in mtp.layers {
+                layer.selfAttn.prepareHadamardProjectionGroups()
+                (layer.mlp as? Qwen35Language.MLP)?.prepareHadamardProjectionGroups()
+            }
         }
     }
 }

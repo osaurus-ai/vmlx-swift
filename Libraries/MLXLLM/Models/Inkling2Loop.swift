@@ -1572,6 +1572,9 @@ public final class Inkling2LoopModelInner: Module {
             }
             return layer + pass * args.numLoopLayers
         }
+        let asyncEvalStride = Int(ProcessInfo.processInfo.environment["VMLX_INKLING_ASYNC_EVAL_STRIDE"] ?? "") ?? 4
+        let totalVisits = args.numHiddenLayers + max(0, args.loopPasses - 1) * args.numLoopLayers
+        var visitCounter = 0
         func run(_ ids: Range<Int>, pass: Int, messages: MLXArray?) {
             for (j, i) in ids.enumerated() {
                 if let capture, capture.ids.contains(visit(i, pass)) {
@@ -1581,25 +1584,31 @@ public final class Inkling2LoopModelInner: Module {
                     (h, stack) = layers[i].multiRowStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
                         loopIndex: j, ones: ones, recorder: recorder, matchDecode: matchDecode)
-                    continue
-                }
-                if let recorder {
+                } else if let recorder {
                     let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
                     (h, stack) = layers[i](
                         h, stack: stack, kv: kv(i, pass), conv: conv(i, pass), messages: msgs,
                         ones: ones, recorder: recorder)
-                    continue
-                }
-                if fastDecode {
+                } else if fastDecode {
                     (h, stack) = layers[i].decodeStep(
                         h, stack: stack, kv: kv(i, pass)!, conv: conv(i, pass)!, messages: messages,
                         loopIndex: j, ones: ones, scalars: scalars)
-                    continue
+                } else {
+                    let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
+                    (h, stack) = layers[i](
+                        h, stack: stack, kv: kv(i, pass), conv: conv(i, pass), messages: msgs,
+                        ones: ones)
                 }
-                let msgs = messages.map { $0[0..., 0..., (4 * j) ..< (4 * j + 4), 0...] }
-                (h, stack) = layers[i](
-                    h, stack: stack, kv: kv(i, pass), conv: conv(i, pass), messages: msgs,
-                    ones: ones)
+                visitCounter += 1
+                if asyncEvalStride > 0 && (fastDecode || multiRow || recorder != nil)
+                    && visitCounter % asyncEvalStride == 0 && visitCounter < totalVisits
+                {
+                    if let stack {
+                        MLX.asyncEval(h, stack)
+                    } else {
+                        MLX.asyncEval(h)
+                    }
+                }
             }
         }
 
@@ -1689,6 +1698,8 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     public private(set) var hasDrafterWeights = false
     /// A dSpark verify in flight (set by the draft session around one target forward).
     var pendingVerify: Inkling2PendingVerify?
+    /// A DFlash 2 verify in flight (set when running under `NativeMTPVerifierStatePolicy` `input_capture`).
+    var dflash2ConvRecorder: Inkling2ConvRecorder?
 
     /// Tensors the generic loader must skip: a JANGH bundle's routed codebook banks (mapped by the preparation).
     let customTensorNames: Set<String>
@@ -1797,8 +1808,31 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
         return cache
     }
 
-    func logits(_ h: MLXArray) -> MLXArray {
-        var out = lmHead(h).asType(.float32)
+    func logits(_ h: MLXArray, matchDecode: Bool = false) -> MLXArray {
+        var out: MLXArray
+        if matchDecode, h.ndim == 3, h.dim(0) == 1, h.dim(1) > 1,
+            let q = lmHead as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self, q.bias == nil,
+            q.mode == .affine, let biases = q.biases, q.scales.dtype == h.dtype,
+            let fast = RowExactAffineQMV.project(
+                h[0], weight: q.weight, scales: q.scales, biases: biases,
+                groupSize: q.groupSize, bits: q.bits,
+                reference: { input in
+                    MLX.quantizedMM(
+                        input.expandedDimensions(axis: 1), q.weight.expandedDimensions(axis: 0),
+                        scales: q.scales.expandedDimensions(axis: 0),
+                        biases: biases.expandedDimensions(axis: 0),
+                        transpose: true, groupSize: q.groupSize, bits: q.bits, mode: .affine
+                    ).squeezed(axis: 1)
+                })
+        {
+            out = fast.expandedDimensions(axis: 0).asType(.float32)
+        } else if matchDecode, h.dim(1) > 1 {
+            return MLX.concatenated(
+                (0 ..< h.dim(1)).map { logits(h[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
+        } else {
+            out = lmHead(h).asType(.float32)
+        }
         if let cap = args.finalLogitSoftcapping, cap > 0 {
             out = softcap(out, cap)
         }
@@ -1811,12 +1845,7 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let matchDecode = pendingVerify != nil && model.usesMixedRoutedExperts
         let hidden = trunk(inputs, cache: cache)
-        if matchDecode, hidden.dim(1) > 1 {
-            // Each verifier row uses the same output projection as an ordinary decode token.
-            return MLX.concatenated(
-                (0 ..< hidden.dim(1)).map { logits(hidden[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
-        }
-        return logits(hidden)
+        return logits(hidden, matchDecode: matchDecode)
     }
 
     /// Chunked text prefill. Non-final chunks run the trunk only (no 200k-vocab logits); the
@@ -2463,4 +2492,76 @@ extension Inkling2LoopModel: LoRAModel {
 extension Inkling2LoopModel: ToolCallTurnStopTokenModel {
     /// `<|content_model_end_sampling|>` closes every assistant turn in the template, tool calls included.
     public var toolCallTurnStopTokenIds: Set<Int> { Set(args.eosTokenId ?? [200006]) }
+}
+
+extension Inkling2LoopModel: TokenEmbedderModel {
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        model.embed(tokenIds)
+    }
+
+    /// Raw un-softcapped logits sliced to `unpadded_vocab_size` (`200058`). DFlash 2 drafters
+    /// configured with `selector_softcap_mode: "after_correction"` apply `final_logit_softcapping`
+    /// after adding the selector edge scores, matching `incoai/Inkling-2-Mini-DFlash2`.
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        var out = lmHead(hidden)
+        if let u = args.unpaddedVocabSize, u < out.dim(-1) {
+            out = out[.ellipsis, ..<u]
+        }
+        return out
+    }
+
+    public var paddedVocabularySize: Int? { args.vocabSize }
+}
+
+extension Inkling2LoopModel: HiddenStateCaptureModel {
+    public var supportsCapturingPrefixCommitRecording: Bool { true }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        callAsFunction(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs,
+            recordPrefixCommitStates: false)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>,
+        recordPrefixCommitStates: Bool
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        let isInputCaptureVerify =
+            NativeMTPVerifierStatePolicy.mode == .inputCapture && inputs.dim(1) > 1
+        let recorder: Inkling2ConvRecorder? = isInputCaptureVerify ? Inkling2ConvRecorder() : nil
+        dflash2ConvRecorder = recorder
+        let cap = captureLayerIDs.isEmpty ? nil : Inkling2Capture(ids: Array(captureLayerIDs).sorted())
+        let hidden = model.forward(
+            inputs, cache: cache, capture: cap, recorder: recorder)
+        let matchDecode = recorder != nil && model.usesMixedRoutedExperts
+        return (logits(hidden, matchDecode: matchDecode), cap?.values ?? [:])
+    }
+}
+
+extension Inkling2LoopModel: DFlash2VerifyRollbackModel {
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        guard let recorder = dflash2ConvRecorder else { return false }
+        recorder.rewind(keep: acceptedInputs)
+        dflash2ConvRecorder = nil
+        return true
+    }
+}
+
+extension Inkling2LoopModel: LaneQMMTargetPolicy {
+    /// Inkling-2-Mini runs its own fused `Inkling2Decode` / `RowExactAffineQMV` / JANGHT kernels.
+    public var laneQMMEnabled: Bool { false }
+    public var laneQMMTiled: Bool { false }
+    public var laneQMMUntiledMinRows: Int { Int.max }
+}
+
+extension Inkling2LoopModel: DFlash2WidthLadderPolicy {
+    public var dflash2WidthLadder: [Int] { [5, 8] }
+    public var dflash2BoundsCostsByWiderRungs: Bool { true }
+    public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }

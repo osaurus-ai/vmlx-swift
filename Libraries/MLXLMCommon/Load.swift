@@ -1372,6 +1372,9 @@ public func loadWeights(
 
     if let hadamardContract {
         try hadamardContract.verifyLoaded(model: model)
+        if let hadamardModel = model as? JangHadamardRuntimeModel {
+            hadamardModel.prepareHadamardProjectionGroups()
+        }
         let dtypePolicy = hadamardContract.supportsPrismV2MTP
             ? "parameter_dtype=float16"
             : "stored_dtypes_preserved=true"
