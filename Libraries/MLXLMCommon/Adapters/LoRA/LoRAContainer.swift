@@ -184,6 +184,11 @@ public struct LoRAContainer: ModelAdapter, @unchecked Sendable {
             parameters: ModuleParameters.unflattened(rekeyed),
             verify: .noUnusedKeys
         )
+
+        // `replaceLayers` built the adapter layers new, and a new `Module` starts in training mode.
+        // Give them the model's mode: eval for a loaded model, training for a trainer that loads
+        // an adapter to continue training it.
+        model.train(model.training)
     }
 
     /// Permanently fuses the adapter weights into the model's base layers.
