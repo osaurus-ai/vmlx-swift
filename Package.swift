@@ -870,6 +870,7 @@ let package = Package(
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
                 "MultiRowDecodeAttentionTests.swift",
+                "Glm5NextBoundedCacheTests.swift",
                 "ProposalHeadStampTests.swift",
                 "DFlash2TreeAndTopKAcceptanceTests.swift",
                 "LaneQMMGroup128Tests.swift",
