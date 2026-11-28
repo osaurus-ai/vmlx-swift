@@ -169,8 +169,10 @@ public class QLoRALinear: QuantizedLinear, LoRALayer {
     /// ### See Also
     /// - ``LoRATrain/fuse(model:layers:deQuantize:)``
     public func fused() -> Module {
+        // `dequantizedWeight` is a COMPUTED property: reading it twice dequantized the whole
+        // weight twice, the second time only to ask its dtype.
         let weight = dequantizedWeight
-        let dtype = dequantizedWeight.dtype
+        let dtype = weight.dtype
         let loraB = (scale * loraB.T).asType(dtype)
         let loraA = loraA.T.asType(dtype)
         return QuantizedLinear(
