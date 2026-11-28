@@ -2,6 +2,7 @@
 // Copyright © 2023 Apple Inc.
 
 #pragma once
+#include <cmath>
 #include <complex>
 #include <Cmlx/mlx-types-half_types.h>
 
@@ -63,8 +64,10 @@ inline bool operator>(const complex64_t& a, const complex64_t& b) {
 }
 
 inline complex64_t operator%(complex64_t a, complex64_t b) {
-  auto real = a.real() - (b.real() * static_cast<int64_t>(a.real() / b.real()));
-  auto imag = a.imag() - (b.imag() * static_cast<int64_t>(a.imag() / b.imag()));
+  // fmod is exact and defined for every input. A conversion of the quotient
+  // to an integer is not defined when the quotient does not fit or is nan.
+  auto real = std::fmod(a.real(), b.real());
+  auto imag = std::fmod(a.imag(), b.imag());
   if (real != 0 && ((real < 0) != (b.real() < 0)))
     real += b.real();
   if (imag != 0 && ((imag < 0) != (b.imag() < 0)))

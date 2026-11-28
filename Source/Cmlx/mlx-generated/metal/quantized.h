@@ -1372,6 +1372,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
+    typename U = T,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
@@ -1380,7 +1381,7 @@ METAL_FUNC void qmm_t_impl(
     const device T* scales,
     const device T* biases,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -1405,7 +1406,7 @@ METAL_FUNC void qmm_t_impl(
 
   // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+      BlockMMA<T, U, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -2110,6 +2111,224 @@ template <
       simd_lid);
 }
 
+template <typename T, int group_size, int bits, int WK, int BN, int TM>
+[[kernel]] void affine_qmv_mma(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BN % 8 == 0, "BN should be divisible by 8");
+  static_assert(TM == 1 || TM == 2, "qmv_mma takes at most 16 rows");
+  static_assert(
+      (bits >= 2 && bits <= 8 && bits != 7) &&
+          (group_size == 32 || group_size == 64 || group_size == 128),
+      "qmv_mma reads 2 to 8 bits (not 7) at group sizes 32, 64 and 128");
+
+  using Frag = mlx::steel::BaseMMAFrag<float, 8, 8>;
+  using frag_t = typename Frag::frag_type;
+  constexpr int BK = 128;
+  constexpr short TN = BN / 8;
+  // The lane's 32 values take bits words
+  constexpr short words = bits;
+  constexpr uint mask = (1 << bits) - 1;
+
+  const short2 coord = Frag::get_coord(simd_lid);
+  const short fn = coord.x;
+  const short fm = coord.y;
+  const int row_bytes = K / 8 * bits;
+  const int row_scales = K / group_size;
+
+  const int y_col = tid.x * BN;
+  auto wl = (const device uint8_t*)w +
+      (y_col + fm) * static_cast<int64_t>(row_bytes) + 2 * fn * bits;
+  const int64_t s_off =
+      (y_col + fm) * static_cast<int64_t>(row_scales) + 16 * fn / group_size;
+  scales += s_off;
+  biases += s_off;
+  x += fn * static_cast<int64_t>(K) + 16 * fm;
+
+  bool x_rows[TM][2];
+  frag_t C[TN][TM];
+  STEEL_PRAGMA_UNROLL
+  for (short mt = 0; mt < TM; mt++) {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < 2; j++) {
+      x_rows[mt][j] = 8 * mt + fn + j < M;
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      C[t][mt] = frag_t(0);
+    }
+  }
+
+  for (int k = simd_gid * BK; k < K; k += WK * BK) {
+    vec<T, 8> xs[TM][2][2];
+    STEEL_PRAGMA_UNROLL
+    for (short mt = 0; mt < TM; mt++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 2; j++) {
+        const device T* xr = x + (8 * mt + j) * static_cast<int64_t>(K) + k;
+        STEEL_PRAGMA_UNROLL
+        for (short h = 0; h < 2; h++) {
+          xs[mt][j][h] = x_rows[mt][j] ? *(const device vec<T, 8>*)(xr + 8 * h)
+                                       : vec<T, 8>(0);
+        }
+      }
+    }
+    uint ws[TN][words];
+    float sc[TN];
+    float bs[TN];
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      const device uint8_t* wt =
+          wl + 8 * t * static_cast<int64_t>(row_bytes) + k / 8 * bits;
+      if constexpr (words % 4 == 0) {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < words; l += 4) {
+          const uint4 v = *(const device uint4*)(wt + 4 * l);
+          ws[t][l] = v.x;
+          ws[t][l + 1] = v.y;
+          ws[t][l + 2] = v.z;
+          ws[t][l + 3] = v.w;
+        }
+      } else if constexpr (words % 2 == 0) {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < words; l += 2) {
+          const uint2 v = *(const device uint2*)(wt + 4 * l);
+          ws[t][l] = v.x;
+          ws[t][l + 1] = v.y;
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short l = 0; l < words; l++) {
+          ws[t][l] = ((const device uint*)wt)[l];
+        }
+      }
+      const int64_t si =
+          8 * t * static_cast<int64_t>(row_scales) + k / group_size;
+      sc[t] = float(scales[si]);
+      bs[t] = float(biases[si]);
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short g = 0; g < 4; g++) {
+      frag_t b[4][TM];
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 4; i++) {
+        const short f = 4 * g + i;
+        STEEL_PRAGMA_UNROLL
+        for (short mt = 0; mt < TM; mt++) {
+          b[i][mt] = frag_t(
+              float(xs[mt][0][f / 8][f % 8]), float(xs[mt][1][f / 8][f % 8]));
+        }
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short t = 0; t < TN; t++) {
+        // p[i] holds weights 4g+i and 16+4g+i of the lane. With 0x6400 set
+        // each half reads as 1024 + q, and taking 1024 off again is exact.
+        uint p[4];
+        if constexpr (bits == 4) {
+          const uint lo = ws[t][g / 2];
+          const uint hi = ws[t][2 + g / 2];
+          const uint q = (g % 2) == 0 ? (lo & 0xffff) | (hi << 16)
+                                      : (lo >> 16) | (hi & 0xffff0000);
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 4; i++) {
+            p[i] = (q >> (4 * i)) & 0x000f000f;
+          }
+        } else if constexpr (bits == 8) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 4; i++) {
+            p[i] = ((ws[t][g] >> (8 * i)) & 0xff) |
+                (((ws[t][4 + g] >> (8 * i)) & 0xff) << 16);
+          }
+        } else {
+          // Values 4g to 4g+3 and 16+4g to 16+4g+3, which can span two words
+          uint q[2];
+          STEEL_PRAGMA_UNROLL
+          for (short h = 0; h < 2; h++) {
+            const short bit = (16 * h + 4 * g) * bits;
+            const short word = bit / 32;
+            const short shift = bit % 32;
+            q[h] = ws[t][word] >> shift;
+            if (shift + 4 * bits > 32) {
+              q[h] |= ws[t][word + 1] << (32 - shift);
+            }
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 4; i++) {
+            p[i] = ((q[0] >> (bits * i)) & mask) |
+                (((q[1] >> (bits * i)) & mask) << 16);
+          }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 4; i++) {
+          const half2 v = as_type<half2>(p[i] | 0x64006400) - half2(1024.0h);
+          frag_t a(
+              fma(float(v.x), sc[t], bs[t]), fma(float(v.y), sc[t], bs[t]));
+          STEEL_PRAGMA_UNROLL
+          for (short mt = 0; mt < TM; mt++) {
+            Frag::mma(C[t][mt], a, b[i][mt], C[t][mt]);
+          }
+        }
+      }
+    }
+  }
+
+  constexpr int tile_elems = TN * TM * 2;
+  threadgroup float Ps[(WK - 1) * tile_elems * 32];
+  if (simd_gid > 0) {
+    threadgroup float* p = Ps + (simd_gid - 1) * tile_elems * 32 + simd_lid;
+    STEEL_PRAGMA_UNROLL
+    for (short t = 0; t < TN; t++) {
+      STEEL_PRAGMA_UNROLL
+      for (short mt = 0; mt < TM; mt++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < 2; j++) {
+          p[((t * TM + mt) * 2 + j) * 32] = C[t][mt][j];
+        }
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    for (int s = 0; s < WK - 1; s++) {
+      const threadgroup float* p = Ps + s * tile_elems * 32 + simd_lid;
+      STEEL_PRAGMA_UNROLL
+      for (short t = 0; t < TN; t++) {
+        STEEL_PRAGMA_UNROLL
+        for (short mt = 0; mt < TM; mt++) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 2; j++) {
+            C[t][mt][j] += p[((t * TM + mt) * 2 + j) * 32];
+          }
+        }
+      }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short mt = 0; mt < TM; mt++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 2; j++) {
+        if (x_rows[mt][j]) {
+          device T* yr =
+              y + (8 * mt + fn + j) * static_cast<int64_t>(N) + y_col + fm;
+          STEEL_PRAGMA_UNROLL
+          for (short t = 0; t < TN; t++) {
+            yr[8 * t] = static_cast<T>(C[t][mt][j]);
+          }
+        }
+      }
+    }
+  }
+}
+
 template <
     typename T,
     const int group_size,
@@ -2284,7 +2503,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN>(
       w,
       scales,
       biases,
@@ -2315,7 +2534,7 @@ template <
     const device T* scales [[buffer(1)]],
     const device T* biases [[buffer(2)]],
     const device T* x [[buffer(3)]],
-    device T* y [[buffer(4)]],
+    device float* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
     const constant int& M [[buffer(7)]],
@@ -2343,7 +2562,7 @@ template <
   biases += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, float, BM, BK, BN>(
       (const device uint32_t*)wl,
       scales,
       biases,
@@ -2737,7 +2956,7 @@ template <
       s_strides,
       b_strides,
       tid);
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN>(
       w,
       scales,
       biases,
@@ -3005,9 +3224,7 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
 
   float w_thread[values_per_reduce];
   float w_min = Limits<T>::max;
-  // One-bit endpoints are the observed min/max. Including an implicit zero
-  // turns a negative-only group {-2, -1} into {-2, 0} and loses an endpoint.
-  float w_max = bits == 1 ? -Limits<T>::max : 0;
+  float w_max = -Limits<T>::max;
 
 #pragma clang loop unroll(full)
   for (int i = 0; i < values_per_reduce; i++) {

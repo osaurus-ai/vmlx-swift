@@ -41,11 +41,7 @@ extern "C" int vmlx_resident_file_array(
     if (fcntl(fd, F_NOCACHE, 1))
       throw std::runtime_error("[resident_file] cannot disable filesystem data caching");
 #endif
-    auto buffer = allocator::malloc(length);
-    auto release = [](void *p) { allocator::free(allocator::Buffer(p)); };
-    std::unique_ptr<void, decltype(release)> pending(buffer.ptr(), release);
-    array tensor(buffer, shape, dtype);
-    pending.release();
+    array tensor(allocator::malloc(length), shape, dtype);  // allocator::Data frees it if this throws
     auto destination = tensor.data<char>();
     auto read = [&](char *out, size_t count, uint64_t position) {
       while (count) {

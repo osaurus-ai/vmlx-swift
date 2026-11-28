@@ -347,7 +347,42 @@ struct ArcTan2 {
 
 struct DivMod {
   template <typename T>
-  metal::array<T, 2> operator()(T x, T y) thread {
+  metal::enable_if_t<metal::is_integral_v<T>, metal::array<T, 2>>
+  operator()(T x, T y) thread {
+    return {FloorDivide{}(x, y), Remainder{}(x, y)};
+  };
+  // As NumPy's divmod: fmod gives the exact remainder, and the quotient is
+  // (x - r) / y rounded to an integer. The floor of x / y is not exact: x / y
+  // in the type of x can round up to the next integer (1 / 0.1f gives 10).
+  // half and bfloat16 are computed in float.
+  template <typename T>
+  metal::enable_if_t<!metal::is_integral_v<T>, metal::array<T, 2>>
+  operator()(T x, T y) thread {
+    float a = static_cast<float>(x);
+    float b = static_cast<float>(y);
+    float r = metal::precise::fmod(a, b);
+    if (b == 0) {
+      return {static_cast<T>(a / b), static_cast<T>(r)};
+    }
+    float q = (a - r) / b;
+    if (r != 0) {
+      if ((r < 0) != (b < 0)) {
+        r += b;
+        q -= 1;
+      }
+    } else {
+      r = metal::copysign(0.0f, b);
+    }
+    float fq = metal::floor(q);
+    if (q - fq > 0.5f) {
+      fq += 1;
+    }
+    if (q == 0) {
+      fq = metal::copysign(0.0f, a / b);
+    }
+    return {static_cast<T>(fq), static_cast<T>(r)};
+  };
+  metal::array<complex64_t, 2> operator()(complex64_t x, complex64_t y) thread {
     return {FloorDivide{}(x, y), Remainder{}(x, y)};
   };
 };
