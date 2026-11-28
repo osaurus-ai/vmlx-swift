@@ -65,6 +65,11 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Maximum number of blocks in the paged cache pool (including sentinel).
     public var maxCacheBlocks: Int
 
+    /// Shared retained paged KV, rotating-companion and SSM byte budget. Nil preserves
+    /// legacy block/entry-count limits; zero admits no retained payloads.
+    /// This is separate from MLX's reusable allocator-buffer cache limit.
+    public var maxCacheBytes: Int?
+
     /// Maximum disk cache size in gigabytes.
     public var diskCacheMaxGB: Float
 
@@ -135,6 +140,7 @@ public struct CacheCoordinatorConfig: Sendable {
         enableDiskCache: Bool = false,
         pagedBlockSize: Int = 64,
         maxCacheBlocks: Int = 1000,
+        maxCacheBytes: Int? = nil,
         diskCacheMaxGB: Float = 10.0,
         diskCacheDir: URL? = nil,
         ssmMaxEntries: Int = 50,
@@ -149,6 +155,7 @@ public struct CacheCoordinatorConfig: Sendable {
         self.enableDiskCache = enableDiskCache
         self.pagedBlockSize = pagedBlockSize
         self.maxCacheBlocks = maxCacheBlocks
+        self.maxCacheBytes = maxCacheBytes
         self.diskCacheMaxGB = diskCacheMaxGB
         self.diskCacheDir = diskCacheDir
         self.ssmMaxEntries = ssmMaxEntries

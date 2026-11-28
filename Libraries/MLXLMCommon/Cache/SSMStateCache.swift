@@ -16,6 +16,10 @@ public struct SSMStateCacheStats: Sendable {
     public let hits: Int
     public let misses: Int
     public let reDerives: Int
+    /// Committed SSM storage charge, including compact-buffer slack.
+    public let residentBytes: Int
+    /// The shared tier ceiling, not a separately allocated SSM partition.
+    public let maxResidentBytes: Int?
 }
 
 /// An LRU companion cache for SSM layer state in hybrid models
@@ -24,7 +28,9 @@ public struct SSMStateCacheStats: Sendable {
 /// SSM state is cumulative (path-dependent) and cannot be reconstructed
 /// from KV cache alone, so it must be cached separately. Entries are keyed
 /// by a SHA-256 hash of the token prefix up to a given boundary, and the
-/// cache uses LRU eviction when the entry limit is reached.
+/// cache uses LRU eviction for the entry limit and the coordinator's shared
+/// retained-byte allowance. Disk write-through/fetch remains usable when a
+/// snapshot cannot be retained in RAM.
 ///
 /// All public methods are thread-safe via `OSAllocatedUnfairLock`.
 ///
@@ -37,7 +43,9 @@ public final class SSMStateCache: @unchecked Sendable {
 
     private let lock = OSAllocatedUnfairLock()
     private let maxEntries: Int
-    private var entries: [(key: String, states: [MLXArray], isComplete: Bool)]
+    private let retainedAccount: RetainedCacheBudget.Account
+    private var residentBytes = 0
+    private var entries: [(key: String, states: [MLXArray], isComplete: Bool, bytes: Int)]
 
     /// One fetched SSM-cache entry. `isComplete == true` means the entry
     /// captured the full prompt prefix at boundary and is safe to extend
@@ -86,7 +94,9 @@ public final class SSMStateCache: @unchecked Sendable {
         return SSMStateCacheStats(
             hits: hits,
             misses: misses,
-            reDerives: reDerives)
+            reDerives: reDerives,
+            residentBytes: residentBytes,
+            maxResidentBytes: retainedAccount.limit)
     }
 
     // MARK: - Initialization
@@ -98,10 +108,42 @@ public final class SSMStateCache: @unchecked Sendable {
     ///   - modelKey: Stable identifier for the loaded model. Mixed into
     ///     every key so hot-swapping models in-process can't collide on
     ///     the same prompt prefix. Empty/`nil` = pre-fix parity.
-    public init(maxEntries: Int = 50, modelKey: String? = nil) {
+    public convenience init(maxEntries: Int = 50, modelKey: String? = nil) {
+        self.init(maxEntries: maxEntries, modelKey: modelKey,
+                  retainedBudget: RetainedCacheBudget(limit: nil))
+    }
+
+    init(maxEntries: Int, modelKey: String?, retainedBudget: RetainedCacheBudget) {
         self.maxEntries = maxEntries
         self.modelKey = modelKey
+        self.retainedAccount = retainedBudget.makeAccount()
         self.entries = []
+    }
+
+    /// All entry/account mutations hold the LRU lock. The shared budget never
+    /// invokes another tier: an SSM store may evict local SSM entries, then
+    /// decline RAM admission while still writing through to disk.
+    private func removeEntry(at index: Int) {
+        let removed = entries.remove(at: index)
+        residentBytes -= removed.bytes
+        retainedAccount.release(removed.bytes)
+    }
+
+    private func removeExistingEntry(key: String) {
+        if let index = entries.firstIndex(where: { $0.key == key }) {
+            removeEntry(at: index)
+        }
+    }
+
+    private func reserveStorage(_ bytes: Int) -> Bool {
+        guard maxEntries > 0, retainedAccount.limit != 0 else { return false }
+        if let limit = retainedAccount.limit, bytes > limit { return false }
+        while entries.count >= maxEntries { removeEntry(at: 0) }
+        while !retainedAccount.reserve(bytes) {
+            guard !entries.isEmpty else { return false }
+            removeEntry(at: 0)
+        }
+        return true
     }
 
     /// Mixed into every cache key. Set once at init time by
@@ -138,6 +180,27 @@ public final class SSMStateCache: @unchecked Sendable {
     ) {
         let key = Self.makeKey(tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
 
+        let bytes = RetainedCacheBudget.storageCharge(ssmStates)
+        lock.lock()
+        // A replacement that cannot be retained must not leave an older,
+        // possibly incomplete snapshot as a false memory hit for this key.
+        removeExistingEntry(key: key)
+        let retain = !ssmStates.isEmpty && reserveStorage(bytes)
+        let disk = diskStore
+        lock.unlock()
+
+        // A disk-only write is synchronous and serializes the caller's state;
+        // it needs no additional private copy for an entry we cannot retain.
+        guard retain else {
+            if persistToDisk, let disk {
+                _ = try? disk.store(
+                    ssmStates: ssmStates, tokens: tokens, boundary: boundary,
+                    mediaSalt: mediaSalt, isComplete: isComplete,
+                    enforceQuota: enforceDiskQuota)
+            }
+            return
+        }
+
         // Materialize each state array into a FRESH buffer. The prior
         // `arr[.ellipsis]` was a shape-preserving slice view that shared
         // the source tensor's storage, so any in-place mutation of the
@@ -164,20 +227,13 @@ public final class SSMStateCache: @unchecked Sendable {
             return materialized
         }
 
-        let disk: SSMCompanionDiskStore?
         lock.lock()
-
-        // Remove existing entry with same key (if any)
-        entries.removeAll { $0.key == key }
-
-        // Append to end (most recently used position)
-        entries.append((key: key, states: copies, isComplete: isComplete))
-
-        // Evict oldest if over capacity
-        if entries.count > maxEntries {
-            entries.removeFirst()
-        }
-        disk = diskStore
+        // Another store may have committed while this copy was materializing.
+        // Our reserved charge survives clear/eviction until this commit.
+        removeExistingEntry(key: key)
+        while entries.count >= maxEntries { removeEntry(at: 0) }
+        entries.append((key: key, states: copies, isComplete: isComplete, bytes: bytes))
+        residentBytes += bytes
         lock.unlock()
 
         // §441 — write-through to disk tier if configured. Done outside
@@ -192,7 +248,7 @@ public final class SSMStateCache: @unchecked Sendable {
         // sharing the same token sequence. Previously hardcoded nil
         // here → silent L2 alias on cold start of the next session.
         if persistToDisk, let disk {
-            try? disk.store(
+            _ = try? disk.store(
                 ssmStates: copies,
                 tokens: tokens,
                 boundary: boundary,
@@ -260,11 +316,15 @@ public final class SSMStateCache: @unchecked Sendable {
                 // from the user's perspective, just one tier deeper.
                 misses -= 1
                 hits += 1
-                entries.append((
-                    key: key,
-                    states: result.states,
-                    isComplete: result.isComplete))
-                if entries.count > maxEntries { entries.removeFirst() }
+                let bytes = RetainedCacheBudget.storageCharge(result.states)
+                if reserveStorage(bytes) {
+                    entries.append((
+                        key: key,
+                        states: result.states,
+                        isComplete: result.isComplete,
+                        bytes: bytes))
+                    residentBytes += bytes
+                }
                 // Return another deep copy so the caller can mutate
                 // freely — same contract as the in-memory hit path.
                 let safeCopies = result.states.map { $0 * 1 }
@@ -333,6 +393,10 @@ public final class SSMStateCache: @unchecked Sendable {
         defer { lock.unlock() }
 
         entries.removeAll()
+        // Release only committed entries. A store currently materializing
+        // outside this lock still owns its reservation until it commits.
+        retainedAccount.release(residentBytes)
+        residentBytes = 0
         hits = 0
         misses = 0
         reDerives = 0

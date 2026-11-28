@@ -105,6 +105,12 @@ public struct CacheCoordinatorStatsSnapshot: Sendable {
 /// Individual sub-caches handle their own internal locking.
 public final class CacheCoordinator: @unchecked Sendable {
 
+    private let retainedBudget: RetainedCacheBudget
+
+    /// Conservative retained charge across paged KV, rotating companions and
+    /// separate SSM snapshots, including reservations for in-flight stores.
+    public var retainedCacheBytes: Int { retainedBudget.residentBytes }
+
     // MARK: - Properties
 
     private let initialConfig: CacheCoordinatorConfig
@@ -231,6 +237,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.initialConfig = config
+        let retainedBudget = RetainedCacheBudget(limit: config.maxCacheBytes)
+        self.retainedBudget = retainedBudget
         self.importRetryInterval = importRetryInterval
         self.now = now
 
@@ -238,7 +246,8 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.pagedCache = PagedCacheManager(
                 blockSize: config.pagedBlockSize,
                 maxBlocks: config.maxCacheBlocks,
-                modelKey: config.modelKey
+                modelKey: config.modelKey,
+                retainedBudget: retainedBudget
             )
         } else {
             self.pagedCache = nil
@@ -264,7 +273,8 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         self.ssmStateCache = SSMStateCache(
             maxEntries: config.ssmMaxEntries,
-            modelKey: config.modelKey)
+            modelKey: config.modelKey,
+            retainedBudget: retainedBudget)
 
         if config.enableDiskCache {
             let baseDir = config.diskCacheDir
@@ -618,7 +628,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// boundary snapshot — the hybrid stripped boundary in particular costs a
     /// retained cache copy or, failing that, a whole extra prefill.
     public var canPersistBoundaries: Bool {
-        (pagedCache != nil && !isPagedIncompatible) || diskCache != nil
+        (pagedCache != nil && !isPagedIncompatible && retainedBudget.limit != 0) || diskCache != nil
     }
 
     /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool
