@@ -1410,17 +1410,19 @@ enum Inkling2Kernels {
 
     private static let affine8G64MultiGemvKernel = MLXFast.metalKernel(
         name: "inkling2_aff8g64_multi_gemv",
-        inputNames: ["x", "w", "scales", "biases", "cap_buf"],
+        inputNames: ["x", "w", "scales", "biases", "cap_buf", "out_n_buf"],
         outputNames: ["out"],
         source: """
             const uint sg = simdgroup_index_in_threadgroup;
             const uint lane = thread_index_in_simdgroup;
+            const uint K = uint(x_shape[1]);
+            const uint OUT_N = uint(out_n_buf[0]);
             const uint row0 = threadgroup_position_in_grid.x * 8u + sg * 2u;
-            if (row0 >= uint(OUT_N)) return;
+            if (row0 >= OUT_N) return;
 
-            const uint r_valid = metal::min(2u, uint(OUT_N) - row0);
-            const uint KW = uint(K) / 4u;
-            const uint NG = uint(K) / 64u;
+            const uint r_valid = metal::min(2u, OUT_N - row0);
+            const uint KW = K >> 2;
+            const uint NG = K >> 6;
             const uint g_sub = lane >> 3;
 
             float acc[ROWS][2];
@@ -1434,13 +1436,13 @@ enum Inkling2Kernels {
             const device ST*   s0 = scales + size_t(row0) * NG;
             const device ST*   b0 = biases + size_t(row0) * NG;
 
-            for (uint k0 = 0u; k0 < uint(K); k0 += 256u) {
+            for (uint k0 = 0u; k0 < K; k0 += 256u) {
                 const uint k_lane = k0 + lane * 8u;
                 const uint g = (k0 >> 6) + g_sub;
                 float4 x_lo[ROWS], x_hi[ROWS];
                 #pragma clang loop unroll(full)
                 for (uint v = 0u; v < uint(ROWS); ++v) {
-                    const device XT* xp = x + size_t(v) * uint(K) + k_lane;
+                    const device XT* xp = x + size_t(v) * K + k_lane;
                     x_lo[v] = float4(*(const device vec<XT, 4>*)(xp));
                     x_hi[v] = float4(*(const device vec<XT, 4>*)(xp + 4u));
                 }
@@ -1481,7 +1483,7 @@ enum Inkling2Kernels {
                         if (HAS_CAP) {
                             total = metal::tanh(total / cap) * cap;
                         }
-                        out[size_t(v) * uint(OUT_N) + row0 + r] = OT(total);
+                        out[size_t(v) * OUT_N + row0 + r] = OT(total);
                     }
                 }
             }
@@ -2274,16 +2276,15 @@ enum Inkling2Kernels {
         }
         let hasCap = softcap > 0
         let capBuf = MLXArray([hasCap ? softcap : Float(1.0)])
+        let outNBuf = MLXArray([Int32(outN)])
         let nTG = (outN + 7) / 8
         let y = affine8G64MultiGemvKernel(
-            [x2, weight, scales, biases, capBuf],
+            [x2, weight, scales, biases, capBuf, outNBuf],
             template: [
                 ("XT", x2.dtype),
                 ("ST", scales.dtype),
                 ("OT", od),
                 ("ROWS", T),
-                ("K", K),
-                ("OUT_N", outN),
                 ("HAS_CAP", hasCap),
             ],
             grid: (nTG * 128, 1, 1),
@@ -2434,8 +2435,8 @@ enum Inkling2Kernels {
         guard S >= tk else { return nil }
         let kMin = window > 0 ? max(0, (S - LQ) - window + 1) : 0
         let span = S - kMin
-        guard span >= 512 else { return nil }
-        let nSplits = min(64, max(8, (span + 511) / 512))
+        guard span >= 256 else { return nil }
+        let nSplits = min(64, max(4, (span + 255) / 256))
         let params = MLXArray([Int32(nSplits), Int32(kMin)])
         let scBuf = MLXArray([scale])
         let s1 = mppGQAS1Kernel(
@@ -2503,7 +2504,7 @@ enum Inkling2Kernels {
         let kMin = window > 0 ? max(0, (S - LQ) - window + 1) : 0
         let span = S - kMin
         let nSplits: Int
-        if span <= 128 {
+        if span <= 256 {
             nSplits = 1
         } else if span <= 1024 {
             nSplits = 4

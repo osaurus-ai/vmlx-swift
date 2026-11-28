@@ -267,6 +267,38 @@ final class Phase4SpeedupKernelTests: XCTestCase {
         }
     }
 
+    // MARK: - Inkling-2 Fused NVFP4 Weighted Down (JANGHT mixed native banks)
+
+    func testInkling2NVFP4DownWeightedMatchesReference() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { return }
+        MLXRandom.seed(48)
+        let E = 16, H = 256, I = 128, k = 8
+        let down = Inkling2NativeSwitchLinear(inputDims: I, outputDims: H, experts: E)
+        let dense = (MLXRandom.normal([E, H, I]) * 0.25).asType(.bfloat16)
+        let (codes, scales, _) = quantized(dense, groupSize: 16, bits: 4, mode: .nvfp4)
+        let es = MLXRandom.uniform(0.5 ..< 1.5, [E]).asType(.float32)
+        try down.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": codes, "scales": scales, "weight_scale_2": es,
+            ]), verify: .none)
+        eval(down)
+
+        for T in [1, 8] {
+            let act = (MLXRandom.normal([T * k, I]) * 0.5).asType(.float32)
+            let inds = MLXRandom.randInt(0 ..< E, [T, k]).asType(.uint32)
+            let rw = MLXRandom.uniform(0.05 ..< 0.3, [T, k]).asType(.float32)
+
+            let got = Inkling2DecodeKernels.nvfp4DownWeighted(
+                act32: act, inds: inds, weights: rw, down: down, outDType: .float32)
+            let raw = down(act.reshaped([T, k, 1, I]), inds, sorted: false).reshaped([T, k, H])
+            let ref = (raw.asType(.float32) * es[inds].expandedDimensions(axis: -1)
+                * rw.expandedDimensions(axis: -1)).sum(axis: 1)
+            eval(got, ref)
+            let maxErr = abs(got - ref).max().item(Float.self)
+            XCTAssertLessThan(maxErr, 2e-2, "nvfp4DownWeighted mismatch at T=\(T): \(maxErr)")
+        }
+    }
+
     // MARK: - ERNIE 5.5 Metal 4 MPP DSA Indexer (Prefill & L=1 Decode)
 
     func testErnie55MPPIndexScoresDecodeAndPrefillMatchReference() throws {

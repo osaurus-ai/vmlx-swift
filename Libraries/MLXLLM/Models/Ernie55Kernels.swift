@@ -964,12 +964,14 @@ enum Ernie55Kernels {
             const uint sgi = simdgroup_index_in_threadgroup;
             const uint lane = thread_index_in_simdgroup;
             const uint g = threadgroup_position_in_grid.y;
+            const uint K = uint(x_shape[2]);
+            const uint N = uint(w_shape[w_ndim - 2]);
             const uint row0 = threadgroup_position_in_grid.x * (4u * uint(RPS)) + sgi * uint(RPS);
-            if (row0 >= uint(N)) return;
+            if (row0 >= N) return;
 
-            const uint r_valid = metal::min(uint(RPS), uint(N) - row0);
-            const uint KW = uint(K) >> 2;
-            const uint NG = uint(K) >> 5;
+            const uint r_valid = metal::min(uint(RPS), N - row0);
+            const uint KW = K >> 2;
+            const uint NG = K >> 5;
             const uint lane_g = lane >> 2;
 
             float acc[ROWS][RPS];
@@ -981,11 +983,11 @@ enum Ernie55Kernels {
                 }
             }
 
-            const device XT* x_g = x + size_t(g) * size_t(ROWS) * uint(K);
-            const device uint* w0 = w + (size_t(g) * uint(N) + row0) * KW;
-            const device uchar* s0 = scales + (size_t(g) * uint(N) + row0) * NG;
+            const device XT* x_g = x + size_t(g) * size_t(ROWS) * K;
+            const device uint* w0 = w + (size_t(g) * N + row0) * KW;
+            const device uchar* s0 = scales + (size_t(g) * N + row0) * NG;
 
-            for (uint k0 = 0u; k0 < uint(K); k0 += 256u) {
+            for (uint k0 = 0u; k0 < K; k0 += 256u) {
                 const uint k_lane = k0 + lane * 8u;
                 const uint g_idx = (k0 >> 5) + lane_g;
                 #pragma clang loop unroll(full)
@@ -1008,7 +1010,7 @@ enum Ernie55Kernels {
                             E4M3_LUT[p1 >> 24]) * sc;
                         #pragma clang loop unroll(full)
                         for (uint v = 0u; v < uint(ROWS); ++v) {
-                            const device XT* xp = x_g + size_t(v) * uint(K) + k_lane;
+                            const device XT* xp = x_g + size_t(v) * K + k_lane;
                             float4 x_lo = float4(*(const device vec<XT, 4>*)(xp));
                             float4 x_hi = float4(*(const device vec<XT, 4>*)(xp + 4u));
                             acc[v][r] += dot(x_lo, w_lo) + dot(x_hi, w_hi);
@@ -1023,7 +1025,7 @@ enum Ernie55Kernels {
                 for (uint r = 0u; r < uint(RPS); ++r) {
                     float total = simd_sum(acc[v][r]);
                     if (lane == 0u && r < r_valid) {
-                        out[(size_t(g) * uint(ROWS) + v) * uint(N) + row0 + r] = OT(total);
+                        out[(size_t(g) * uint(ROWS) + v) * N + row0 + r] = OT(total);
                     }
                 }
             }
@@ -1086,8 +1088,6 @@ enum Ernie55Kernels {
                 ("OT", x.dtype),
                 ("ROWS", T),
                 ("RPS", rps),
-                ("K", K),
-                ("N", N),
             ],
             grid: (nTG * 128, G, 1),
             threadGroup: (128, 1, 1),

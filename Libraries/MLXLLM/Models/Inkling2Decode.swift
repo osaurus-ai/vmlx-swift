@@ -684,6 +684,89 @@ enum Inkling2DecodeKernels {
             """,
         header: nvfp4Header)
 
+    /// Fused NVFP4 routed down + per-expert scale + route weights + sum across all K slots in 1 dispatch!
+    /// Eliminates intermediate [T*K, H] buffer and separate moeCombine dispatch across all 15 native-down
+    /// layers in JANGHT4.2.
+    /// Grid: (H / 4 * 32 * KPER, T, 1), TG: (32 * KPER, 1, 1) (1 simdgroup per slot k = 0..<KPER,
+    /// 8 lanes per output row = 4 output rows per TG).
+    static let moeDownWeighted = MLXFast.metalKernel(
+        name: "inkling2_moe_down_weighted",
+        inputNames: ["x", "codes", "scales", "idx", "es", "rw"],
+        outputNames: ["out"],
+        source: """
+            uint lane = thread_index_in_simdgroup;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint tid = thread_position_in_threadgroup.x;
+            uint t = threadgroup_position_in_grid.y;
+            threadgroup float lut[16];
+            if (tid < 16) {
+                uint m_ = tid & 7, e_ = m_ >> 1, f_ = m_ & 1;
+                float v_ = e_ == 0 ? 0.5f * float(f_) : (1.f + 0.5f * float(f_)) * float(1 << (e_ - 1));
+                lut[tid] = (tid & 8) ? -v_ : v_;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int N = codes_shape[1];
+            int Kin = codes_shape[2] * 8;
+            uint sub = lane / 8, sl = lane % 8;
+            int row0 = int(threadgroup_position_in_grid.x) * 4;
+            int row = row0 + int(sub);
+            size_t slotIdx = (size_t)t * KPER + sg;
+            uint e = idx[slotIdx];
+            const device uint32_t* cw = codes + ((size_t)e * N + row) * (Kin / 8);
+            const device uint8_t* sw = scales + ((size_t)e * N + row) * (Kin / 16);
+            const device float* xr = x + slotIdx * Kin;
+            float acc = 0.f;
+            if (row < N) {
+                for (int g = sl; g < Kin / 16; g += 8)
+                    acc += ink_e4m3(sw[g]) * ink_fp4_dot16(*(const device uint2*)(cw + 2 * g), xr + g * 16, lut);
+            }
+            for (uint o = 4; o > 0; o >>= 1) acc += simd_shuffle_xor(acc, o);
+            threadgroup float prod[KPER][4];
+            if (sl == 0) {
+                prod[sg][sub] = (row < N) ? ((acc * es[e]) * rw[slotIdx]) : 0.f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0 && lane < 4 && row0 + int(lane) < N) {
+                float sum = 0.f;
+                #pragma clang loop unroll(full)
+                for (int k = 0; k < KPER; ++k) sum += prod[k][lane];
+                ink_store(out, (size_t)t * N + row0 + lane, sum);
+            }
+            """,
+        header: nvfp4Header)
+
+    /// Fused NVFP4 gate/up + softcapped activation for T rows x k picks -> `[T*k, I]` fp32.
+    static func nvfp4GateUpAct(
+        x32: MLXArray, inds: MLXArray, gateUp: Inkling2NativeSwitchLinear, caps: MLXArray, topK: Int
+    ) -> MLXArray {
+        let n = inds.size
+        let I = gateUp.codes.dim(1) / 2
+        let nsg = 4
+        return moeGateUpAct(
+            [x32, gateUp.codes, gateUp.blockScales, inds.reshaped([n]), gateUp.expertScale, caps],
+            template: [("NSG", nsg), ("KPER", topK)],
+            grid: ((I + nsg - 1) / nsg * 32 * nsg, n, 1), threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[n, I]], outputDTypes: [f32])[0]
+    }
+
+    /// Fused NVFP4 weighted down for T rows x k picks -> `[T, H]` in `outDType`.
+    static func nvfp4DownWeighted(
+        act32: MLXArray, inds: MLXArray, weights: MLXArray, down: Inkling2NativeSwitchLinear,
+        outDType: DType
+    ) -> MLXArray {
+        let T = inds.dim(0)
+        let k = inds.dim(1)
+        let H = down.codes.dim(1)
+        let flatInds = inds.reshaped([T * k])
+        let flatW = weights.asType(f32).reshaped([T * k])
+        let tg = 32 * k
+        return moeDownWeighted(
+            [act32, down.codes, down.blockScales, flatInds, down.expertScale, flatW],
+            template: [("KPER", k)],
+            grid: (((H + 3) / 4) * tg, T, 1), threadGroup: (tg, 1, 1),
+            outputShapes: [[T, H]], outputDTypes: [outDType])[0]
+    }
+
     /// NVFP4 experts for T rows x k picks: `(act [T*k, I], down [T*k, H])`, both fp32.
     static func nvfp4Experts(
         x32: MLXArray, inds: MLXArray, mlp: Inkling2SwitchMLP, topK: Int

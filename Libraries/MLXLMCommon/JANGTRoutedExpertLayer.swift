@@ -365,12 +365,13 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             return JANGTFastDecode.routed(x, ids: ids, weights: weights, t).asType(input.dtype).reshaped(input.shape)
         }
         do {
+            let slotFastest = x.dim(0) > 1
             let hidden: MLXArray
             switch gateUp {
             case .trellis(let gate, let up, let signs):
                 hidden = JANGTKernels.gateUp(
                     xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids, gate: gate, up: up,
-                    limit: limit, activation: activation, outputDType: .float32)
+                    limit: limit, activation: activation, outputDType: .float32, slotFastest: slotFastest)
             case .codebook(_, _, let gate, let up, let separate?):
                 let g = try separate.gateDecode.project(x, packed: gate.packed, scales: gate.scales, indices: ids)
                 let u = try separate.upDecode.project(x, packed: up.packed, scales: up.scales, indices: ids)
@@ -378,7 +379,8 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             case .codebook(let kernel, _, let gate, let up, nil):
                 hidden = try kernel.activatePreparedInput(
                     kernel.prepareInputForFusedDecode(x), gatePacked: gate.packed, gateScales: gate.scales,
-                    upPacked: up.packed, upScales: up.scales, indices: ids, limit: limit > 0 ? limit : nil)
+                    upPacked: up.packed, upScales: up.scales, indices: ids,
+                    limit: limit > 0 ? limit : nil, slotFastest: slotFastest)
             case .external:
                 preconditionFailure("JANGT half layer: the host runs gate/up and calls routedDown")
             }
@@ -386,14 +388,16 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             switch down {
             case .trellis(let projection, let signs):
                 let rotated = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: ids.flattened())
-                y = JANGTKernels.down(hr: rotated, h: hidden, indices: ids, weights: weights, projection: projection)
-                    .asType(input.dtype)
+                y = JANGTKernels.down(
+                    hr: rotated, h: hidden, indices: ids, weights: weights, projection: projection,
+                    slotFastest: slotFastest
+                ).asType(input.dtype)
             case .codebook(let kernel, _, let bank):
                 let prepared = kernel.inputRotation == .hadamard32
                     ? try rowRotation(hidden, outputDType: .float32) : hidden
                 y = try kernel.projectPreparedHidden(
                     prepared, preparedBasis: kernel.inputRotation, packed: bank.packed, scales: bank.scales,
-                    indices: ids, scores: weights, outputDType: input.dtype)
+                    indices: ids, scores: weights, outputDType: input.dtype, slotFastest: slotFastest)
             case .external:
                 preconditionFailure("JANGT half layer: the host runs down on routedHidden")
             }
@@ -687,11 +691,12 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                     plan: expertTilePlan(sortedIDs), rotateForDown: false)
                 return take(hidden.asType(.float32), argSort(order), axis: 0)
             }
+            let slotFastest = x.dim(0) > 1
             switch gateUp {
             case .trellis(let gate, let up, let signs):
                 return JANGTKernels.gateUp(
                     xr: JANGTKernels.rotateRows(x, signs: signs), x: x, indices: ids, gate: gate, up: up,
-                    limit: limit, activation: activation, outputDType: .float32)
+                    limit: limit, activation: activation, outputDType: .float32, slotFastest: slotFastest)
             case .codebook(_, _, let gate, let up, let separate?):
                 let g = try separate.gateDecode.project(x, packed: gate.packed, scales: gate.scales, indices: ids)
                 let u = try separate.upDecode.project(x, packed: up.packed, scales: up.scales, indices: ids)
@@ -699,7 +704,8 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
             case .codebook(let kernel, _, let gate, let up, nil):
                 return try kernel.activatePreparedInput(
                     kernel.prepareInputForFusedDecode(x), gatePacked: gate.packed, gateScales: gate.scales,
-                    upPacked: up.packed, upScales: up.scales, indices: ids, limit: limit > 0 ? limit : nil
+                    upPacked: up.packed, upScales: up.scales, indices: ids,
+                    limit: limit > 0 ? limit : nil, slotFastest: slotFastest
                 ).asType(.float32)
             case .external:
                 preconditionFailure("JANGT half layer without a gate/up group")
@@ -735,17 +741,20 @@ public final class JANGTRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
                 return matmul(weights.reshaped(tokens, 1, routes), restored).reshaped(tokens, hiddenSize)
                     .asType(outputDType)
             }
+            let slotFastest = tokens > 1
             switch down {
             case .trellis(let projection, let signs):
                 let rotated = JANGTKernels.rotateRows(hidden, signs: signs, rowExperts: ids.flattened())
-                return JANGTKernels.down(hr: rotated, h: hidden, indices: ids, weights: weights,
-                                         projection: projection).asType(outputDType)
+                return JANGTKernels.down(
+                    hr: rotated, h: hidden, indices: ids, weights: weights,
+                    projection: projection, slotFastest: slotFastest
+                ).asType(outputDType)
             case .codebook(let kernel, _, let bank):
                 let prepared = kernel.inputRotation == .hadamard32
                     ? try rowRotation(hidden, outputDType: .float32) : hidden
                 return try kernel.projectPreparedHidden(
                     prepared, preparedBasis: kernel.inputRotation, packed: bank.packed, scales: bank.scales,
-                    indices: ids, scores: weights, outputDType: outputDType)
+                    indices: ids, scores: weights, outputDType: outputDType, slotFastest: slotFastest)
             case .external:
                 preconditionFailure("JANGT half layer without a down group")
             }

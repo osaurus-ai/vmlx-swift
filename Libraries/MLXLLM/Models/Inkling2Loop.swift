@@ -1044,10 +1044,17 @@ final class Inkling2MixedExperts: Module {
     /// Native gate/up + the softcapped activation: `[N * k, I]` fp32 in pair order (row-major (row, slot)).
     private func nativeActivation(_ x: MLXArray, _ inds: MLXArray, _ gateUp: Inkling2NativeSwitchLinear) -> MLXArray {
         let (N, k) = (inds.dim(0), inds.dim(1))
+        if inklingUseKernels, gateUp.isNVFP4, N <= 16,
+            inter % 16 == 0, x.dim(-1) % 16 == 0, gateUp.codes.dim(1) == 2 * inter,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        {
+            return Inkling2DecodeKernels.nvfp4GateUpAct(
+                x32: x.asType(f32), inds: inds, gateUp: gateUp, caps: caps, topK: k)
+        }
         var xs = x.asType(f32).reshaped([N, 1, 1, x.dim(-1)])
         var idx = inds
         var inverse: MLXArray? = nil
-        let doSort = inds.size >= 64
+        let doSort = inds.size >= 72
         if doSort {
             let flat = inds.flattened()
             let order = MLX.argSort(flat)
@@ -1078,7 +1085,15 @@ final class Inkling2MixedExperts: Module {
         _ hidden: MLXArray, _ inds: MLXArray, _ w: MLXArray, _ down: Inkling2NativeSwitchLinear, dtype: DType
     ) -> MLXArray {
         let (N, k) = (inds.dim(0), inds.dim(1))
-        let doSort = inds.size >= 64
+        if inklingUseKernels, down.isNVFP4, N <= 16, (1 ... 16).contains(k),
+            inter % 16 == 0, down.codes.dim(1) % 16 == 0,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        {
+            return Inkling2DecodeKernels.nvfp4DownWeighted(
+                act32: hidden.asType(f32).reshaped([N * k, inter]),
+                inds: inds, weights: w, down: down, outDType: dtype)
+        }
+        let doSort = inds.size >= 72
         var y: MLXArray
         if doSort {
             let flat = inds.flattened()
