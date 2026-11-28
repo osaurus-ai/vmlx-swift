@@ -131,27 +131,33 @@ enum Ernie55MXFP4Kernels {
             return as_type<float>(s == 0u ? 0x00400000u : (s << 23u));
         }
         template <typename T>
-        static inline float fp4_dot32(const uint4 p, const device T* xp) {
+        static inline float fp4_dot32_regs(const uint4 p, const thread float4* xv) {
             float acc = 0.0f;
             #pragma clang loop unroll(full)
             for (uint w = 0u; w < 4u; ++w) {
                 const uint u = (w == 0u) ? p.x : (w == 1u) ? p.y : (w == 2u) ? p.z : p.w;
-                const device T* xw = xp + w * 8u;
-                float4 x0 = float4(float(xw[0]), float(xw[1]), float(xw[2]), float(xw[3]));
                 float4 f0 = float4(
                     FP4_LUT[u & 15u],
                     FP4_LUT[(u >> 4u) & 15u],
                     FP4_LUT[(u >> 8u) & 15u],
                     FP4_LUT[(u >> 12u) & 15u]);
-                float4 x1 = float4(float(xw[4]), float(xw[5]), float(xw[6]), float(xw[7]));
                 float4 f1 = float4(
                     FP4_LUT[(u >> 16u) & 15u],
                     FP4_LUT[(u >> 20u) & 15u],
                     FP4_LUT[(u >> 24u) & 15u],
                     FP4_LUT[(u >> 28u) & 15u]);
-                acc += dot(x0, f0) + dot(x1, f1);
+                acc += dot(xv[2u * w], f0) + dot(xv[2u * w + 1u], f1);
             }
             return acc;
+        }
+        template <typename T>
+        static inline void load_x32(const device T* xp, thread float4* xv) {
+            #pragma clang loop unroll(full)
+            for (uint w = 0u; w < 4u; ++w) {
+                const device T* xw = xp + w * 8u;
+                xv[2u * w] = float4(float(xw[0]), float(xw[1]), float(xw[2]), float(xw[3]));
+                xv[2u * w + 1u] = float4(float(xw[4]), float(xw[5]), float(xw[6]), float(xw[7]));
+            }
         }
         """
 
@@ -178,14 +184,15 @@ enum Ernie55MXFP4Kernels {
 
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             for (uint g = lane; g < groups; g += 32u) {
-                const device T* xp = xrow + g * 32u;
+                float4 xv[8];
+                load_x32<T>(xrow + g * 32u, xv);
                 #pragma clang loop unroll(full)
                 for (uint r = 0u; r < 4u; ++r) {
                     const uint row = row0 + r;
                     if (row < uint(N)) {
                         const uint4 p = *reinterpret_cast<const device uint4*>(wbank + size_t(row) * k_u32 + g * 4u);
                         const float sf = e8m0_scale(sbank[size_t(row) * groups + g]);
-                        acc[r] += fp4_dot32<T>(p, xp) * sf;
+                        acc[r] += fp4_dot32_regs<T>(p, xv) * sf;
                     }
                 }
             }
@@ -244,14 +251,15 @@ enum Ernie55MXFP4Kernels {
 
                 float slot_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 for (uint g = lane; g < groups; g += 32u) {
-                    const device T* xp = xrow + g * 32u;
+                    float4 xv[8];
+                    load_x32<T>(xrow + g * 32u, xv);
                     #pragma clang loop unroll(full)
                     for (uint r = 0u; r < 4u; ++r) {
                         const uint row = row0 + r;
                         if (row < uint(H)) {
                             const uint4 p = *reinterpret_cast<const device uint4*>(wbank + size_t(row) * k_u32 + g * 4u);
                             const float sf = e8m0_scale(sbank[size_t(row) * groups + g]);
-                            slot_acc[r] += fp4_dot32<T>(p, xp) * sf;
+                            slot_acc[r] += fp4_dot32_regs<T>(p, xv) * sf;
                         }
                     }
                 }

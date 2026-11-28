@@ -1044,10 +1044,17 @@ final class Inkling2MixedExperts: Module {
     /// Native gate/up + the softcapped activation: `[N * k, I]` fp32 in pair order (row-major (row, slot)).
     private func nativeActivation(_ x: MLXArray, _ inds: MLXArray, _ gateUp: Inkling2NativeSwitchLinear) -> MLXArray {
         let (N, k) = (inds.dim(0), inds.dim(1))
+        if inklingUseKernels, gateUp.isNVFP4, N <= 16,
+            inter % 16 == 0, x.dim(-1) % 16 == 0, gateUp.codes.dim(1) == 2 * inter,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        {
+            return Inkling2DecodeKernels.nvfp4GateUpAct(
+                x32: x.asType(f32), inds: inds, gateUp: gateUp, caps: caps, topK: k)
+        }
         var xs = x.asType(f32).reshaped([N, 1, 1, x.dim(-1)])
         var idx = inds
         var inverse: MLXArray? = nil
-        let doSort = inds.size >= 64
+        let doSort = inds.size >= 72
         if doSort {
             let flat = inds.flattened()
             let order = MLX.argSort(flat)
@@ -1078,7 +1085,15 @@ final class Inkling2MixedExperts: Module {
         _ hidden: MLXArray, _ inds: MLXArray, _ w: MLXArray, _ down: Inkling2NativeSwitchLinear, dtype: DType
     ) -> MLXArray {
         let (N, k) = (inds.dim(0), inds.dim(1))
-        let doSort = inds.size >= 64
+        if inklingUseKernels, down.isNVFP4, N <= 16, (1 ... 16).contains(k),
+            inter % 16 == 0, down.codes.dim(1) % 16 == 0,
+            ProcessInfo.processInfo.environment["VMLX_INKLING2_MLX_EXPERTS"] != "1"
+        {
+            return Inkling2DecodeKernels.nvfp4DownWeighted(
+                act32: hidden.asType(f32).reshaped([N * k, inter]),
+                inds: inds, weights: w, down: down, outDType: dtype)
+        }
+        let doSort = inds.size >= 72
         var y: MLXArray
         if doSort {
             let flat = inds.flattened()
@@ -1849,6 +1864,18 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     }
 
     func logits(_ h: MLXArray, matchDecode: Bool = false) -> MLXArray {
+        if h.ndim == 3, h.dim(0) == 1, (1 ... 16).contains(h.dim(1)),
+            let q = lmHead as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self, q.bias == nil,
+            q.mode == .affine, q.bits == 8, q.groupSize == 64, let biases = q.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                h, weight: q.weight, scales: q.scales, biases: biases,
+                outDType: .float32,
+                softcap: args.finalLogitSoftcapping ?? 0,
+                outCols: args.unpaddedVocabSize ?? 0)
+        {
+            return fast
+        }
         var out: MLXArray
         if matchDecode, h.ndim == 3, h.dim(0) == 1, h.dim(1) > 1,
             let q = lmHead as? QuantizedLinear,
@@ -2551,6 +2578,18 @@ extension Inkling2LoopModel: TokenEmbedderModel {
     /// configured with `selector_softcap_mode: "after_correction"` apply `final_logit_softcapping`
     /// after adding the selector edge scores, matching `incoai/Inkling-2-Mini-DFlash2`.
     public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if hidden.ndim == 3, hidden.dim(0) == 1, (1 ... 16).contains(hidden.dim(1)),
+            let q = lmHead as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self, q.bias == nil,
+            q.mode == .affine, q.bits == 8, q.groupSize == 64, let biases = q.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                hidden, weight: q.weight, scales: q.scales, biases: biases,
+                outDType: .float32,
+                softcap: 0,
+                outCols: args.unpaddedVocabSize ?? 0)
+        {
+            return fast
+        }
         var out = lmHead(hidden)
         if let u = args.unpaddedVocabSize, u < out.dim(-1) {
             out = out[.ellipsis, ..<u]
@@ -2615,7 +2654,7 @@ extension Inkling2LoopModel: LaneQMMTargetPolicy {
 }
 
 extension Inkling2LoopModel: DFlash2WidthLadderPolicy {
-    public var dflash2WidthLadder: [Int] { [5, 8] }
+    public var dflash2WidthLadder: [Int] { [5, 8, 12] }
     public var dflash2BoundsCostsByWiderRungs: Bool { true }
     public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }

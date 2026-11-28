@@ -343,6 +343,11 @@ final class GroupedDynamicCausalConv: Module {
         // precondition took the whole host down (observed live
         // 2026-08-20).
         guard hidden.ndim == 3, dynamic.ndim >= 3 else { return hidden }
+        if let fused = DFlash2Kernels.groupedDynamicConvolveK2(
+            hidden: hidden, dynamic: dynamic, base: base, groupSize: groupSize)
+        {
+            return fused
+        }
         let batch = hidden.dim(0)
         let length = hidden.dim(1)
         let hiddenSize = hidden.dim(2)
@@ -702,11 +707,38 @@ final class DFlash2CandidateSelector: Module {
     ) -> DFlash2Proposal {
         let vocab = logits.dim(-1)
         let length = hidden.dim(1)
-        // argPartition places the K largest in the trailing K slots.
-        let candidates = argPartition(logits, kth: vocab - topK, axis: -1)[
-            .ellipsis, (vocab - topK)...]
-        let unary = takeAlong(logits, candidates, axis: -1)
+        let candidates: MLXArray
+        let unary: MLXArray
+        if let fastTopK = DFlash2Kernels.topK(logits: logits, topK: topK) {
+            unary = fastTopK.unary
+            candidates = fastTopK.candidates
+        } else {
+            // argPartition places the K largest in the trailing K slots.
+            candidates = argPartition(logits, kth: vocab - topK, axis: -1)[
+                .ellipsis, (vocab - topK)...]
+            unary = takeAlong(logits, candidates, axis: -1)
+        }
         let projected = hiddenProjection(hidden)
+        let denseCodebooks =
+            type(of: predecessorCodebook) == Embedding.self
+            && type(of: successorCodebook) == Embedding.self
+        let capValue = postSoftcap ?? 0
+
+        if temperature <= 0, denseCodebooks,
+            let fastPath = DFlash2Kernels.markovSelectGreedy(
+                unary: unary,
+                candidates: candidates,
+                hiddenProj: projected,
+                predWeight: predecessorCodebook.weight,
+                succWeight: successorCodebook.weight,
+                anchorIds: anchorIds,
+                cap: capValue)
+        {
+            return DFlash2Proposal(
+                tokens: fastPath,
+                candidates: candidates,
+                probabilities: nil)
+        }
 
         var predecessor = anchorIds
         var path: [MLXArray] = []
@@ -714,13 +746,27 @@ final class DFlash2CandidateSelector: Module {
         path.reserveCapacity(length)
 
         for position in 0 ..< length {
-            let prev = predecessorCodebook(predecessor).expandedDimensions(axis: 1)
-            let h = projected[0..., position, 0...].expandedDimensions(axis: 1)
-            let succ = successorCodebook(candidates[0..., position, 0...])
-            let edges = (prev * h * succ).sum(axis: -1)
-            var scores = unary[0..., position, 0...] + edges
-            if let cap = postSoftcap, cap > 0 {
-                scores = tanh(scores / cap) * cap
+            var scores: MLXArray
+            if denseCodebooks,
+                let fastScores = DFlash2Kernels.markovStepScores(
+                    unaryRow: unary[0..., position, 0...],
+                    candRow: candidates[0..., position, 0...],
+                    hRow: projected[0..., position, 0...],
+                    predWeight: predecessorCodebook.weight,
+                    succWeight: successorCodebook.weight,
+                    predId: predecessor,
+                    cap: capValue)
+            {
+                scores = fastScores
+            } else {
+                let prev = predecessorCodebook(predecessor).expandedDimensions(axis: 1)
+                let h = projected[0..., position, 0...].expandedDimensions(axis: 1)
+                let succ = successorCodebook(candidates[0..., position, 0...])
+                let edges = (prev * h * succ).sum(axis: -1)
+                scores = unary[0..., position, 0...] + edges
+                if let cap = postSoftcap, cap > 0 {
+                    scores = tanh(scores / cap) * cap
+                }
             }
 
             let selected: MLXArray
@@ -754,9 +800,16 @@ extension DFlash2CandidateSelector {
     func lattice(hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray) -> DFlash2LatticeArrays {
         let vocab = logits.dim(-1)
         let length = hidden.dim(1)
-        let candidates = argPartition(logits, kth: vocab - topK, axis: -1)[
-            .ellipsis, (vocab - topK)...]  // [1, L, K]
-        let unary = takeAlong(logits, candidates, axis: -1).asType(.float32)
+        let candidates: MLXArray
+        let unary: MLXArray
+        if let fastTopK = DFlash2Kernels.topK(logits: logits, topK: topK) {
+            unary = fastTopK.unary
+            candidates = fastTopK.candidates
+        } else {
+            candidates = argPartition(logits, kth: vocab - topK, axis: -1)[
+                .ellipsis, (vocab - topK)...]  // [1, L, K]
+            unary = takeAlong(logits, candidates, axis: -1).asType(.float32)
+        }
         let projected = hiddenProjection(hidden).asType(.float32)  // [1, L, R]
         let successor = successorCodebook(candidates).asType(.float32)  // [1, L, K, R]
         let anchor = predecessorCodebook(anchorIds).asType(.float32)  // [1, R]

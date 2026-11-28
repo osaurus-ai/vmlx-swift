@@ -1297,6 +1297,13 @@ enum Inkling2Kernels {
         let gqa = NQ / NKV
         let meta = MLXArray([Int32(seen), Int32(kStart), Int32(window ?? 0), Int32(relExtent)])
         let scaleArr = MLXArray([scale])
+        if T >= 2, B == 1,
+            let mppOut = prefillAttentionMPP(
+                q: q, k: k, v: v, r: r, projT: projT, sinks: sinks,
+                seen: seen, kStart: kStart, window: window ?? 0, relExtent: relExtent, scale: scale)
+        {
+            return mppOut
+        }
         if T >= 8 {
             let tBlocks = (T + 31) / 32
             return prefillAttnMMAKernel(
@@ -1380,6 +1387,1158 @@ enum Inkling2Kernels {
             grid: (NQ * 128, T, B),
             threadGroup: (128, 1, 1),
             outputShapes: [[B, NQ, T, D]],
+            outputDTypes: [.bfloat16])[0]
+        #else
+        return nil
+        #endif
+    }
+
+    // MARK: Multi-Vector Affine 8-bit g=64 GEMV (fused optional softcap + unpadded vocab slice)
+
+    #if canImport(Metal)
+    private static let stdMetalHeader = """
+        #include <metal_stdlib>
+        using namespace metal;
+        """
+
+    private static let mppHeader = """
+        #include <metal_stdlib>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace metal;
+        using namespace mpp::tensor_ops;
+        """
+
+    private static let affine8G64MultiGemvKernel = MLXFast.metalKernel(
+        name: "inkling2_aff8g64_multi_gemv",
+        inputNames: ["x", "w", "scales", "biases", "cap_buf", "out_n_buf"],
+        outputNames: ["out"],
+        source: """
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint K = uint(x_shape[1]);
+            const uint OUT_N = uint(out_n_buf[0]);
+            const uint row0 = threadgroup_position_in_grid.x * 8u + sg * 2u;
+            if (row0 >= OUT_N) return;
+
+            const uint r_valid = metal::min(2u, OUT_N - row0);
+            const uint KW = K >> 2;
+            const uint NG = K >> 6;
+            const uint g_sub = lane >> 3;
+
+            float acc[ROWS][2];
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                acc[v][0] = 0.0f;
+                acc[v][1] = 0.0f;
+            }
+
+            const device uint* w0 = w + size_t(row0) * KW;
+            const device ST*   s0 = scales + size_t(row0) * NG;
+            const device ST*   b0 = biases + size_t(row0) * NG;
+
+            for (uint k0 = 0u; k0 < K; k0 += 256u) {
+                const uint k_lane = k0 + lane * 8u;
+                const uint g = (k0 >> 6) + g_sub;
+                float4 x_lo[ROWS], x_hi[ROWS];
+                #pragma clang loop unroll(full)
+                for (uint v = 0u; v < uint(ROWS); ++v) {
+                    const device XT* xp = x + size_t(v) * K + k_lane;
+                    x_lo[v] = float4(*(const device vec<XT, 4>*)(xp));
+                    x_hi[v] = float4(*(const device vec<XT, 4>*)(xp + 4u));
+                }
+
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < 2u; ++r) {
+                    if (r < r_valid) {
+                        const device uint* wr = w0 + size_t(r) * KW + (k_lane >> 2);
+                        const uint p0 = wr[0];
+                        const uint p1 = wr[1];
+                        const float sc = float(s0[size_t(r) * NG + g]);
+                        const float bi = float(b0[size_t(r) * NG + g]);
+                        const float4 w_lo = float4(
+                            float(p0 & 0xFFu),
+                            float((p0 >> 8) & 0xFFu),
+                            float((p0 >> 16) & 0xFFu),
+                            float((p0 >> 24) & 0xFFu)) * sc + bi;
+                        const float4 w_hi = float4(
+                            float(p1 & 0xFFu),
+                            float((p1 >> 8) & 0xFFu),
+                            float((p1 >> 16) & 0xFFu),
+                            float((p1 >> 24) & 0xFFu)) * sc + bi;
+                        #pragma clang loop unroll(full)
+                        for (uint v = 0u; v < uint(ROWS); ++v) {
+                            acc[v][r] += dot(x_lo[v], w_lo) + dot(x_hi[v], w_hi);
+                        }
+                    }
+                }
+            }
+
+            const float cap = cap_buf[0];
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < 2u; ++r) {
+                    float total = simd_sum(acc[v][r]);
+                    if (lane == 0u && r < r_valid) {
+                        if (HAS_CAP) {
+                            total = metal::tanh(total / cap) * cap;
+                        }
+                        out[size_t(v) * OUT_N + row0 + r] = OT(total);
+                    }
+                }
+            }
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    // MARK: Fused Inkling-2 MoE Router (E=128, K=2304, T=1..16)
+
+    private static let routerScoresKernel = MLXFast.metalKernel(
+        name: "inkling2_router_scores_fused",
+        inputNames: ["x", "w"],
+        outputNames: ["scores"],
+        source: """
+            const uint sgi = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = threadgroup_position_in_grid.x;
+            if (row >= uint(E)) return;
+
+            threadgroup float sh[ROWS][9];
+            const uint k_lane = sgi * 256u + lane * 8u;
+            const device WT* wp = w + size_t(row) * uint(K) + k_lane;
+            float4 w_lo = float4(*(const device vec<WT, 4>*)(wp));
+            float4 w_hi = float4(*(const device vec<WT, 4>*)(wp + 4u));
+
+            #pragma clang loop unroll(full)
+            for (uint t = 0u; t < uint(ROWS); ++t) {
+                const device XT* xp = x + size_t(t) * uint(K) + k_lane;
+                float4 x_lo = float4(*(const device vec<XT, 4>*)(xp));
+                float4 x_hi = float4(*(const device vec<XT, 4>*)(xp + 4u));
+                float s = simd_sum(dot(x_lo, w_lo) + dot(x_hi, w_hi));
+                if (lane == 0u) sh[t][sgi] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgi == 0u && lane == 0u) {
+                #pragma clang loop unroll(full)
+                for (uint t = 0u; t < uint(ROWS); ++t) {
+                    float tot = sh[t][0] + sh[t][1] + sh[t][2]
+                              + sh[t][3] + sh[t][4] + sh[t][5]
+                              + sh[t][6] + sh[t][7] + sh[t][8];
+                    scores[size_t(t) * uint(E) + row] = 1.0f / (1.0f + metal::exp(-tot));
+                }
+            }
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    private static let routerTopKKernel = MLXFast.metalKernel(
+        name: "inkling2_router_topk_fused",
+        inputNames: ["scores", "bias", "scale_buf"],
+        outputNames: ["out_ids", "out_w"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint sg = tid >> 5;
+            const uint lane = tid & 31u;
+            const uint row = threadgroup_position_in_grid.y;
+
+            const float raw0 = scores[size_t(row) * 128u + tid];
+            float val = raw0 + float(bias[tid]);
+
+            threadgroup float sg_v[4];
+            threadgroup uint  sg_i[4];
+            threadgroup uint  win_i;
+            threadgroup uint  picked_i[TOPK];
+            threadgroup float picked_r[TOPK];
+
+            for (uint k = 0u; k < uint(TOPK); ++k) {
+                float sm = simd_max(val);
+                uint  si = simd_min((val == sm) ? tid : 0xFFFFFFFFu);
+                if (lane == 0u) {
+                    sg_v[sg] = sm;
+                    sg_i[sg] = si;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0u) {
+                    float bv = sg_v[0];
+                    uint  bi = sg_i[0];
+                    for (uint s = 1u; s < 4u; ++s) {
+                        if (sg_v[s] > bv || (sg_v[s] == bv && sg_i[s] < bi)) {
+                            bv = sg_v[s];
+                            bi = sg_i[s];
+                        }
+                    }
+                    win_i = bi;
+                    picked_i[k] = bi;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == win_i) {
+                    picked_r[k] = raw0;
+                    val = -INFINITY;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                float r = (lane < uint(TOPK)) ? picked_r[lane] : 0.0f;
+                float denom = simd_sum(r) + 1e-20f;
+                if (lane < uint(TOPK)) {
+                    out_ids[size_t(row) * uint(TOPK) + lane] = picked_i[lane];
+                    out_w[size_t(row) * uint(TOPK) + lane] = (r / denom) * scale_buf[0];
+                }
+            }
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    // MARK: Zero-Mask Split-K Verify Attention (sliding & full, all S, LQ=1..16)
+
+    private static let verifyAttnS1Body = """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint sg = tid >> 5;
+            const uint lane = tid & 31u;
+            const uint split = threadgroup_position_in_grid.y;
+            const uint h = threadgroup_position_in_grid.z;
+            const uint kv_h = h / uint(GQA);
+            const int LQ = int(q_shape[2]);
+            const int S  = int(k_shape[2]);
+            const int n_splits = int(params[0]);
+            const int k_min = int(params[1]);
+            const float sc = scale_buf[0];
+
+            const int span = S - k_min;
+            const int chunk = (span + n_splits - 1) / n_splits;
+            const int s0 = min(k_min + int(split) * chunk, S);
+            const int s1 = min(s0 + chunk, S);
+
+            const bool active = int(sg) < LQ;
+            const int q_pos = (S - LQ) + int(sg);
+
+            float4 qv = float4(0.0f);
+            if (active) {
+                qv = float4(*(const device vec<bfloat, 4>*)(q + ((size_t)h * LQ + int(sg)) * 128u + lane * 4u));
+            }
+
+            threadgroup float rel_sh[8 * 16];
+            if (tid < uint(LQ * 16)) {
+                uint qi = tid >> 4;
+                uint d  = tid & 15u;
+                rel_sh[tid] = float(rel[((size_t)qi * H + h) * 16u + d]);
+            }
+            threadgroup bfloat k_sh[8 * 128];
+            threadgroup bfloat v_sh[8 * 128];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const size_t kv_base = (size_t)kv_h * (size_t)S * 128u;
+            float m = -1e30f;
+            float l = 0.0f;
+            float4 o = float4(0.0f);
+
+            for (int k0 = s0; k0 < s1; k0 += 8) {
+                const int kp_load = k0 + int(sg);
+                if (kp_load < s1) {
+                    *(threadgroup vec<bfloat, 4>*)(k_sh + sg * 128u + lane * 4u) =
+                        *(const device vec<bfloat, 4>*)(k + kv_base + (size_t)kp_load * 128u + lane * 4u);
+                    *(threadgroup vec<bfloat, 4>*)(v_sh + sg * 128u + lane * 4u) =
+                        *(const device vec<bfloat, 4>*)(v + kv_base + (size_t)kp_load * 128u + lane * 4u);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (active) {
+                    const int b_lim = min(8, s1 - k0);
+                    const threadgroup float* rq = rel_sh + sg * 16u;
+                    for (int b = 0; b < b_lim; ++b) {
+                        const int kp = k0 + b;
+                        const int dist = q_pos - kp;
+                        if (dist < 0 || (SLIDING > 0 && dist >= SLIDING)) continue;
+                        float4 kv = float4(*(const threadgroup vec<bfloat, 4>*)(k_sh + uint(b) * 128u + lane * 4u));
+                        float4 vv = float4(*(const threadgroup vec<bfloat, 4>*)(v_sh + uint(b) * 128u + lane * 4u));
+                        float score = simd_sum(dot(qv, kv)) * sc;
+                        if (dist < REL_EXTENT) {
+                            const device vec<bfloat, 4>* rp = (const device vec<bfloat, 4>*)(rel_proj_t + (size_t)dist * 16u);
+                            float4 a0 = float4(rp[0]), a1 = float4(rp[1]), a2 = float4(rp[2]), a3 = float4(rp[3]);
+                            float rb = a0.x * rq[0]  + a0.y * rq[1]  + a0.z * rq[2]  + a0.w * rq[3]
+                                     + a1.x * rq[4]  + a1.y * rq[5]  + a1.z * rq[6]  + a1.w * rq[7]
+                                     + a2.x * rq[8]  + a2.y * rq[9]  + a2.z * rq[10] + a2.w * rq[11]
+                                     + a3.x * rq[12] + a3.y * rq[13] + a3.z * rq[14] + a3.w * rq[15];
+                            score += float(bfloat(rb));
+                        }
+                        float m_new = metal::max(m, score);
+                        float alpha = (l > 0.0f) ? metal::exp(m - m_new) : 0.0f;
+                        float p = metal::exp(score - m_new);
+                        o = o * alpha + vv * p;
+                        l = l * alpha + p;
+                        m = m_new;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (active) {
+        """
+
+    private static let verifyAttnS1SingleKernel = MLXFast.metalKernel(
+        name: "inkling2_verify_attn_s1_single",
+        inputNames: ["q", "k", "v", "rel", "rel_proj_t", "sinks", "params", "scale_buf"],
+        outputNames: ["out"],
+        source: verifyAttnS1Body + """
+                const float sk = float(sinks[(size_t)int(sg) * H + h]);
+                float gm = (l > 0.0f) ? metal::max(m, sk) : sk;
+                float w_k = (l > 0.0f) ? metal::exp(m - gm) : 0.0f;
+                float w_s = metal::exp(sk - gm);
+                float inv_l = 1.0f / (l * w_k + w_s);
+                float4 go = o * (w_k * inv_l);
+                device vec<bfloat, 4>* dst = (device vec<bfloat, 4>*)(out + ((size_t)h * LQ + int(sg)) * 128u + lane * 4u);
+                *dst = vec<bfloat, 4>(bfloat(go.x), bfloat(go.y), bfloat(go.z), bfloat(go.w));
+            }
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    private static let verifyAttnS1MultiKernel = MLXFast.metalKernel(
+        name: "inkling2_verify_attn_s1_multi",
+        inputNames: ["q", "k", "v", "rel", "rel_proj_t", "sinks", "params", "scale_buf"],
+        outputNames: ["part_m", "part_l", "part_o"],
+        source: verifyAttnS1Body + """
+                const size_t p_idx = ((size_t)h * LQ + int(sg)) * uint(n_splits) + split;
+                if (lane == 0u) {
+                    part_m[p_idx] = m;
+                    part_l[p_idx] = l;
+                }
+                *(device float4*)(part_o + p_idx * 128u + lane * 4u) = o;
+            }
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    private static let verifyAttnS2Kernel = MLXFast.metalKernel(
+        name: "inkling2_verify_attn_s2",
+        inputNames: ["part_m", "part_l", "part_o", "sinks"],
+        outputNames: ["out"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint r = threadgroup_position_in_grid.y;
+            const uint h = threadgroup_position_in_grid.z;
+            const uint H = uint(part_m_shape[0]);
+            const uint LQ = uint(part_m_shape[1]);
+            const uint n_splits = uint(part_m_shape[2]);
+
+            const size_t base = ((size_t)h * LQ + r) * n_splits;
+            const device float* pm = part_m + base;
+            const device float* pl = part_l + base;
+            const device float* po = part_o + base * 128u;
+
+            const float sk = float(sinks[(size_t)r * H + h]);
+            float gm = sk;
+            for (uint s = 0u; s < n_splits; ++s) {
+                if (pl[s] > 0.0f) gm = metal::max(gm, pm[s]);
+            }
+            float gl = metal::exp(sk - gm);
+            float4 go = float4(0.0f);
+            for (uint s = 0u; s < n_splits; ++s) {
+                if (pl[s] > 0.0f) {
+                    float w = metal::exp(pm[s] - gm);
+                    gl += pl[s] * w;
+                    go += *(const device float4*)(po + (size_t)s * 128u + lane * 4u) * w;
+                }
+            }
+            float inv_l = 1.0f / gl;
+            device vec<bfloat, 4>* dst = (device vec<bfloat, 4>*)(out + ((size_t)h * LQ + r) * 128u + lane * 4u);
+            *dst = vec<bfloat, 4>(bfloat(go.x * inv_l), bfloat(go.y * inv_l), bfloat(go.z * inv_l), bfloat(go.w * inv_l));
+            """,
+        header: stdMetalHeader,
+        ensureRowContiguous: true)
+
+    // MARK: Metal 4 MPP Kernels (GQA-grouped Split-K Verify + 32x128x128 FlashAttention Prefill)
+
+    private static let mppLock = NSLock()
+    nonisolated(unsafe) private static var mppPrefillCache: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var mppGQACache: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var mppVerified: Bool?
+
+    private static let mppPrefillSource = #"""
+          const uint tid = thread_position_in_threadgroup.x;
+          const uint sg = tid >> 5;
+          const uint lane = tid & 31u;
+          const int LQ = int(q_shape[2]);
+          const int S  = int(k_shape[2]);
+          const int r0 = min(int(threadgroup_position_in_grid.y) * 32, LQ - 32);
+          const int h  = int(threadgroup_position_in_grid.z);
+          const int kv_h = h / GQA;
+          const int q_offset = int(q_off_buf[0]);
+          const float sc = scale_buf[0];
+
+          const int k_start = (SLIDING > 0) ? max(0, q_offset + r0 - SLIDING + 1) : 0;
+          const int k_end   = min(S, q_offset + r0 + 32);
+
+          threadgroup float S_sh[32 * 128];
+          threadgroup bfloat P_sh[32 * 128];
+          threadgroup float rel_sh[32 * 16];
+          threadgroup float m_sh[32];
+          threadgroup float l_sh[32];
+          threadgroup float alpha_sh[32];
+
+          if (tid < 32u) {
+            m_sh[tid] = float(sinks[(size_t)(r0 + int(tid)) * H + h]);
+            l_sh[tid] = 1.0f;
+          }
+          for (uint i = tid; i < 32u * 16u; i += 128u) {
+            uint qi = i >> 4;
+            uint d  = i & 15u;
+            rel_sh[i] = float(rel[((size_t)(r0 + int(qi)) * H + h) * 16u + d]);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          constexpr auto desc_qk = matmul2d_descriptor(32, 128, 128, false, true, false, matmul2d_descriptor::mode::multiply);
+          constexpr auto desc_pv = matmul2d_descriptor(32, 128, 128, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+          matmul2d<desc_qk, execution_simdgroups<4>> op_qk;
+          matmul2d<desc_pv, execution_simdgroups<4>> op_pv;
+
+          tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tQ(
+              (device bfloat*)q + ((size_t)h * LQ + r0) * 128u, dextents<int32_t, 2>(128, 32));
+          auto aQ = tQ.slice<128, 32>(0, 0);
+
+          tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tP(
+              P_sh, dextents<int32_t, 2>(128, 32));
+          auto aP = tP.slice<128, 32>(0, 0);
+
+          const size_t kv_head_base = (size_t)kv_h * (size_t)S * 128u;
+          tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV0(
+              (device bfloat*)v + kv_head_base, dextents<int32_t, 2>(128, 128));
+          auto bV0 = tV0.slice<128, 128>(0, 0);
+
+          auto O_acc = op_pv.template get_destination_cooperative_tensor<decltype(aP), decltype(bV0), float>();
+          #pragma unroll
+          for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+            if (O_acc.is_valid_element(i)) O_acc[i] = 0.0f;
+          }
+
+          for (int k0 = k_start; k0 < k_end; k0 += 128) {
+            const int c0 = (k0 + 128 <= S) ? k0 : (S - 128);
+            const bool is_clamped = (c0 < k0) || (c0 + 128 > k_end);
+            const bool pure_prefix = (!is_clamped) && (SLIDING == 0) && ((q_offset + r0) - (c0 + 127) >= REL_EXTENT);
+
+            tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tK(
+                (device bfloat*)k + kv_head_base + (size_t)c0 * 128u, dextents<int32_t, 2>(128, 128));
+            auto bK = tK.slice<128, 128>(0, 0);
+            auto S_coop = op_qk.template get_destination_cooperative_tensor<decltype(aQ), decltype(bK), float>();
+            op_qk.run(aQ, bK, S_coop);
+
+            #pragma unroll
+            for (uint16_t i = 0; i < S_coop.get_capacity(); ++i) {
+              if (S_coop.is_valid_element(i)) {
+                const auto idx = S_coop.get_multidimensional_index(i);
+                S_sh[idx[1] * 128 + idx[0]] = S_coop[i] * sc;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (pure_prefix) {
+              for (uint r = 0u; r < 8u; ++r) {
+                const uint qi = sg * 8u + r;
+                const uint rb = qi * 128u;
+                const float s0 = S_sh[rb + lane];
+                const float s1 = S_sh[rb + lane + 32u];
+                const float s2 = S_sh[rb + lane + 64u];
+                const float s3 = S_sh[rb + lane + 96u];
+                const float rmax = simd_max(metal::max(metal::max(s0, s1), metal::max(s2, s3)));
+                const float m_old = m_sh[qi];
+                const float m_new = metal::max(m_old, rmax);
+                const float alpha = metal::exp(m_old - m_new);
+                const float p0 = metal::exp(s0 - m_new);
+                const float p1 = metal::exp(s1 - m_new);
+                const float p2 = metal::exp(s2 - m_new);
+                const float p3 = metal::exp(s3 - m_new);
+                const float l_tile = simd_sum((p0 + p1) + (p2 + p3));
+                if (lane == 0u) {
+                  m_sh[qi] = m_new;
+                  l_sh[qi] = l_sh[qi] * alpha + l_tile;
+                  alpha_sh[qi] = alpha;
+                }
+                P_sh[rb + lane]       = bfloat(p0);
+                P_sh[rb + lane + 32u] = bfloat(p1);
+                P_sh[rb + lane + 64u] = bfloat(p2);
+                P_sh[rb + lane + 96u] = bfloat(p3);
+              }
+            } else {
+              for (uint r = 0u; r < 8u; ++r) {
+                const uint qi = sg * 8u + r;
+                const uint rb = qi * 128u;
+                const int q_pos = q_offset + r0 + int(qi);
+                const threadgroup float* rq = rel_sh + qi * 16u;
+                float sv[4];
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                  const uint ki = lane + c * 32u;
+                  const int kp = c0 + int(ki);
+                  float s = S_sh[rb + ki];
+                  const int d = q_pos - kp;
+                  if (kp < k0 || kp >= k_end || d < 0 || (SLIDING > 0 && d >= SLIDING)) {
+                    s = -1e30f;
+                  } else if (d < REL_EXTENT) {
+                    const device vec<bfloat, 4>* rp = (const device vec<bfloat, 4>*)(rel_proj_t + (size_t)d * 16u);
+                    float4 a0 = float4(rp[0]), a1 = float4(rp[1]), a2 = float4(rp[2]), a3 = float4(rp[3]);
+                    float rbias = a0.x * rq[0]  + a0.y * rq[1]  + a0.z * rq[2]  + a0.w * rq[3]
+                                + a1.x * rq[4]  + a1.y * rq[5]  + a1.z * rq[6]  + a1.w * rq[7]
+                                + a2.x * rq[8]  + a2.y * rq[9]  + a2.z * rq[10] + a2.w * rq[11]
+                                + a3.x * rq[12] + a3.y * rq[13] + a3.z * rq[14] + a3.w * rq[15];
+                    s += float(bfloat(rbias));
+                  }
+                  sv[c] = s;
+                }
+                const float rmax = simd_max(metal::max(metal::max(sv[0], sv[1]), metal::max(sv[2], sv[3])));
+                const float m_old = m_sh[qi];
+                const float m_new = metal::max(m_old, rmax);
+                const float alpha = metal::exp(m_old - m_new);
+                float l_acc = 0.0f;
+                #pragma unroll
+                for (uint c = 0u; c < 4u; ++c) {
+                  float p = (sv[c] > -1e29f) ? metal::exp(sv[c] - m_new) : 0.0f;
+                  l_acc += p;
+                  P_sh[rb + lane + c * 32u] = bfloat(p);
+                }
+                const float l_tile = simd_sum(l_acc);
+                if (lane == 0u) {
+                  m_sh[qi] = m_new;
+                  l_sh[qi] = l_sh[qi] * alpha + l_tile;
+                  alpha_sh[qi] = alpha;
+                }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+              if (O_acc.is_valid_element(i)) {
+                O_acc[i] *= alpha_sh[O_acc.get_multidimensional_index(i)[1]];
+              }
+            }
+            tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV(
+                (device bfloat*)v + kv_head_base + (size_t)c0 * 128u, dextents<int32_t, 2>(128, 128));
+            auto bV = tV.slice<128, 128>(0, 0);
+            op_pv.run(aP, bV, O_acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+
+          device bfloat* out_base = (device bfloat*)out + ((size_t)h * LQ + r0) * 128u;
+          #pragma unroll
+          for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+            if (O_acc.is_valid_element(i)) {
+              const auto idx = O_acc.get_multidimensional_index(i);
+              out_base[idx[1] * 128 + idx[0]] = bfloat(O_acc[i] / l_sh[idx[1]]);
+            }
+          }
+        """#
+
+    private static let mppGQAS1Source = #"""
+          const uint tid = thread_position_in_threadgroup.x;
+          const uint sg = tid >> 5;
+          const uint lane = tid & 31u;
+          const int split = int(threadgroup_position_in_grid.y);
+          const int kv_h = int(threadgroup_position_in_grid.z);
+
+          const int LQ = int(q_shape[2]);
+          const int S  = int(k_shape[2]);
+          const int n_splits = int(params[0]);
+          const int k_min = int(params[1]);
+          const float sc = scale_buf[0];
+
+          const int M = GQA * LQ;
+          const int h0 = kv_h * GQA;
+          const int span = S - k_min;
+          const int chunk = (span + n_splits - 1) / n_splits;
+          const int s0 = min(k_min + split * chunk, S);
+          const int s1 = min(s0 + chunk, S);
+
+          threadgroup bfloat Q_sh[TQ * 128];
+          threadgroup float  S_sh[TQ * TK];
+          threadgroup bfloat P_sh[TQ * TK];
+          threadgroup bfloat rel_sh[TQ * 16];
+          threadgroup float  m_sh[TQ];
+          threadgroup float  l_sh[TQ];
+          threadgroup float  alpha_sh[TQ];
+
+          for (uint idx4 = tid; idx4 < uint(TQ * 32); idx4 += 128u) {
+            const int m = int(idx4 >> 5);
+            const uint d4 = (idx4 & 31u) * 4u;
+            vec<bfloat, 4> qv = vec<bfloat, 4>(bfloat(0.0f));
+            if (m < M) {
+              const int g = m / LQ;
+              const int qi = m - g * LQ;
+              qv = *(const device vec<bfloat, 4>*)(q + ((size_t)(h0 + g) * LQ + qi) * 128u + d4);
+            }
+            *(threadgroup vec<bfloat, 4>*)(Q_sh + m * 128 + int(d4)) = qv;
+          }
+          for (uint i = tid; i < uint(TQ * 16); i += 128u) {
+            const int m = int(i >> 4);
+            const uint d = i & 15u;
+            bfloat rv = bfloat(0.0f);
+            if (m < M) {
+              const int g = m / LQ;
+              const int qi = m - g * LQ;
+              rv = rel[((size_t)qi * H + (h0 + g)) * 16u + d];
+            }
+            rel_sh[i] = rv;
+          }
+          if (int(tid) < TQ) {
+            m_sh[tid] = -1e30f;
+            l_sh[tid] = 0.0f;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (s0 >= s1) {
+            for (int m = int(tid); m < M; m += 128) {
+              const int g = m / LQ;
+              const int qi = m - g * LQ;
+              const size_t p_idx = ((size_t)(h0 + g) * LQ + qi) * uint(n_splits) + uint(split);
+              part_m[p_idx] = -1e30f;
+              part_l[p_idx] = 0.0f;
+            }
+            for (uint idx4 = tid; idx4 < uint(M * 32); idx4 += 128u) {
+              const int m = int(idx4 >> 5);
+              const uint d4 = (idx4 & 31u) * 4u;
+              const int g = m / LQ;
+              const int qi = m - g * LQ;
+              const size_t p_idx = ((size_t)(h0 + g) * LQ + qi) * uint(n_splits) + uint(split);
+              *(device float4*)(part_o + p_idx * 128u + d4) = float4(0.0f);
+            }
+            return;
+          }
+
+          constexpr auto desc_qk = matmul2d_descriptor(TQ, TK, 128, false, true, false, matmul2d_descriptor::mode::multiply);
+          constexpr auto desc_pv = matmul2d_descriptor(TQ, 128, TK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+          matmul2d<desc_qk, execution_simdgroups<4>> op_qk;
+          matmul2d<desc_pv, execution_simdgroups<4>> op_pv;
+
+          tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tQ(
+              Q_sh, dextents<int32_t, 2>(128, TQ));
+          auto aQ = tQ.slice<128, TQ>(0, 0);
+
+          tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline> tP(
+              P_sh, dextents<int32_t, 2>(TK, TQ));
+          auto aP = tP.slice<TK, TQ>(0, 0);
+
+          const size_t kv_head_base = (size_t)kv_h * (size_t)S * 128u;
+          tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV0(
+              (device bfloat*)v + kv_head_base, dextents<int32_t, 2>(128, TK));
+          auto bV0 = tV0.slice<128, TK>(0, 0);
+
+          auto O_acc = op_pv.template get_destination_cooperative_tensor<decltype(aP), decltype(bV0), float>();
+          #pragma unroll
+          for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+            if (O_acc.is_valid_element(i)) O_acc[i] = 0.0f;
+          }
+
+          const int q_base_pos = S - LQ;
+          constexpr uint ROWS_PER_SG = TQ / 4;
+          constexpr uint COLS_PER_LANE = TK / 32;
+
+          for (int k0 = s0; k0 < s1; k0 += TK) {
+            const int c0 = (k0 + TK <= S) ? k0 : (S - TK);
+            const bool is_clamped = (c0 < k0) || (c0 + TK > s1);
+            const bool pure_prefix = (!is_clamped) && (SLIDING == 0) && (q_base_pos - (c0 + TK - 1) >= REL_EXTENT);
+
+            tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tK(
+                (device bfloat*)k + kv_head_base + (size_t)c0 * 128u, dextents<int32_t, 2>(128, TK));
+            auto bK = tK.slice<128, TK>(0, 0);
+            auto S_coop = op_qk.template get_destination_cooperative_tensor<decltype(aQ), decltype(bK), float>();
+            op_qk.run(aQ, bK, S_coop);
+
+            #pragma unroll
+            for (uint16_t i = 0; i < S_coop.get_capacity(); ++i) {
+              if (S_coop.is_valid_element(i)) {
+                const auto idx = S_coop.get_multidimensional_index(i);
+                S_sh[idx[1] * TK + idx[0]] = S_coop[i] * sc;
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (pure_prefix) {
+              for (uint r = 0u; r < ROWS_PER_SG; ++r) {
+                const uint m = sg * ROWS_PER_SG + r;
+                const uint rb = m * TK;
+                float sv[COLS_PER_LANE];
+                float rmax = -1e30f;
+                #pragma unroll
+                for (uint c = 0u; c < COLS_PER_LANE; ++c) {
+                  float s = S_sh[rb + lane + c * 32u];
+                  sv[c] = s;
+                  rmax = metal::max(rmax, s);
+                }
+                rmax = simd_max(rmax);
+                const float m_old = m_sh[m];
+                const float l_old = l_sh[m];
+                const float m_new = (l_old > 0.0f) ? metal::max(m_old, rmax) : rmax;
+                const float alpha = (l_old > 0.0f) ? metal::exp(m_old - m_new) : 0.0f;
+                float l_acc = 0.0f;
+                #pragma unroll
+                for (uint c = 0u; c < COLS_PER_LANE; ++c) {
+                  float p = metal::exp(sv[c] - m_new);
+                  l_acc += p;
+                  P_sh[rb + lane + c * 32u] = bfloat(p);
+                }
+                const float l_tile = simd_sum(l_acc);
+                if (lane == 0u) {
+                  m_sh[m] = m_new;
+                  l_sh[m] = l_old * alpha + l_tile;
+                  alpha_sh[m] = alpha;
+                }
+              }
+            } else {
+              for (uint r = 0u; r < ROWS_PER_SG; ++r) {
+                const int m = int(sg * ROWS_PER_SG + r);
+                const uint rb = uint(m) * TK;
+                const int qi = (m < M) ? (m % LQ) : 0;
+                const int q_pos = q_base_pos + qi;
+                const threadgroup bfloat* rq = rel_sh + uint(m) * 16u;
+                float sv[COLS_PER_LANE];
+                float rmax = -1e30f;
+                #pragma unroll
+                for (uint c = 0u; c < COLS_PER_LANE; ++c) {
+                  const uint ki = lane + c * 32u;
+                  const int kp = c0 + int(ki);
+                  float s = S_sh[rb + ki];
+                  const int d = q_pos - kp;
+                  if (m >= M || kp < k0 || kp >= s1 || d < 0 || (SLIDING > 0 && d >= SLIDING)) {
+                    s = -1e30f;
+                  } else if (d < REL_EXTENT) {
+                    const device vec<bfloat, 4>* rp = (const device vec<bfloat, 4>*)(rel_proj_t + (size_t)d * 16u);
+                    float4 a0 = float4(rp[0]), a1 = float4(rp[1]), a2 = float4(rp[2]), a3 = float4(rp[3]);
+                    float rbias = a0.x * float(rq[0])  + a0.y * float(rq[1])  + a0.z * float(rq[2])  + a0.w * float(rq[3])
+                                + a1.x * float(rq[4])  + a1.y * float(rq[5])  + a1.z * float(rq[6])  + a1.w * float(rq[7])
+                                + a2.x * float(rq[8])  + a2.y * float(rq[9])  + a2.z * float(rq[10]) + a2.w * float(rq[11])
+                                + a3.x * float(rq[12]) + a3.y * float(rq[13]) + a3.z * float(rq[14]) + a3.w * float(rq[15]);
+                    s += float(bfloat(rbias));
+                  }
+                  sv[c] = s;
+                  rmax = metal::max(rmax, s);
+                }
+                rmax = simd_max(rmax);
+                const float m_old = m_sh[m];
+                const float l_old = l_sh[m];
+                const bool has_valid = rmax > -1e29f;
+                const float m_new = has_valid ? ((l_old > 0.0f) ? metal::max(m_old, rmax) : rmax) : m_old;
+                const float alpha = (l_old > 0.0f && has_valid) ? metal::exp(m_old - m_new) : (l_old > 0.0f ? 1.0f : 0.0f);
+                float l_acc = 0.0f;
+                #pragma unroll
+                for (uint c = 0u; c < COLS_PER_LANE; ++c) {
+                  float p = (sv[c] > -1e29f) ? metal::exp(sv[c] - m_new) : 0.0f;
+                  l_acc += p;
+                  P_sh[rb + lane + c * 32u] = bfloat(p);
+                }
+                const float l_tile = simd_sum(l_acc);
+                if (lane == 0u) {
+                  m_sh[m] = m_new;
+                  l_sh[m] = l_old * alpha + l_tile;
+                  alpha_sh[m] = alpha;
+                }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+              if (O_acc.is_valid_element(i)) {
+                O_acc[i] *= alpha_sh[O_acc.get_multidimensional_index(i)[1]];
+              }
+            }
+            tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tV(
+                (device bfloat*)v + kv_head_base + (size_t)c0 * 128u, dextents<int32_t, 2>(128, TK));
+            auto bV = tV.slice<128, TK>(0, 0);
+            op_pv.run(aP, bV, O_acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+
+          for (int m = int(tid); m < M; m += 128) {
+            const int g = m / LQ;
+            const int qi = m - g * LQ;
+            const size_t p_idx = ((size_t)(h0 + g) * LQ + qi) * uint(n_splits) + uint(split);
+            part_m[p_idx] = m_sh[m];
+            part_l[p_idx] = l_sh[m];
+          }
+          #pragma unroll
+          for (uint16_t i = 0; i < O_acc.get_capacity(); ++i) {
+            if (O_acc.is_valid_element(i)) {
+              const auto idx = O_acc.get_multidimensional_index(i);
+              const int m = int(idx[1]);
+              if (m < M) {
+                const int g = m / LQ;
+                const int qi = m - g * LQ;
+                const size_t p_idx = ((size_t)(h0 + g) * LQ + qi) * uint(n_splits) + uint(split);
+                part_o[p_idx * 128u + uint(idx[0])] = O_acc[i];
+              }
+            }
+          }
+        """#
+
+    private static func mppPrefillKernel(h: Int, gqa: Int, sliding: Int, relExtent: Int)
+        -> MLXFast.MLXFastKernel
+    {
+        let key = "h\(h)_g\(gqa)_s\(sliding)_r\(relExtent)"
+        mppLock.lock()
+        defer { mppLock.unlock() }
+        if let k = mppPrefillCache[key] { return k }
+        let consts = """
+              constexpr int H = \(h);
+              constexpr int GQA = \(gqa);
+              constexpr int SLIDING = \(sliding);
+              constexpr int REL_EXTENT = \(relExtent);
+            """
+        let k = MLXFast.metalKernel(
+            name: "inkling2_mpp_fa128_\(key)",
+            inputNames: ["q", "k", "v", "rel", "rel_proj_t", "sinks", "scale_buf", "q_off_buf"],
+            outputNames: ["out"],
+            source: consts + mppPrefillSource,
+            header: mppHeader,
+            ensureRowContiguous: true)
+        mppPrefillCache[key] = k
+        return k
+    }
+
+    private static func mppGQAS1Kernel(
+        h: Int, gqa: Int, tq: Int, tk: Int, sliding: Int, relExtent: Int
+    ) -> MLXFast.MLXFastKernel {
+        let key = "h\(h)_g\(gqa)_q\(tq)_k\(tk)_s\(sliding)_r\(relExtent)"
+        mppLock.lock()
+        defer { mppLock.unlock() }
+        if let k = mppGQACache[key] { return k }
+        let consts = """
+              constexpr int H = \(h);
+              constexpr int GQA = \(gqa);
+              constexpr int TQ = \(tq);
+              constexpr int TK = \(tk);
+              constexpr int SLIDING = \(sliding);
+              constexpr int REL_EXTENT = \(relExtent);
+            """
+        let k = MLXFast.metalKernel(
+            name: "inkling2_gqa_mpp_s1_\(key)",
+            inputNames: ["q", "k", "v", "rel", "rel_proj_t", "params", "scale_buf"],
+            outputNames: ["part_m", "part_l", "part_o"],
+            source: consts + mppGQAS1Source,
+            header: mppHeader,
+            ensureRowContiguous: true)
+        mppGQACache[key] = k
+        return k
+    }
+
+    static func mppAvailable() -> Bool {
+        if ProcessInfo.processInfo.environment["VMLX_INKLING2_MPP"] == "0" { return false }
+        mppLock.lock()
+        if let v = mppVerified {
+            mppLock.unlock()
+            return v
+        }
+        mppLock.unlock()
+        let ok = DeepseekV41MPPIndexScores.available()
+        mppLock.lock()
+        mppVerified = ok
+        mppLock.unlock()
+        return ok
+    }
+    #endif
+
+    static func affine8G64MultiGemv(
+        _ x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        outDType: DType? = nil,
+        softcap: Float = 0,
+        outCols: Int = 0
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard ProcessInfo.processInfo.environment["VMLX_INKLING2_AFF8_MV"] != "0",
+            Device.defaultDevice().deviceType == .gpu
+        else { return nil }
+        let lead = Array(x.shape.dropLast())
+        let K = x.dim(-1)
+        let N = weight.dim(0)
+        let outN = (outCols > 0 && outCols <= N) ? outCols : N
+        let T = x.size / K
+        let od = outDType ?? x.dtype
+        guard T >= 1, K % 256 == 0,
+            [.bfloat16, .float16, .float32].contains(x.dtype),
+            [.bfloat16, .float16, .float32].contains(scales.dtype),
+            biases.dtype == scales.dtype,
+            weight.dtype == .uint32
+        else { return nil }
+        let x2 = x.reshaped(T, K)
+        if T > 8 {
+            var parts: [MLXArray] = []
+            var i = 0
+            while i < T {
+                let end = min(i + 8, T)
+                guard let p = affine8G64MultiGemv(
+                    x2[i ..< end], weight: weight, scales: scales, biases: biases,
+                    outDType: od, softcap: softcap, outCols: outN)
+                else { return nil }
+                parts.append(p)
+                i = end
+            }
+            return MLX.concatenated(parts, axis: 0).reshaped(lead + [outN])
+        }
+        let hasCap = softcap > 0
+        let capBuf = MLXArray([hasCap ? softcap : Float(1.0)])
+        let outNBuf = MLXArray([Int32(outN)])
+        let nTG = (outN + 7) / 8
+        let y = affine8G64MultiGemvKernel(
+            [x2, weight, scales, biases, capBuf, outNBuf],
+            template: [
+                ("XT", x2.dtype),
+                ("ST", scales.dtype),
+                ("OT", od),
+                ("ROWS", T),
+                ("HAS_CAP", hasCap),
+            ],
+            grid: (nTG * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[T, outN]],
+            outputDTypes: [od])[0]
+        return y.reshaped(lead + [outN])
+        #else
+        return nil
+        #endif
+    }
+
+    static func routerTopK(
+        _ x: MLXArray, gateWeight: MLXArray, bias: MLXArray, topK: Int, routeScale: Float
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        #if canImport(Metal)
+        guard ProcessInfo.processInfo.environment["VMLX_INKLING2_FUSED_ROUTER"] != "0",
+            Device.defaultDevice().deviceType == .gpu
+        else { return nil }
+        let lead = Array(x.shape.dropLast())
+        let K = x.dim(-1)
+        let E = gateWeight.dim(0)
+        let T = x.size / K
+        guard E == 128, K == 2304, (1 ... 16).contains(T), (1 ... 16).contains(topK),
+            [.bfloat16, .float16, .float32].contains(x.dtype),
+            [.bfloat16, .float16, .float32].contains(gateWeight.dtype),
+            [.bfloat16, .float16, .float32].contains(bias.dtype)
+        else { return nil }
+        let x2 = x.reshaped(T, K)
+        let scores: MLXArray
+        if T <= 8 {
+            scores = routerScoresKernel(
+                [x2, gateWeight],
+                template: [
+                    ("XT", x2.dtype), ("WT", gateWeight.dtype),
+                    ("ROWS", T), ("E", E), ("K", K),
+                ],
+                grid: (E * 288, 1, 1),
+                threadGroup: (288, 1, 1),
+                outputShapes: [[T, E]],
+                outputDTypes: [.float32])[0]
+        } else {
+            let sA = routerScoresKernel(
+                [x2[..<8], gateWeight],
+                template: [
+                    ("XT", x2.dtype), ("WT", gateWeight.dtype),
+                    ("ROWS", 8), ("E", E), ("K", K),
+                ],
+                grid: (E * 288, 1, 1),
+                threadGroup: (288, 1, 1),
+                outputShapes: [[8, E]],
+                outputDTypes: [.float32])[0]
+            let rem = T - 8
+            let sB = routerScoresKernel(
+                [x2[8...], gateWeight],
+                template: [
+                    ("XT", x2.dtype), ("WT", gateWeight.dtype),
+                    ("ROWS", rem), ("E", E), ("K", K),
+                ],
+                grid: (E * 288, 1, 1),
+                threadGroup: (288, 1, 1),
+                outputShapes: [[rem, E]],
+                outputDTypes: [.float32])[0]
+            scores = MLX.concatenated([sA, sB], axis: 0)
+        }
+        let picked = routerTopKKernel(
+            [scores, bias, MLXArray([routeScale])],
+            template: [("TOPK", topK)],
+            grid: (128, T, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[T, topK], [T, topK]],
+            outputDTypes: [.uint32, .float32])
+        return (picked[0].reshaped(lead + [topK]), picked[1].reshaped(lead + [topK]))
+        #else
+        return nil
+        #endif
+    }
+
+    static func prefillAttentionMPP(
+        q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray, projT: MLXArray, sinks: MLXArray,
+        seen: Int, kStart: Int, window: Int, relExtent: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard mppAvailable(),
+            Device.defaultDevice().deviceType == .gpu,
+            q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+            r.dtype == .bfloat16, projT.dtype == .bfloat16,
+            q.ndim == 4, q.dim(0) == 1, q.dim(3) == 128, r.dim(3) == 16
+        else { return nil }
+        let H = q.dim(1), LQ = q.dim(2)
+        let Hkv = k.dim(1), S = k.dim(2)
+        guard LQ >= 2, S >= 128, Hkv > 0, H % Hkv == 0 else { return nil }
+        let gqa = H / Hkv
+        let sc = MLXArray([scale])
+        let qOff = MLXArray([Int32(seen - kStart)])
+        let sinks2D = sinks.reshaped(LQ, H).asType(.bfloat16)
+        let run = mppPrefillKernel(h: H, gqa: gqa, sliding: window, relExtent: relExtent)
+        if LQ < 32 {
+            let pad = 32 - LQ
+            let qIn = MLX.padded(q, widths: [0, 0, .init((0, pad)), 0])
+            let rIn = MLX.padded(r, widths: [0, .init((0, pad)), 0, 0])
+            let skIn = MLX.padded(sinks2D, widths: [.init((0, pad)), 0])
+            let out = run(
+                [qIn, k, v, rIn, projT, skIn, sc, qOff],
+                grid: (128, 1, H),
+                threadGroup: (128, 1, 1),
+                outputShapes: [[1, H, 32, 128]],
+                outputDTypes: [.bfloat16])[0]
+            return out[0..., 0..., ..<LQ, 0...]
+        }
+        let nQy = (LQ + 31) / 32
+        return run(
+            [q, k, v, r, projT, sinks2D, sc, qOff],
+            grid: (128, nQy, H),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1, H, LQ, 128]],
+            outputDTypes: [.bfloat16])[0]
+        #else
+        return nil
+        #endif
+    }
+
+    static func gqaMPPAttention(
+        q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray, projT: MLXArray, sinks: MLXArray,
+        window: Int, relExtent: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard mppAvailable(),
+            Device.defaultDevice().deviceType == .gpu,
+            q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+            r.dtype == .bfloat16, projT.dtype == .bfloat16,
+            q.ndim == 4, q.dim(0) == 1, q.dim(3) == 128, r.dim(3) == 16
+        else { return nil }
+        let H = q.dim(1), LQ = q.dim(2)
+        let Hkv = k.dim(1), S = k.dim(2)
+        guard Hkv > 0, H % Hkv == 0, LQ >= 1 else { return nil }
+        let gqa = H / Hkv
+        let M = gqa * LQ
+        let tq: Int
+        let tk: Int
+        if M <= 32 {
+            tq = 32; tk = 64
+        } else if M <= 64 {
+            tq = 64; tk = 32
+        } else {
+            return nil
+        }
+        guard S >= tk else { return nil }
+        let kMin = window > 0 ? max(0, (S - LQ) - window + 1) : 0
+        let span = S - kMin
+        guard span >= 256 else { return nil }
+        let nSplits = min(64, max(4, (span + 255) / 256))
+        let params = MLXArray([Int32(nSplits), Int32(kMin)])
+        let scBuf = MLXArray([scale])
+        let s1 = mppGQAS1Kernel(
+            h: H, gqa: gqa, tq: tq, tk: tk, sliding: window, relExtent: relExtent
+        )(
+            [q, k, v, r, projT, params, scBuf],
+            grid: (128, nSplits, Hkv),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[H, LQ, nSplits], [H, LQ, nSplits], [H, LQ, nSplits, 128]],
+            outputDTypes: [.float32, .float32, .float32])
+        return verifyAttnS2Kernel(
+            [s1[0], s1[1], s1[2], sinks.reshaped(LQ, H).asType(.bfloat16)],
+            grid: (32, LQ, H),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[1, H, LQ, 128]],
+            outputDTypes: [.bfloat16])[0]
+        #else
+        return nil
+        #endif
+    }
+
+    static func verifyAttention(
+        q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray, projT: MLXArray, sinks: MLXArray,
+        window: Int, relExtent: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard ProcessInfo.processInfo.environment["VMLX_INKLING2_VERIFY_ATTN"] != "0",
+            Device.defaultDevice().deviceType == .gpu,
+            q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+            r.dtype == .bfloat16, projT.dtype == .bfloat16,
+            q.ndim == 4, q.dim(0) == 1, q.dim(3) == 128, r.dim(3) == 16
+        else { return nil }
+        let H = q.dim(1), LQ = q.dim(2)
+        let Hkv = k.dim(1), S = k.dim(2)
+        guard (1 ... 16).contains(LQ), Hkv > 0, H % Hkv == 0, S >= LQ else { return nil }
+        if LQ > 8 {
+            let prefix = S - LQ
+            let sinks2D = sinks.reshaped(LQ, H)
+            guard let o1 = verifyAttention(
+                q: q[0..., 0..., ..<8, 0...],
+                k: k[0..., 0..., ..<(prefix + 8), 0...],
+                v: v[0..., 0..., ..<(prefix + 8), 0...],
+                r: r[0..., ..<8, 0..., 0...],
+                projT: projT,
+                sinks: sinks2D[..<8, 0...],
+                window: window, relExtent: relExtent, scale: scale),
+                let o2 = verifyAttention(
+                    q: q[0..., 0..., 8..., 0...],
+                    k: k, v: v,
+                    r: r[0..., 8..., 0..., 0...],
+                    projT: projT,
+                    sinks: sinks2D[8..., 0...],
+                    window: window, relExtent: relExtent, scale: scale)
+            else { return nil }
+            return MLX.concatenated([o1, o2], axis: 2)
+        }
+        // Prefer GQA-grouped M5 MPP Split-K when span >= 512 (reads each KV head ONCE for all GQA*LQ queries).
+        if let mppOut = gqaMPPAttention(
+            q: q, k: k, v: v, r: r, projT: projT, sinks: sinks,
+            window: window, relExtent: relExtent, scale: scale)
+        {
+            return mppOut
+        }
+        let gqa = H / Hkv
+        let kMin = window > 0 ? max(0, (S - LQ) - window + 1) : 0
+        let span = S - kMin
+        let nSplits: Int
+        if span <= 256 {
+            nSplits = 1
+        } else if span <= 1024 {
+            nSplits = 4
+        } else {
+            nSplits = min(64, max(8, (span + 511) / 512))
+        }
+        let sinks2D = sinks.reshaped(LQ, H).asType(.bfloat16)
+        let params = MLXArray([Int32(nSplits), Int32(kMin)])
+        let scBuf = MLXArray([scale])
+        if nSplits == 1 {
+            return verifyAttnS1SingleKernel(
+                [q, k, v, r, projT, sinks2D, params, scBuf],
+                template: [
+                    ("H", H), ("GQA", gqa), ("SLIDING", window), ("REL_EXTENT", relExtent),
+                ],
+                grid: (256, 1, H),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[1, H, LQ, 128]],
+                outputDTypes: [.bfloat16])[0]
+        }
+        let s1 = verifyAttnS1MultiKernel(
+            [q, k, v, r, projT, sinks2D, params, scBuf],
+            template: [
+                ("H", H), ("GQA", gqa), ("SLIDING", window), ("REL_EXTENT", relExtent),
+            ],
+            grid: (256, nSplits, H),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[H, LQ, nSplits], [H, LQ, nSplits], [H, LQ, nSplits, 128]],
+            outputDTypes: [.float32, .float32, .float32])
+        return verifyAttnS2Kernel(
+            [s1[0], s1[1], s1[2], sinks2D],
+            grid: (32, LQ, H),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[1, H, LQ, 128]],
             outputDTypes: [.bfloat16])[0]
         #else
         return nil

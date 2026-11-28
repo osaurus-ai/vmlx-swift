@@ -207,6 +207,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let verifyRows: Int
         let logits: MLXArray
         let greedyTargetIds: MLXArray?
+        let targetProbs: MLXArray?
         let newHidden: MLXArray
         let stagedCycle: Bool
         let usesInputCapture: Bool
@@ -1378,18 +1379,29 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             newHidden = extractContextFeature(
                 captured: captured, targetLayerIDs: orderedLayerIDs)
         }
-        // Greedy target ids join the same flush as the hidden states, so
-        // the argmax never costs its own graph submission.
+        // Greedy target ids or sampled probabilities join the same flush as the hidden states, so
+        // argmax / softmax+top-p never stall on an extra host sync after verify.
         if isGreedy, greedyTargetIds == nil {
             greedyTargetIds = argMax(logits, axis: -1)
         }
+        let targetProbs: MLXArray? = isGreedy
+            ? nil
+            : DFlash2Sampling.probabilities(logits, temperature: temperature, topP: topP, topK: topK)
         if let greedyTargetIds {
             asyncEval(greedyTargetIds, newHidden)
+        } else if let targetProbs {
+            asyncEval(targetProbs, newHidden)
         } else {
             asyncEval(logits, newHidden)
         }
         if syncPhaseTiming {
-            if let greedyTargetIds { eval(greedyTargetIds, newHidden) } else { eval(logits, newHidden) }
+            if let greedyTargetIds {
+                eval(greedyTargetIds, newHidden)
+            } else if let targetProbs {
+                eval(targetProbs, newHidden)
+            } else {
+                eval(logits, newHidden)
+            }
         }
         let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
         stats.verifySeconds += cycleVerifySeconds
@@ -1402,6 +1414,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             verifyRows: verifyRows,
             logits: logits,
             greedyTargetIds: greedyTargetIds,
+            targetProbs: targetProbs,
             newHidden: newHidden,
             stagedCycle: stagedCycle,
             usesInputCapture: usesInputCapture,
@@ -1433,7 +1446,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             acceptance = DFlash2Sampling.acceptGreedy(
                 draftTokens: draftIDs, targetTokens: targetIDs)
         } else {
-            let targetProbs = DFlash2Sampling.probabilities(
+            let targetProbs = flight.targetProbs ?? DFlash2Sampling.probabilities(
                 logits, temperature: temperature, topP: topP, topK: topK)
             guard let draftProbs = proposal.probabilities else {
                 // Sampled request with no q: cannot run the accept test.

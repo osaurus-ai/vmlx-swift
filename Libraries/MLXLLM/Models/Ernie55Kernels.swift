@@ -922,7 +922,182 @@ enum Ernie55Kernels {
         #endif
     }
 
-    // MARK: - 3c. Native MXFP8 Linear / Row Projection
+    // MARK: - 3c. Native MXFP8 Multi-Vector GEMV (2D & 3D Grouped, T = 1..8)
+
+    #if canImport(Metal)
+    /// OCP FP8 E4M3FN lookup table (0x7F and 0xFF are NaN -> 0.0f).
+    private static let e4m3LutHeader: String = {
+        var entries: [String] = []
+        entries.reserveCapacity(256)
+        for byte in 0 ..< 256 {
+            let sign: Float = (byte & 0x80) != 0 ? -1.0 : 1.0
+            let expBits = (byte >> 3) & 0xF
+            let mantBits = byte & 0x7
+            let val: Float
+            if expBits == 0xF && mantBits == 0x7 {
+                val = 0.0
+            } else if expBits == 0 {
+                val = sign * ldexpf(Float(mantBits), -9)
+            } else {
+                val = sign * ldexpf(1.0 + Float(mantBits) / 8.0, Int32(expBits - 7))
+            }
+            if val == 0 {
+                entries.append("0.0f")
+            } else {
+                entries.append(String(format: "%.9e", val) + "f")
+            }
+        }
+        return """
+            #include <metal_stdlib>
+            using namespace metal;
+            constant float E4M3_LUT[256] = { \(entries.joined(separator: ", ")) };
+            """
+    }()
+
+    /// Barrier-free zero-spill (~28 regs) MXFP8 multi-vector GEMV for 2D (G=1) and 3D grouped (G>1).
+    /// Reads 8-bit E4M3 weights (`uint2` = 8 bytes) + 1 UE8M0 scale byte ONCE across up to 8 rows.
+    private static let mxfp8MultiGemvKernel = MLXFast.metalKernel(
+        name: "ernie55_mxfp8_multi_gemv",
+        inputNames: ["x", "w", "scales"],
+        outputNames: ["out"],
+        source: """
+            const uint sgi = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint g = threadgroup_position_in_grid.y;
+            const uint K = uint(x_shape[2]);
+            const uint N = uint(w_shape[w_ndim - 2]);
+            const uint row0 = threadgroup_position_in_grid.x * (4u * uint(RPS)) + sgi * uint(RPS);
+            if (row0 >= N) return;
+
+            const uint r_valid = metal::min(uint(RPS), N - row0);
+            const uint KW = K >> 2;
+            const uint NG = K >> 5;
+            const uint lane_g = lane >> 2;
+
+            float acc[ROWS][RPS];
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    acc[v][r] = 0.0f;
+                }
+            }
+
+            const device XT* x_g = x + size_t(g) * size_t(ROWS) * K;
+            const device uint* w0 = w + (size_t(g) * N + row0) * KW;
+            const device uchar* s0 = scales + (size_t(g) * N + row0) * NG;
+
+            for (uint k0 = 0u; k0 < K; k0 += 256u) {
+                const uint k_lane = k0 + lane * 8u;
+                const uint g_idx = (k0 >> 5) + lane_g;
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    if (r < r_valid) {
+                        const device uint2* wr = (const device uint2*)(w0 + size_t(r) * KW + (k_lane >> 2));
+                        const uint2 p = *wr;
+                        const uint p0 = p.x;
+                        const uint p1 = p.y;
+                        const float sc = as_type<float>(uint(s0[size_t(r) * NG + g_idx]) << 23);
+                        const float4 w_lo = float4(
+                            E4M3_LUT[p0 & 0xFFu],
+                            E4M3_LUT[(p0 >> 8) & 0xFFu],
+                            E4M3_LUT[(p0 >> 16) & 0xFFu],
+                            E4M3_LUT[p0 >> 24]) * sc;
+                        const float4 w_hi = float4(
+                            E4M3_LUT[p1 & 0xFFu],
+                            E4M3_LUT[(p1 >> 8) & 0xFFu],
+                            E4M3_LUT[(p1 >> 16) & 0xFFu],
+                            E4M3_LUT[p1 >> 24]) * sc;
+                        #pragma clang loop unroll(full)
+                        for (uint v = 0u; v < uint(ROWS); ++v) {
+                            const device XT* xp = x_g + size_t(v) * K + k_lane;
+                            float4 x_lo = float4(*(const device vec<XT, 4>*)(xp));
+                            float4 x_hi = float4(*(const device vec<XT, 4>*)(xp + 4u));
+                            acc[v][r] += dot(x_lo, w_lo) + dot(x_hi, w_hi);
+                        }
+                    }
+                }
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    float total = simd_sum(acc[v][r]);
+                    if (lane == 0u && r < r_valid) {
+                        out[(size_t(g) * uint(ROWS) + v) * N + row0 + r] = OT(total);
+                    }
+                }
+            }
+            """,
+        header: e4m3LutHeader,
+        ensureRowContiguous: true)
+    #endif
+
+    static func mxfp8MultiGemv(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
+        #if canImport(Metal)
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FAST_MXFP8"] != "0",
+            Device.defaultDevice().deviceType == .gpu,
+            [.bfloat16, .float16, .float32].contains(x.dtype),
+            weight.dtype == .uint32, scales.dtype == .uint8
+        else { return nil }
+        let K = x.dim(-1)
+        guard K > 0, K % 256 == 0 else { return nil }
+        let G: Int
+        let T: Int
+        let N: Int
+        let x3: MLXArray
+        let outShape: [Int]
+        if weight.ndim == 3 {
+            // Grouped 3D MXFP8 projection: weight [G, N, K/4], scales [G, N, K/32].
+            G = weight.dim(0)
+            N = weight.dim(1)
+            guard scales.ndim == 3, scales.dim(0) == G, scales.dim(1) == N,
+                weight.dim(2) == K / 4, scales.dim(2) == K / 32
+            else { return nil }
+            if x.ndim == 3, x.dim(0) == G {
+                T = x.dim(1)
+                x3 = x
+                outShape = [G, T, N]
+            } else if x.ndim == 4, x.dim(0) == 1, x.dim(1) == G {
+                T = x.dim(2)
+                x3 = x.reshaped(G, T, K)
+                outShape = [1, G, T, N]
+            } else {
+                return nil
+            }
+        } else if weight.ndim == 2 {
+            G = 1
+            N = weight.dim(0)
+            guard scales.ndim == 2, scales.dim(0) == N,
+                weight.dim(1) == K / 4, scales.dim(1) == K / 32
+            else { return nil }
+            T = x.size / K
+            x3 = x.reshaped(1, T, K)
+            outShape = Array(x.shape.dropLast()) + [N]
+        } else {
+            return nil
+        }
+        guard (1 ... 8).contains(T) else { return nil }
+        let rps = (G * N) >= 4096 ? 2 : 1
+        let nTG = (N + 4 * rps - 1) / (4 * rps)
+        let y = mxfp8MultiGemvKernel(
+            [x3, weight, scales],
+            template: [
+                ("XT", x.dtype),
+                ("OT", x.dtype),
+                ("ROWS", T),
+                ("RPS", rps),
+            ],
+            grid: (nTG * 128, G, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[G, T, N]],
+            outputDTypes: [x.dtype])[0]
+        return y.reshaped(outShape)
+        #else
+        return nil
+        #endif
+    }
 
     static func releaseMXFP8(_ linear: QuantizedLinear) {
         linear.update(parameters: ModuleParameters.unflattened([
@@ -933,6 +1108,9 @@ enum Ernie55Kernels {
 
     static func mxfp8Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
         if let q = linear as? QuantizedLinear, q.mode == .mxfp8, q.bias == nil {
+            if let fast = mxfp8MultiGemv(x, weight: q.weight, scales: q.scales) {
+                return fast
+            }
             return quantizedMM(
                 x, q.weight, scales: q.scales, biases: nil,
                 transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
@@ -942,6 +1120,9 @@ enum Ernie55Kernels {
 
     static func mxfp8Rows(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
         guard weight.dtype == .uint32, scales.dtype == .uint8 else { return nil }
+        if let fast = mxfp8MultiGemv(x, weight: weight, scales: scales) {
+            return fast
+        }
         return quantizedMM(
             x, weight, scales: scales, biases: nil,
             transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
@@ -2220,7 +2401,275 @@ enum Ernie55Kernels {
                 out[qAbsBase + lane + 32 * e] = bfloat16_t(acc[e] * invL);
             }
             """)
+    /// Split-K Stage 1 hardware-MMA HCA decode & DSpark verify attention (T = 1...16).
+    /// Streams local window + visible pooled KV directly with ZERO KV concat and ZERO boolean mask,
+    /// splitting `totalK` across `NSPLITS` threadgroups so T=1..16 saturates all GPU cores at 65K-300K+.
+    private static let hcaSplitKStage1Kernel = MLXFast.metalKernel(
+        name: "ernie55_hca_splitk_s1",
+        inputNames: ["qT", "localKV", "pooled", "meta", "scaleArr"],
+        outputNames: ["oPart", "mPart", "lPart"],
+        source: """
+            constexpr int BK = 16;
+            constexpr int D_PER_SG = HEAD_DIM / 4;
+            constexpr int D_TILES = D_PER_SG / 8;
+            uint hg = threadgroup_position_in_grid.x;
+            uint splitIdx = threadgroup_position_in_grid.y;
+            uint t = threadgroup_position_in_grid.z;
+            uint tid = thread_position_in_threadgroup.x;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint sg_h = sg / 4u;
+            uint sg_d = sg % 4u;
+
+            int NQ = qT_shape[2];
+            int T = qT_shape[1];
+            int L_LOC = localKV_shape[2];
+            int S_POOL = pooled_shape[1];
+            int offset = meta[0];
+            int priorLocal = meta[1];
+            int window = meta[2];
+            int ratio = meta[3];
+            int nSplits = meta[4];
+            float sc = scaleArr[0];
+
+            int qPos = offset + int(t);
+            int kLo = max(0, priorLocal + int(t) - (window - 1));
+            int kHi = min(L_LOC, priorLocal + int(t) + 1);
+            int nLocal = max(0, kHi - kLo);
+            int nPool = min(S_POOL, (qPos + 1) / ratio);
+            int totalK = nLocal + nPool;
+
+            int chunkK = ((totalK + nSplits - 1) / nSplits + BK - 1) / BK * BK;
+            int kStart = int(splitIdx) * chunkK;
+            int kEnd = min(totalK, kStart + chunkK);
+
+            int hGroup0 = int(hg) * 16;
+            int h0 = hGroup0 + int(sg_h) * 8;
+            int d0 = int(sg_d) * D_PER_SG;
+
+            if (kStart >= kEnd) {
+                if (tid < 16u) {
+                    size_t mlOff = ((size_t)(hGroup0 + int(tid)) * T + t) * nSplits + splitIdx;
+                    mPart[mlOff] = -INFINITY;
+                    lPart[mlOff] = 0.0f;
+                }
+                for (int idx = int(tid); idx < 16 * HEAD_DIM; idx += 256) {
+                    int rh = idx / HEAD_DIM;
+                    int dc = idx % HEAD_DIM;
+                    size_t oOff = (((size_t)(hGroup0 + rh) * T + t) * nSplits + splitIdx) * HEAD_DIM + dc;
+                    oPart[oOff] = 0.0f;
+                }
+                return;
+            }
+
+            threadgroup bfloat16_t kvTile[BK][HEAD_DIM];
+            threadgroup float sPart[2][4][8][BK];
+            threadgroup bfloat16_t pTile[16][BK];
+            threadgroup float diagMat[2][8][8];
+            threadgroup float mState[16];
+            threadgroup float lState[16];
+
+            if (tid < 16u) {
+                mState[tid] = -INFINITY;
+                lState[tid] = 0.0f;
+            }
+            for (uint i = tid; i < 128u; i += 256u) {
+                diagMat[i / 64u][(i % 64u) / 8u][i % 8u] = 0.0f;
+            }
+
+            simdgroup_float8x8 accO[D_TILES];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < D_TILES; ++j) accO[j] = simdgroup_float8x8(0.0f);
+
+            size_t qTokenBase = (size_t)t * NQ * HEAD_DIM + (size_t)h0 * HEAD_DIM + d0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int kBase = kStart; kBase < kEnd; kBase += BK) {
+                int tileLen = min(BK, kEnd - kBase);
+                for (int i = int(tid); i < tileLen * (HEAD_DIM / 4); i += 256) {
+                    int kk = i / (HEAD_DIM / 4);
+                    int d4 = (i % (HEAD_DIM / 4)) * 4;
+                    int idx = kBase + kk;
+                    const device bfloat16_t* srcPtr = (idx < nLocal)
+                        ? (localKV + (size_t)(kLo + idx) * HEAD_DIM + d4)
+                        : (pooled + (size_t)(idx - nLocal) * HEAD_DIM + d4);
+                    *(threadgroup vec<bfloat16_t, 4>*)(&kvTile[kk][d4]) =
+                        *(const device vec<bfloat16_t, 4>*)(srcPtr);
+                }
+                if (tileLen < BK) {
+                    for (int i = int(tid); i < (BK - tileLen) * (HEAD_DIM / 4); i += 256) {
+                        int kk = tileLen + i / (HEAD_DIM / 4);
+                        int d4 = (i % (HEAD_DIM / 4)) * 4;
+                        *(threadgroup vec<bfloat16_t, 4>*)(&kvTile[kk][d4]) =
+                            vec<bfloat16_t, 4>(bfloat16_t(0.f));
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                simdgroup_float8x8 accS0(0.0f), accS1(0.0f);
+                for (int ks = 0; ks < D_PER_SG; ks += 8) {
+                    simdgroup_bfloat8x8 qa, k0, k1;
+                    simdgroup_load(qa, qT + qTokenBase + ks, HEAD_DIM);
+                    simdgroup_load(k0, &kvTile[0][d0 + ks], HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_load(k1, &kvTile[8][d0 + ks], HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(accS0, qa, k0, accS0);
+                    simdgroup_multiply_accumulate(accS1, qa, k1, accS1);
+                }
+                simdgroup_store(accS0, &sPart[sg_h][sg_d][0][0], BK);
+                simdgroup_store(accS1, &sPart[sg_h][sg_d][0][8], BK);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < 16u) {
+                    uint gh = tid / 8u;
+                    uint rh = tid % 8u;
+                    float mOld = mState[tid];
+                    float lOld = lState[tid];
+                    float mNew = mOld;
+                    float scRow[BK];
+                    for (int kk = 0; kk < BK; ++kk) {
+                        if (kk < tileLen) {
+                            float s = (sPart[gh][0][rh][kk] + sPart[gh][1][rh][kk]
+                                     + sPart[gh][2][rh][kk] + sPart[gh][3][rh][kk]) * sc;
+                            scRow[kk] = s;
+                            mNew = max(mNew, s);
+                        } else {
+                            scRow[kk] = -INFINITY;
+                        }
+                    }
+                    float alpha = (lOld > 0.0f) ? exp(mOld - mNew) : 0.0f;
+                    float lNew = lOld * alpha;
+                    for (int kk = 0; kk < BK; ++kk) {
+                        float p = (kk < tileLen) ? exp(scRow[kk] - mNew) : 0.0f;
+                        lNew += p;
+                        pTile[tid][kk] = bfloat16_t(p);
+                    }
+                    mState[tid] = mNew;
+                    lState[tid] = lNew;
+                    diagMat[gh][rh][rh] = alpha;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                simdgroup_float8x8 dA;
+                simdgroup_load(dA, &diagMat[sg_h][0][0], 8);
+                simdgroup_bfloat8x8 p0, p1;
+                simdgroup_load(p0, &pTile[sg_h * 8u][0], BK);
+                simdgroup_load(p1, &pTile[sg_h * 8u][8], BK);
+
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < D_TILES; ++j) {
+                    simdgroup_multiply(accO[j], dA, accO[j]);
+                    simdgroup_bfloat8x8 v0, v1;
+                    simdgroup_load(v0, &kvTile[0][d0 + j * 8], HEAD_DIM);
+                    simdgroup_load(v1, &kvTile[8][d0 + j * 8], HEAD_DIM);
+                    simdgroup_multiply_accumulate(accO[j], p0, v0, accO[j]);
+                    simdgroup_multiply_accumulate(accO[j], p1, v1, accO[j]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid < 16u) {
+                size_t mlOff = ((size_t)(hGroup0 + int(tid)) * T + t) * nSplits + splitIdx;
+                mPart[mlOff] = mState[tid];
+                lPart[mlOff] = lState[tid];
+            }
+            for (int j = 0; j < D_TILES; j += 2) {
+                simdgroup_store(accO[j], &sPart[sg_h][sg_d][0][0], BK);
+                if (j + 1 < D_TILES) {
+                    simdgroup_store(accO[j + 1], &sPart[sg_h][sg_d][0][8], BK);
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                uint lane = thread_index_in_simdgroup;
+                int cols = (j + 1 < D_TILES) ? 16 : 8;
+                for (int idx = int(lane); idx < 8 * cols; idx += 32) {
+                    int rh = idx / cols;
+                    int dc = idx % cols;
+                    size_t oOff = (((size_t)(h0 + rh) * T + t) * nSplits + splitIdx) * HEAD_DIM + d0 + j * 8 + dc;
+                    oPart[oOff] = sPart[sg_h][sg_d][rh][dc];
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """,
+        header: compressorTiledHeader)
+
+    /// Split-K Stage 2: reduces all NSPLITS partials + attention sink into final `[1, NQ, T, HEAD_DIM]`.
+    private static let hcaSplitKStage2Kernel = MLXFast.metalKernel(
+        name: "ernie55_hca_splitk_s2",
+        inputNames: ["oPart", "mPart", "lPart", "sinks"],
+        outputNames: ["out"],
+        source: """
+            uint h = threadgroup_position_in_grid.x;
+            uint t = threadgroup_position_in_grid.y;
+            uint tid = thread_position_in_threadgroup.x;
+            int T = mPart_shape[1];
+            int nSplits = mPart_shape[2];
+            int D = oPart_shape[3];
+
+            size_t mlBase = ((size_t)h * T + t) * nSplits;
+            float mMax = float(sinks[h]);
+            for (int s = 0; s < nSplits; ++s) {
+                if (lPart[mlBase + s] > 0.0f) {
+                    mMax = max(mMax, mPart[mlBase + s]);
+                }
+            }
+            float lTotal = exp(float(sinks[h]) - mMax);
+            for (int s = 0; s < nSplits; ++s) {
+                float ls = lPart[mlBase + s];
+                if (ls > 0.0f) {
+                    lTotal += ls * exp(mPart[mlBase + s] - mMax);
+                }
+            }
+            float invL = 1.0f / lTotal;
+            size_t oBase = ((size_t)h * T + t) * D;
+            for (int d = int(tid); d < D; d += 128) {
+                float acc = 0.0f;
+                for (int s = 0; s < nSplits; ++s) {
+                    float ls = lPart[mlBase + s];
+                    if (ls > 0.0f) {
+                        float w = exp(mPart[mlBase + s] - mMax);
+                        acc += oPart[(mlBase + s) * D + d] * w;
+                    }
+                }
+                out[oBase + d] = bfloat16_t(acc * invL);
+            }
+            """)
     #endif
+
+    static func hcaDecodeVerifyAttention(
+        q: MLXArray, localKV: MLXArray, pooled: MLXArray, sinks: MLXArray,
+        offset: Int, priorLocal: Int, window: Int, ratio: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            ProcessInfo.processInfo.environment["VMLX_ERNIE_HCA_SPLITK"] != "0",
+            q.ndim == 4, localKV.ndim == 4, pooled.ndim == 3,
+            q.dim(0) == 1, localKV.dim(0) == 1, localKV.dim(1) == 1
+        else { return nil }
+        let (NQ, T, headDim) = (q.dim(1), q.dim(2), q.dim(3))
+        guard NQ % 16 == 0, headDim > 0, headDim <= 512, headDim % 32 == 0, (headDim / 4) % 8 == 0,
+            (1 ... 16).contains(T), pooled.dim(1) >= 64
+        else { return nil }
+        let approxTotalK = min(window, localKV.dim(2)) + pooled.dim(1)
+        let nSplits = min(16, max(2, (approxTotalK + 127) / 128))
+        let qT = contiguous(q.transposed(0, 2, 1, 3).asType(.bfloat16))
+        let meta = MLXArray([Int32(offset), Int32(priorLocal), Int32(window), Int32(ratio), Int32(nSplits)])
+        let scaleArr = MLXArray([scale])
+        let s1 = hcaSplitKStage1Kernel(
+            [qT, contiguous(localKV.asType(.bfloat16)), contiguous(pooled.asType(.bfloat16)), meta, scaleArr],
+            template: [("HEAD_DIM", headDim)],
+            grid: ((NQ / 16) * 256, nSplits, T),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[NQ, T, nSplits, headDim], [NQ, T, nSplits], [NQ, T, nSplits]],
+            outputDTypes: [.float32, .float32, .float32])
+        let out = hcaSplitKStage2Kernel(
+            [s1[0], s1[1], s1[2], contiguous(sinks.asType(.bfloat16))],
+            grid: (NQ * 128, T, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1, NQ, T, headDim]],
+            outputDTypes: [.bfloat16])[0]
+        return out.asType(q.dtype)
+        #else
+        return nil
+        #endif
+    }
 
     static func mlaIndexScores(
         q: MLXArray, k: MLXArray, weights: MLXArray, startQPos: Int = 0, window: Int = 0
@@ -2233,6 +2682,26 @@ enum Ernie55Kernels {
         else { return nil }
         let (B, H, T) = (q.dim(0), q.dim(1), q.dim(2))
         let S = k.dim(2)
+        if B == 1, ProcessInfo.processInfo.environment["VMLX_ERNIE_INDEX_MPP"] != "0" {
+            if T == 1, S >= 128,
+                let mppDec = DeepseekV41MPPIndexScores.decodeIndexScores(
+                    q: q.transposed(0, 2, 1, 3).asType(.bfloat16),
+                    poolKeys: k.reshaped(1, S, 128).asType(.bfloat16),
+                    headW: weights.asType(.float32),
+                    scale: 1.0)
+            {
+                return mppDec.reshaped(1, 1, 1, S)
+            }
+            if T >= 2, S >= 256,
+                let mppPre = DeepseekV41MPPIndexScores.poolIndexScores(
+                    q: q.transposed(0, 2, 1, 3).asType(.bfloat16),
+                    poolKeys: k.reshaped(1, S, 128).asType(.bfloat16),
+                    headW: weights.asType(.float32),
+                    scale: 1.0)
+            {
+                return mppPre.reshaped(1, 1, T, S)
+            }
+        }
         if T >= 2 {
             let cBlocks = (S + 63) / 64
             let tBlocks = (T + 15) / 16
