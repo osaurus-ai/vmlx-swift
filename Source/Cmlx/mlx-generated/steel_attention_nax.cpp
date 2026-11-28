@@ -130,13 +130,11 @@ using Int = integral_constant<int, val>;
 // Binary Operators on Integral constants
 ///////////////////////////////////////////////////////////////////////////////
 
-#define integral_const_binop(__op__, __operator__)          \
-  template <typename T, T tv, typename U, U uv>             \
-  METAL_FUNC constexpr auto __operator__(                   \
-      integral_constant<T, tv>, integral_constant<U, uv>) { \
-    constexpr auto res = tv __op__ uv;                      \
-    using res_t = metal::remove_addrspace_t<decltype(res)>; \
-    return integral_constant<res_t, res>{};                 \
+#define integral_const_binop(__op__, __operator__)                            \
+  template <typename T, T tv, typename U, U uv>                               \
+  METAL_FUNC constexpr auto __operator__(                                     \
+      integral_constant<T, tv>, integral_constant<U, uv>) {                   \
+    return integral_constant<const decltype(tv __op__ uv), (tv __op__ uv)>{}; \
   }
 
 integral_const_binop(+, operator+);
@@ -1305,6 +1303,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool save_lse [[function_constant(303)]];
 
 template <typename T>
 struct TransformScale {
@@ -1378,6 +1377,7 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    device float* lse [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1404,6 +1404,13 @@ template <
   O += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
+
+  if (save_lse) {
+    // [B, H, qL], contiguous.
+    lse += tidl.z * params->H * params->qL + // Batch
+        tidl.y * params->qL + // Head
+        tidl.x * BQ; // Sequence
+  }
 
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
@@ -1763,6 +1770,16 @@ template <
 
   Otile.template row_bin_op<MulOp>(rcp);
 
+  if (save_lse && sn == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const short r = tm + i * otile_t::kFragRowsJump + sm;
+      if (align_Q || !is_last_q || r < params->qL_rem) {
+        lse[r] = max_score[i] * M_LN2_F + metal::log(sum_score[i]);
+      }
+    }
+  }
+
   // Store results
   O += tm * int(params->O_strides[2]);
 
@@ -1804,6 +1821,7 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    device float* LSE [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -2189,6 +2207,21 @@ template <
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
     rcp[i] = 1.f / sum_score[i];
+  }
+
+  if (save_lse && d_group == 0 && sn == 0) {
+    const int lse_row_base = int(tid.x) * BQ + tm;
+    const int lse_head_off = (int(tid.z) * params->H + int(tid.y)) * params->qL;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const int row = lse_row_base + i * stile_t::kFragRowsJump + sm;
+      if (row < params->qL) {
+        LSE[lse_head_off + row] = (sum_score[i] == 0)
+            ? -INFINITY
+            : float(M_LN2_F * (max_score[i] + metal::log2(sum_score[i])));
+      }
+    }
   }
 
   Otile.template row_bin_op<MulOp>(rcp);

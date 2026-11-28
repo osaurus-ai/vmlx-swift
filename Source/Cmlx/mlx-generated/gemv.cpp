@@ -707,8 +707,10 @@ constexpr complex_t<T> operator/(U a, complex_t<T> b) {
 
 template <typename T>
 constexpr complex_t<T> operator%(complex_t<T> a, complex_t<T> b) {
-  auto real = a.real - (b.real * static_cast<int64_t>(a.real / b.real));
-  auto imag = a.imag - (b.imag * static_cast<int64_t>(a.imag / b.imag));
+  // fmod is exact and defined for every input. A conversion of the quotient
+  // to an integer is not defined when the quotient does not fit or is nan.
+  auto real = metal::fmod(a.real, b.real);
+  auto imag = metal::fmod(a.imag, b.imag);
   if (real != 0 && (real < 0 != b.real < 0)) {
     real += b.real;
   }

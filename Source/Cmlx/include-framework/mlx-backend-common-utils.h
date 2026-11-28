@@ -15,17 +15,17 @@ namespace mlx::core {
 std::filesystem::path current_binary_dir();
 
 inline int64_t
-elem_to_loc(int elem, const Shape& shape, const Strides& strides) {
+elem_to_loc(int64_t elem, const Shape& shape, const Strides& strides) {
   int64_t loc = 0;
   for (int i = shape.size() - 1; i >= 0; --i) {
-    auto q_and_r = ldiv(elem, shape[i]);
+    auto q_and_r = lldiv(elem, shape[i]);
     loc += q_and_r.rem * strides[i];
     elem = q_and_r.quot;
   }
   return loc;
 }
 
-inline int64_t elem_to_loc(int elem, const array& a) {
+inline int64_t elem_to_loc(int64_t elem, const array& a) {
   if (a.flags().row_contiguous) {
     return elem;
   }

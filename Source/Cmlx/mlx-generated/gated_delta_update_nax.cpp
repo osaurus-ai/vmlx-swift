@@ -130,13 +130,11 @@ using Int = integral_constant<int, val>;
 // Binary Operators on Integral constants
 ///////////////////////////////////////////////////////////////////////////////
 
-#define integral_const_binop(__op__, __operator__)          \
-  template <typename T, T tv, typename U, U uv>             \
-  METAL_FUNC constexpr auto __operator__(                   \
-      integral_constant<T, tv>, integral_constant<U, uv>) { \
-    constexpr auto res = tv __op__ uv;                      \
-    using res_t = metal::remove_addrspace_t<decltype(res)>; \
-    return integral_constant<res_t, res>{};                 \
+#define integral_const_binop(__op__, __operator__)                            \
+  template <typename T, T tv, typename U, U uv>                               \
+  METAL_FUNC constexpr auto __operator__(                                     \
+      integral_constant<T, tv>, integral_constant<U, uv>) {                   \
+    return integral_constant<const decltype(tv __op__ uv), (tv __op__ uv)>{}; \
   }
 
 integral_const_binop(+, operator+);
@@ -1455,8 +1453,8 @@ template <typename InT, int Dk, int Dv, int Hk, int Hv, int C>
     const device InT* k [[buffer(1)]],
     const device InT* v [[buffer(2)]],
     const device float* state_in [[buffer(3)]],
-    const device InT* g [[buffer(4)]],
-    const device InT* beta [[buffer(5)]],
+    const device float* g [[buffer(4)]],
+    const device float* beta [[buffer(5)]],
     device InT* y [[buffer(6)]],
     device float* state_out [[buffer(7)]],
     constant int& T [[buffer(8)]],
