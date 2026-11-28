@@ -174,24 +174,15 @@ final class Ernie55HCAAttention: Module {
         let attended: MLXArray
         if length == 1 {
             // Single-token decode: every local window row and every completed pooled row is visible.
-            let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
+            // MLX's native sdpa_vector_2pass (32-way barrier-free split-K) is fastest for T=1 mask=nil.
+            var kv = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
-            let scale: Float = 1 / sqrt(Float(shape.headWidth))
-            if pooled.dim(1) >= 256,
-                let splitFused = Ernie55Kernels.hcaDecodeVerifyAttention(
-                    q: q, localKV: localKV, pooled: pooled, sinks: typedSinks,
-                    offset: offset, priorLocal: localKV.dim(2) - 1, window: window, ratio: ratio, scale: scale)
-            {
-                attended = splitFused
-            } else {
-                var kv = localKV
-                if pooled.dim(1) > 0 {
-                    kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-                }
-                attended = MLXFast.scaledDotProductAttention(
-                    queries: q, keys: kv, values: kv, scale: scale,
-                    mask: nil, sinks: typedSinks)
+            if pooled.dim(1) > 0 {
+                kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
             }
+            attended = MLXFast.scaledDotProductAttention(
+                queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
+                mask: nil, sinks: typedSinks)
         } else if length > 16 {
             // Long-context & prefill HCA: fused hardware-MMA attention streams local window + visible
             // pooled KV through L2 with zero score-matrix materialization and zero KV concat copies.
@@ -242,7 +233,7 @@ final class Ernie55HCAAttention: Module {
             let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
             let scale: Float = 1 / sqrt(Float(shape.headWidth))
-            if pooled.dim(1) >= 64,
+            if (64 ... 1024).contains(pooled.dim(1)),
                 let splitFused = Ernie55Kernels.hcaDecodeVerifyAttention(
                     q: q, localKV: localKV, pooled: pooled, sinks: typedSinks,
                     offset: offset, priorLocal: localKV.dim(2) - length, window: window, ratio: ratio, scale: scale)
