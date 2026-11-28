@@ -922,7 +922,182 @@ enum Ernie55Kernels {
         #endif
     }
 
-    // MARK: - 3c. Native MXFP8 Linear / Row Projection
+    // MARK: - 3c. Native MXFP8 Multi-Vector GEMV (2D & 3D Grouped, T = 1..8)
+
+    #if canImport(Metal)
+    /// OCP FP8 E4M3FN lookup table (0x7F and 0xFF are NaN -> 0.0f).
+    private static let e4m3LutHeader: String = {
+        var entries: [String] = []
+        entries.reserveCapacity(256)
+        for byte in 0 ..< 256 {
+            let sign: Float = (byte & 0x80) != 0 ? -1.0 : 1.0
+            let expBits = (byte >> 3) & 0xF
+            let mantBits = byte & 0x7
+            let val: Float
+            if expBits == 0xF && mantBits == 0x7 {
+                val = 0.0
+            } else if expBits == 0 {
+                val = sign * ldexpf(Float(mantBits), -9)
+            } else {
+                val = sign * ldexpf(1.0 + Float(mantBits) / 8.0, Int32(expBits - 7))
+            }
+            if val == 0 {
+                entries.append("0.0f")
+            } else {
+                entries.append(String(format: "%.9e", val) + "f")
+            }
+        }
+        return """
+            #include <metal_stdlib>
+            using namespace metal;
+            constant float E4M3_LUT[256] = { \(entries.joined(separator: ", ")) };
+            """
+    }()
+
+    /// Barrier-free zero-spill (~28 regs) MXFP8 multi-vector GEMV for 2D (G=1) and 3D grouped (G>1).
+    /// Reads 8-bit E4M3 weights (`uint2` = 8 bytes) + 1 UE8M0 scale byte ONCE across up to 8 rows.
+    private static let mxfp8MultiGemvKernel = MLXFast.metalKernel(
+        name: "ernie55_mxfp8_multi_gemv",
+        inputNames: ["x", "w", "scales"],
+        outputNames: ["out"],
+        source: """
+            const uint sgi = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint g = threadgroup_position_in_grid.y;
+            const uint row0 = threadgroup_position_in_grid.x * (4u * uint(RPS)) + sgi * uint(RPS);
+            if (row0 >= uint(N)) return;
+
+            const uint r_valid = metal::min(uint(RPS), uint(N) - row0);
+            const uint KW = uint(K) >> 2;
+            const uint NG = uint(K) >> 5;
+            const uint lane_g = lane >> 2;
+
+            float acc[ROWS][RPS];
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    acc[v][r] = 0.0f;
+                }
+            }
+
+            const device XT* x_g = x + size_t(g) * size_t(ROWS) * uint(K);
+            const device uint* w0 = w + (size_t(g) * uint(N) + row0) * KW;
+            const device uchar* s0 = scales + (size_t(g) * uint(N) + row0) * NG;
+
+            for (uint k0 = 0u; k0 < uint(K); k0 += 256u) {
+                const uint k_lane = k0 + lane * 8u;
+                const uint g_idx = (k0 >> 5) + lane_g;
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    if (r < r_valid) {
+                        const device uint2* wr = (const device uint2*)(w0 + size_t(r) * KW + (k_lane >> 2));
+                        const uint2 p = *wr;
+                        const uint p0 = p.x;
+                        const uint p1 = p.y;
+                        const float sc = as_type<float>(uint(s0[size_t(r) * NG + g_idx]) << 23);
+                        const float4 w_lo = float4(
+                            E4M3_LUT[p0 & 0xFFu],
+                            E4M3_LUT[(p0 >> 8) & 0xFFu],
+                            E4M3_LUT[(p0 >> 16) & 0xFFu],
+                            E4M3_LUT[p0 >> 24]) * sc;
+                        const float4 w_hi = float4(
+                            E4M3_LUT[p1 & 0xFFu],
+                            E4M3_LUT[(p1 >> 8) & 0xFFu],
+                            E4M3_LUT[(p1 >> 16) & 0xFFu],
+                            E4M3_LUT[p1 >> 24]) * sc;
+                        #pragma clang loop unroll(full)
+                        for (uint v = 0u; v < uint(ROWS); ++v) {
+                            const device XT* xp = x_g + size_t(v) * uint(K) + k_lane;
+                            float4 x_lo = float4(*(const device vec<XT, 4>*)(xp));
+                            float4 x_hi = float4(*(const device vec<XT, 4>*)(xp + 4u));
+                            acc[v][r] += dot(x_lo, w_lo) + dot(x_hi, w_hi);
+                        }
+                    }
+                }
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint v = 0u; v < uint(ROWS); ++v) {
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < uint(RPS); ++r) {
+                    float total = simd_sum(acc[v][r]);
+                    if (lane == 0u && r < r_valid) {
+                        out[(size_t(g) * uint(ROWS) + v) * uint(N) + row0 + r] = OT(total);
+                    }
+                }
+            }
+            """,
+        header: e4m3LutHeader,
+        ensureRowContiguous: true)
+    #endif
+
+    static func mxfp8MultiGemv(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
+        #if canImport(Metal)
+        guard ProcessInfo.processInfo.environment["VMLX_ERNIE_FAST_MXFP8"] != "0",
+            Device.defaultDevice().deviceType == .gpu,
+            [.bfloat16, .float16, .float32].contains(x.dtype),
+            weight.dtype == .uint32, scales.dtype == .uint8
+        else { return nil }
+        let K = x.dim(-1)
+        guard K > 0, K % 256 == 0 else { return nil }
+        let G: Int
+        let T: Int
+        let N: Int
+        let x3: MLXArray
+        let outShape: [Int]
+        if weight.ndim == 3 {
+            // Grouped 3D MXFP8 projection: weight [G, N, K/4], scales [G, N, K/32].
+            G = weight.dim(0)
+            N = weight.dim(1)
+            guard scales.ndim == 3, scales.dim(0) == G, scales.dim(1) == N,
+                weight.dim(2) == K / 4, scales.dim(2) == K / 32
+            else { return nil }
+            if x.ndim == 3, x.dim(0) == G {
+                T = x.dim(1)
+                x3 = x
+                outShape = [G, T, N]
+            } else if x.ndim == 4, x.dim(0) == 1, x.dim(1) == G {
+                T = x.dim(2)
+                x3 = x.reshaped(G, T, K)
+                outShape = [1, G, T, N]
+            } else {
+                return nil
+            }
+        } else if weight.ndim == 2 {
+            G = 1
+            N = weight.dim(0)
+            guard scales.ndim == 2, scales.dim(0) == N,
+                weight.dim(1) == K / 4, scales.dim(1) == K / 32
+            else { return nil }
+            T = x.size / K
+            x3 = x.reshaped(1, T, K)
+            outShape = Array(x.shape.dropLast()) + [N]
+        } else {
+            return nil
+        }
+        guard (1 ... 8).contains(T) else { return nil }
+        let rps = (G * N) >= 4096 ? 2 : 1
+        let nTG = (N + 4 * rps - 1) / (4 * rps)
+        let y = mxfp8MultiGemvKernel(
+            [x3, weight, scales],
+            template: [
+                ("XT", x.dtype),
+                ("OT", x.dtype),
+                ("ROWS", T),
+                ("RPS", rps),
+                ("K", K),
+                ("N", N),
+            ],
+            grid: (nTG * 128, G, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[G, T, N]],
+            outputDTypes: [x.dtype])[0]
+        return y.reshaped(outShape)
+        #else
+        return nil
+        #endif
+    }
 
     static func releaseMXFP8(_ linear: QuantizedLinear) {
         linear.update(parameters: ModuleParameters.unflattened([
@@ -933,6 +1108,9 @@ enum Ernie55Kernels {
 
     static func mxfp8Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
         if let q = linear as? QuantizedLinear, q.mode == .mxfp8, q.bias == nil {
+            if let fast = mxfp8MultiGemv(x, weight: q.weight, scales: q.scales) {
+                return fast
+            }
             return quantizedMM(
                 x, q.weight, scales: q.scales, biases: nil,
                 transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
@@ -942,6 +1120,9 @@ enum Ernie55Kernels {
 
     static func mxfp8Rows(_ x: MLXArray, weight: MLXArray, scales: MLXArray) -> MLXArray? {
         guard weight.dtype == .uint32, scales.dtype == .uint8 else { return nil }
+        if let fast = mxfp8MultiGemv(x, weight: weight, scales: scales) {
+            return fast
+        }
         return quantizedMM(
             x, weight, scales: scales, biases: nil,
             transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
@@ -2233,6 +2414,26 @@ enum Ernie55Kernels {
         else { return nil }
         let (B, H, T) = (q.dim(0), q.dim(1), q.dim(2))
         let S = k.dim(2)
+        if B == 1, ProcessInfo.processInfo.environment["VMLX_ERNIE_INDEX_MPP"] != "0" {
+            if T == 1, S >= 128,
+                let mppDec = DeepseekV41MPPIndexScores.decodeIndexScores(
+                    q: q.transposed(0, 2, 1, 3).asType(.bfloat16),
+                    poolKeys: k.reshaped(1, S, 128).asType(.bfloat16),
+                    headW: weights.asType(.float32),
+                    scale: 1.0)
+            {
+                return mppDec.reshaped(1, 1, 1, S)
+            }
+            if T >= 2, S >= 256,
+                let mppPre = DeepseekV41MPPIndexScores.poolIndexScores(
+                    q: q.transposed(0, 2, 1, 3).asType(.bfloat16),
+                    poolKeys: k.reshaped(1, S, 128).asType(.bfloat16),
+                    headW: weights.asType(.float32),
+                    scale: 1.0)
+            {
+                return mppPre.reshaped(1, 1, T, S)
+            }
+        }
         if T >= 2 {
             let cBlocks = (S + 63) / 64
             let tBlocks = (T + 15) / 16

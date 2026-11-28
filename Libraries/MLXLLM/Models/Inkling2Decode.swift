@@ -1029,15 +1029,28 @@ struct Inkling2QuantizedProjections {
     }
 
     func callAsFunction(_ x: MLXArray, _ p: Packed) -> MLXArray {
-        MLX.quantizedMM(
+        if mode == .affine, bits == 8, groupSize == 64, let biases = p.biases,
+            x.size / max(x.dim(-1), 1) <= 8,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                x, weight: p.weight, scales: p.scales, biases: biases, outDType: x.dtype)
+        {
+            return fast
+        }
+        return MLX.quantizedMM(
             x, p.weight, scales: p.scales, biases: p.biases, transpose: true, groupSize: groupSize,
             bits: bits, mode: mode)
     }
 
     /// Batch independent vectors while keeping M = 1 arithmetic bit-exact.
-    /// Uses `RowExactAffineQMV` (single weight read across all T rows) for supported affine shapes,
-    /// falling back to batched M = 1 `quantizedMM`.
+    /// Uses `affine8G64MultiGemv` (bit-exact across T=1..8) for affine 8-bit g=64 shapes,
+    /// falling back to `RowExactAffineQMV` or batched M = 1 `quantizedMM`.
     func verifyVectors(_ x: MLXArray, _ p: Packed) -> MLXArray {
+        if mode == .affine, bits == 8, groupSize == 64, let biases = p.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                x, weight: p.weight, scales: p.scales, biases: biases, outDType: x.dtype)
+        {
+            return fast
+        }
         let fallback: (MLXArray) -> MLXArray = { input in
             if input.dtype != p.scales.dtype {
                 return MLX.concatenated(
@@ -1122,6 +1135,7 @@ final class Inkling2DecodeWeights: @unchecked Sendable {
     var mlpFG: MLXArray?
     var gateEps: MLXArray?
     var routerT: MLXArray?
+    var routerW: MLXArray?
     /// Post-attention (MLP) norm weight `[1, H]` fp32.
     var mlpNorm: MLXArray?
     var ones: MLXArray?
@@ -1251,6 +1265,7 @@ extension Inkling2DecoderLayer {
             }
         }
         w.routerT = mlp.gate.weight.asType(f32).T
+        w.routerW = MLX.contiguous(mlp.gate.weight)
         w.ones = MLXArray.ones([mlp.gate.weight.dim(0)], dtype: f32)
         w.downOnes = w.ones
         let nqa = isSliding ? 1 : 3
@@ -1281,7 +1296,7 @@ extension Inkling2DecoderLayer {
         eval(
             [
                 w.xFused, w.qFused, w.kFused, w.vFused, w.attnNorm, w.gateNorm,
-                w.qkvDown, w.qkvFG, w.mlpDown, w.mlpFG, w.routerT, w.ones, w.mlpNorm, w.attnQuery,
+                w.qkvDown, w.qkvFG, w.mlpDown, w.mlpFG, w.routerT, w.routerW, w.ones, w.mlpNorm, w.attnQuery,
                 w.mlpQuery, w.zeroState, w.singleSlot, w.unitWeight,
             ].compactMap { $0 } + (w.quant?.arrays ?? []))
         w.ready = true
@@ -1413,7 +1428,7 @@ extension Inkling2DecoderLayer {
         let seen = kv.offset
         let S = a.window.map { min(seen + 1, $0) } ?? (seen + 1)
         let useSplitK =
-            !a.isSliding && S > 2048 && dtype == .bfloat16 && hd == 128 && dRel == 16
+            !a.isSliding && S >= 512 && dtype == .bfloat16 && hd == 128 && dRel == 16
             && ProcessInfo.processInfo.environment["VMLX_INKLING2_SPLITK_ATTN"] != "0"
         // relative-bias rows: one simdgroup per 128 keys per head (skipped when split-K runs zero-mask)
         let nb = useSplitK ? 1 : max(1, (S + 127) / 128)
@@ -1470,7 +1485,17 @@ extension Inkling2DecoderLayer {
         let gated = Inkling2DecodeKernels.sigmoidGate(
             [attn, y, w.sigMeta!], grid: (nQ, 1, 1),
             threadGroup: (256, 1, 1), outputShapes: [[1, nQ]], outputDTypes: [dtype])[0]
-        let o = a.oProj(gated)
+        let o: MLXArray
+        if let q = a.oProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+            q.bias == nil, q.mode == .affine, q.bits == 8, q.groupSize == 64,
+            let biases = q.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                gated, weight: q.weight, scales: q.scales, biases: biases, outDType: dtype)
+        {
+            o = fast
+        } else {
+            o = a.oProj(gated)
+        }
 
         // 4. residual + MLP input
         let states = isBlockBoundary ? inklingAppendState(stack, h) : stack
@@ -1501,10 +1526,10 @@ extension Inkling2DecoderLayer {
         // 5. MoE
         let x32 = xm32
         let router = mlp.gate
-        let logits = MLX.matmul(x32, w.routerT!)
         let k = router.topK
         if let jx = mlp.janghExperts, let banks = w.jangh {
             // Router GEMV, then the JANGH gate/up kernel ranks the logits itself (no selection dispatch).
+            let logits = MLX.matmul(x32, w.routerT!)
             let ex = Inkling2DecodeKernels.janghExperts(
                 x32: x32, inds: nil, banks: banks, topK: k,
                 router: (logits, router.bias, router.scaleArray))
@@ -1521,22 +1546,34 @@ extension Inkling2DecoderLayer {
             conv.offset += 1
             return (fin[0], states)
         }
-        let sel = Inkling2Kernels.routerSelect(
-            [logits, router.bias, router.meta, router.scaleArray], grid: (128, 1, 1),
-            threadGroup: (128, 1, 1), outputShapes: [[1, router.topK], [1, router.topK]],
-            outputDTypes: [.uint32, f32])
-        let inds = sel[0]
+        let inds: MLXArray
+        let routeWeights: MLXArray
+        if let rw = w.routerW,
+            let fastRoute = Inkling2Kernels.routerTopK(
+                x32, gateWeight: rw, bias: router.bias, topK: router.topK, routeScale: router.routeScale)
+        {
+            inds = fastRoute.indices
+            routeWeights = fastRoute.weights
+        } else {
+            let logits = MLX.matmul(x32, w.routerT!)
+            let sel = Inkling2Kernels.routerSelect(
+                [logits, router.bias, router.meta, router.scaleArray], grid: (128, 1, 1),
+                threadGroup: (128, 1, 1), outputShapes: [[1, router.topK], [1, router.topK]],
+                outputDTypes: [.uint32, f32])
+            inds = sel[0]
+            routeWeights = sel[1]
+        }
         if let jx = mlp.janghExperts {
             // JANGH: H32 rotate + fused gate/up (softcapped activation, H32 output) + router-weighted down, F32.
             // Per-pick outputs (combined by `final` with the route weights) or the generic route's weighted sum.
             let perPick = w.jangh.map {
                 Inkling2DecodeKernels.janghExperts(x32: x32, inds: inds, banks: $0, topK: k).down
             }
-            let sum = perPick ?? jx.decodeWeightedSum(x32, indices: inds, scores: sel[1])
+            let sum = perPick ?? jx.decodeWeightedSum(x32, indices: inds, scores: routeWeights)
             let slotted = perPick != nil
             let fin = Inkling2DecodeKernels.final(
                 [
-                    sum, slotted ? inds : w.singleSlot!, w.ones!, slotted ? sel[1] : w.unitWeight!,
+                    sum, slotted ? inds : w.singleSlot!, w.ones!, slotted ? routeWeights : w.unitWeight!,
                     packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
                 ],
                 template: [("PP", P)],
@@ -1551,7 +1588,7 @@ extension Inkling2DecoderLayer {
             // decode kernels), combined by the final kernel as one slot.
             let fin = Inkling2DecodeKernels.final(
                 [
-                    mx(x32, inds, sel[1]), w.singleSlot!, w.ones!, w.unitWeight!,
+                    mx(x32, inds, routeWeights), w.singleSlot!, w.ones!, w.unitWeight!,
                     packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
                 ],
                 template: [("PP", P)],
@@ -1579,7 +1616,7 @@ extension Inkling2DecoderLayer {
         let fin = Inkling2DecodeKernels.final(
             [
                 down.reshaped([k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,
-                sel[1],
+                routeWeights,
                 packed, postMLPConv.weight, midOut[2], outs[4], midOut[3], w.finalMeta!,
             ],
             template: [("PP", P)],

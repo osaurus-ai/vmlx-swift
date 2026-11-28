@@ -448,7 +448,17 @@ extension Inkling2DecoderLayer {
         }
         let sinkOff = 2 * nQ + nR
         let merged: MLXArray
-        if !a.isSliding, S > 2048, dtype == .bfloat16, hd == 128, dRel == 16,
+        if dtype == .bfloat16, hd == 128, dRel == 16,
+            let fastAttn = Inkling2Kernels.verifyAttention(
+                q: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
+                k: keys, v: values,
+                r: outs[1].reshaped([1, T, nq, dRel]),
+                projT: a.relLogits.transposedBF16(),
+                sinks: qa[0..., sinkOff ..< (sinkOff + nq)],
+                window: a.window ?? 0, relExtent: a.relExtent, scale: a.scale)
+        {
+            merged = fastAttn.transposed(0, 2, 1, 3).reshaped([T, nQ])
+        } else if !a.isSliding, S > 2048, dtype == .bfloat16, hd == 128, dRel == 16,
             ProcessInfo.processInfo.environment["VMLX_INKLING2_SPLITK_ATTN"] != "0",
             let splitOut = Inkling2Kernels.decodeSplitKAttention(
                 q: outs[0].reshaped([1, T, nq, hd]).transposed(0, 2, 1, 3),
@@ -532,7 +542,15 @@ extension Inkling2DecoderLayer {
             grid: (T * nQ, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[T, nQ]],
             outputDTypes: [dtype])[0]
         let o: MLXArray
-        if !matchDecode {
+        if let linear = a.oProj as? QuantizedLinear,
+            type(of: linear) == QuantizedLinear.self, linear.bias == nil,
+            linear.mode == .affine, linear.bits == 8, linear.groupSize == 64,
+            let biases = linear.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                gated, weight: linear.weight, scales: linear.scales, biases: biases, outDType: dtype)
+        {
+            o = fast
+        } else if !matchDecode {
             o = a.oProj(gated)
         } else if let linear = a.oProj as? QuantizedLinear,
             type(of: linear) == QuantizedLinear.self, linear.bias == nil,
@@ -599,23 +617,34 @@ extension Inkling2DecoderLayer {
 
         // 5. MoE
         let router = mlp.gate
-        let logits = denseProject(xm32, w.routerT!)
-        let sel = Inkling2Kernels.routerSelect(
-            [logits, router.bias, router.meta, router.scaleArray], grid: (T * 128, 1, 1),
-            threadGroup: (128, 1, 1), outputShapes: [[T, router.topK], [T, router.topK]],
-            outputDTypes: [.uint32, f32])
-        let inds = sel[0]
+        let inds: MLXArray
+        let routeWeights: MLXArray
+        if let rw = w.routerW,
+            let fastRoute = Inkling2Kernels.routerTopK(
+                xm32, gateWeight: rw, bias: router.bias, topK: router.topK, routeScale: router.routeScale)
+        {
+            inds = fastRoute.indices
+            routeWeights = fastRoute.weights
+        } else {
+            let logits = denseProject(xm32, w.routerT!)
+            let sel = Inkling2Kernels.routerSelect(
+                [logits, router.bias, router.meta, router.scaleArray], grid: (T * 128, 1, 1),
+                threadGroup: (128, 1, 1), outputShapes: [[T, router.topK], [T, router.topK]],
+                outputDTypes: [.uint32, f32])
+            inds = sel[0]
+            routeWeights = sel[1]
+        }
         let k = router.topK
         if let jx = mlp.janghExperts {
             // JANGH: the router-weighted sum per row (decode kernels, F32), combined by the final kernel as one slot.
             let perPick = w.jangh.map {
                 Inkling2DecodeKernels.janghExperts(x32: xm32, inds: inds, banks: $0, topK: k).down  // [T * k, H]
             }
-            let sum = perPick ?? jx.decodeWeightedSum(xm32, indices: inds, scores: sel[1])  // [T, H]
+            let sum = perPick ?? jx.decodeWeightedSum(xm32, indices: inds, scores: routeWeights)  // [T, H]
             let fin = Inkling2VerifyKernels.finalT(
                 [
                     sum, perPick != nil ? inds : MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
-                    perPick != nil ? sel[1] : MLXArray.ones([T, 1], dtype: f32),
+                    perPick != nil ? routeWeights : MLXArray.ones([T, 1], dtype: f32),
                     packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
                     MLXArray([Int32(2 * C), Int32(H)]),
                 ],
@@ -639,7 +668,7 @@ extension Inkling2DecoderLayer {
             // combined by the final kernel as one slot.
             let fin = Inkling2VerifyKernels.finalT(
                 [
-                    mx(xm32, inds, sel[1]), MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
+                    mx(xm32, inds, routeWeights), MLXArray.zeros([T, 1], dtype: .uint32), w.ones!,
                     MLXArray.ones([T, 1], dtype: f32),
                     packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
                     MLXArray([Int32(2 * C), Int32(H)]),
@@ -680,7 +709,7 @@ extension Inkling2DecoderLayer {
         let fin = Inkling2VerifyKernels.finalT(
             [
                 down.reshaped([T * k, H]), inds, sw.down.isNVFP4 ? sw.down.expertScale : w.ones!,
-                sel[1],
+                routeWeights,
                 packed, postMLPConv.weight, res2, outs[4], newAttn.reshaped([3, H]),
                 MLXArray([Int32(2 * C), Int32(H)]),
             ],

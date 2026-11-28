@@ -1849,6 +1849,18 @@ public final class Inkling2LoopModel: Module, LLMModel, ModalityBearing {
     }
 
     func logits(_ h: MLXArray, matchDecode: Bool = false) -> MLXArray {
+        if h.ndim == 3, h.dim(0) == 1, (1 ... 16).contains(h.dim(1)),
+            let q = lmHead as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self, q.bias == nil,
+            q.mode == .affine, q.bits == 8, q.groupSize == 64, let biases = q.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                h, weight: q.weight, scales: q.scales, biases: biases,
+                outDType: .float32,
+                softcap: args.finalLogitSoftcapping ?? 0,
+                outCols: args.unpaddedVocabSize ?? 0)
+        {
+            return fast
+        }
         var out: MLXArray
         if matchDecode, h.ndim == 3, h.dim(0) == 1, h.dim(1) > 1,
             let q = lmHead as? QuantizedLinear,
@@ -2551,6 +2563,18 @@ extension Inkling2LoopModel: TokenEmbedderModel {
     /// configured with `selector_softcap_mode: "after_correction"` apply `final_logit_softcapping`
     /// after adding the selector edge scores, matching `incoai/Inkling-2-Mini-DFlash2`.
     public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if hidden.ndim == 3, hidden.dim(0) == 1, (1 ... 16).contains(hidden.dim(1)),
+            let q = lmHead as? QuantizedLinear,
+            type(of: q) == QuantizedLinear.self, q.bias == nil,
+            q.mode == .affine, q.bits == 8, q.groupSize == 64, let biases = q.biases,
+            let fast = Inkling2Kernels.affine8G64MultiGemv(
+                hidden, weight: q.weight, scales: q.scales, biases: biases,
+                outDType: .float32,
+                softcap: 0,
+                outCols: args.unpaddedVocabSize ?? 0)
+        {
+            return fast
+        }
         var out = lmHead(hidden)
         if let u = args.unpaddedVocabSize, u < out.dim(-1) {
             out = out[.ellipsis, ..<u]

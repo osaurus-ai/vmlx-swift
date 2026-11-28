@@ -97,6 +97,73 @@ enum DeepseekV41MPPIndexScores {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var compiled: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var decodeCompiled: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// L == 1 zero-padding M5 MPP decode indexer: runs Q[TH, D] @ K[128, D]^T directly on the
+    /// matrix units without 16-query padding, streaming K at ~500 GB/s DRAM.
+    static let decodeSource = #"""
+          const int S = int(k_shape[1]);
+          const int c0 = min(int(threadgroup_position_in_grid.x) * TK, S - TK);
+          const uint tid = thread_position_in_threadgroup.x;
+          const float sc = scale[0];
+
+          threadgroup float w_sh[H];
+          if (tid < uint(H)) w_sh[tid] = float(w[tid]);
+          threadgroup float tile[TH * TK];
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          constexpr auto desc = matmul2d_descriptor(TH, TK, D, false, true, false, matmul2d_descriptor::mode::multiply);
+          matmul2d<desc, execution_simdgroups<NSG>> op;
+
+          tensor<device elem_t, dextents<int32_t, 2>, tensor_inline> tK(
+              (device elem_t*)k + (size_t)c0 * D, dextents<int32_t, 2>(D, TK));
+          auto b = tK.slice<D, TK>(0, 0);
+
+          float my_sum = 0.0f;
+          for (int h0 = 0; h0 < H; h0 += TH) {
+            tensor<device elem_t, dextents<int32_t, 2>, tensor_inline> tQ(
+                (device elem_t*)q + (size_t)h0 * D, dextents<int32_t, 2>(D, TH));
+            auto a = tQ.slice<D, TH>(0, 0);
+            auto P = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+            op.run(a, b, P);
+            #pragma unroll
+            for (uint16_t i = 0; i < P.get_capacity(); ++i) {
+              if (P.is_valid_element(i)) {
+                const auto idx = P.get_multidimensional_index(i);
+                const float s = HAS_SCALE ? P[i] * sc : P[i];
+                tile[idx[1] * TK + idx[0]] = metal::max(s, 0.0f) * w_sh[h0 + idx[1]];
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int h = 0; h < TH; ++h) {
+              my_sum += tile[h * TK + tid];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          out[c0 + tid] = my_sum;
+        """#
+
+    private static func decodeKernel(elem: String, heads H: Int, dim D: Int, tileH TH: Int, hasScale: Bool)
+        -> MLXFast.MLXFastKernel
+    {
+        let key = "\(elem)_h\(H)_d\(D)_th\(TH)_s\(hasScale ? 1 : 0)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = decodeCompiled[key] { return k }
+        let consts =
+            "  using elem_t = \(elem);\n"
+            + [("H", H), ("D", D), ("TH", TH), ("TK", 128), ("NSG", 4), ("HAS_SCALE", hasScale ? 1 : 0)]
+            .map { "  constexpr int \($0.0) = \($0.1);\n" }.joined()
+        let k = MLXFast.metalKernel(
+            name: "vmlx_dsv41_mpp_decode_v1_\(key)",
+            inputNames: ["q", "k", "w", "scale"],
+            outputNames: ["out"],
+            source: consts + decodeSource,
+            header: header,
+            ensureRowContiguous: true)
+        decodeCompiled[key] = k
+        return k
+    }
 
     /// Python `_kernel`: one kernel per (element type, H, D, has-scale); the constants are baked into the
     /// source as `constexpr` lines so `matmul2d_descriptor` sees compile-time values.
@@ -213,7 +280,30 @@ enum DeepseekV41MPPIndexScores {
                     let peak = abs(ref).max().item(Float.self)
                     let err = abs(got[0] - ref).max().item(Float.self) / max(peak, 1e-6)
                     try error.check()
-                    return err < 1e-4
+                    guard err < 1e-4 else { return false }
+
+                    // Also verify L == 1 zero-padding decode MPP kernel against CPU fp32 reference.
+                    let Hd = 16, Sd = 300
+                    let qd = wave([1, 1, Hd, D], 0.5113).asType(.bfloat16)
+                    let kd = wave([1, Sd, D], 0.2917).asType(.bfloat16)
+                    let wd = wave([1, 1, Hd], 0.8731)
+                    let decRun = decodeKernel(elem: "bfloat", heads: Hd, dim: D, tileH: 16, hasScale: true)
+                    let gotD = decRun(
+                        [qd, kd, wd, MLXArray([Float(0.5)])],
+                        grid: (((Sd + 127) / 128) * 128, 1, 1),
+                        threadGroup: (128, 1, 1),
+                        outputShapes: [[1, 1, Sd]],
+                        outputDTypes: [.float32])[0]
+                    eval(gotD)
+                    try error.check()
+                    let sd = matmul(
+                        qd[0, 0].asType(.float32), kd[0].asType(.float32).transposed(), stream: .cpu)
+                    let refD = (maximum(sd * 0.5, Float(0), stream: .cpu)
+                        * wd[0, 0].expandedDimensions(axis: -1)).sum(axis: 0, stream: .cpu)
+                    let peakD = abs(refD).max().item(Float.self)
+                    let errD = abs(gotD[0, 0] - refD).max().item(Float.self) / max(peakD, 1e-6)
+                    try error.check()
+                    return errD < 1e-4
                 }
             }
         } catch {
@@ -248,6 +338,32 @@ enum DeepseekV41MPPIndexScores {
             return launch(q: qq, k: kk, w: ww, scale: scale)[0..., 0 ..< S, 0 ..< P]
         }
         return launch(q: q, k: poolKeys, w: headW, scale: scale)
+    }
+
+    /// L == 1 zero-padding M5 MPP decode indexer: `q` `(1, 1, H, D)`, `poolKeys` `(1, S, D)`,
+    /// `headW` `(1, 1, H)` -> `(1, 1, S)` fp32.
+    static func decodeIndexScores(
+        q: MLXArray, poolKeys: MLXArray, headW: MLXArray, scale: Float = 1.0, enabled on: Bool = enabled
+    ) -> MLXArray? {
+        guard on else { return nil }
+        guard Device.defaultDevice().deviceType == .gpu else { return nil }
+        guard q.ndim == 4, poolKeys.ndim == 3, headW.ndim == 3 else { return nil }
+        let B = q.dim(0), L = q.dim(1), H = q.dim(2), D = q.dim(3)
+        let S = poolKeys.dim(1)
+        guard B == 1, L == 1, poolKeys.dim(0) == 1, poolKeys.dim(2) == D, headW.shape == [1, 1, H],
+            let elem = elementType(q.dtype), poolKeys.dtype == q.dtype,
+            [DType.float32, .bfloat16, .float16].contains(headW.dtype),
+            D % 32 == 0, D <= 512, H >= 16, H % 16 == 0, H <= 256, S >= 128, scale > 0
+        else { return nil }
+        guard available() else { return nil }
+        let th = (H % 32 == 0) ? 32 : 16
+        let run = decodeKernel(elem: elem, heads: H, dim: D, tileH: th, hasScale: scale != 1.0)
+        return run(
+            [q, poolKeys, headW, MLXArray([scale])],
+            grid: (((S + 127) / 128) * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1, 1, S]],
+            outputDTypes: [.float32])[0]
     }
 
     /// The shape / dtype half of the admission (no device or availability check).
