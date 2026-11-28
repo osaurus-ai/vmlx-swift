@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import CmlxDistributedShim
@@ -86,7 +87,7 @@ public enum Collectives {
         ) -> Int32
     ) -> MLXArray {
         var resPtr: UnsafeMutableRawPointer? = nil
-        let srcPtr = unsafeBitCast(x.ctx, to: UnsafeMutableRawPointer?.self)
+        let srcPtr = x.ctx.ctx
         let grpPtr = group.handle.raw.ctx
         let stmPtr = defaultStream()
         let rc = call(&resPtr, srcPtr, grpPtr, stmPtr)
@@ -108,7 +109,7 @@ public enum Collectives {
         ) -> Int32
     ) -> MLXArray {
         var resPtr: UnsafeMutableRawPointer? = nil
-        let srcPtr = unsafeBitCast(x.ctx, to: UnsafeMutableRawPointer?.self)
+        let srcPtr = x.ctx.ctx
         let grpPtr = group.handle.raw.ctx
         let stmPtr = defaultStream()
         let rc = call(&resPtr, srcPtr, intArg, grpPtr, stmPtr)
@@ -117,20 +118,11 @@ public enum Collectives {
     }
 }
 
-/// Reconstruct an MLXArray from the void* ctx of a freshly synthesized
-/// mlx_array. We can't directly call MLXArray.init(ctx:) without
-/// importing Cmlx; we use unsafeBitCast on a Swift struct that is
-/// layout-compatible with mlx_array (both are single-pointer aggregates).
+/// Wraps the `mlx_array` handle a collective returned. `MLXArray` is a
+/// class that owns an `mlx_array`, so the handle must go through its
+/// designated initializer. Reinterpreting a one-pointer struct as the class
+/// (the previous `unsafeBitCast`) read the C handle as a Swift object and
+/// crashed on first use; it only ran once a real multi-rank group existed.
 internal func mlxArrayFromCtx(_ ptr: UnsafeMutableRawPointer?) -> MLXArray {
-    // mlx_array is { void* ctx } — same shape as a single pointer.
-    // MLXArray's stored ctx field accepts an mlx_array value; we
-    // construct one by reinterpreting the pointer.
-    let raw = _MLXArrayCtxBox(ctx: ptr)
-    return unsafeBitCast(raw, to: MLXArray.self)
-}
-
-/// Layout-compatible mirror of mlx_array. Used only for the
-/// `unsafeBitCast` round-trip in `mlxArrayFromCtx`.
-internal struct _MLXArrayCtxBox {
-    var ctx: UnsafeMutableRawPointer?
+    MLXArray(mlx_array(ctx: ptr))
 }
