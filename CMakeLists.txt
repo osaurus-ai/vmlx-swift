@@ -29,7 +29,8 @@ endif()
 # Use the same checked-out core/C ABI as SwiftPM. A stock mlx-c release
 # omits the fork's mmap and compiler-cache lifetime entry points.
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx/CMakeLists.txt" OR
-   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c/CMakeLists.txt")
+   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c/CMakeLists.txt" OR
+   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/highway/CMakeLists.txt")
   message(FATAL_ERROR "Initialize the pinned dependencies with git submodule update --init --recursive")
 endif()
 FetchContent_Declare(
@@ -38,6 +39,11 @@ FetchContent_Declare(
 FetchContent_Declare(
   mlx-c
   SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c")
+# ml-explore/mlx#3019's Highway kernels take Google Highway from this submodule
+# instead of fetching it at build time.
+set(MLX_HIGHWAY_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/highway"
+    CACHE PATH "Google Highway sources")
 FetchContent_MakeAvailable(mlx-c)
 
 # swift-numerics

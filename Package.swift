@@ -66,9 +66,41 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         "mlx/mlx/backend/cpu/gemms/bnns.cpp",  // macOS Accelerate version
         "mlx-conditional",
         "mlx-c/mlx/c/metal.cpp",
+        // ml-explore/mlx#3019's per-target dispatch shims, which only MSVC builds.
+        "mlx/mlx/backend/cpu/norms_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/rope_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
     ]
 
-    let cxxSettings: [CXXSetting] = []
+    // Google Highway SIMD kernels in the CPU backend, on Linux x86-64 and arm64. In a manifest,
+    // #if arch tests the host, which is the target in a native build. VMLX_HWY_ALL_TARGETS=1
+    // compiles every attainable target, EMU128 included, for the kernel tests. VMLX_NO_HIGHWAY=1
+    // builds without Highway's kernels and the CPU pool: MLX's scalar CPU code, which ULPBaseline
+    // is measured on. Give such a build a scratch path of its own, as
+    // scripts/run-cpu-kernel-tests.sh does (.build/no-hwy): in a shared one, each switch recompiles
+    // all of Cmlx.
+    #if arch(x86_64) || arch(arm64)
+        let highwayDefines: [CXXSetting] = {
+            if Context.environment["VMLX_NO_HIGHWAY"] == "1" {
+                return []
+            }
+            var defines: [CXXSetting] = [
+                .define("MLX_USE_HIGHWAY_KERNELS"), .define("HWY_DISABLE_PCLMUL_AES"),
+                // No SVE until the dispatched kernels are vector-length agnostic. Also set on
+                // x86-64, since #if arch tests the host, not the target; there it does nothing.
+                .define("HWY_DISABLED_TARGETS", to: "HWY_ALL_SVE"),
+            ]
+            if Context.environment["VMLX_HWY_ALL_TARGETS"] == "1" {
+                defines.append(.define("HWY_COMPILE_ALL_ATTAINABLE"))
+            }
+            return defines
+        }()
+    #else
+        let highwayDefines: [CXXSetting] = []
+    #endif
+
+    let cxxSettings: [CXXSetting] = [.headerSearchPath("highway")] + highwayDefines
 
     let linkerSettings: [LinkerSetting] = [
         .linkedLibrary("gfortran", .when(platforms: [.linux])),
@@ -94,6 +126,24 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         // bnns instead of simd (accelerate)
         "mlx/mlx/backend/cpu/gemms/simd_fp16.cpp",
         "mlx/mlx/backend/cpu/gemms/simd_bf16.cpp",
+
+        // The CPU backend's Highway kernels are Linux-only, and so is the Highway runtime.
+        "highway-runtime",
+        "mlx/mlx/backend/cpu/highway_info.cpp",
+        "mlx/mlx/backend/cpu/norms.cpp",
+        "mlx/mlx/backend/cpu/norms_highway.cpp",
+        "mlx/mlx/backend/cpu/norms_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/precision.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_backend.cpp",
+        "mlx/mlx/backend/cpu/quantized_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/rope.cpp",
+        "mlx/mlx/backend/cpu/rope_highway.cpp",
+        "mlx/mlx/backend/cpu/rope_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/sdpa.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway.cpp",
+        "mlx/mlx/backend/cpu/sdpa_highway_dispatch.cpp",
+        "mlx/mlx/backend/cpu/threading",
     ]
 
     let cxxSettings: [CXXSetting] = [
@@ -105,6 +155,8 @@ let mlxLMCommonSwiftSettings: [SwiftSetting] = {
         .define("SWIFTPM_BUNDLE", to: "\"mlx-swift_Cmlx\""),
         .define("METAL_PATH", to: "\"default.metallib\""),
     ]
+
+    let highwayDefines: [CXXSetting] = []
 
     let linkerSettings: [LinkerSetting] = [
         .linkedFramework("Foundation"),
@@ -195,6 +247,10 @@ let cmlx = Target.target(
 
         // vendored library, include header only
         "json",
+
+        // Google Highway, a submodule. Builds with Highway kernels compile its runtime sources
+        // through the wrappers in highway-runtime/, and nothing else of it compiles anywhere.
+        "highway",
 
         // vendored library
         "fmt/test",
@@ -606,6 +662,15 @@ let package = Package(
                 .headerSearchPath("../../Source/Cmlx/mlx"),
                 .headerSearchPath("../../Source/Cmlx/fmt/include"),
             ]
+        ),
+        .target(
+            name: "CmlxCPUShim",
+            dependencies: ["Cmlx"],
+            path: "Libraries/CmlxCPUShim",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("../../Source/Cmlx/mlx")
+            ] + highwayDefines
         ),
         .target(
             name: "MLXDistributedTP",
@@ -1116,6 +1181,21 @@ package.targets.append(
     )
 )
 
+// MARK: - VMLXCPUKernelTests
+
+// The CPU backend's kernels against references computed on the host in Double,
+// with two exceptions: the quantized matmul's bound takes MLX's float64 matmul, and the functions
+// MLX takes from libm are compared with glibc's own. Declared on every platform, and before the
+// Linux profile, which must find it; its sources compile only on Linux.
+// Run it through scripts/run-cpu-kernel-tests.sh, which sets what the host must execute.
+package.targets.append(
+    .testTarget(
+        name: "VMLXCPUKernelTests",
+        dependencies: ["MLX", "CmlxCPUShim"],
+        path: "Tests/VMLXCPUKernelTests"
+    )
+)
+
 // MARK: - Linux profile
 
 #if os(Linux)
@@ -1150,7 +1230,7 @@ package.targets.append(
     if Context.environment["VMLX_LINUX_PROFILE"] != "0" {
         let roots = [
             "MLXEmbedders", "MLXLLM", "MLXVLM", "MLXHuggingFace", "VMLXTokenizers", "MLXFFT",
-            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests",
+            "MLXLinalg", "CSQLite3Linux", "VMLXLinuxTests", "VMLXCPUKernelTests",
         ]
         let targetsByName = Dictionary(
             package.targets.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
