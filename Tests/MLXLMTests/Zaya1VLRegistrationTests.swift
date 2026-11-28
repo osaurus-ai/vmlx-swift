@@ -477,6 +477,64 @@ struct Zaya1VLRegistrationTests {
         #expect(!decoded.contains("value_1"), "decoded prompt: \(decoded)")
     }
 
+    @Test(
+        "Real ZAYA1-VL tokenizer preserves nested spawn-batch schema",
+        .enabled(if: hasJANGTQ4TokenizerBundle))
+    func realTokenizerPreservesNestedSpawnBatchSchema() async throws {
+        let dir = URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-JANGTQ4"))
+        let tokenizerDir = JangLoader.resolveTokenizerClassSubstitution(
+            for: JangLoader.resolveChatTemplateSidecarSubstitution(
+                for: JangLoader.resolveTokenizerDirectory(for: dir)))
+        let tokenizer = try await #huggingFaceTokenizerLoader().load(from: tokenizerDir)
+        let messages: [[String: any Sendable]] = [
+            ["role": "user", "content": "Delegate both jobs."]
+        ]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "spawn_batch",
+                    "description": "Run a batch of delegated jobs.",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "jobs": [
+                                "type": "array",
+                                "items": [
+                                    "type": "object",
+                                    "properties": [
+                                        "agent": ["type": "string"],
+                                        "task": ["type": "string"],
+                                        "job_id": ["type": "string"],
+                                    ] as [String: any Sendable],
+                                    "required": ["agent", "task"],
+                                ] as [String: any Sendable],
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["jobs"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable]
+        ]
+        let tokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: tools,
+            additionalContext: [
+                "enable_thinking": false,
+                "tool_choice": "required",
+                "tool_choice_name": "spawn_batch",
+            ])
+        let decoded = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+
+        #expect(decoded.contains("<name>jobs</name>"), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("<items>"), "decoded prompt: \(decoded)")
+        #expect(!decoded.contains("<schema>"), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("\"properties\""), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("\"agent\""), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("\"task\""), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("\"job_id\""), "decoded prompt: \(decoded)")
+    }
+
     @Test("Real ZAYA1-VL tokenizer grounds required tool text from media messages",
           .enabled(if: hasJANGTQ4TokenizerBundle))
     func realTokenizerGroundsRequiredToolTextFromMediaMessages() async throws {
