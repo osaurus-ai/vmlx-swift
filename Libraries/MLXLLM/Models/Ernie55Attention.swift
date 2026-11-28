@@ -174,14 +174,24 @@ final class Ernie55HCAAttention: Module {
         let attended: MLXArray
         if length == 1 {
             // Single-token decode: every local window row and every completed pooled row is visible.
-            var kv = cache?.updateSharedKV(currentKV) ?? currentKV
+            let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
-            if pooled.dim(1) > 0 {
-                kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
+            let scale: Float = 1 / sqrt(Float(shape.headWidth))
+            if pooled.dim(1) >= 256,
+                let splitFused = Ernie55Kernels.hcaDecodeVerifyAttention(
+                    q: q, localKV: localKV, pooled: pooled, sinks: typedSinks,
+                    offset: offset, priorLocal: localKV.dim(2) - 1, window: window, ratio: ratio, scale: scale)
+            {
+                attended = splitFused
+            } else {
+                var kv = localKV
+                if pooled.dim(1) > 0 {
+                    kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
+                }
+                attended = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: kv, values: kv, scale: scale,
+                    mask: nil, sinks: typedSinks)
             }
-            attended = MLXFast.scaledDotProductAttention(
-                queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
-                mask: nil, sinks: typedSinks)
         } else if length > 16 {
             // Long-context & prefill HCA: fused hardware-MMA attention streams local window + visible
             // pooled KV through L2 with zero score-matrix materialization and zero KV concat copies.
@@ -229,24 +239,34 @@ final class Ernie55HCAAttention: Module {
                 attended = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 2)
             }
         } else {
-            var mask: MLXArray?
-            let localMode = makeAttentionMask(n: length, cache: cache, windowSize: window, returnArray: true)
-            var kv = cache?.updateSharedKV(currentKV) ?? currentKV
-            if case .array(let local) = localMode {
-                mask = local[.ellipsis, (local.dim(-1) - kv.dim(2))...]
-            }
+            let localKV = cache?.updateSharedKV(currentKV) ?? currentKV
             let pooled = compressor(x, rope: rope, cache: cache, start: offset)
-            if pooled.dim(1) > 0 {
-                let prefixMask = Ernie55Math.hcaPoolMask(
-                    start: offset, length: length, columns: pooled.dim(1), ratio: ratio)
-                mask = concatenated([
-                    mask ?? MLXArray.ones([length, kv.dim(2)], dtype: .bool), prefixMask,
-                ], axis: -1)
-                kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
+            let scale: Float = 1 / sqrt(Float(shape.headWidth))
+            if pooled.dim(1) >= 64,
+                let splitFused = Ernie55Kernels.hcaDecodeVerifyAttention(
+                    q: q, localKV: localKV, pooled: pooled, sinks: typedSinks,
+                    offset: offset, priorLocal: localKV.dim(2) - length, window: window, ratio: ratio, scale: scale)
+            {
+                attended = splitFused
+            } else {
+                var mask: MLXArray?
+                let localMode = makeAttentionMask(n: length, cache: cache, windowSize: window, returnArray: true)
+                var kv = localKV
+                if case .array(let local) = localMode {
+                    mask = local[.ellipsis, (local.dim(-1) - kv.dim(2))...]
+                }
+                if pooled.dim(1) > 0 {
+                    let prefixMask = Ernie55Math.hcaPoolMask(
+                        start: offset, length: length, columns: pooled.dim(1), ratio: ratio)
+                    mask = concatenated([
+                        mask ?? MLXArray.ones([length, kv.dim(2)], dtype: .bool), prefixMask,
+                    ], axis: -1)
+                    kv = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
+                }
+                attended = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: kv, values: kv, scale: scale,
+                    mask: mask, sinks: typedSinks)
             }
-            attended = MLXFast.scaledDotProductAttention(
-                queries: q, keys: kv, values: kv, scale: 1 / sqrt(Float(shape.headWidth)),
-                mask: mask, sinks: typedSinks)
         }
         let groups: MLXArray
         if batch == 1, let fusedGroups = Ernie55Kernels.invRoPEVHAGroup(

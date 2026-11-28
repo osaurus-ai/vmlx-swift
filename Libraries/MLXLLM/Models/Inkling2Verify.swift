@@ -365,13 +365,19 @@ extension Inkling2DecoderLayer {
             }
             // Affine projections: qa = [q | r | gate | sink] (the plain sink appended, as the mask reads it at
             // 2nQ + nR), ka / va from the quantized k / v rows (+ the plain dynamic-tap rows after them).
-            qa = MLX.concatenated([project(rowsQ, qp.qrg), denseProject(rowsQ, qp.sink)], axis: -1)
             if rowsK == nil {
-                let kv = project(rowsQ, qp.kv)  // [T, 2C]
-                ka = kv
-                va = kv
-                imeta = [0, Int32(nQ), 0, 0, Int32(C), 0, Int32(qa.dim(1)), Int32(2 * C), Int32(2 * C)]
+                // Sliding layers: fuse [q | r | gate | k | v] into ONE multi-row GEMV dispatch!
+                let allOut = project(rowsQ, qp.all)
+                let nQRG = 2 * nQ + nR
+                qa = MLX.concatenated([allOut[0..., ..<nQRG], denseProject(rowsQ, qp.sink)], axis: -1)
+                ka = allOut
+                va = allOut
+                imeta = [
+                    0, Int32(nQ), Int32(nQRG), 0, Int32(nQRG + C), 0,
+                    Int32(qa.dim(1)), Int32(allOut.dim(1)), Int32(allOut.dim(1)),
+                ]
             } else {
+                qa = MLX.concatenated([project(rowsQ, qp.qrg), denseProject(rowsQ, qp.sink)], axis: -1)
                 var kk = project(rowsK!, qp.k)
                 var vv = project(rowsV!, qp.v)
                 if !a.isSliding, let kt = qp.kTaps, let vt = qp.vTaps {

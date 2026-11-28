@@ -2654,7 +2654,7 @@ extension Inkling2LoopModel: LaneQMMTargetPolicy {
 }
 
 extension Inkling2LoopModel: DFlash2WidthLadderPolicy {
-    public var dflash2WidthLadder: [Int] { [5, 8] }
+    public var dflash2WidthLadder: [Int] { [5, 8, 12] }
     public var dflash2BoundsCostsByWiderRungs: Bool { true }
     public var dflash2ProbesWhileEvidenceIsThin: Bool { true }
 }

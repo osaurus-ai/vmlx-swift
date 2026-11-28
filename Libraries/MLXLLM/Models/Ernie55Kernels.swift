@@ -2401,7 +2401,275 @@ enum Ernie55Kernels {
                 out[qAbsBase + lane + 32 * e] = bfloat16_t(acc[e] * invL);
             }
             """)
+    /// Split-K Stage 1 hardware-MMA HCA decode & DSpark verify attention (T = 1...16).
+    /// Streams local window + visible pooled KV directly with ZERO KV concat and ZERO boolean mask,
+    /// splitting `totalK` across `NSPLITS` threadgroups so T=1..16 saturates all GPU cores at 65K-300K+.
+    private static let hcaSplitKStage1Kernel = MLXFast.metalKernel(
+        name: "ernie55_hca_splitk_s1",
+        inputNames: ["qT", "localKV", "pooled", "meta", "scaleArr"],
+        outputNames: ["oPart", "mPart", "lPart"],
+        source: """
+            constexpr int BK = 16;
+            constexpr int D_PER_SG = HEAD_DIM / 4;
+            constexpr int D_TILES = D_PER_SG / 8;
+            uint hg = threadgroup_position_in_grid.x;
+            uint splitIdx = threadgroup_position_in_grid.y;
+            uint t = threadgroup_position_in_grid.z;
+            uint tid = thread_position_in_threadgroup.x;
+            uint sg = simdgroup_index_in_threadgroup;
+            uint sg_h = sg / 4u;
+            uint sg_d = sg % 4u;
+
+            int NQ = qT_shape[2];
+            int T = qT_shape[1];
+            int L_LOC = localKV_shape[2];
+            int S_POOL = pooled_shape[1];
+            int offset = meta[0];
+            int priorLocal = meta[1];
+            int window = meta[2];
+            int ratio = meta[3];
+            int nSplits = meta[4];
+            float sc = scaleArr[0];
+
+            int qPos = offset + int(t);
+            int kLo = max(0, priorLocal + int(t) - (window - 1));
+            int kHi = min(L_LOC, priorLocal + int(t) + 1);
+            int nLocal = max(0, kHi - kLo);
+            int nPool = min(S_POOL, (qPos + 1) / ratio);
+            int totalK = nLocal + nPool;
+
+            int chunkK = ((totalK + nSplits - 1) / nSplits + BK - 1) / BK * BK;
+            int kStart = int(splitIdx) * chunkK;
+            int kEnd = min(totalK, kStart + chunkK);
+
+            int hGroup0 = int(hg) * 16;
+            int h0 = hGroup0 + int(sg_h) * 8;
+            int d0 = int(sg_d) * D_PER_SG;
+
+            if (kStart >= kEnd) {
+                if (tid < 16u) {
+                    size_t mlOff = ((size_t)(hGroup0 + int(tid)) * T + t) * nSplits + splitIdx;
+                    mPart[mlOff] = -INFINITY;
+                    lPart[mlOff] = 0.0f;
+                }
+                for (int idx = int(tid); idx < 16 * HEAD_DIM; idx += 256) {
+                    int rh = idx / HEAD_DIM;
+                    int dc = idx % HEAD_DIM;
+                    size_t oOff = (((size_t)(hGroup0 + rh) * T + t) * nSplits + splitIdx) * HEAD_DIM + dc;
+                    oPart[oOff] = 0.0f;
+                }
+                return;
+            }
+
+            threadgroup bfloat16_t kvTile[BK][HEAD_DIM];
+            threadgroup float sPart[2][4][8][BK];
+            threadgroup bfloat16_t pTile[16][BK];
+            threadgroup float diagMat[2][8][8];
+            threadgroup float mState[16];
+            threadgroup float lState[16];
+
+            if (tid < 16u) {
+                mState[tid] = -INFINITY;
+                lState[tid] = 0.0f;
+            }
+            for (uint i = tid; i < 128u; i += 256u) {
+                diagMat[i / 64u][(i % 64u) / 8u][i % 8u] = 0.0f;
+            }
+
+            simdgroup_float8x8 accO[D_TILES];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < D_TILES; ++j) accO[j] = simdgroup_float8x8(0.0f);
+
+            size_t qTokenBase = (size_t)t * NQ * HEAD_DIM + (size_t)h0 * HEAD_DIM + d0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int kBase = kStart; kBase < kEnd; kBase += BK) {
+                int tileLen = min(BK, kEnd - kBase);
+                for (int i = int(tid); i < tileLen * (HEAD_DIM / 4); i += 256) {
+                    int kk = i / (HEAD_DIM / 4);
+                    int d4 = (i % (HEAD_DIM / 4)) * 4;
+                    int idx = kBase + kk;
+                    const device bfloat16_t* srcPtr = (idx < nLocal)
+                        ? (localKV + (size_t)(kLo + idx) * HEAD_DIM + d4)
+                        : (pooled + (size_t)(idx - nLocal) * HEAD_DIM + d4);
+                    *(threadgroup vec<bfloat16_t, 4>*)(&kvTile[kk][d4]) =
+                        *(const device vec<bfloat16_t, 4>*)(srcPtr);
+                }
+                if (tileLen < BK) {
+                    for (int i = int(tid); i < (BK - tileLen) * (HEAD_DIM / 4); i += 256) {
+                        int kk = tileLen + i / (HEAD_DIM / 4);
+                        int d4 = (i % (HEAD_DIM / 4)) * 4;
+                        *(threadgroup vec<bfloat16_t, 4>*)(&kvTile[kk][d4]) =
+                            vec<bfloat16_t, 4>(bfloat16_t(0.f));
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                simdgroup_float8x8 accS0(0.0f), accS1(0.0f);
+                for (int ks = 0; ks < D_PER_SG; ks += 8) {
+                    simdgroup_bfloat8x8 qa, k0, k1;
+                    simdgroup_load(qa, qT + qTokenBase + ks, HEAD_DIM);
+                    simdgroup_load(k0, &kvTile[0][d0 + ks], HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_load(k1, &kvTile[8][d0 + ks], HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(accS0, qa, k0, accS0);
+                    simdgroup_multiply_accumulate(accS1, qa, k1, accS1);
+                }
+                simdgroup_store(accS0, &sPart[sg_h][sg_d][0][0], BK);
+                simdgroup_store(accS1, &sPart[sg_h][sg_d][0][8], BK);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < 16u) {
+                    uint gh = tid / 8u;
+                    uint rh = tid % 8u;
+                    float mOld = mState[tid];
+                    float lOld = lState[tid];
+                    float mNew = mOld;
+                    float scRow[BK];
+                    for (int kk = 0; kk < BK; ++kk) {
+                        if (kk < tileLen) {
+                            float s = (sPart[gh][0][rh][kk] + sPart[gh][1][rh][kk]
+                                     + sPart[gh][2][rh][kk] + sPart[gh][3][rh][kk]) * sc;
+                            scRow[kk] = s;
+                            mNew = max(mNew, s);
+                        } else {
+                            scRow[kk] = -INFINITY;
+                        }
+                    }
+                    float alpha = (lOld > 0.0f) ? exp(mOld - mNew) : 0.0f;
+                    float lNew = lOld * alpha;
+                    for (int kk = 0; kk < BK; ++kk) {
+                        float p = (kk < tileLen) ? exp(scRow[kk] - mNew) : 0.0f;
+                        lNew += p;
+                        pTile[tid][kk] = bfloat16_t(p);
+                    }
+                    mState[tid] = mNew;
+                    lState[tid] = lNew;
+                    diagMat[gh][rh][rh] = alpha;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                simdgroup_float8x8 dA;
+                simdgroup_load(dA, &diagMat[sg_h][0][0], 8);
+                simdgroup_bfloat8x8 p0, p1;
+                simdgroup_load(p0, &pTile[sg_h * 8u][0], BK);
+                simdgroup_load(p1, &pTile[sg_h * 8u][8], BK);
+
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < D_TILES; ++j) {
+                    simdgroup_multiply(accO[j], dA, accO[j]);
+                    simdgroup_bfloat8x8 v0, v1;
+                    simdgroup_load(v0, &kvTile[0][d0 + j * 8], HEAD_DIM);
+                    simdgroup_load(v1, &kvTile[8][d0 + j * 8], HEAD_DIM);
+                    simdgroup_multiply_accumulate(accO[j], p0, v0, accO[j]);
+                    simdgroup_multiply_accumulate(accO[j], p1, v1, accO[j]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid < 16u) {
+                size_t mlOff = ((size_t)(hGroup0 + int(tid)) * T + t) * nSplits + splitIdx;
+                mPart[mlOff] = mState[tid];
+                lPart[mlOff] = lState[tid];
+            }
+            for (int j = 0; j < D_TILES; j += 2) {
+                simdgroup_store(accO[j], &sPart[sg_h][sg_d][0][0], BK);
+                if (j + 1 < D_TILES) {
+                    simdgroup_store(accO[j + 1], &sPart[sg_h][sg_d][0][8], BK);
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                uint lane = thread_index_in_simdgroup;
+                int cols = (j + 1 < D_TILES) ? 16 : 8;
+                for (int idx = int(lane); idx < 8 * cols; idx += 32) {
+                    int rh = idx / cols;
+                    int dc = idx % cols;
+                    size_t oOff = (((size_t)(h0 + rh) * T + t) * nSplits + splitIdx) * HEAD_DIM + d0 + j * 8 + dc;
+                    oPart[oOff] = sPart[sg_h][sg_d][rh][dc];
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """,
+        header: compressorTiledHeader)
+
+    /// Split-K Stage 2: reduces all NSPLITS partials + attention sink into final `[1, NQ, T, HEAD_DIM]`.
+    private static let hcaSplitKStage2Kernel = MLXFast.metalKernel(
+        name: "ernie55_hca_splitk_s2",
+        inputNames: ["oPart", "mPart", "lPart", "sinks"],
+        outputNames: ["out"],
+        source: """
+            uint h = threadgroup_position_in_grid.x;
+            uint t = threadgroup_position_in_grid.y;
+            uint tid = thread_position_in_threadgroup.x;
+            int T = mPart_shape[1];
+            int nSplits = mPart_shape[2];
+            int D = oPart_shape[3];
+
+            size_t mlBase = ((size_t)h * T + t) * nSplits;
+            float mMax = float(sinks[h]);
+            for (int s = 0; s < nSplits; ++s) {
+                if (lPart[mlBase + s] > 0.0f) {
+                    mMax = max(mMax, mPart[mlBase + s]);
+                }
+            }
+            float lTotal = exp(float(sinks[h]) - mMax);
+            for (int s = 0; s < nSplits; ++s) {
+                float ls = lPart[mlBase + s];
+                if (ls > 0.0f) {
+                    lTotal += ls * exp(mPart[mlBase + s] - mMax);
+                }
+            }
+            float invL = 1.0f / lTotal;
+            size_t oBase = ((size_t)h * T + t) * D;
+            for (int d = int(tid); d < D; d += 128) {
+                float acc = 0.0f;
+                for (int s = 0; s < nSplits; ++s) {
+                    float ls = lPart[mlBase + s];
+                    if (ls > 0.0f) {
+                        float w = exp(mPart[mlBase + s] - mMax);
+                        acc += oPart[(mlBase + s) * D + d] * w;
+                    }
+                }
+                out[oBase + d] = bfloat16_t(acc * invL);
+            }
+            """)
     #endif
+
+    static func hcaDecodeVerifyAttention(
+        q: MLXArray, localKV: MLXArray, pooled: MLXArray, sinks: MLXArray,
+        offset: Int, priorLocal: Int, window: Int, ratio: Int, scale: Float
+    ) -> MLXArray? {
+        #if canImport(Metal)
+        guard Device.defaultDevice().deviceType == .gpu,
+            ProcessInfo.processInfo.environment["VMLX_ERNIE_HCA_SPLITK"] != "0",
+            q.ndim == 4, localKV.ndim == 4, pooled.ndim == 3,
+            q.dim(0) == 1, localKV.dim(0) == 1, localKV.dim(1) == 1
+        else { return nil }
+        let (NQ, T, headDim) = (q.dim(1), q.dim(2), q.dim(3))
+        guard NQ % 16 == 0, headDim > 0, headDim <= 512, headDim % 32 == 0, (headDim / 4) % 8 == 0,
+            (1 ... 16).contains(T), pooled.dim(1) >= 64
+        else { return nil }
+        let approxTotalK = min(window, localKV.dim(2)) + pooled.dim(1)
+        let nSplits = min(16, max(2, (approxTotalK + 127) / 128))
+        let qT = contiguous(q.transposed(0, 2, 1, 3).asType(.bfloat16))
+        let meta = MLXArray([Int32(offset), Int32(priorLocal), Int32(window), Int32(ratio), Int32(nSplits)])
+        let scaleArr = MLXArray([scale])
+        let s1 = hcaSplitKStage1Kernel(
+            [qT, contiguous(localKV.asType(.bfloat16)), contiguous(pooled.asType(.bfloat16)), meta, scaleArr],
+            template: [("HEAD_DIM", headDim)],
+            grid: ((NQ / 16) * 256, nSplits, T),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[NQ, T, nSplits, headDim], [NQ, T, nSplits], [NQ, T, nSplits]],
+            outputDTypes: [.float32, .float32, .float32])
+        let out = hcaSplitKStage2Kernel(
+            [s1[0], s1[1], s1[2], contiguous(sinks.asType(.bfloat16))],
+            grid: (NQ * 128, T, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1, NQ, T, headDim]],
+            outputDTypes: [.bfloat16])[0]
+        return out.asType(q.dtype)
+        #else
+        return nil
+        #endif
+    }
 
     static func mlaIndexScores(
         q: MLXArray, k: MLXArray, weights: MLXArray, startQPos: Int = 0, window: Int = 0

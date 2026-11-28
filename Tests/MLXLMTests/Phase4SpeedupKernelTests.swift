@@ -299,6 +299,68 @@ final class Phase4SpeedupKernelTests: XCTestCase {
         }
     }
 
+    func testInkling2NVFP4GateUpActV2MatchesReference() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { return }
+        MLXRandom.seed(49)
+        let E = 16, H = 256, I = 128, k = 8
+        let gateUp = Inkling2NativeSwitchLinear(inputDims: H, outputDims: 2 * I, experts: E)
+        let dense = (MLXRandom.normal([E, 2 * I, H]) * 0.25).asType(.bfloat16)
+        let (codes, scales, _) = quantized(dense, groupSize: 16, bits: 4, mode: .nvfp4)
+        let es = MLXRandom.uniform(0.5 ..< 1.5, [E]).asType(.float32)
+        try gateUp.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": codes, "scales": scales, "weight_scale_2": es,
+            ]), verify: .none)
+        eval(gateUp)
+        let caps = MLXArray([Float(7.0), Float(7.0)])
+
+        for T in [1, 8] {
+            let x = (MLXRandom.normal([T, H]) * 0.5).asType(.float32)
+            let inds = MLXRandom.randInt(0 ..< E, [T, k]).asType(.uint32)
+            let got = Inkling2DecodeKernels.nvfp4GateUpAct(
+                x32: x, inds: inds, gateUp: gateUp, caps: caps, topK: k)
+            let raw = gateUp(x.reshaped([T, 1, 1, H]), inds, sorted: false).reshaped([T * k, 2 * I])
+            let ref = Inkling2Kernels.moeActivation(
+                [raw, inds.reshaped([T * k]), es, caps],
+                grid: (I, T * k, 1), threadGroup: (min(256, I), 1, 1),
+                outputShapes: [[T * k, I]], outputDTypes: [.float32])[0]
+            eval(got, ref)
+            let maxErr = abs(got - ref).max().item(Float.self)
+            XCTAssertLessThan(maxErr, 2e-2, "nvfp4GateUpAct v2 mismatch at T=\(T): \(maxErr)")
+        }
+    }
+
+    // MARK: - ERNIE 5.5 Split-K Hardware-MMA HCA Decode & Verify Attention
+
+    func testErnie55HCASplitKDecodeVerifyMatchesReference() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { return }
+        MLXRandom.seed(50)
+        let NQ = 64, D = 128, window = 128, ratio = 128, pooledRows = 512
+        let offset = pooledRows * ratio + 37
+        let scale: Float = 1.0 / sqrt(Float(D))
+        let pooled = (MLXRandom.normal([1, pooledRows, D]) * 0.4).asType(.bfloat16)
+        let sinks = (MLXRandom.normal([NQ]) * 0.5).asType(.bfloat16)
+
+        for T in [1, 6] {
+            let priorLocal = window - 1
+            let localKV = (MLXRandom.normal([1, 1, priorLocal + T, D]) * 0.4).asType(.bfloat16)
+            let q = (MLXRandom.normal([1, NQ, T, D]) * 0.4).asType(.bfloat16)
+
+            let got = try XCTUnwrap(
+                Ernie55Kernels.hcaDecodeVerifyAttention(
+                    q: q, localKV: localKV, pooled: pooled, sinks: sinks,
+                    offset: offset, priorLocal: priorLocal, window: window, ratio: ratio, scale: scale))
+            let ref = try XCTUnwrap(
+                Ernie55Kernels.hcaPrefillAttention(
+                    q: q, localKV: localKV, pooled: pooled, sinks: sinks,
+                    offset: offset, priorLocal: priorLocal, window: window, ratio: ratio, scale: scale))
+            eval(got, ref)
+            let maxErr = abs(got.asType(.float32) - ref.asType(.float32)).max().item(Float.self)
+            XCTAssertLessThan(
+                maxErr, 5e-3, "Ernie55 hcaDecodeVerifyAttention Split-K mismatch T=\(T): maxErr=\(maxErr)")
+        }
+    }
+
     // MARK: - ERNIE 5.5 Metal 4 MPP DSA Indexer (Prefill & L=1 Decode)
 
     func testErnie55MPPIndexScoresDecodeAndPrefillMatchReference() throws {
